@@ -1,0 +1,8 @@
+project (tdlua)
+cmake_minimum_required (VERSION 3.1)
+find_package(Td 1.1.1 REQUIRED)
+include (dist.cmake)
+add_library (tdlua tdlua.h tdlua.cpp)
+set_target_properties(tdlua PROPERTIES PREFIX "")
+target_link_libraries (tdlua PRIVATE Td::TdJson)
+set_property (TARGET tdlua PROPERTY CXX_STANDARD 11)

@@ -1,0 +1,5 @@
+test/*
+cmake-build-debug/*
+build/*
+*.so
+.idea/*
