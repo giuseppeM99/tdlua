@@ -29,7 +29,6 @@ client:send(
 while true do
     local res = client:receive(1)
     if res then
-        res = json.decode(res)
         vardump(res)
         if res['@type'] == 'updateAuthorizationState' and res['authorization_state']['@type'] == 'authorizationStateClosed' then
             print('exiting')

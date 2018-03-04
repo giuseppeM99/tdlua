@@ -18,6 +18,11 @@ static int tdclient_setlogmaxsize(lua_State *L);
 static int tdclient_setlogverbosity(lua_State *L);
 static void tdclient_fatalerrorcb(const char *error);
 
+#if LUA_VERSION_NUM < 503
+    #define lua_isinteger(L, x) \
+    lua_tonumber(L, x) == lua_tointeger(L, x);
+#endif
+
 static void * getTD(lua_State *L)
 {
     if(lua_type(L, 1) == LUA_TUSERDATA) {

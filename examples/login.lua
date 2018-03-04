@@ -17,7 +17,6 @@ local api_hash = ""
 while true do
     local res = client:receive(1)
     if res then
-        res = json.decode(res)
         vardump(res)
         if res["@type"] == "updateAuthorizationState" then
             local res = res.authorization_state

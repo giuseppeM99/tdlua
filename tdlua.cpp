@@ -5,6 +5,7 @@
  */
 
 #include "tdlua.h"
+#include "luajson.h"
 
 static int tdclient_new(lua_State *L)
 {
@@ -31,7 +32,11 @@ static int tdclient_receive(lua_State *L)
         timeout = lua_tonumber(L, 2);
     }
     const char *result = td_json_client_receive(client, timeout);
-    lua_pushstring(L, result);
+    if(result == nullptr) {
+        lua_pushnil(L);
+    } else {
+        lua_pushjson(L, result);
+    }
     return 1;
 }
 
@@ -41,6 +46,10 @@ static int tdclient_send(lua_State *L)
     if(client == nullptr) return 0;
     if(lua_type(L, 2) == LUA_TSTRING) {
         td_json_client_send(client, lua_tostring(L, 2));
+    } else if(lua_type(L, 2) == LUA_TTABLE) {
+        std::string j;
+        lua_getjson(L, j);
+        td_json_client_send(client, j.c_str());
     }
     return 0;
 
@@ -53,6 +62,16 @@ static int tdclient_execute(lua_State *L)
     if(lua_type(L, 2) == LUA_TSTRING) {
         const char *result = td_json_client_execute(client, lua_tostring(L, 2));
         lua_pushstring(L, result);
+        return 1;
+    } else if(lua_type(L, 2) == LUA_TTABLE) {
+        std::string j;
+        lua_getjson(L, j);
+        const char *result = td_json_client_execute(client, j.c_str());
+        if(result == nullptr) {
+            lua_pushnil(L);
+        } else {
+            lua_pushjson(L, result);
+        }
         return 1;
     }
     return 0;
@@ -95,7 +114,7 @@ static int tdclient_setlogmaxsize(lua_State *L)
 static int tdclient_setlogverbosity(lua_State *L)
 {
     if(lua_isinteger(L, 1)) {
-        td_set_log_verbosity_level(lua_tointeger(L, 1));
+        td_set_log_verbosity_level(static_cast<int>(lua_tointeger(L, 1)));
         lua_pushboolean(L, 1);
     } else {
         lua_pushboolean(L, 0);
@@ -109,7 +128,7 @@ static luaL_Reg tdlua[] = {
         {"setLogMaxSize", tdclient_setlogmaxsize},
         {"setLogLevel", tdclient_setlogverbosity},
 
-        {NULL, NULL}
+        {nullptr, nullptr}
 };
 
 extern "C" {
