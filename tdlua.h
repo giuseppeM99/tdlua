@@ -20,7 +20,7 @@ static void tdclient_fatalerrorcb(const char *error);
 
 #if LUA_VERSION_NUM < 503
     #define lua_isinteger(L, x) \
-    lua_tonumber(L, x) == lua_tointeger(L, x);
+    lua_tonumber(L, x) == lua_tointeger(L, x)
 #endif
 
 static void * getTD(lua_State *L)
