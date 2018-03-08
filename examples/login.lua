@@ -11,14 +11,18 @@ client:send(
     )
 )
 
-local api_id = ""
-local api_hash = ""
+local api_id = "6"
+local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+local dbpassword = ""
 while true do
     local res = client:receive(1)
     if res then
-        --vardump(res)
+        vardump(res)
+        if type(res) ~= "table" then
+            goto continue
+        end
         if res["@type"] == "updateAuthorizationState" then
-            local res = res.authorization_state
+            res = res.authorization_state
         end
         if res["@type"] == "authorizationStateClosed" then
             print("exiting")
@@ -45,18 +49,31 @@ while true do
         elseif res["@type"] == "authorizationStateWaitEncryptionKey" then
             client:send(
                 {
-                    ["@type"] = "checkDatabaseEncryptionKey"
+                    ["@type"] = "checkDatabaseEncryptionKey",
+                    encryption_key = dbpassword
                 }
             )
         elseif res["@type"] == "authorizationStateWaitPhoneNumber" then
-            print("Enter phone: ")
-            local phone = io.read()
-            client:send(
-                {
-                    ["@type"] = "setAuthenticationPhoneNumber",
-                    phone_number = phone
-                }
-            )
+            print("Do you want to login as a Bot or as an User? [U/b]")
+            if io.read() == 'b' then
+                print("Enter bot token: ")
+                local token = io.read()
+                client:send(
+                    {
+                        ["@type"] = "checkAuthenticationBotToken",
+                        token = token
+                    }
+                )
+            else
+                print("Enter phone: ")
+                local phone = io.read()
+                client:send(
+                    {
+                        ["@type"] = "setAuthenticationPhoneNumber",
+                        phone_number = phone
+                    }
+                )
+            end
         elseif res["@type"] == "authorizationStateWaitCode" then
             print("Enter code: ")
             local code = io.read()
@@ -77,7 +94,8 @@ while true do
             )
         elseif res["@type"] == "authorizationStateReady" then
             print("LOGGED IN")
-            os.exit(0)
+            --os.exit(0)
         end
+        ::continue::
     end
 end
