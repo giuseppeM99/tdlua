@@ -10,7 +10,7 @@ You first need to install
 ```
 mkdir build
 cd build
-cmake ..
+cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build .
 ```
 *Since i didn't wrote an actual installation script you'll need to manually copy the file tdlua.so into the appropriate directory*

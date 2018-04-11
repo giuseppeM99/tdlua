@@ -1,6 +1,7 @@
 #include <rapidjson/reader.h>
 #include <rapidjson/writer.h>
 #include <vector>
+#include <limits>
 
 #include "luajson.h"
 
