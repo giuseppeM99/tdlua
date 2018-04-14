@@ -1,6 +1,8 @@
 sudo: true
 dist: xenial
 
+language: cpp
+
 before_install:
   - sudo apt-get -qq update
   - sudo apt-get install -y build-essential libssl-dev openssl rapidjson-dev zlib1g-dev cmake gperf liblua5.2-dev
