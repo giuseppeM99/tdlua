@@ -3,28 +3,20 @@
 This file is under GPLv3 license see LICENCE
 --]]
 local tdlua = require 'tdlua'
-local json = require 'cjson'
 local serpent = require 'serpent'
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
 tdlua.setLogLevel(2)
 local client = tdlua()
+
+client:send({['@type'] = 'getAuthorizationState', ['@extra'] = 1.01234})
+
 vardump(
-    json.decode(
-        client:execute(
-            json.encode(
-                {
-                    ['@type'] = 'getTextEntities', text = '@telegram /test_command https://telegram.org telegram.me',
-                    ['@extra'] = {'5', 7.0},
-                })
-        )
-    )
-)
-client:send(
-    json.encode(
-        {['@type'] = 'getAuthorizationState', ['@extra'] = 1.01234}
-    )
+    client:execute({
+        ['@type'] = 'getTextEntities', text = '@telegram /test_command https://telegram.org telegram.me',
+        ['@extra'] = {'5', 7.0},
+    })
 )
 while true do
     local res = client:receive(1)

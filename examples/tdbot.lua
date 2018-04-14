@@ -1,3 +1,20 @@
+--[[
+    tdbot / tdcli retrocompatibility script
+    put this file into your bot folder and append in the end of the main bot file
+    require "tdbot"
+
+    examle:
+    file bot.lua:
+        function tdbot_update_callback(data)
+            ...
+        end
+    become
+        function tdbot_update_callback(data)
+            ...
+        end
+        require "tdbot"
+    the script will start a loop and register the function callback, it will handle everything (if it work) throw tdlua
+--]]
 local tdlua = require "tdlua"
 local serpent = require "serpent"
 local function vardump(wut)
@@ -6,7 +23,7 @@ end
 local api_id = "6"
 local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 local dbpassword = ""
-tdlua.setLogLevel(2)
+tdlua.setLogLevel(0)
 local client = tdlua()
 client:send(
     (
@@ -14,6 +31,27 @@ client:send(
     )
 )
 local ready = false
+
+local function oldtonew(t)
+  for k, v in pairs(t) do
+    if type(v) == "table" then
+      oldtonew(v)
+    end
+  end
+  t["@type"] = t._
+  t._ = nil
+end
+
+local function newtoold(t)
+  for k, v in pairs(t) do
+    if type(v) == "table" then
+      newtoold(v)
+    end
+  end
+  t._ = t["@type"]
+  t["@type"] = nil
+end
+
 local function authstate(state)
     if state["@type"] == "authorizationStateClosed" then
         os.exit(0)
@@ -78,25 +116,27 @@ local function authstate(state)
         )
     elseif state["@type"] == "authorizationStateReady" then
         ready = true
+        print("ready")
         --os.exit(0)
     end
 end
 
-local updates = {}
+local function err(e)
+  return e .. " " .. debug.traceback()
+end
 
 local function _call(params, cb, extra)
-    local nonce = math.random()
-    params["@extra"] = nonce
-    client:send(params)
+    vardump(params)
+    local res = client:execute(params)
     if type(cb) == "function" then
-        while true do
-            local res = client:receive(1)
-            if type(res) == "table" then
-                if res["@extra"] == nonce then
-                    return cb(extra, res)
-                end
-                table.insert(updates)
+        if type(res) == "table" then
+            local ok, rres = xpcall(cb, err, extra, res)
+            if not ok then
+                print("Result cb failed", rres, debug.traceback())
+                --vardump(res)
+                return false
             end
+            return ok
         end
     end
 end
@@ -104,28 +144,27 @@ end
 tdbot_function = _call
 tdcli_function = _call
 
-local function pop(t)
-  local n = {}
-  for k, v in pairs(t) do
-    n[k-1] = v
-  end
-  local r = n[0]
-  n[0] = nil
-  updates = n
-  return r
-end
-
 while true do
-    local callback = tdbot_update_callback or tdcli_update_callback or function(...) vardump({...}) end
-    local res = #updates == 0 and client:receive(1) or pop(updates)
+    local callback = tdbot_update_callback or tdcli_update_callback or vardump
+    local res = client:receive(1)
     if res then
         if type(res) ~= "table" then
             goto continue
         end
         if not ready or res["@type"] == "updateAuthorizationState" then
             authstate(res.authorization_state and res.authorization_state or res)
+            goto continue
         end
-        callback(res)
+        if res["@type"] == "connectionStateUpdating" then
+          goto continue
+        end
+        print("Calling update CB", ready)
+        newtoold(res)
+        local ok, rres = xpcall(callback, err, res)
+        if not ok then
+          print("Update cb failed", rres)
+          --vardump(res)
+        end
         ::continue::
     end
 end

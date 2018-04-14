@@ -17,15 +17,22 @@ static int tdclient_new(lua_State *L)
     lua_pushcfunction(L, tdclient_unload);
     lua_settable(L, -3);
     void *td = td_json_client_create();
-    void **client = (void**)(lua_newuserdata(L, sizeof(void*)));
-    *client = td;
+    TDLua **client = (TDLua**)(lua_newuserdata(L, sizeof(void*)));
+    *client = new TDLua;
+    (*client)->setTD(td);
     luaL_setmetatable(L, "tdclient");
     return 1;
 }
 
 static int tdclient_receive(lua_State *L)
 {
-    void *client = getTD(L);
+    TDLua* td = getTD(L);
+    if (!td->empty()) {
+        std::string res = td->pop();
+        lua_pushstring(L, res.c_str());
+        return 1;
+    }
+    void *client = td->getTD();
     if(client == nullptr) return 0;
     lua_Number timeout = 10;
     if(lua_type(L, 2) == LUA_TNUMBER) {
@@ -42,7 +49,7 @@ static int tdclient_receive(lua_State *L)
 
 static int tdclient_send(lua_State *L)
 {
-    void *client = getTD(L);
+    void *client = getTD(L)->getTD();
     if(client == nullptr) return 0;
     if(lua_type(L, 2) == LUA_TSTRING) {
         td_json_client_send(client, lua_tostring(L, 2));
@@ -52,10 +59,44 @@ static int tdclient_send(lua_State *L)
         td_json_client_send(client, j.c_str());
     }
     return 0;
-
 }
 
 static int tdclient_execute(lua_State *L)
+{
+    if(lua_type(L, 2) == LUA_TSTRING) { // [client, json]
+        std::string j = lua_tostring(L, -1); // decode json string to lua table
+        lua_pop(L, 1); // [client]
+        lua_pushjson(L, j); // [client, table]
+    }
+    if (lua_type(L, 2) == LUA_TTABLE) { // [client, table]
+        int nonce = rand();
+        lua_pushstring(L, "@extra"); // [client, table, "@extra"]
+        lua_pushinteger(L, nonce); // [client, table, "@extra", nonce]
+        lua_settable(L, -3); // [client, table]
+        tdclient_send(L); // [client, table]
+        TDLua *td = getTD(L);
+        while (true) {
+            tdclient_receive(L); // [client, table, restable]
+            if (lua_type(L, -1) != LUA_TTABLE) { // nil
+                continue;
+            }
+            lua_pushstring(L, "@extra"); // [client, table, restable, "@extra"]
+            lua_gettable(L, -2); // [client, table, restable, restable["@extra"]]
+            if (lua_type(L, -1) == LUA_TNUMBER && lua_tointeger(L, -1) == nonce) {
+                lua_pop(L, 1); // [client, table, restable]
+                return 1;
+            } else {
+                lua_pop(L, 1); // [client, table, restable]
+                std::string res;
+                lua_getjson(L, res); // [client, table, restable]
+                td->push(res);
+            }
+        }
+    }
+    return 0;
+}
+
+static int tdclient_rawexecute(lua_State *L)
 {
     void *client = getTD(L);
     if(client == nullptr) return 0;
