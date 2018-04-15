@@ -1,13 +1,4 @@
 #!/bin/bash
-git clone https://github.com/Tencent/rapidjson
-cd rapidjson
-git submodule update --init
-mkdir build
-cd build
-cmake ..
-make -j8
-sudo make install
-cd ../..
 git clone https://github.com/tdlib/td
 cd td
 mkdir build

@@ -5,7 +5,7 @@ language: cpp
 
 before_install:
   - sudo apt-get -y update
-  - sudo apt-get install -y build-essential libssl-dev openssl zlib1g-dev cmake gperf liblua5.2-dev
+  - sudo apt-get install -y build-essential libssl-dev openssl zlib1g-dev cmake gperf liblua5.2-dev rapidjson-dev
 
 script:
   - ./compile.sh

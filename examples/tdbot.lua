@@ -48,6 +48,7 @@ local function newtoold(t)
       newtoold(v)
     end
   end
+  t["@extra"] = nil
   t._ = t["@type"]
   t["@type"] = nil
 end
@@ -126,10 +127,11 @@ local function err(e)
 end
 
 local function _call(params, cb, extra)
-    vardump(params)
+    oldtonew(params)
     local res = client:execute(params)
     if type(cb) == "function" then
         if type(res) == "table" then
+            newtoold(res)
             local ok, rres = xpcall(cb, err, extra, res)
             if not ok then
                 print("Result cb failed", rres, debug.traceback())
@@ -158,7 +160,6 @@ while true do
         if res["@type"] == "connectionStateUpdating" then
           goto continue
         end
-        print("Calling update CB", ready)
         newtoold(res)
         local ok, rres = xpcall(callback, err, res)
         if not ok then
