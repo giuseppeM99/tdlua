@@ -15,7 +15,7 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j8
 sudo make install
-cd ../../tdlua
+cd ../../
 mkdir build
 cmake -DCMAKE_BUILD_TYPE=Release -DTDLUA_TD_STATIC=1 ..
 cmake --build .
