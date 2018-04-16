@@ -11,6 +11,7 @@
 #include <queue>
 #include <string>
 static int tdclient_new(lua_State *L);
+static int tdclient_call(lua_State *L);
 static int tdclient_send(lua_State *L);
 static int tdclient_unload(lua_State *L);
 static int tdclient_receive(lua_State *L);
@@ -26,12 +27,24 @@ private:
     void * tdjson;
     std::queue<std::string> updates;
 public:
+
+    TDLua()
+    {
+        tdjson = td_json_client_create();
+    }
+
+    ~TDLua()
+    {
+        td_json_client_destroy(tdjson);
+        std::cout << "Descructor called!\n";
+    }
+
     void setTD(void* td)
     {
         tdjson = td;
     }
 
-    void* getTD()
+    void* getTD() const
     {
         return tdjson;
     }
@@ -43,15 +56,33 @@ public:
         return res;
     }
 
+    void send(const std::string json) const
+    {
+        td_json_client_send(tdjson, json.c_str());
+    }
+
+    std::string execute(const std::string json) const
+    {
+        const char *res = td_json_client_execute(tdjson, json.c_str());
+        return res != nullptr ? res : "";
+    }
+
+    std::string receive(const size_t timeout = 10) const
+    {
+        const char *res = td_json_client_receive(tdjson, timeout);
+        return res != nullptr ? res : "";
+    }
+
     void push(std::string update)
     {
         updates.push(update);
     }
 
-    bool empty()
+    bool empty() const
     {
         return updates.empty();
     }
+
 };
 
 #if LUA_VERSION_NUM < 503
@@ -69,7 +100,6 @@ static TDLua * getTD(lua_State *L)
 
 static luaL_Reg mt[] = {
         {"receive", tdclient_receive},
-        {"close", tdclient_unload},
         {"send", tdclient_send},
         {"execute", tdclient_execute},
         {"_execute", tdclient_rawexecute},

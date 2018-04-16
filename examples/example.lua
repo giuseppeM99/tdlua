@@ -18,6 +18,13 @@ vardump(
         ['@extra'] = {'5', 7.0},
     })
 )
+--Same as
+vardump(
+    client:getTextEntities({
+        text = '@telegram /test_command https://telegram.org telegram.me',
+    })
+)
+
 while true do
     local res = client:receive(1)
     if res then
@@ -28,5 +35,6 @@ while true do
         end
     else
         print('res is nil')
+        client = nil
     end
 end
