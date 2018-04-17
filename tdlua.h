@@ -36,7 +36,6 @@ public:
     ~TDLua()
     {
         td_json_client_destroy(tdjson);
-        std::cout << "Descructor called!\n";
     }
 
     void setTD(void* td)
