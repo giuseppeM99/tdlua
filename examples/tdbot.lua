@@ -33,24 +33,29 @@ client:send(
 local ready = false
 
 local function oldtonew(t)
+  if type(t) ~= "table" then return t end
   for k, v in pairs(t) do
     if type(v) == "table" then
       oldtonew(v)
     end
   end
-  t["@type"] = t._
-  t._ = nil
+  if not t["@type"] then
+    t["@type"] = t._
+  end
+  return t
 end
 
 local function newtoold(t)
+  if type(t) ~= "table" then return t end
   for k, v in pairs(t) do
     if type(v) == "table" then
       newtoold(v)
     end
   end
-  t["@extra"] = nil
-  t._ = t["@type"]
-  t["@type"] = nil
+  if t["@type"] then
+    t._ = t["@type"]
+  end
+  return t
 end
 
 local function authstate(state)
@@ -127,11 +132,9 @@ local function err(e)
 end
 
 local function _call(params, cb, extra)
-    oldtonew(params)
     local res = client:execute(params)
     if type(cb) == "function" then
         if type(res) == "table" then
-            newtoold(res)
             local ok, rres = xpcall(cb, err, extra, res)
             if not ok then
                 print("Result cb failed", rres, debug.traceback())
@@ -145,6 +148,8 @@ end
 
 tdbot_function = _call
 tdcli_function = _call
+
+client = setmetatable({_client = client,}, {__index = function(self, call, ...) return function(self, params) return newtoold(self._client[call](self._client, type(params) == "table" and oldtonew(params) or params)) end end})
 
 while true do
     local callback = tdbot_update_callback or tdcli_update_callback or vardump
@@ -160,7 +165,6 @@ while true do
         if res["@type"] == "connectionStateUpdating" then
           goto continue
         end
-        newtoold(res)
         local ok, rres = xpcall(callback, err, res)
         if not ok then
           print("Update cb failed", rres)

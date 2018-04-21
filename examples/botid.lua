@@ -7,6 +7,7 @@ local function saveid(extra, result)
 end
 
 function tdbot_update_callback(res)
+  print(res["@type"])
   if res._ == "updateNewMessage" then
     tdbot_function({_ = "getMe"}, saveid)
   end
