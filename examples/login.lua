@@ -78,7 +78,7 @@ while true do
             print("Enter code: ")
             local code = io.read()
             client:send(
-                json.encode {
+                {
                     ["@type"] = "checkAuthenticationCode",
                     code = code
                 }
