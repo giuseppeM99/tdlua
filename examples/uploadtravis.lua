@@ -3,16 +3,6 @@ local serpent = require "serpent"
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
-local function newtoold(t)
-  for k, v in pairs(t) do
-    if type(v) == "table" then
-      newtoold(v)
-    end
-  end
-  t["@extra"] = nil
-  t._ = t["@type"]
-  t["@type"] = nil
-end
 local api_id = "6"
 local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 local dbpassword = ""
@@ -23,19 +13,6 @@ client:send(
         {["@type"] = "getAuthorizationState"}
     )
 )
-
-local function oldtonew(t)
-  for k, v in pairs(t) do
-    if type(v) == "table" then
-      oldtonew(v)
-    end
-  end
-  if not t["@type"] then
-    t["@type"] = t._
-    t._ = nil
-  end
-  return t
-end
 
 local function authstate(state)
     if state["@type"] == "authorizationStateClosed" then
