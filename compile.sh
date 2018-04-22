@@ -4,7 +4,7 @@ cd td
 mkdir build
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j4
+make -j6
 sudo make install
 cd ../../
 mkdir build

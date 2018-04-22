@@ -1,8 +1,4 @@
 local tdlua = require "tdlua"
-local serpent = require "serpent"
-local function vardump(wut)
-    print(serpent.block(wut, {comment=false}))
-end
 local api_id = "6"
 local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 local dbpassword = ""
@@ -70,7 +66,7 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua MD5".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+")
+                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+")
                 }
             }
         }
