@@ -37,6 +37,7 @@ public:
     ~TDLua()
     {
         td_json_client_destroy(tdjson);
+        delete updates;
     }
 
     void setTD(void* td)
