@@ -2,7 +2,6 @@ local tdlua = require "tdlua"
 local api_id = "6"
 local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 local dbpassword = ""
-tdlua.setLogLevel(0)
 local client = tdlua()
 client:send(
     (
@@ -66,13 +65,15 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+")
+                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+")..
+                    "\n\nFile sent with TDLua"
                 }
             }
         }
         if res.sending_state and res.sending_state["@type"] == "messageSendingStatePending" then
             os.execute("sleep 1")
         end
+        print("DONE")
         client:close()
     end
 end

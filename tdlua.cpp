@@ -136,7 +136,6 @@ static int tdclient_rawexecute(lua_State *L)
 static int tdclient_unload(lua_State *L)
 {
     TDLua *td = getTD(L);
-    std::cout << td << std::endl;
     delete td;
     return 0;
 }
