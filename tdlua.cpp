@@ -32,7 +32,7 @@ static int tdclient_receive(lua_State *L)
     TDLua* td = getTD(L);
     if (!td->empty()) {
         std::string res = td->pop();
-        lua_pushstring(L, res.c_str());
+        lua_pushjson(L, res);
         return 1;
     }
     lua_Number timeout = 10;
@@ -77,7 +77,8 @@ static int tdclient_execute(lua_State *L)
         TDLua *td = getTD(L);
         while (true) {
             lua_checkstack(L, 3);
-            tdclient_receive(L); // [client, table, restable]
+            std::string res = td->receive(1);
+            lua_pushjson(L, res); // [client, table, restable]
             if (lua_type(L, -1) != LUA_TTABLE) { // nil
                 continue;
             }
@@ -88,8 +89,6 @@ static int tdclient_execute(lua_State *L)
                 return 1;
             } else {
                 lua_pop(L, 1); // [client, table, restable]
-                std::string res;
-                lua_getjson(L, res); // [client, table, restable]
                 td->push(res);
             }
         }
@@ -99,11 +98,17 @@ static int tdclient_execute(lua_State *L)
 
 static int call(lua_State *L)
 {
+    auto f = tdclient_execute;
+    if (lua_type(L, -1) == LUA_TBOOLEAN) {
+        if (lua_toboolean(L, -1))
+            f = tdclient_send;
+        lua_pop(L, 1);
+    }
     if (lua_type(L, -1) != LUA_TTABLE) lua_newtable(L);
     lua_pushstring(L, "@type");
     lua_pushstring(L, lua_tostring(L, lua_upvalueindex(1)));
     lua_settable(L, -3);
-    return tdclient_execute(L);
+    return f(L);
 }
 
 static int tdclient_call(lua_State *L)

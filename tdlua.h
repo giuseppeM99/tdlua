@@ -50,7 +50,7 @@ public:
         return tdjson;
     }
 
-    std::string pop()
+    std::string pop() const
     {
         std::string res = updates->back();
         updates->pop();
@@ -74,7 +74,7 @@ public:
         return res != nullptr ? res : "";
     }
 
-    void push(std::string update)
+    void push(std::string update) const
     {
         updates->push(update);
     }

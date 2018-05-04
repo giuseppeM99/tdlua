@@ -146,10 +146,11 @@ private:
 void lua_pushjson(lua_State *L, std::string jstr)
 {
     Decoder handler(L);
-    auto reader = new rapidjson::Reader();
+    //auto reader = new rapidjson::Reader();
+    rapidjson::Reader reader;
     rapidjson::StringStream stream(jstr.c_str());
-    reader->Parse(stream, handler);
-    delete reader;
+    reader.Parse(stream, handler);
+    //delete reader;
 }
 
 
@@ -236,8 +237,9 @@ void encode(lua_State *L, T *writer)
 void lua_getjson(lua_State *L, std::string &str)
 {
     rapidjson::StringBuffer s;
-    auto writer = new rapidjson::Writer<rapidjson::StringBuffer> (s);
-    encode(L, writer);
-    delete writer;
+    //auto writer = new rapidjson::Writer<rapidjson::StringBuffer> (s);
+    rapidjson::Writer<rapidjson::StringBuffer> writer(s);
+    encode(L, &writer);
+    //delete writer;
     str = s.GetString();
 }
