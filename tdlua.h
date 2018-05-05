@@ -25,19 +25,17 @@ static void tdclient_fatalerrorcb(const char *error);
 class TDLua {
 private:
     void * tdjson;
-    std::queue<std::string>* updates;
+    std::queue<std::string> updates;
 public:
 
     TDLua()
     {
         tdjson = td_json_client_create();
-        updates = new std::queue<std::string>;
     }
 
     ~TDLua()
     {
         td_json_client_destroy(tdjson);
-        delete updates;
     }
 
     void setTD(void* td)
@@ -50,10 +48,10 @@ public:
         return tdjson;
     }
 
-    std::string pop() const
+    std::string pop()
     {
-        std::string res = updates->back();
-        updates->pop();
+        std::string res = updates.back();
+        updates.pop();
         return res;
     }
 
@@ -68,20 +66,20 @@ public:
         return res != nullptr ? res : "";
     }
 
-    std::string receive(const size_t timeout = 10) const
+    std::string receive(const size_t timeout = 10)
     {
         const char *res = td_json_client_receive(tdjson, timeout);
         return res != nullptr ? res : "";
     }
 
-    void push(std::string update) const
+    void push(std::string update)
     {
-        updates->push(update);
+        updates.push(update);
     }
 
     bool empty() const
     {
-        return updates->empty();
+        return updates.empty();
     }
 
 };
