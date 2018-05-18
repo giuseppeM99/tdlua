@@ -84,10 +84,11 @@ public:
 
 };
 
-#if LUA_VERSION_NUM < 503
-    #define lua_isinteger(L, x) \
-    lua_tonumber(L, x) == lua_tointeger(L, x)
-#endif
+
+bool my_lua_isinteger(lua_State *L, int x)
+{
+    return (lua_tonumber(L, x) == lua_tointeger(L, x));
+}
 
 static TDLua * getTD(lua_State *L)
 {

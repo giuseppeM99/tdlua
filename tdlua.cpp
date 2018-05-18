@@ -173,12 +173,13 @@ static int tdclient_setlogmaxsize(lua_State *L)
 
 static int tdclient_setlogverbosity(lua_State *L)
 {
-    if(lua_isinteger(L, 1)) {
+    if(my_lua_isinteger(L, 1)) {
         td_set_log_verbosity_level(static_cast<int>(lua_tointeger(L, 1)));
         lua_pushboolean(L, 1);
     } else {
         lua_pushboolean(L, 0);
     }
+    return 1;
 }
 
 //Open Lib
