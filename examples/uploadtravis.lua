@@ -54,6 +54,7 @@ local function authstate(state)
             end
             chat = res.id
         end
+        tdlua.setLogLevel(1)
         local res = client:execute {
             ["@type"] = "sendMessage",
             chat_id = chat,
@@ -70,11 +71,9 @@ local function authstate(state)
                 }
             }
         }
-        if res.sending_state and res.sending_state["@type"] == "messageSendingStatePending" then
-            os.execute("sleep 1")
-        end
-        print("DONE")
-        client:close()
+    elseif state["@type"] == "updateMessageSendSucceeded" then
+      print("DONE")
+      client:close()
     end
 end
 
