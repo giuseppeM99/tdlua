@@ -76,7 +76,7 @@ static int tdclient_execute(lua_State *L)
         tdclient_send(L); // [client, table]
         TDLua *td = getTD(L);
         while (true) {
-            lua_checkstack(L, 3);
+            //lua_checkstack(L, 3);
             std::string res = td->receive(1);
             lua_pushjson(L, res); // [client, table, restable]
             if (lua_type(L, -1) != LUA_TTABLE) { // nil
