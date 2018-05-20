@@ -50,7 +50,7 @@ public:
 
     std::string pop()
     {
-        std::string res = updates.back();
+        std::string res = updates.front();
         updates.pop();
         return res;
     }
