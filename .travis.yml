@@ -13,7 +13,6 @@ addons:
     - zlib1g-dev
     - gperf
     - liblua5.2-dev
-    - rapidjson-dev
     - lua5.2
 
 script:
