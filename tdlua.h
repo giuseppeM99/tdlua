@@ -8,11 +8,15 @@
 #include <td/telegram/td_log.h>
 #include <lua.hpp>
 #include <iostream>
+#include <fstream>
 #include <queue>
 #include <string>
+#include "json.hpp"
+
 static int tdclient_new(lua_State *L);
 static int tdclient_call(lua_State *L);
 static int tdclient_send(lua_State *L);
+static int tdclient_save(lua_State *L);
 static int tdclient_unload(lua_State *L);
 static int tdclient_receive(lua_State *L);
 static int tdclient_execute(lua_State *L);
@@ -24,13 +28,16 @@ static void tdclient_fatalerrorcb(const char *error);
 
 class TDLua {
 private:
-    void * tdjson;
-    std::queue<std::string> updates;
+    void *tdjson;
+    std::queue<nlohmann::json> updates;
+    std::string dbpath;
+    bool _ready;
 public:
 
     TDLua()
     {
         tdjson = td_json_client_create();
+        _ready = false;
     }
 
     ~TDLua()
@@ -48,31 +55,47 @@ public:
         return tdjson;
     }
 
-    std::string pop()
+    nlohmann::json pop()
     {
-        std::string res = updates.front();
+        nlohmann::json res = updates.front();
         updates.pop();
         return res;
     }
 
-    void send(const std::string json) const
+    void setDB(std::string path)
     {
-        td_json_client_send(tdjson, json.c_str());
+        dbpath = path;
+        if (dbpath.back() != '/')
+            dbpath += "/";
+        dbpath += "tdlua.json";
     }
 
-    std::string execute(const std::string json) const
+    void send(const nlohmann::json json) const
     {
-        const char *res = td_json_client_execute(tdjson, json.c_str());
-        return res != nullptr ? res : "";
+        td_json_client_send(tdjson, json.dump().c_str());
     }
 
-    std::string receive(const size_t timeout = 10)
+    nlohmann::json execute(const nlohmann::json json) const
+    {
+        const char *res = td_json_client_execute(tdjson, json.dump().c_str());
+        if (!res) {
+            return nullptr;
+        }
+        nlohmann::json jres = nlohmann::json::parse(res);
+        return jres;
+    }
+
+    nlohmann::json receive(const size_t timeout = 10) const
     {
         const char *res = td_json_client_receive(tdjson, timeout);
-        return res != nullptr ? res : "";
+        if (!res) {
+            return nullptr;
+        }
+        nlohmann::json jres = nlohmann::json::parse(res);
+        return jres;
     }
 
-    void push(std::string update)
+    void push(const nlohmann::json update)
     {
         updates.push(update);
     }
@@ -80,6 +103,43 @@ public:
     bool empty() const
     {
         return updates.empty();
+    }
+
+    void saveUpdatesBuffer()
+    {
+        if (dbpath.empty()) return;
+        nlohmann::json jupdates = nlohmann::json::array();
+        while(updates.size()) {
+            jupdates[updates.size()] = this->pop();
+        }
+        std::ofstream out(dbpath);
+        out << jupdates.dump();
+        out.close();
+    }
+
+    void loadUpdatesBuffer()
+    {
+        if (dbpath.empty() || _ready) return;
+        std::ifstream in(dbpath);
+        if (in && in.is_open()) {
+            std::string buf;
+            in.seekg(0, std::ios::end);
+            buf.resize(in.tellg());
+            in.seekg(0, std::ios::beg);
+            in.read(&buf[0], buf.size());
+            in.close();
+            nlohmann::json j = nlohmann::json::parse(buf);
+            if (j.is_array() && !j.empty()) {
+                for (auto &elem : j) {
+                    updates.push(elem);
+                }
+            }
+        }
+        _ready = true;
+    }
+    bool ready() const
+    {
+        return _ready;
     }
 
 };
@@ -92,7 +152,7 @@ bool my_lua_isinteger(lua_State *L, int x)
 
 static TDLua * getTD(lua_State *L)
 {
-    if(lua_type(L, 1) == LUA_TUSERDATA) {
+    if (lua_type(L, 1) == LUA_TUSERDATA) {
         return (TDLua*) *((void**)lua_touserdata(L,1));
     }
     return nullptr;
@@ -103,8 +163,9 @@ static luaL_Reg mt[] = {
         {"send", tdclient_send},
         {"execute", tdclient_execute},
         {"_execute", tdclient_rawexecute},
+        {"close", tdclient_unload},
+        {"save", tdclient_save},
         {NULL, NULL}
-
 };
 
 extern "C" {

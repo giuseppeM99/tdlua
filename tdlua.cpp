@@ -7,6 +7,7 @@
 #include "tdlua.h"
 #include "luajson.h"
 
+using json = nlohmann::json;
 static int tdclient_new(lua_State *L)
 {
     luaL_newmetatable(L, "tdclient");
@@ -31,18 +32,21 @@ static int tdclient_receive(lua_State *L)
 {
     TDLua* td = getTD(L);
     if (!td->empty()) {
-        std::string res = td->pop();
-        lua_pushjson(L, res);
+        lua_pushjson(L, td->pop());
         return 1;
     }
     lua_Number timeout = 10;
-    if(lua_type(L, 2) == LUA_TNUMBER) {
-        timeout = lua_tonumber(L, 2);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        timeout = lua_tonumber(L, -1);
+        lua_pop(L, 1);
     }
-    std::string result = td->receive(timeout);
-    if(result.empty()) {
+    json result = td->receive(timeout);
+    if (result.empty()) {
         lua_pushnil(L);
     } else {
+        if (!td->ready() && result["@type"] == "updateAuthorizationState" && result["authorization_state"]["@type"] == "authorizationStateReady") {
+            td->loadUpdatesBuffer();
+        }
         lua_pushjson(L, result);
     }
     return 1;
@@ -51,46 +55,60 @@ static int tdclient_receive(lua_State *L)
 static int tdclient_send(lua_State *L)
 {
     TDLua *td = getTD(L);
-    if(lua_type(L, 2) == LUA_TSTRING) {
-        td->send(lua_tostring(L, 2));
-    } else if(lua_type(L, 2) == LUA_TTABLE) {
-        std::string j;
+    json j;
+    if (lua_type(L, 2) == LUA_TSTRING) {
+        j = json::parse(lua_tostring(L, 2));
+    } else if (lua_type(L, 2) == LUA_TTABLE) {
         lua_getjson(L, j);
-        td->send(j);
     }
+    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
+        td->setDB(j["parameters"]["database_directory"]);
+    }
+    td->send(j);
     return 0;
 }
 
 static int tdclient_execute(lua_State *L)
 {
-    if(lua_type(L, 2) == LUA_TSTRING) { // [client, json]
-        std::string j = lua_tostring(L, -1); // decode json string to lua table
-        lua_pop(L, 1); // [client]
-        lua_pushjson(L, j); // [client, table]
+    json j;
+    lua_Number timeout = 10*CLOCKS_PER_SEC;
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        timeout = lua_tonumber(L, -1) * CLOCKS_PER_SEC;
+        lua_pop(L, 1);
     }
-    if (lua_type(L, 2) == LUA_TTABLE) { // [client, table]
-        int nonce = rand();
-        lua_pushstring(L, "@extra"); // [client, table, "@extra"]
-        lua_pushinteger(L, nonce); // [client, table, "@extra", nonce]
-        lua_settable(L, -3); // [client, table]
-        tdclient_send(L); // [client, table]
-        TDLua *td = getTD(L);
-        while (true) {
-            //lua_checkstack(L, 3);
-            std::string res = td->receive(1);
-            lua_pushjson(L, res); // [client, table, restable]
-            if (lua_type(L, -1) != LUA_TTABLE) { // nil
-                continue;
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        j = json::parse(lua_tostring(L, -1));
+    } else if (lua_type(L, -1) == LUA_TTABLE) { // [client, table]
+        lua_getjson(L, j);
+    } else {
+        return 0;
+    }
+    lua_pop(L, 1);
+    if (!j.is_object()) {
+        return 0;
+    }
+    int nonce = rand();
+    json extra = j["@extra"];
+    j["@extra"] = nonce;
+    TDLua *td = getTD(L);
+    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
+        td->setDB(j["parameters"]["database_directory"]);
+    }
+    td->send(j);
+    auto t = clock();
+    while (clock() - t < timeout) {
+        json res = td->receive(1);
+        if (!res.is_object()) {
+            continue;
+        }
+        if (res["@extra"].is_number() && nonce == res["@extra"].get<int>()) {
+            if (!extra.empty()) {
+                res["@extra"] = extra;
             }
-            lua_pushstring(L, "@extra"); // [client, table, restable, "@extra"]
-            lua_gettable(L, -2); // [client, table, restable, restable["@extra"]]
-            if (lua_type(L, -1) == LUA_TNUMBER && lua_tointeger(L, -1) == nonce) {
-                lua_pop(L, 1); // [client, table, restable]
-                return 1;
-            } else {
-                lua_pop(L, 1); // [client, table, restable]
-                td->push(res);
-            }
+            lua_pushjson(L, res);
+            return 1;
+        } else {
+            td->push(res);
         }
     }
     return 0;
@@ -104,7 +122,9 @@ static int call(lua_State *L)
             f = tdclient_send;
         lua_pop(L, 1);
     }
-    if (lua_type(L, -1) != LUA_TTABLE) lua_newtable(L);
+    if (lua_type(L, -1) != LUA_TTABLE) {
+        lua_newtable(L);
+    }
     lua_pushstring(L, "@type");
     lua_pushstring(L, lua_tostring(L, lua_upvalueindex(1)));
     lua_settable(L, -3);
@@ -119,40 +139,46 @@ static int tdclient_call(lua_State *L)
 
 static int tdclient_rawexecute(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if(lua_type(L, 2) == LUA_TSTRING) {
-        std::string result = td->execute(lua_tostring(L, 2));
-        lua_pushstring(L, result.c_str());
-        return 1;
-    } else if(lua_type(L, 2) == LUA_TTABLE) {
-        std::string j;
+    json j;
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        j = json::parse(lua_tostring(L, -1));
+    } else if (lua_type(L, -1) == LUA_TTABLE) {
         lua_getjson(L, j);
-        std::string result = td->execute(j);
-        if(result.empty()) {
-            lua_pushnil(L);
-        } else {
-            lua_pushjson(L, result);
-        }
-        return 1;
     }
+    TDLua *td = getTD(L);
+    auto result = td->execute(j);
+    if (result.empty()) {
+        lua_pushnil(L);
+    } else {
+        lua_pushjson(L, result);
+    }
+    return 0;
+}
+
+static int tdclient_save(lua_State *L)
+{
+    TDLua *td = getTD(L);
+    td->saveUpdatesBuffer();
     return 0;
 }
 
 static int tdclient_unload(lua_State *L)
 {
     TDLua *td = getTD(L);
+    td->send({{"@type", "close"}});
+    td->saveUpdatesBuffer();
     delete td;
     return 0;
 }
 
-static void tdclient_fatalerrorcb(const char * error)
+static void tdclient_fatalerrorcb(const char *error)
 {
     std::cerr << "[TDLUA FATAL ERROR] " << error << std::endl;
 }
 
 static int tdclient_setlogpath(lua_State *L)
 {
-    if(lua_type(L, 1) == LUA_TSTRING) {
+    if (lua_type(L, 1) == LUA_TSTRING) {
         lua_pushboolean(L, td_set_log_file_path(lua_tostring(L, 1)));
     } else {
         lua_pushboolean(L, 0);
@@ -162,7 +188,7 @@ static int tdclient_setlogpath(lua_State *L)
 
 static int tdclient_setlogmaxsize(lua_State *L)
 {
-    if(lua_type(L, 1) == LUA_TNUMBER) {
+    if (lua_type(L, 1) == LUA_TNUMBER) {
         td_set_log_max_file_size(lua_tointeger(L, 1));
         lua_pushboolean(L, 1);
     } else {
@@ -173,7 +199,7 @@ static int tdclient_setlogmaxsize(lua_State *L)
 
 static int tdclient_setlogverbosity(lua_State *L)
 {
-    if(my_lua_isinteger(L, 1)) {
+    if (my_lua_isinteger(L, 1)) {
         td_set_log_verbosity_level(static_cast<int>(lua_tointeger(L, 1)));
         lua_pushboolean(L, 1);
     } else {
@@ -188,7 +214,6 @@ static luaL_Reg tdlua[] = {
         {"setLogPath", tdclient_setlogpath},
         {"setLogMaxSize", tdclient_setlogmaxsize},
         {"setLogLevel", tdclient_setlogverbosity},
-
         {nullptr, nullptr}
 };
 
