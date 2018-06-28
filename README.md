@@ -5,7 +5,6 @@
 You first need to install
 * [tdlib](https://github.com/tdlib/td)
 * [Lua](https://lua.org)
-* [RapidJSON](https://github.com/Tencent/rapidjson)
 
 ```
 mkdir build
