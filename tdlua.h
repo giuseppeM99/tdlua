@@ -62,7 +62,7 @@ public:
         return res;
     }
 
-    void setDB(std::string path)
+    void setDB(const std::string path)
     {
         dbpath = path;
         if (dbpath.back() != '/')
@@ -107,7 +107,7 @@ public:
 
     void saveUpdatesBuffer()
     {
-        if (dbpath.empty()) return;
+        if (!_ready || dbpath.empty()) return;
         nlohmann::json jupdates = nlohmann::json::array();
         while(updates.size()) {
             jupdates[updates.size()] = this->pop();
@@ -119,7 +119,7 @@ public:
 
     void loadUpdatesBuffer()
     {
-        if (dbpath.empty() || _ready) return;
+        if (dbpath.empty() || _ready || !updates.empty()) return;
         std::ifstream in(dbpath);
         if (in && in.is_open()) {
             std::string buf;
@@ -137,6 +137,27 @@ public:
         }
         _ready = true;
     }
+
+    void emptyUpdatesBuffer()
+    {
+        while (!updates.empty()) {
+            updates.pop();
+        }
+    }
+
+    void checkAuthState(const nlohmann::json update)
+    {
+        if (update["@type"] == "updateAuthorizationState") {
+            if (!ready() && update["authorization_state"]["@type"] == "authorizationStateReady") {
+                loadUpdatesBuffer();
+            } else if (update["authorization_state"]["@type"] == "authorizationStateClosed") {
+                saveUpdatesBuffer();
+                emptyUpdatesBuffer();
+                _ready = false;
+            }
+        }
+    }
+
     bool ready() const
     {
         return _ready;
@@ -163,7 +184,6 @@ static luaL_Reg mt[] = {
         {"send", tdclient_send},
         {"execute", tdclient_execute},
         {"_execute", tdclient_rawexecute},
-        {"close", tdclient_unload},
         {"save", tdclient_save},
         {NULL, NULL}
 };

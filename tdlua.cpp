@@ -44,9 +44,7 @@ static int tdclient_receive(lua_State *L)
     if (result.empty()) {
         lua_pushnil(L);
     } else {
-        if (!td->ready() && result["@type"] == "updateAuthorizationState" && result["authorization_state"]["@type"] == "authorizationStateReady") {
-            td->loadUpdatesBuffer();
-        }
+        td->checkAuthState(result);
         lua_pushjson(L, result);
     }
     return 1;
@@ -101,6 +99,7 @@ static int tdclient_execute(lua_State *L)
         if (!res.is_object()) {
             continue;
         }
+        td->checkAuthState(res);
         if (res["@extra"].is_number() && nonce == res["@extra"].get<int>()) {
             if (!extra.empty()) {
                 res["@extra"] = extra;
@@ -165,8 +164,14 @@ static int tdclient_save(lua_State *L)
 static int tdclient_unload(lua_State *L)
 {
     TDLua *td = getTD(L);
-    td->send({{"@type", "close"}});
-    td->saveUpdatesBuffer();
+    if (td->ready()) {
+        td->send({{"@type", "close"}});
+    }
+    while (td->ready()) {
+        json res = td->receive();
+        td->checkAuthState(res);
+        td->push(res);
+    }
     delete td;
     return 0;
 }
