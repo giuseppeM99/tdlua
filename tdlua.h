@@ -17,6 +17,7 @@ static int tdclient_new(lua_State *L);
 static int tdclient_call(lua_State *L);
 static int tdclient_send(lua_State *L);
 static int tdclient_save(lua_State *L);
+static int tdclient_clear(lua_State *L);
 static int tdclient_unload(lua_State *L);
 static int tdclient_receive(lua_State *L);
 static int tdclient_execute(lua_State *L);
@@ -81,7 +82,12 @@ public:
         if (!res) {
             return nullptr;
         }
-        nlohmann::json jres = nlohmann::json::parse(res);
+        nlohmann::json jres = nullptr;
+        try {
+            jres = nlohmann::json::parse(res);
+        } catch (nlohmann::json::parse_error &e) {
+            std::cout << "[TDCLIENT EXECUTE] JSON Parse error " << e.what() << "\n";
+        }
         return jres;
     }
 
@@ -91,7 +97,12 @@ public:
         if (!res) {
             return nullptr;
         }
-        nlohmann::json jres = nlohmann::json::parse(res);
+        nlohmann::json jres = nullptr;
+        try {
+            jres = nlohmann::json::parse(res);
+        } catch (nlohmann::json::parse_error &e) {
+            std::cout << "[TDCLIENT RECEIVE] JSON Parse error " << e.what() << "\n";
+        }
         return jres;
     }
 
@@ -185,6 +196,7 @@ static luaL_Reg mt[] = {
         {"execute", tdclient_execute},
         {"_execute", tdclient_rawexecute},
         {"save", tdclient_save},
+        {"clearBuffer", tdclient_clear},
         {NULL, NULL}
 };
 

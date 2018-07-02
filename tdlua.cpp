@@ -55,7 +55,13 @@ static int tdclient_send(lua_State *L)
     TDLua *td = getTD(L);
     json j;
     if (lua_type(L, 2) == LUA_TSTRING) {
-        j = json::parse(lua_tostring(L, 2));
+        try {
+            j = json::parse(lua_tostring(L, 2));
+        } catch (json::parse_error &e) {
+            std::cerr << "[TDLUA SEND] JSON Parse error " << e.what() << "\n";
+            luaL_error(L, "Malformed JSON");
+            return 0;
+        }
     } else if (lua_type(L, 2) == LUA_TTABLE) {
         lua_getjson(L, j);
     }
@@ -75,8 +81,14 @@ static int tdclient_execute(lua_State *L)
         lua_pop(L, 1);
     }
     if (lua_type(L, -1) == LUA_TSTRING) {
-        j = json::parse(lua_tostring(L, -1));
-    } else if (lua_type(L, -1) == LUA_TTABLE) { // [client, table]
+        try {
+            j = json::parse(lua_tostring(L, -1));
+        }   catch (json::parse_error &e) {
+            std::cerr << "[TDLUA EXECUTE] JSON Parse error " << e.what() << "\n";
+            luaL_error(L, "Malformed JSON");
+            return 0;
+        }
+    } else if (lua_type(L, -1) == LUA_TTABLE) {
         lua_getjson(L, j);
     } else {
         return 0;
@@ -94,7 +106,7 @@ static int tdclient_execute(lua_State *L)
     }
     td->send(j);
     auto t = clock();
-    while (clock() - t < timeout) {
+    while (td->ready() && (clock() - t < timeout)) {
         json res = td->receive(1);
         if (!res.is_object()) {
             continue;
@@ -140,7 +152,13 @@ static int tdclient_rawexecute(lua_State *L)
 {
     json j;
     if (lua_type(L, -1) == LUA_TSTRING) {
-        j = json::parse(lua_tostring(L, -1));
+        try {
+            j = json::parse(lua_tostring(L, -1));
+        }   catch (json::parse_error &e) {
+            std::cerr << "[TDLUA RAWEXECUTE] JSON Parse error " << e.what() << "\n";
+            luaL_error(L, "Malformed JSON");
+            return 0;
+        }
     } else if (lua_type(L, -1) == LUA_TTABLE) {
         lua_getjson(L, j);
     }
@@ -158,6 +176,13 @@ static int tdclient_save(lua_State *L)
 {
     TDLua *td = getTD(L);
     td->saveUpdatesBuffer();
+    return 0;
+}
+
+static int tdclient_clear(lua_State *L)
+{
+    TDLua *td = getTD(L);
+    td->emptyUpdatesBuffer();
     return 0;
 }
 

@@ -3,7 +3,7 @@ local serpent = require "serpent"
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
-tdlua.setLogLevel(2)
+tdlua.setLogLevel(3)
 local client = tdlua()
 client:send(
     (
@@ -94,6 +94,7 @@ while true do
             )
         elseif res["@type"] == "authorizationStateReady" then
             print("LOGGED IN")
+            client:close(true)
             --os.exit(0)
         end
         ::continue::
