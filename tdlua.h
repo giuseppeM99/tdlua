@@ -139,11 +139,19 @@ public:
             in.seekg(0, std::ios::beg);
             in.read(&buf[0], buf.size());
             in.close();
-            nlohmann::json j = nlohmann::json::parse(buf);
-            if (j.is_array() && !j.empty()) {
-                for (auto &elem : j) {
-                    updates.push(elem);
+            try {
+                nlohmann::json j = nlohmann::json::parse(buf);
+                if (j.is_array() && !j.empty()) {
+                    for (auto &elem : j) {
+                        updates.push(elem);
+                    }
                 }
+            } catch (nlohmann::json::parse_error &e){
+                std::cerr << "[TDCLIENT LOAD BUFFER] JSON Parse error " << e.what() << "\n";
+                _ready = true;
+                emptyUpdatesBuffer();
+                saveUpdatesBuffer();
+                return;
             }
         }
         _ready = true;
