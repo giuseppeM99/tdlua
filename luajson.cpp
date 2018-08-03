@@ -75,6 +75,8 @@ void lua_getjson(lua_State *L, json &j)
                     const char *key = lua_tolstring(L, -2, &len);
                     std::string k = std::string(key, len);
                     lua_getjson(L, j[k]);
+                    if (k == "_" && j["@type"].empty())
+                        j["@type"] = j["_"];
                 }
                 lua_pop(L, 1);
             }
@@ -121,6 +123,12 @@ void lua_pushjson (lua_State *L, const json j) {
             lua_pushlstring(L, s.c_str(), s.length());
             lua_pushjson(L, it.value());
             lua_settable(L, -3);
+            if (s == "@type") {
+                lua_pushstring(L, "_");
+                lua_pushstring(L, "@type");
+                lua_gettable(L, -3);
+                lua_settable(L, -3);
+            }
         }
     } else {
         lua_pushnil(L);

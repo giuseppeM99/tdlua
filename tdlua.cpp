@@ -113,9 +113,7 @@ static int tdclient_execute(lua_State *L)
         }
         td->checkAuthState(res);
         if (res["@extra"].is_number() && nonce == res["@extra"].get<int>()) {
-            if (!extra.empty()) {
-                res["@extra"] = extra;
-            }
+            res["@extra"] = extra;
             lua_pushjson(L, res);
             return 1;
         } else {
