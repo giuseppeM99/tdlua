@@ -25,7 +25,7 @@ vardump(
         text = '@telegram /test_command https://telegram.org telegram.me',
     })
 )
-
+client:sendMessage({['@extra'] = 'asd'})
 while true do
     if not client then
       break

@@ -41,6 +41,8 @@ void lua_getjson(lua_State *L, json &j)
             j = x;
         }
         return;
+    } else if (lua_isboolean(L, -1)) {
+        j = lua_toboolean(L, -1);
     } else if (lua_isstring(L, -1)) {
         size_t len;
         const char *s = lua_tolstring(L, -1, &len);
@@ -120,15 +122,18 @@ void lua_pushjson (lua_State *L, const json j) {
         for (auto it = j.begin(); it != j.end(); it++) {
             auto s = it.key();
 
+            //if (s == "@type") lua_pushstring(L, "_"); else
             lua_pushlstring(L, s.c_str(), s.length());
             lua_pushjson(L, it.value());
             lua_settable(L, -3);
+            //*
             if (s == "@type") {
                 lua_pushstring(L, "_");
                 lua_pushstring(L, "@type");
                 lua_gettable(L, -3);
                 lua_settable(L, -3);
             }
+            //*/
         }
     } else {
         lua_pushnil(L);
