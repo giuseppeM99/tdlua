@@ -116,6 +116,7 @@ target_link_libraries (libtgvoip opus
     dl
     "-pthread"
 )
+set_property (TARGET libtgvoip PROPERTY CXX_STANDARD 11)
 
 #include_directories (libtgvoip)
 add_library (tdlua SHARED tdlua.cpp luajson.cpp LuaTDVoip.cpp base64/base64.cpp)
