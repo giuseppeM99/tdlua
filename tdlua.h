@@ -11,7 +11,9 @@
 #include <fstream>
 #include <queue>
 #include <string>
+#include <map>
 #include "json.hpp"
+#include "LuaTDVoip.h"
 
 static int tdclient_new(lua_State *L);
 static int tdclient_call(lua_State *L);
@@ -21,6 +23,7 @@ static int tdclient_clear(lua_State *L);
 static int tdclient_unload(lua_State *L);
 static int tdclient_receive(lua_State *L);
 static int tdclient_execute(lua_State *L);
+static int tdclient_getcall(lua_State *L);
 static int tdclient_rawexecute(lua_State *L);
 static int tdclient_setlogpath(lua_State *L);
 static int tdclient_setlogmaxsize(lua_State *L);
@@ -32,6 +35,7 @@ private:
     void *tdjson;
     std::queue<nlohmann::json> updates;
     std::string dbpath;
+    std::map<int32_t, Call*> calls;
     bool _ready;
 public:
 
@@ -116,6 +120,34 @@ public:
         return updates.empty();
     }
 
+    void setCall(const int32_t id, const Call* call)
+    {
+        calls[id] = (Call*) call;
+    }
+
+    void delCall(const int32_t id)
+    {
+        calls.erase(id);
+    }
+
+    Call* getCall(const int32_t id) const
+    {
+        return calls.at(id);
+    }
+
+    void deinitAllCalls()
+    {
+        for (auto call : calls)
+        {
+            call.second->closeCall();
+        }
+    }
+
+    uint64_t runningCalls()
+    {
+        return calls.size();
+    }
+
     void saveUpdatesBuffer()
     {
         if (!_ready || dbpath.empty()) return;
@@ -185,18 +217,7 @@ public:
 };
 
 
-bool my_lua_isinteger(lua_State *L, int x)
-{
-    return (lua_tonumber(L, x) == lua_tointeger(L, x));
-}
-
-static TDLua * getTD(lua_State *L)
-{
-    if (lua_type(L, 1) == LUA_TUSERDATA) {
-        return (TDLua*) *((void**)lua_touserdata(L,1));
-    }
-    return nullptr;
-}
+bool my_lua_isinteger(lua_State *L, int x);
 
 static luaL_Reg mt[] = {
         {"receive", tdclient_receive},
@@ -205,6 +226,7 @@ static luaL_Reg mt[] = {
         {"_execute", tdclient_rawexecute},
         {"save", tdclient_save},
         {"clearBuffer", tdclient_clear},
+        {"getCall", tdclient_getcall},
         {NULL, NULL}
 };
 

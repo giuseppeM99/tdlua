@@ -1,0 +1,7 @@
+[submodule "libtgvoip"]
+	path = libtgvoip
+	url = https://github.com/grishka/libtgvoip
+	branch = public
+[submodule "base64"]
+	path = base64
+	url = https://github.com/ReneNyffenegger/cpp-base64
