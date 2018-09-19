@@ -18,8 +18,8 @@ matrix:
             - zlib1g-dev
             - gperf
             - libopus-dev
-        env:
-            - LUA_VERSION="Lua 5.1"
+      env:
+        - LUA_VERSION="Lua 5.1"
     - addons:
         apt:
           update: true
@@ -32,8 +32,8 @@ matrix:
             - zlib1g-dev
             - gperf
             - libopus-dev
-        env:
-            - LUA_VERSION="Lua 5.2"
+      env:
+        - LUA_VERSION="Lua 5.2"
     - addons:
         apt:
           update: true
@@ -46,8 +46,8 @@ matrix:
             - zlib1g-dev
             - gperf
             - libopus-dev
-        env:
-            - LUA_VERSION="Lua 5.3"
+      env:
+        - LUA_VERSION="Lua 5.3"
 
 script:
 - ./compile.sh

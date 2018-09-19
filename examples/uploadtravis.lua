@@ -55,6 +55,7 @@ local function authstate(state)
             chat = res.id
         end
         tdlua.setLogLevel(1)
+        local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
         local res = client:execute {
             ["@type"] = "sendMessage",
             chat_id = chat,
@@ -66,8 +67,8 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").."\n".._VERSION
-                    "\n\nFile sent with TDLua"
+                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").."\n".._VERSION..
+                    "\n\nFile sent with TDLua".."\nDirect link: "..link
                 }
             }
         }
