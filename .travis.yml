@@ -8,32 +8,46 @@ matrix:
   include:
     - addons:
         apt:
+          update: true
           packages:
             - lua5.1
             - liblua5.1-dev
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
+            - libopus-dev
+        env:
+            - LUA_VERSION="Lua 5.1"
     - addons:
         apt:
+          update: true
           packages:
             - lua5.2
             - liblua5.2-dev
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
+            - libopus-dev
+        env:
+            - LUA_VERSION="Lua 5.2"
     - addons:
         apt:
+          update: true
           packages:
             - lua5.3
             - liblua5.3-dev
-
-compiler: clang
-
-addons:
-  apt:
-    update: true
-    packages:
-    - libssl-dev
-    - ninja
-    - openssl
-    - zlib1g-dev
-    - gperf
-    - libopus-dev
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
+            - libopus-dev
+        env:
+            - LUA_VERSION="Lua 5.3"
 
 script:
 - ./compile.sh
