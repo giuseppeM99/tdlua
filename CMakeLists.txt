@@ -108,7 +108,8 @@ set_target_properties(libtgvoip PROPERTIES SUFFIX ".a")
 list(APPEND libtgvoip__include_dirs  "${CMAKE_CURRENT_LIST_DIR}/libtgvoip/webrtc_dsp")
 set_property(TARGET libtgvoip APPEND PROPERTY INCLUDE_DIRECTORIES ${libtgvoip__include_dirs})
 set_target_properties(libtgvoip PROPERTIES COMPILE_DEFINITIONS "WEBRTC_APM_DEBUG_DUMP=0;TGVOIP_USE_DESKTOP_DSP;WEBRTC_POSIX;USE_KISS_FFT;FIXED_POINT;TGVOIP_USE_CXX11_LIB;TGVOIP_OTHER;TGVOIP_USE_CALLBACK_AUDIO_IO;TGVOIP_LOG_VERBOSITY=0")
-target_link_libraries (libtgvoip opus
+target_link_libraries (libtgvoip
+    "libopus.a"
     pthread
     stdc++
     crypto

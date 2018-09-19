@@ -1,4 +1,15 @@
 #!/bin/bash
+
+
+git clone https://github.com/xiph/opus
+cd opus
+git checkout v1.2.1
+./autogen.sh
+./configure
+make
+sudo make install
+cd ..
+
 git clone https://github.com/tdlib/td
 cd td
 mkdir build
