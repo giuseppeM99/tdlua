@@ -3,6 +3,27 @@ dist: xenial
 
 language: cpp
 compiler: clang
+
+matrix:
+  include:
+    - addons:
+        apt:
+          packages:
+            - lua5.1
+            - liblua5.1-dev
+    - addons:
+        apt:
+          packages:
+            - lua5.2
+            - liblua5.2-dev
+    - addons:
+        apt:
+          packages:
+            - lua5.3
+            - liblua5.3-dev
+
+compiler: clang
+
 addons:
   apt:
     update: true
@@ -12,8 +33,6 @@ addons:
     - openssl
     - zlib1g-dev
     - gperf
-    - liblua5.2-dev
-    - lua5.2
     - libopus-dev
 
 script:
