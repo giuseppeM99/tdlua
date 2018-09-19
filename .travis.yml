@@ -2,7 +2,7 @@ sudo: true
 dist: xenial
 
 language: cpp
-compiler: gcc
+compiler: clang
 
 matrix:
   include:
@@ -17,7 +17,6 @@ matrix:
             - openssl
             - zlib1g-dev
             - gperf
-            - libopus-dev
       env:
         - LUA_VERSION="Lua 5.1"
     - addons:
@@ -31,7 +30,6 @@ matrix:
             - openssl
             - zlib1g-dev
             - gperf
-            - libopus-dev
       env:
         - LUA_VERSION="Lua 5.2"
     - addons:
@@ -45,7 +43,6 @@ matrix:
             - openssl
             - zlib1g-dev
             - gperf
-            - libopus-dev
       env:
         - LUA_VERSION="Lua 5.3"
 
