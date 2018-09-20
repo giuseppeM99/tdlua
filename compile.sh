@@ -4,7 +4,7 @@ git clone https://github.com/xiph/opus
 cd opus
 git checkout v1.2.1
 ./autogen.sh
-./configure
+./configure CFLAGS="-fPIC"
 make
 sudo make install
 cd ..
