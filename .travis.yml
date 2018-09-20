@@ -10,19 +10,6 @@ matrix:
         apt:
           update: true
           packages:
-            - lua5.1
-            - liblua5.1-dev
-            - libssl-dev
-            - ninja
-            - openssl
-            - zlib1g-dev
-            - gperf
-      env:
-        - LUA_VERSION="Lua 5.1"
-    - addons:
-        apt:
-          update: true
-          packages:
             - lua5.2
             - liblua5.2-dev
             - libssl-dev
@@ -32,6 +19,7 @@ matrix:
             - gperf
       env:
         - LUA_VERSION="Lua 5.2"
+        - LUA="lua"
     - addons:
         apt:
           update: true
@@ -45,6 +33,7 @@ matrix:
             - gperf
       env:
         - LUA_VERSION="Lua 5.3"
+        - LUA="lua5.3"
 
 script:
 - ./compile.sh
