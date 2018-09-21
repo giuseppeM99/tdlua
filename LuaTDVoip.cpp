@@ -1,3 +1,9 @@
+/**
+ * @author Giuseppe Marino
+ * ©Giuseppe Marino 2018 - 2018
+ * This file is under GPLv3 license see LICENCE
+ */
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -44,7 +50,7 @@ static void stackDump (lua_State *L) {
 //*/
 
 
-Call::Call(const json _call, void* _td, lua_State *l)
+Call::Call(const json _call, TDLua* _td, lua_State *l)
 {
     L = l;
     call = _call;
@@ -149,7 +155,7 @@ Call* Call::getCall(lua_State *L)
     return nullptr;
 }
 
-Call* Call::NewLua(lua_State *L, const json c, void* td) // [{1}, {2}
+Call* Call::NewLua(lua_State *L, const json c, TDLua* td) // [{1}, {2}
 {
     Call **call = (Call**)(lua_newuserdata(L, sizeof(Call*))); // [{1}, {2}, call]
     *call = new Call(c, td, L);
@@ -270,7 +276,6 @@ static struct luaL_Reg CallMeta[] = {
 
 void Call::closeCall()
 {
-    TDLua* td =  (TDLua*)this->td;
     td->send({
         {"@type", "discardCall"},
         {"call_id", id},
@@ -303,7 +308,7 @@ void Call::setMeta(lua_State *L)
     /*
     lua_pushcfunction(L, [](lua_State *L) {
         Call* call = Call::getCall(L);
-        TDLua* td = (TDLua*)call->td;
+        TDLua* td = call->td;
         td->send({
             {"@type", "discardCall"},
             {"call_id", call->id},

@@ -118,12 +118,12 @@ target_link_libraries (libtgvoip
     ssl
     dl
     "-pthread"
-    "-Wl,--allow-shlib-undefined"
+#    "-Wl,--allow-shlib-undefined"
 )
 set_property (TARGET libtgvoip PROPERTY CXX_STANDARD 11)
 
 #include_directories (libtgvoip)
-add_library (tdlua SHARED tdlua.cpp luajson.cpp LuaTDVoip.cpp base64/base64.cpp)
+add_library (tdlua SHARED tdlua.cpp luajson.cpp LuaTDVoip.cpp base64/base64.cpp luaIF.cpp)
 
 set_target_properties(tdlua PROPERTIES PREFIX "")
 set_target_properties(tdlua PROPERTIES COMPILE_DEFINITIONS "TGVOIP_USE_CALLBACK_AUDIO_IO")

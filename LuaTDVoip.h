@@ -1,3 +1,9 @@
+/**
+ * @author Giuseppe Marino
+ * ©Giuseppe Marino 2018 - 2018
+ * This file is under GPLv3 license see LICENCE
+ */
+
 #pragma once
 #ifndef TGVOIP_USE_CALLBACK_AUDIO_IO
 #define TGVOIP_USE_CALLBACK_AUDIO_IO
@@ -10,6 +16,8 @@
 //#include "libtgvoip/webrtc_dsp/webrtc/common_audio/wav_file.h"
 #include "libtgvoip/VoIPController.h"
 
+class TDLua;
+
 class Call {
 private:
     bool playing = false;
@@ -17,7 +25,7 @@ private:
     nlohmann::json call;
     uint32_t id;
     int state;
-    void* td;
+    TDLua* td;
     void sendAudioFrame(int16_t *data, size_t size);
     void recvAudioFrame(int16_t *data, size_t size);
     std::queue<FILE*> inputFiles;
@@ -30,10 +38,10 @@ private:
     //bool nextFile();
     lua_State *L;
 public:
-    Call(const nlohmann::json _call, void* _td, lua_State *l);
+    Call(const nlohmann::json _call, TDLua* _td, lua_State *l);
     ~Call();
     void deInit();
-    static Call* NewLua(lua_State *L, const nlohmann::json call, void* _td);
+    static Call* NewLua(lua_State *L, const nlohmann::json call, TDLua* _td);
     static void setMeta(lua_State *L);
     static Call* getCall(lua_State *L);
     nlohmann::json getTDCall() const;

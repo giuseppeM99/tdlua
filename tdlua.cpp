@@ -5,306 +5,182 @@
  */
 
 #include "tdlua.h"
-#include "luajson.h"
+#include <iostream>
+#include <fstream>
+#include <td/telegram/td_json_client.h>
 
-static TDLua * getTD(lua_State *L)
+
+TDLua::TDLua()
 {
-    if (lua_type(L, 1) == LUA_TUSERDATA) {
-        return (TDLua*) *((void**)lua_touserdata(L,1));
-    }
-    return nullptr;
+    tdjson = td_json_client_create();
+    _ready = false;
 }
 
-bool my_lua_isinteger(lua_State *L, int x)
+TDLua::~TDLua()
 {
-    return (lua_tonumber(L, x) == lua_tointeger(L, x));
+    td_json_client_destroy(tdjson);
 }
 
-using json = nlohmann::json;
-static int tdclient_new(lua_State *L)
+void TDLua::setTD(void* td)
 {
-    luaL_newmetatable(L, "tdclient");
-    lua_pushstring(L, "__index");
-    luaL_newlib(L, mt);
-    lua_newtable(L);
-    lua_pushstring(L, "__index");
-    lua_pushcfunction(L, tdclient_call);
-    lua_settable(L, -3);
-    lua_setmetatable(L, -2);
-    lua_settable(L, -3);
-    lua_pushstring(L, "__gc");
-    lua_pushcfunction(L, tdclient_unload);
-    lua_settable(L, -3);
-    TDLua **client = (TDLua**)(lua_newuserdata(L, sizeof(void*)));
-    *client = new TDLua();
-    luaL_setmetatable(L, "tdclient");
-    return 1;
+    tdjson = td;
 }
 
-static int tdclient_receive(lua_State *L)
+void* TDLua::getTD() const
 {
-    TDLua* td = getTD(L);
-    if (!td->empty()) {
-        lua_pushjson(L, td->pop());
-        return 1;
+    return tdjson;
+}
+
+nlohmann::json TDLua::pop()
+{
+    nlohmann::json res = updates.front();
+    updates.pop();
+    return res;
+}
+
+void TDLua::setDB(const std::string path)
+{
+    dbpath = path;
+    if (dbpath.back() != '/')
+        dbpath += "/";
+    dbpath += "tdlua.json";
+}
+
+void TDLua::send(const nlohmann::json json) const
+{
+    td_json_client_send(tdjson, json.dump().c_str());
+}
+
+nlohmann::json TDLua::execute(const nlohmann::json json) const
+{
+    const char *res = td_json_client_execute(tdjson, json.dump().c_str());
+    if (!res) {
+        return nullptr;
     }
-    lua_Number timeout = 10;
-    if (lua_type(L, -1) == LUA_TNUMBER) {
-        timeout = lua_tonumber(L, -1);
-        lua_pop(L, 1);
+    nlohmann::json jres = nullptr;
+    try {
+        jres = nlohmann::json::parse(res);
+    } catch (nlohmann::json::parse_error &e) {
+        std::cout << "[TDCLIENT EXECUTE] JSON Parse error " << e.what() << "\n";
     }
-    json result = td->receive(timeout);
-    if (result.empty()) {
-        lua_pushnil(L);
-    } else {
-        td->checkAuthState(result);
-        lua_pushjson(L, result); //murda murda
-        if (result["@type"] == "updateCall") {
-            std::string callState = result["call"]["state"]["@type"];
-            if (callState == "callStateReady") {
-                lua_getfield(L, -1, "call");
-                Call* call = Call::NewLua(L, result["call"], td);
-                lua_remove(L, -2);
-                td->setCall(result["call"]["id"], call);
-                lua_setfield(L, -2, "call");
-            } else if (callState == "callStateDiscarded") {
-                std::string reason = result["call"]["state"]["reason"]["@type"];
-                if (reason == "callDiscardReasonHungUp" || reason == "callDiscardReasonDisconnected") {
-                    Call* call = td->getCall(result["call"]["id"]);
-                    delete call;
-                    td->delCall(result["call"]["id"]);
+    return jres;
+}
+
+nlohmann::json TDLua::receive(const size_t timeout) const
+{
+    const char *res = td_json_client_receive(tdjson, timeout);
+    if (!res) {
+        return nullptr;
+    }
+    nlohmann::json jres = nullptr;
+    try {
+        jres = nlohmann::json::parse(res);
+    } catch (nlohmann::json::parse_error &e) {
+        std::cout << "[TDCLIENT RECEIVE] JSON Parse error " << e.what() << "\n";
+    }
+    return jres;
+}
+
+void TDLua::push(const nlohmann::json update)
+{
+    updates.push(update);
+}
+
+bool TDLua::empty() const
+{
+    return updates.empty();
+}
+
+void TDLua::setCall(const int32_t id, const Call* call)
+{
+    calls[id] = (Call*) call;
+}
+
+void TDLua::delCall(const int32_t id)
+{
+    calls.erase(id);
+}
+
+Call* TDLua::getCall(const int32_t id) const
+{
+    return calls.at(id);
+}
+
+void TDLua::deinitAllCalls()
+{
+    for (auto call : calls)
+    {
+        call.second->closeCall();
+    }
+}
+
+uint64_t TDLua::runningCalls()
+{
+    return calls.size();
+}
+
+void TDLua::saveUpdatesBuffer()
+{
+    if (!_ready || dbpath.empty()) return;
+    nlohmann::json jupdates = nlohmann::json::array();
+    while(updates.size()) {
+        jupdates[updates.size()] = this->pop();
+    }
+    std::ofstream out(dbpath);
+    out << jupdates.dump();
+    out.close();
+}
+
+void TDLua::loadUpdatesBuffer()
+{
+    if (dbpath.empty() || _ready || !updates.empty()) return;
+    std::ifstream in(dbpath);
+    if (in && in.is_open()) {
+        std::string buf;
+        in.seekg(0, std::ios::end);
+        buf.resize(in.tellg());
+        in.seekg(0, std::ios::beg);
+        in.read(&buf[0], buf.size());
+        in.close();
+        try {
+            nlohmann::json j = nlohmann::json::parse(buf);
+            if (j.is_array() && !j.empty()) {
+                for (auto &elem : j) {
+                    updates.push(elem);
                 }
             }
+        } catch (nlohmann::json::parse_error &e){
+            std::cerr << "[TDCLIENT LOAD BUFFER] JSON Parse error " << e.what() << "\n";
+            _ready = true;
+            emptyUpdatesBuffer();
+            saveUpdatesBuffer();
+            return;
         }
     }
-    return 1;
+    _ready = true;
 }
 
-static int tdclient_send(lua_State *L)
+void TDLua::emptyUpdatesBuffer()
 {
-    TDLua *td = getTD(L);
-    json j;
-    if (lua_type(L, 2) == LUA_TSTRING) {
-        try {
-            j = json::parse(lua_tostring(L, 2));
-        } catch (json::parse_error &e) {
-            std::cerr << "[TDLUA SEND] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
-        }
-    } else if (lua_type(L, 2) == LUA_TTABLE) {
-        lua_getjson(L, j);
+    while (!updates.empty()) {
+        updates.pop();
     }
-    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
-        td->setDB(j["parameters"]["database_directory"]);
-    }
-    td->send(j);
-    return 0;
 }
 
-static int tdclient_execute(lua_State *L)
+void TDLua::checkAuthState(const nlohmann::json update)
 {
-    json j;
-    lua_Number timeout = 10*CLOCKS_PER_SEC;
-    if (lua_type(L, -1) == LUA_TNUMBER) {
-        timeout = lua_tonumber(L, -1) * CLOCKS_PER_SEC;
-        lua_pop(L, 1);
-    }
-    if (lua_type(L, -1) == LUA_TSTRING) {
-        try {
-            j = json::parse(lua_tostring(L, -1));
-        }   catch (json::parse_error &e) {
-            std::cerr << "[TDLUA EXECUTE] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
-        }
-    } else if (lua_type(L, -1) == LUA_TTABLE) {
-        lua_getjson(L, j);
-    } else {
-        return 0;
-    }
-    lua_pop(L, 1);
-    if (!j.is_object()) {
-        return 0;
-    }
-    int nonce = rand();
-    json extra = j["@extra"];
-    j["@extra"] = nonce;
-    TDLua *td = getTD(L);
-    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
-        td->setDB(j["parameters"]["database_directory"]);
-    }
-    td->send(j);
-    auto t = clock();
-    while (td->ready() && (clock() - t < timeout)) {
-        json res = td->receive(1);
-        if (!res.is_object()) {
-            continue;
-        }
-        td->checkAuthState(res);
-        if (res["@extra"].is_number() && nonce == res["@extra"].get<int>()) {
-            res["@extra"] = extra;
-            lua_pushjson(L, res);
-            return 1;
-        } else {
-            td->push(res);
+    if (update["@type"] == "updateAuthorizationState") {
+        if (!ready() && update["authorization_state"]["@type"] == "authorizationStateReady") {
+            loadUpdatesBuffer();
+        } else if (update["authorization_state"]["@type"] == "authorizationStateClosed") {
+            saveUpdatesBuffer();
+            emptyUpdatesBuffer();
+            _ready = false;
         }
     }
-    return 0;
 }
 
-static int call(lua_State *L)
+bool TDLua::ready() const
 {
-    auto f = tdclient_execute;
-    if (lua_type(L, -1) == LUA_TBOOLEAN) {
-        if (lua_toboolean(L, -1))
-            f = tdclient_send;
-        lua_pop(L, 1);
-    }
-    if (lua_type(L, -1) != LUA_TTABLE) {
-        lua_newtable(L);
-    }
-    lua_pushstring(L, "@type");
-    lua_pushstring(L, lua_tostring(L, lua_upvalueindex(1)));
-    lua_settable(L, -3);
-    return f(L);
-}
-
-static int tdclient_call(lua_State *L)
-{
-    lua_pushcclosure(L, call, 1);
-    return 1;
-}
-
-static int tdclient_rawexecute(lua_State *L)
-{
-    json j;
-    if (lua_type(L, -1) == LUA_TSTRING) {
-        try {
-            j = json::parse(lua_tostring(L, -1));
-        }   catch (json::parse_error &e) {
-            std::cerr << "[TDLUA RAWEXECUTE] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
-        }
-    } else if (lua_type(L, -1) == LUA_TTABLE) {
-        lua_getjson(L, j);
-    }
-    TDLua *td = getTD(L);
-    auto result = td->execute(j);
-    if (result.empty()) {
-        lua_pushnil(L);
-    } else {
-        lua_pushjson(L, result);
-    }
-    return 0;
-}
-
-static int tdclient_save(lua_State *L)
-{
-    TDLua *td = getTD(L);
-    td->saveUpdatesBuffer();
-    return 0;
-}
-
-static int tdclient_clear(lua_State *L)
-{
-    TDLua *td = getTD(L);
-    td->emptyUpdatesBuffer();
-    return 0;
-}
-
-static int tdclient_unload(lua_State *L)
-{
-    TDLua *td = getTD(L);
-    td->deinitAllCalls();
-    while (td->runningCalls()) {
-        tdclient_receive(L);
-    }
-    if (td->ready()) {
-        td->send({{"@type", "close"}});
-    }
-    while (td->ready()) {
-        json res = td->receive();
-        td->checkAuthState(res);
-        td->push(res);
-    }
-    delete td;
-    return 0;
-}
-
-static int tdclient_getcall(lua_State *L)
-{
-    TDLua *td = getTD(L);
-    if (my_lua_isinteger(L, 2)) {
-        int32_t callID = lua_tointeger(L, 2);
-        Call* call = td->getCall(callID);
-        if (call) {
-            json j = call->getTDCall();
-            lua_pushjson(L, j);
-            *((Call**) lua_newuserdata(L, sizeof(void**))) = call;
-            Call::setMeta(L);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void tdclient_fatalerrorcb(const char *error)
-{
-    std::cerr << "[TDLUA FATAL ERROR] " << error << std::endl;
-}
-
-static int tdclient_setlogpath(lua_State *L)
-{
-    if (lua_type(L, 1) == LUA_TSTRING) {
-        lua_pushboolean(L, td_set_log_file_path(lua_tostring(L, 1)));
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-static int tdclient_setlogmaxsize(lua_State *L)
-{
-    if (lua_type(L, 1) == LUA_TNUMBER) {
-        td_set_log_max_file_size(lua_tointeger(L, 1));
-        lua_pushboolean(L, 1);
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-static int tdclient_setlogverbosity(lua_State *L)
-{
-    if (my_lua_isinteger(L, 1)) {
-        td_set_log_verbosity_level(static_cast<int>(lua_tointeger(L, 1)));
-        lua_pushboolean(L, 1);
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-//Open Lib
-static luaL_Reg tdlua[] = {
-        {"new", tdclient_new},
-        {"setLogPath", tdclient_setlogpath},
-        {"setLogMaxSize", tdclient_setlogmaxsize},
-        {"setLogLevel", tdclient_setlogverbosity},
-        {nullptr, nullptr}
-};
-
-extern "C" {
-    LUALIB_API int luaopen_tdlua(lua_State *L) {
-        luaL_newmetatable(L, "tdlua");
-        lua_pushstring(L, "__call");
-        lua_pushcfunction(L, tdclient_new);
-        lua_settable(L, -3);
-        luaL_newlib(L, tdlua);
-        luaL_setmetatable(L, "tdlua");
-        td_set_log_fatal_error_callback(tdclient_fatalerrorcb);
-        return 1;
-    }
+    return _ready;
 }
