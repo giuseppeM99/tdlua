@@ -10,10 +10,8 @@
 #endif
 
 #include <queue>
-#include <stdio.h>
 
 #include "luajson.h"
-//#include "libtgvoip/webrtc_dsp/webrtc/common_audio/wav_file.h"
 #include "libtgvoip/VoIPController.h"
 
 class TDLua;
@@ -28,11 +26,12 @@ private:
     TDLua* td;
     void sendAudioFrame(int16_t *data, size_t size);
     void recvAudioFrame(int16_t *data, size_t size);
-    std::queue<FILE*> inputFiles;
-    std::queue<FILE*> holdFiles;
+    std::queue<std::string> inputFiles;
+    std::queue<std::string> holdFiles;
     size_t readInput;
     size_t readOutput;
     tgvoip::Mutex inputMutex;
+    FILE* input = NULL;
     //int r;
     //bool luaCB = false;
     //bool nextFile();
@@ -49,6 +48,7 @@ public:
     bool play(const char* filename);
     bool onHold(nlohmann::json list);
     nlohmann::json getDebug() const;
+    void stop();
     //void setLuaCallback();
     //void delLuaCallback();
 };

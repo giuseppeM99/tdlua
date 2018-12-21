@@ -61,7 +61,8 @@ static int tdclient_receive(lua_State *L)
         lua_pushnil(L);
     } else {
         td->checkAuthState(result);
-        lua_pushjson(L, result); //murda murda
+        lua_pushjson(L, result);
+        #ifdef TDLUA_CALLS
         if (result["@type"] == "updateCall") {
             std::string callState = result["call"]["state"]["@type"];
             if (callState == "callStateReady") {
@@ -79,6 +80,7 @@ static int tdclient_receive(lua_State *L)
                 }
             }
         }
+        #endif
     }
     return 1;
 }
@@ -92,8 +94,7 @@ static int tdclient_send(lua_State *L)
             j = json::parse(lua_tostring(L, 2));
         } catch (json::parse_error &e) {
             std::cerr << "[TDLUA SEND] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
+            return luaL_error(L, "Malformed JSON");
         }
     } else if (lua_type(L, 2) == LUA_TTABLE) {
         lua_getjson(L, j);
@@ -118,8 +119,7 @@ static int tdclient_execute(lua_State *L)
             j = json::parse(lua_tostring(L, -1));
         }   catch (json::parse_error &e) {
             std::cerr << "[TDLUA EXECUTE] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
+            return luaL_error(L, "Malformed JSON");
         }
     } else if (lua_type(L, -1) == LUA_TTABLE) {
         lua_getjson(L, j);
@@ -187,8 +187,7 @@ static int tdclient_rawexecute(lua_State *L)
             j = json::parse(lua_tostring(L, -1));
         }   catch (json::parse_error &e) {
             std::cerr << "[TDLUA RAWEXECUTE] JSON Parse error " << e.what() << "\n";
-            luaL_error(L, "Malformed JSON");
-            return 0;
+            return luaL_error(L, "Malformed JSON");
         }
     } else if (lua_type(L, -1) == LUA_TTABLE) {
         lua_getjson(L, j);
@@ -220,10 +219,12 @@ static int tdclient_clear(lua_State *L)
 static int tdclient_unload(lua_State *L)
 {
     TDLua *td = getTD(L);
+    #ifdef TDLUA_CALLS
     td->deinitAllCalls();
     while (td->runningCalls()) {
         tdclient_receive(L);
     }
+    #endif
     if (td->ready()) {
         td->send({{"@type", "close"}});
     }
@@ -238,6 +239,7 @@ static int tdclient_unload(lua_State *L)
 
 static int tdclient_getcall(lua_State *L)
 {
+    #ifdef TDLUA_CALLS
     TDLua *td = getTD(L);
     if (my_lua_isinteger(L, 2)) {
         int32_t callID = lua_tointeger(L, 2);
@@ -251,6 +253,9 @@ static int tdclient_getcall(lua_State *L)
         }
     }
     return 0;
+    #else
+    return luaL_error(L, "TDLUA was not compiled with libtgvoip");
+    #endif
 }
 
 static void tdclient_fatalerrorcb(const char *error)

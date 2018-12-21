@@ -3,19 +3,24 @@
  * ©Giuseppe Marino 2018 - 2018
  * This file is under GPLv3 license see LICENCE
  */
- 
+
 #pragma once
 #include <queue>
 #include <map>
 #include "json.hpp"
+
+#ifdef TDLUA_CALLS
 #include "LuaTDVoip.h"
+#endif
 
 class TDLua {
 private:
     void *tdjson;
     std::queue<nlohmann::json> updates;
     std::string dbpath;
+    #ifdef TDLUA_CALLS
     std::map<int32_t, Call*> calls;
+    #endif
     bool _ready;
 public:
 
@@ -41,6 +46,7 @@ public:
 
     bool empty() const;
 
+    #ifdef TDLUA_CALLS
     void setCall(const int32_t id, const Call* call);
 
     void delCall(const int32_t id);
@@ -48,6 +54,7 @@ public:
     Call* getCall(const int32_t id) const;
 
     void deinitAllCalls();
+    #endif
 
     uint64_t runningCalls();
 

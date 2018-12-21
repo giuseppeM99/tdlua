@@ -66,13 +66,12 @@ Call::Call(const json _call, TDLua* _td, lua_State *l)
         auto ipv6 = IPv6Address(e["ipv6"].get<std::string>());
         std::string _peer_tag = base64_decode(e["peer_tag"].get<std::string>());
         auto peer_tag = (unsigned char*) _peer_tag.c_str();
-        auto ep = Endpoint(id, port, ipv4, ipv6, Endpoint::TYPE_UDP_RELAY, peer_tag);
+        auto ep = Endpoint(id, port, ipv4, ipv6, Endpoint::Type::UDP_RELAY, peer_tag);
         endpoints.push_back(ep);
     }
 
     auto p2p = call["state"]["protocol"]["udp_p2p"].get<bool>();
     auto layer = call["state"]["protocol"]["max_layer"].get<int32_t>();
-    std::map<std::string, std::string> config;
     auto ekey = base64_decode(call["state"]["encryption_key"].get<std::string>());
     bool outgoing = call["is_outgoing"];
 
@@ -81,18 +80,7 @@ Call::Call(const json _call, TDLua* _td, lua_State *l)
     jconfig["audio_init_bitrate"] = 100000;
     jconfig["audio_min_bitrate"] = 10000;
     jconfig["audio_congestion_window"] = 4 * 1024;
-    for (auto it = jconfig.begin(); it != jconfig.end(); it++) {
-        std::string key = it.key();
-        auto value = it.value();
-        if (value.is_string()) {
-            config[key] = value.get<std::string>();
-        } else if (value.is_number_integer()){
-            config[key] = std::to_string(value.get<int64_t>());
-        } else if (value.is_boolean()) {
-            config[key] = std::to_string(value.get<bool>());
-        }
-    }
-    ServerConfig::GetSharedInstance()->Update(config);
+    ServerConfig::GetSharedInstance()->Update(jconfig.dump());
     VoIPController::Config cfg;
     cfg.enableNS = jconfig["use_system_ns"].get<bool>();
     cfg.enableAEC = jconfig["use_system_aec"].get<bool>();
@@ -102,7 +90,7 @@ Call::Call(const json _call, TDLua* _td, lua_State *l)
     controller = new VoIPController();
     VoIPController::Callbacks callbacks;
     controller->implData = this;
-    callbacks.connectionStateChanged = [](VoIPController *controller, int state) {
+    callbacks.connectionStateChanged = [](VoIPController* controller, int state) {
         ((Call*) controller->implData)->state = state;
         if (state == STATE_FAILED)
         {
@@ -130,7 +118,9 @@ Call::Call(const json _call, TDLua* _td, lua_State *l)
 
 json Call::getDebug() const
 {
-    return json::parse(controller->GetDebugLog());
+    auto debug = controller->GetDebugLog();
+    return json::parse(debug);
+    //return nullptr;
 }
 
 void Call::deInit()
@@ -170,16 +160,23 @@ json Call::getTDCall() const
 
 bool Call::play(const char* filename)
 {
-    FILE *tmp = fopen(filename, "rb");
-
-    if (tmp == NULL)
-    {
-        return false;
-    }
-
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL) return false;
+    fclose(f);
     MutexGuard m(inputMutex);
-    inputFiles.push(tmp);
+    inputFiles.push(filename);
     return true;
+}
+
+void Call::stop()
+{
+    MutexGuard m(inputMutex);
+    inputFiles = {};
+    if (input) {
+        fclose(input);
+        input = NULL;
+    }
+    playing = false;
 }
 /*
 void Call::setLuaCallback()
@@ -212,6 +209,10 @@ static int play(lua_State *L)
 {
     auto call = Call::getCall(L);
     //call->delLuaCallback();
+    if (lua_isboolean(L, -1) && lua_toboolean(L, -1)) {
+        lua_pop(L, 1);
+        call->stop();
+    }
     if (lua_isstring(L, -1)) {
         const char* fileName = lua_tostring(L, -1);
         call->play(fileName);
@@ -233,21 +234,18 @@ static int play(lua_State *L)
 
 bool Call::onHold(json list)
 {
-    FILE *tmp = NULL;
-
     MutexGuard m(inputMutex);
+    /*
     while (holdFiles.size())
     {
         fclose(holdFiles.front());
         holdFiles.pop();
     }
+    */
+    holdFiles = {};
     for (int i = 0; i < list.size(); i++)
     {
-        tmp = fopen(list[i].get<std::string>().c_str(), "rb");
-        if (tmp != NULL)
-        {
-            holdFiles.push(tmp);
-        }
+        holdFiles.push(list[i].get<std::string>());
     }
     return true;
 }
@@ -329,7 +327,29 @@ void Call::setMeta(lua_State *L)
 // https://github.com/danog/php-libtgvoip/blob/master/main.cpp#L97
 void Call::sendAudioFrame(int16_t *data, size_t size)
 {
+    if (state != STATE_ESTABLISHED) return;
     MutexGuard m(inputMutex);
+    if (input) {
+        if ((readInput = fread(data, sizeof(int16_t), size, input)) != size) {
+            fclose(input);
+            input = NULL;
+            memset(data + (readInput % size), 0, size - (readInput % size));
+            playing = false;
+        } else {
+            return;
+        }
+    }
+    if (!inputFiles.empty()) {
+        input = fopen(inputFiles.front().c_str(), "rb");
+        inputFiles.pop();
+        playing = true;
+    } else if (!holdFiles.empty()) {
+        std::string next = holdFiles.front();
+        input = fopen(next.c_str(), "rb");
+        holdFiles.push(next);
+        holdFiles.pop();
+    }
+    /*
     if (!inputFiles.empty())
     {
         if ((readInput = fread(data, sizeof(int16_t), size, inputFiles.front())) != size)
@@ -353,6 +373,7 @@ void Call::sendAudioFrame(int16_t *data, size_t size)
             }
         }
     }
+    */
 }
 
 void Call::recvAudioFrame(int16_t *data, size_t size)

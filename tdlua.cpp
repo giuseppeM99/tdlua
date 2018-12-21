@@ -91,6 +91,7 @@ bool TDLua::empty() const
     return updates.empty();
 }
 
+#ifdef TDLUA_CALLS
 void TDLua::setCall(const int32_t id, const Call* call)
 {
     calls[id] = (Call*) call;
@@ -118,6 +119,7 @@ uint64_t TDLua::runningCalls()
 {
     return calls.size();
 }
+#endif
 
 void TDLua::saveUpdatesBuffer()
 {
