@@ -3,20 +3,17 @@ dist: xenial
 
 language: cpp
 compiler: clang
-apt:
-  update: true
-  packages:
-    - libssl-dev
-    - ninja
-    - openssl
-    - zlib1g-dev
-    - gperf
 
 matrix:
   include:
     - addons:
         apt:
           packages:
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
             - lua5.2
             - liblua5.2-dev
       env:
@@ -27,6 +24,11 @@ matrix:
     - addons:
         apt:
           packages:
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
             - lua5.3
             - liblua5.3-dev
       env:
@@ -37,6 +39,11 @@ matrix:
     - addons:
         apt:
           packages:
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
             - lua5.2
             - liblua5.2-dev
       env:
@@ -46,6 +53,11 @@ matrix:
     - addons:
         apt:
           packages:
+            - libssl-dev
+            - ninja
+            - openssl
+            - zlib1g-dev
+            - gperf
             - lua5.3
             - liblua5.3-dev
       env:
