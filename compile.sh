@@ -18,7 +18,7 @@ make -j6 VERBOSE=1
 sudo make install
 cd ../../
 mkdir build
-if [-n "$TDLUA_CALLS"]; then
+if [ -n "$TDLUA_CALLS" ]; then
     git submodule init
     git submodule update
 fi

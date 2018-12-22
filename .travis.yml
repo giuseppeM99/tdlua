@@ -12,10 +12,6 @@ apt:
     - zlib1g-dev
     - gperf
 
-env:
-  - TDLUA_CALLS=0
-  - TDLUA_CALLS=1
-
 matrix:
   include:
     - addons:
@@ -26,6 +22,8 @@ matrix:
       env:
         - LUA_VERSION="Lua 5.2"
         - LUA="lua"
+        - TDLUA_CALLS=1
+
     - addons:
         apt:
           packages:
@@ -34,6 +32,27 @@ matrix:
       env:
         - LUA_VERSION="Lua 5.3"
         - LUA="lua5.3"
+        - TDLUA_CALLS=1
+
+    - addons:
+        apt:
+          packages:
+            - lua5.2
+            - liblua5.2-dev
+      env:
+        - LUA_VERSION="Lua 5.2"
+        - LUA="lua"
+        - TDLUA_CALLS=0
+    - addons:
+        apt:
+          packages:
+            - lua5.3
+            - liblua5.3-dev
+      env:
+        - LUA_VERSION="Lua 5.3"
+        - LUA="lua5.3"
+        - TDLUA_CALLS=0
+
 
 script:
 - ./compile.sh
