@@ -67,7 +67,7 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").. (os.getenv("TDLUA_CALLS") == 1 and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings").."\n".._VERSION.."n\nFile sent with TDLua".."\nDirect link: "..link
+                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").. (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings").."\n".._VERSION.."\n\nFile sent with TDLua".."\nDirect link: "..link
                 }
             }
         }
