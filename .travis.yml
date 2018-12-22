@@ -5,15 +5,16 @@ language: cpp
 compiler: clang
 apt:
   update: true
-  - libssl-dev
-  - ninja
-  - openssl
-  - zlib1g-dev
-  - gperf
+  packages:
+    - libssl-dev
+    - ninja
+    - openssl
+    - zlib1g-dev
+    - gperf
 
 env:
-    - TDLUA_CALLS=0
-    - TDLUA_CALLS=1
+  - TDLUA_CALLS=0
+  - TDLUA_CALLS=1
 
 matrix:
   include:
