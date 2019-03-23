@@ -1,14 +1,14 @@
 #!/bin/bash
-
-git clone https://github.com/xiph/opus
-cd opus
-git checkout v1.2.1
-./autogen.sh
-./configure CFLAGS="-fPIC"
-make
-sudo make install
+if [ -n "$TDLUA_CALLS" ]; then
+    git clone https://github.com/xiph/opus
+    cd opus
+    git checkout v1.2.1
+    ./autogen.sh
+    ./configure CFLAGS="-fPIC"
+    make
+    sudo make install
 cd ..
-
+fi
 git clone https://github.com/tdlib/td
 cd td
 mkdir build

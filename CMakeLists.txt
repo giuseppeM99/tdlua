@@ -309,6 +309,7 @@ if (TDLUA_CALLS)
         "libtgvoip/webrtc_dsp/common_audio/vad/vad.cc"
         "libtgvoip/video/VideoSource.cpp"
         "libtgvoip/video/VideoRenderer.cpp"
+        "libtgvoip/video/ScreamCongestionController.cpp"
     )
     include_directories (
         "includes"
@@ -318,7 +319,7 @@ if (TDLUA_CALLS)
     set_target_properties(libtgvoip PROPERTIES PREFIX "lib")
     set_target_properties(libtgvoip PROPERTIES ARCHIVE_OUTPUT_NAME "tgvoip")
     set_target_properties(libtgvoip PROPERTIES SUFFIX ".a")
-    set_target_properties(libtgvoip PROPERTIES COMPILE_DEFINITIONS "WEBRTC_APM_DEBUG_DUMP=0;TGVOIP_USE_DESKTOP_DSP;WEBRTC_POSIX;WEBRTC_LINUX;WEBRTC_NS_FLOAT;USE_KISS_FFT;FIXED_POINT;TGVOIP_USE_CXX11_LIB;TGVOIP_OTHER;TGVOIP_USE_CALLBACK_AUDIO_IO;TGVOIP_LOG_VERBOSITY=0")
+    set_target_properties(libtgvoip PROPERTIES COMPILE_DEFINITIONS "WEBRTC_APM_DEBUG_DUMP=0;TGVOIP_USE_DESKTOP_DSP;WEBRTC_POSIX;WEBRTC_LINUX;WEBRTC_NS_FLOAT;USE_KISS_FFT;FIXED_POINT;TGVOIP_USE_CXX11_LIB;TGVOIP_OTHER;TGVOIP_USE_CALLBACK_AUDIO_IO;TGVOIP_LOG_VERBOSITY=3")
     target_link_libraries (libtgvoip
         opus
     #    "libopus.a"
