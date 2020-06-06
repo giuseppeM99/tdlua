@@ -1,6 +1,7 @@
 local tdlua = require "tdlua"
-local api_id = "6"
-local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+
+local api_id = os.getenv('TG_APP_ID')
+local api_hash = os.getenv('TG_APP_HASH')
 local dbpassword = ""
 local client = tdlua()
 client:send(

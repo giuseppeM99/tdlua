@@ -3,7 +3,7 @@ local serpent = require "serpent"
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
-tdlua.setLogLevel(3)
+tdlua.setLogLevel(0)
 local client = tdlua()
 client:send(
     (
@@ -11,8 +11,9 @@ client:send(
     )
 )
 
-local api_id = "6"
-local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+local api_id = os.getenv('TG_APP_ID')
+local api_hash = os.getenv('TG_APP_HASH')
+
 local dbpassword = ""
 while true do
     local res = client:receive(1)
@@ -28,6 +29,15 @@ while true do
             print("exiting")
             break
         elseif res["@type"] == "authorizationStateWaitTdlibParameters" then
+            if not api_id then
+                print("Enter app id (take it from https://my.telegram.org/apps)")
+                api_id = io.read()
+            end
+
+            if not api_hash then
+                print("Enter app hash (take it from https://my.telegram.org/apps)")
+                api_hash = io.read()
+            end
             client:send(
                  {
                     ["@type"] = "setTdlibParameters",
@@ -94,9 +104,10 @@ while true do
             )
         elseif res["@type"] == "authorizationStateReady" then
             print("LOGGED IN")
-            client:close(true)
+            --client:close(true)
             --os.exit(0)
         end
+        vardump(res)
         ::continue::
     end
 end

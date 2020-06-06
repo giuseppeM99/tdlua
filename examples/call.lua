@@ -1,13 +1,16 @@
 local tdlua = require "tdlua"
 local serpent = require "serpent"
 local json = require 'dkjson'
+
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
-local api_id = "6"
-local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+
+local api_id = os.getenv('TG_APP_ID')
+local api_hash = os.getenv('TG_APP_HASH')
+
 local dbpassword = ""
-tdlua.setLogLevel(0)
+tdlua.setLogLevel(2)
 local client = tdlua()
 client:send(
     (
@@ -19,6 +22,15 @@ local function authstate(state)
     if state._ == "authorizationStateClosed" then
         os.exit(0)
     elseif state._ == "authorizationStateWaitTdlibParameters" then
+        if not api_id then
+            print("Enter app id (take it from https://my.telegram.org/apps)")
+            api_id = io.read()
+        end
+
+        if not api_hash then
+            print("Enter app hash (take it from https://my.telegram.org/apps)")
+            api_hash = io.read()
+        end
         client:send({
                 _ = "setTdlibParameters",
                 parameters = {
@@ -101,6 +113,8 @@ while true do
         if res._ == "connectionStateUpdating" then
           goto continue
         end
+--        vardump(res)
+--        goto continue
         if res._ == "updateNewMessage" then
             if not res.message.is_outgoing then
                 local msg = res.message
@@ -127,8 +141,8 @@ while true do
                         _ = "callProtocol",
                         udp_p2p = true,
                         udp_reflector = true,
-                        min_layer = 65,
-                        max_layer = 74
+                        min_layer = 75,
+                        max_layer = 85
                     }
                 }))
                 --]]
@@ -143,10 +157,14 @@ while true do
                         }
                     }
                 }, true)
-                local songs = {"example.raw", "example.wav"} -- must be Mono 16-bit 48000Hz
+                local songs = {"thecallingft.wav"} -- must be Mono 16-bit 48000Hz
+                vardump(call)
                 call:play(songs)
                 call:onHold({"hold.pcm"})
             end
+        elseif res._ == "updateUser" and res.user.id==68972553 then
+            vardump(res)
+            client:createCall{user_id = res.user.id, protocol = {_="callProtocol", udp_p2p = true, udp_reflector = true, min_layer = 75, max_layer = 85}}
         else
             print("GOT", res._)
         end

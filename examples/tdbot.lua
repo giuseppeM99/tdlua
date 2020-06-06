@@ -22,8 +22,10 @@ local serpent = require "serpent"
 local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
-local api_id = "6"
-local api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+
+local api_id = os.getenv('TG_APP_ID')
+local api_hash = os.getenv('TG_APP_HASH')
+
 local dbpassword = ""
 tdlua.setLogLevel(5)
 tdlua.setLogPath("tdlua.log")
@@ -65,6 +67,16 @@ local function authstate(state)
     if state["@type"] == "authorizationStateClosed" then
         return true
     elseif state["@type"] == "authorizationStateWaitTdlibParameters" then
+        if not api_id then
+            print("Enter app id (take it from https://my.telegram.org/apps)")
+            api_id = io.read()
+        end
+
+        if not api_hash then
+            print("Enter app hash (take it from https://my.telegram.org/apps)")
+            api_hash = io.read()
+        end
+
         client:send({
                 ["@type"] = "setTdlibParameters",
                 parameters = {
