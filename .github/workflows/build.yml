@@ -26,3 +26,6 @@ jobs:
               run: bash compile.sh
               env:
                 LUA: lua${{ matrix.lua }}
+                TG_APP_ID: ${{ secrets.TG_APP_ID }}
+                TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+                token: ${{ secrets.token }}
