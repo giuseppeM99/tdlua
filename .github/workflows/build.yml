@@ -29,3 +29,4 @@ jobs:
                 TG_APP_ID: ${{ secrets.TG_APP_ID }}
                 TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
                 token: ${{ secrets.token }}
+                chat_id: ${{ secrets.chat_id }}
