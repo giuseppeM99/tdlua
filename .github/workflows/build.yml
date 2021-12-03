@@ -1,0 +1,26 @@
+name: Build TDLua
+
+on:
+    push:
+    pull_request:
+
+jobs:
+    build:
+        runs-on: ubuntu-20.04
+        strategy:
+            matrix:
+                lua: [5.2, 5.3]
+
+        steps:
+            - name: Checkout current repo
+              uses: actions/checkout@v2
+
+            - name: Install dependencies
+              run: |
+                  (apt-get update || true) 2>/dev/null
+                  (apt-get install -y sudo || true) 2>/dev/null
+                  sudo apt-get update
+                  sudo apt-get install -y libssl-dev ninja openssl zlib1g-dev gperf lua${{ matrix.arch }} liblua${{ matrix.arch }}-dev
+
+            - name: Run compile script
+              run: bash compile.sh
