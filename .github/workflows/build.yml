@@ -24,3 +24,5 @@ jobs:
 
             - name: Run compile script
               run: bash compile.sh
+              env:
+                LUA: lua${{ matrix.lua }}
