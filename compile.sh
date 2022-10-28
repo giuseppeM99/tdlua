@@ -11,7 +11,7 @@ cd ..
 fi
 git clone https://github.com/tdlib/td
 cd td
-#git checkout ab3a8282d4ee307d341071267ef1090b1a941478
+git checkout a7a17b34b3c8fd3f7f6295f152746beb68f34d83
 mkdir build
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
