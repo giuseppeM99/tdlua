@@ -99,8 +99,8 @@ static int tdclient_send(lua_State *L)
     } else if (lua_type(L, 2) == LUA_TTABLE) {
         lua_getjson(L, j);
     }
-    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
-        td->setDB(j["parameters"]["database_directory"]);
+    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
+        td->setDB(j["database_directory"]);
     }
     td->send(j);
     return 0;
@@ -134,8 +134,8 @@ static int tdclient_execute(lua_State *L)
     json extra = j["@extra"];
     j["@extra"] = nonce;
     TDLua *td = getTD(L);
-    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["parameters"]["database_directory"].is_string()) {
-        td->setDB(j["parameters"]["database_directory"]);
+    if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
+        td->setDB(j["database_directory"]);
     }
     td->send(j);
     auto t = clock();
