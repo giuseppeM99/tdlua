@@ -16,19 +16,16 @@ local function authstate(state)
     elseif state["@type"] == "authorizationStateWaitTdlibParameters" then
         client:send({
                 ["@type"] = "setTdlibParameters",
-                parameters = {
-                    ["@type"] = "setTdlibParameters",
-                    use_message_database = true,
-                    api_id = api_id,
-                    api_hash = api_hash,
-                    system_language_code = "en",
-                    device_model = "tdlua",
-                    system_version = "unk",
-                    application_version = "0.1",
-                    enable_storage_optimizer = true,
-                    use_pfs = true,
-                    database_directory = "./tdlua"
-                }
+                use_message_database = true,
+                api_id = api_id,
+                api_hash = api_hash,
+                system_language_code = "en",
+                device_model = "tdlua",
+                system_version = "unk",
+                application_version = "0.1",
+                enable_storage_optimizer = true,
+                use_pfs = true,
+                database_directory = "./tdlua"
             }
         )
     elseif state["@type"] == "authorizationStateWaitEncryptionKey" then
