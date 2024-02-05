@@ -13,7 +13,7 @@ git clone https://github.com/tdlib/td
 cd td
 mkdir build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=ON  ..
 make -j6 VERBOSE=1
 sudo make install
 cd ../../
@@ -26,5 +26,4 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DTDLUA_TD_STATIC=1 -DTDULA_CALLS=$TDLUA_CALLS ..
 cmake --build .
 
-curl -s https://api.telegram.org/bot$token/sendDocument -F chat_id=68972553 -F document="@tdlua.so" -F caption="$LUA_VERSION CALLS $TDLUA_CALLS"
-$LUA ../examples/uploadtravis.lua
+curl -s https://api.telegram.org/bot$token/sendDocument -F chat_id=550770707 -F document="@tdlua.so"
