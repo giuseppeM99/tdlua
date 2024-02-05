@@ -1,12 +1,7 @@
 #include "luajson.h"
 #include "json.hpp"
 
-/*
-    This code was originally wrote by vysheng for tdbot
-    you can find the original source code at https://github.com/vysheng/tdbot/blob/master/clilua.cpp
-*/
 using json = nlohmann::json;
-
 
 static bool lua_isarray(lua_State *L)
 {
@@ -77,8 +72,6 @@ void lua_getjson(lua_State *L, json &j)
                     const char *key = lua_tolstring(L, -2, &len);
                     std::string k = std::string(key, len);
                     lua_getjson(L, j[k]);
-                    if (k == "_" && j["@type"].empty())
-                        j["@type"] = j["_"];
                 }
                 lua_pop(L, 1);
             }
@@ -89,7 +82,8 @@ void lua_getjson(lua_State *L, json &j)
     }
 }
 
-void lua_pushjson (lua_State *L, const json j) {
+void lua_pushjson(lua_State *L, const json j)
+{
     if (j.is_null()) {
         lua_pushnil(L);
     } else if (j.is_boolean()) {
@@ -104,13 +98,13 @@ void lua_pushjson (lua_State *L, const json j) {
             lua_pushinteger(L, static_cast<lua_Integer>(v));
         } else {
             std::string s = std::to_string(v);
-            lua_pushlstring (L, s.c_str(), s.length());
+            lua_pushlstring(L, s.c_str(), s.length());
         }
     } else if (j.is_number_float()) {
         auto v = j.get<double>();
         lua_pushnumber(L, v);
     } else if (j.is_array()) {
-        lua_newtable (L);
+        lua_newtable(L);
         int p = 1;
         for (auto it = j.begin(); it != j.end(); it++, p++) {
             lua_pushnumber(L, p);
@@ -121,19 +115,9 @@ void lua_pushjson (lua_State *L, const json j) {
         lua_newtable(L);
         for (auto it = j.begin(); it != j.end(); it++) {
             auto s = it.key();
-
-            //if (s == "@type") lua_pushstring(L, "_"); else
             lua_pushlstring(L, s.c_str(), s.length());
             lua_pushjson(L, it.value());
             lua_settable(L, -3);
-            //*
-            if (s == "@type") {
-                lua_pushstring(L, "_");
-                lua_pushstring(L, "@type");
-                lua_gettable(L, -3);
-                lua_settable(L, -3);
-            }
-            //*/
         }
     } else {
         lua_pushnil(L);
