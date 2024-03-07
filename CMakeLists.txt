@@ -1,7 +1,7 @@
 project (tdlua)
 cmake_minimum_required (VERSION 3.1)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-find_package(Td REQUIRED)
+add_subdirectory(td)
 if(NOT LUA_INCLUDE_DIR)
   find_package(Lua REQUIRED)
 endif()
