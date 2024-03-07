@@ -9,14 +9,7 @@ if [ -n "$TDLUA_CALLS" ]; then
     sudo make install
 cd ..
 fi
-git clone https://github.com/tdlib/td
-cd td
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=ON  ..
-make -j6 VERBOSE=1
-sudo make install
-cd ../../
+
 mkdir build
 if [ -n "$TDLUA_CALLS" ]; then
     git submodule init
