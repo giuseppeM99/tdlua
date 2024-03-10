@@ -54,7 +54,7 @@ local function authstate(state)
         end
         tdlua.setLogLevel(1)
         --local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
-        local version = = client:getOption('version')
+        local version = client:getOption('version')
         local commit_hash = client:getOption('commit_hash')
         local res = client:execute {
             ["@type"] = "sendMessage",
