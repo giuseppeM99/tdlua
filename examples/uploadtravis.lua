@@ -53,7 +53,9 @@ local function authstate(state)
             chat = res.id
         end
         tdlua.setLogLevel(1)
-        local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
+        --local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
+        local version = = client:getOption('version')
+        local commit_hash = client:getOption('commit_hash')
         local res = client:execute {
             ["@type"] = "sendMessage",
             chat_id = chat,
@@ -65,7 +67,11 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").. (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings").."\n".._VERSION.."\n\nFile sent with TDLua".."\nDirect link: "..link
+                    text = "TDLua " .. version .. " commit " .. commit_hash..
+                    "\nMD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") ..
+                    "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+") ..
+                    (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings") ..
+                    "\n" .. _VERSION .. "\n\nFile sent with TDLua" .. "\nSupport me: https://ko-fi.com/giuseppeM99"
                 }
             }
         }
