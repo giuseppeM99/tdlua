@@ -54,8 +54,8 @@ local function authstate(state)
         end
         tdlua.setLogLevel(1)
         --local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
-        local version = client:getOption('version')
-        local commit_hash = client:getOption('commit_hash')
+        local version = client:getOption({name='version'}).value
+        local commit_hash = client:getOption({name='commit_hash'}).value
         local res = client:execute {
             ["@type"] = "sendMessage",
             chat_id = chat,
@@ -71,7 +71,7 @@ local function authstate(state)
                     "\nMD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") ..
                     "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+") ..
                     (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings") ..
-                    "\n" .. _VERSION .. "\n\nFile sent with TDLua" .. "\nSupport me: https://ko-fi.com/giuseppeM99"
+                    "\n" .. _VERSION .. "\n\nFile sent with TDLua" .. "\nSupport me: https://giuseppem99.xyz/donate.html"
                 }
             }
         }
