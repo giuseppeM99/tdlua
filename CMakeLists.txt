@@ -1,5 +1,5 @@
 project (tdlua)
-cmake_minimum_required (VERSION 3.1)
+cmake_minimum_required (VERSION 3.5)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(td)
 if(NOT LUA_INCLUDE_DIR)
@@ -341,6 +341,7 @@ if (TDLUA_CALLS)
 endif()
 
 add_library (tdlua SHARED ${tdlua_srcs})
+
 if(TDLUA_CALLS)
     set_target_properties(tdlua PROPERTIES COMPILE_DEFINITIONS "TGVOIP_USE_CALLBACK_AUDIO_IO;WEBRTC_POSIX;TDLUA_CALLS")
     target_link_libraries (tdlua PRIVATE libtgvoip)
