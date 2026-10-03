@@ -4,7 +4,7 @@
 #include <map>
 #include <string>
 
-#include <lua.hpp>
+#include "lua_compat.h"
 
 #include "json.hpp"
 

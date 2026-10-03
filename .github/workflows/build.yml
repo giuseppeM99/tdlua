@@ -1,36 +1,258 @@
 name: Build TDLua
 
 on:
-    push:
-    pull_request:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
 
 jobs:
-    build:
-        runs-on: ubuntu-24.04
-        strategy:
-            matrix:
-                lua: [5.2, 5.3, 5.4]
+  bundled:
+    name: Lua ${{ matrix.lua }} / bundled TDLib
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        lua: ["5.1", "5.2", "5.3", "5.4"]
 
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-              with:
-                submodules: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-            - name: Install dependencies
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y cmake gperf libssl-dev openssl zlib1g-dev lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            liblua${{ matrix.lua }}-dev \
+            lua${{ matrix.lua }} \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
 
-            - name: Configure
-              run: |
-                  cmake -S . -B build \
-                    -DCMAKE_BUILD_TYPE=Release \
-                    -DTDLUA_BUILD_TESTS=ON \
-                    -DLUA_EXECUTABLE="$(command -v lua${{ matrix.lua }})"
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DLUA_EXECUTABLE="$(command -v lua${{ matrix.lua }})" \
+            -DLUA_INCLUDE_DIR="/usr/include/lua${{ matrix.lua }}" \
+            -DLUA_LIBRARY="/usr/lib/x86_64-linux-gnu/liblua${{ matrix.lua }}.so"
 
-            - name: Build
-              run: cmake --build build --parallel 2
+      - name: Build TDLua and regression tests
+        run: cmake --build build --target tdlua tdlua_codec_test
 
-            - name: Test
-              run: ctest --test-dir build --output-on-failure -R '^tdlua_'
+      - name: Verify bundled TDLib version
+        run: |
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' dist.info)"
+          tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
+          test "$(cat build/tdlua-version.txt)" = "${base_version}-${tdlib_version}"
+          test -e "build/td/libtdjson.so.${tdlib_version}"
+
+      - name: Run regression tests
+        run: ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Check Lua examples
+        run: |
+          for example in examples/*.lua; do
+            luac${{ matrix.lua }} -p "$example"
+          done
+
+      - name: Verify installation
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/tdlua-install"
+          test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
+
+      - name: Upload Lua 5.3 build to Telegram
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.lua == '5.3'
+        working-directory: build
+        env:
+          TG_APP_ID: ${{ secrets.TG_APP_ID }}
+          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
+        run: |
+          if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
+             [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Telegram upload secrets are not configured; skipping upload"
+            exit 0
+          fi
+          export TDLUA_VERSION="$(cat tdlua-version.txt)"
+          LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
+          LD_LIBRARY_PATH="$PWD/td:${LD_LIBRARY_PATH:-}" \
+            lua5.3 ../examples/uploadtravis.lua
+
+  external-tdlib:
+    name: Lua 5.3 / installed TDLib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            liblua5.3-dev \
+            lua5.3 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Build and install TDLib
+        run: |
+          cmake -S td -B td-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTD_INSTALL_STATIC_LIBRARIES=OFF \
+            -DTD_INSTALL_SHARED_LIBRARIES=ON \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/tdlib"
+          cmake --build td-build --target tdjson
+          cmake --install td-build
+
+      - name: Configure TDLua against installed TDLib
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DLUA_EXECUTABLE="$(command -v lua5.3)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
+            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.3.so
+
+      - name: Build and test TDLua
+        run: |
+          cmake --build build --target tdlua tdlua_codec_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+  lua55:
+    name: Lua 5.5 / bundled TDLib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            curl \
+            gperf \
+            libssl-dev \
+            ninja-build \
+            openssl \
+            zlib1g-dev
+
+      - name: Build Lua 5.5
+        run: |
+          curl -fsSL https://www.lua.org/ftp/lua-5.5.0.tar.gz | tar -xz
+          make -C lua-5.5.0 linux \
+            MYCFLAGS="-fPIC" \
+            MYLDFLAGS="-fPIC"
+          make -C lua-5.5.0 install \
+            INSTALL_TOP="$RUNNER_TEMP/lua55"
+
+      - name: Configure and test Lua 5.5
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
+            -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
+            -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
+          cmake --build build --target tdlua tdlua_codec_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+  luajit:
+    name: LuaJIT / bundled TDLib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            libluajit-5.1-dev \
+            luajit \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Configure and test LuaJIT
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DLUA_EXECUTABLE="$(command -v luajit)" \
+            -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
+            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/libluajit-5.1.so
+          cmake --build build --target tdlua tdlua_codec_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+  luarocks:
+    name: LuaRocks package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            liblua5.3-dev \
+            lua5.3 \
+            luarocks \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Validate rockspec
+        run: luarocks --lua-version=5.3 lint tdlua-scm-1.rockspec
+
+      - name: Build and install rock
+        run: |
+          luarocks --lua-version=5.3 \
+            --tree="$RUNNER_TEMP/rocks" \
+            make --no-doc tdlua-scm-1.rockspec
+
+      - name: Load installed module
+        run: |
+          eval "$(luarocks --lua-version=5.3 --tree=\"$RUNNER_TEMP/rocks\" path)"
+          LUA_CPATH="$RUNNER_TEMP/rocks/lib/lua/5.3/?.so;$LUA_CPATH" \
+            lua5.3 -e 'assert(require("tdlua"))'

@@ -1,5 +1,5 @@
 #include "luajson.h"
-#include <lua.hpp>
+#include "lua_compat.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -64,6 +64,38 @@ static void test_values(lua_State *L)
             std::to_string(static_cast<int>(value["items"][2]["nested"].type())));
 }
 
+static void test_number_types(lua_State *L)
+{
+    json value;
+    load_table(L, "return {integer = 42, integral_float = 42.0, fraction = 1.5}");
+    lua_getjson(L, value);
+    lua_pop(L, 1);
+
+    require(value["integer"].is_number_integer(),
+            "Lua integer conversion failed");
+    require(value["fraction"].is_number_float(),
+            "Lua fraction conversion failed");
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+    require(value["integral_float"].is_number_float(),
+            "Lua 5.3+ float/integer distinction was lost");
+#else
+    require(value["integral_float"].is_number_integer(),
+            "legacy Lua integral-number conversion failed");
+#endif
+
+    lua_settop(L, 0);
+    lua_pushjson(L, json(static_cast<std::int64_t>(9007199254740993LL)));
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+    require(lua_isinteger(L, -1), "Lua 5.3+ did not preserve an int64 value");
+    require(lua_tointeger(L, -1) == static_cast<lua_Integer>(9007199254740993LL),
+            "Lua 5.3+ int64 value changed during output conversion");
+#else
+    require(lua_isstring(L, -1),
+            "legacy Lua output must not round an unrepresentable int64");
+#endif
+    lua_settop(L, 0);
+}
+
 static void test_unsupported_value(lua_State *L)
 {
     load_table(L, "return {foo = function() end}");
@@ -93,6 +125,7 @@ int main()
     try {
         test_type_alias(L);
         test_values(L);
+        test_number_types(L);
         test_unsupported_value(L);
     } catch (const std::exception &error) {
         std::cerr << error.what() << "\n";

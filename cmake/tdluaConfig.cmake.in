@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../Td/TdConfig.cmake")
+    set(Td_DIR "${CMAKE_CURRENT_LIST_DIR}/../Td")
+endif()
+find_dependency(Td CONFIG REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/TDLuaTargets.cmake")

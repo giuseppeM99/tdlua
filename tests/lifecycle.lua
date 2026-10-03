@@ -2,6 +2,7 @@ local module_dir = assert(arg[1], "the module directory is required")
 package.cpath = module_dir .. "/?.so;" .. package.cpath
 
 local tdlua = require "tdlua"
+assert(tdlua.version == tdlua.api_version .. "-" .. tdlua.tdlib_version)
 local client = tdlua()
 
 assert(client:isClosed() == false)

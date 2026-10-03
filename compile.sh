@@ -10,14 +10,22 @@ if [ -n "$TDLUA_CALLS" ]; then
 cd ..
 fi
 
-mkdir build
 if [ -n "$TDLUA_CALLS" ]; then
     git submodule init
     git submodule update
 fi
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DTDLUA_TD_STATIC=1 -DTDULA_CALLS=$TDLUA_CALLS ..
-cmake --build .
 
-curl -s https://api.telegram.org/bot$token/sendDocument -F chat_id=68972553 -F document="@tdlua.so" -F caption="$LUA_VERSION CALLS $TDLUA_CALLS"
+cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTDLUA_TD_STATIC=ON \
+    -DTDLUA_CALLS="$TDLUA_CALLS"
+cmake --build build --target tdlua
+
+export TDLUA_VERSION="$(cat build/tdlua-version.txt)"
+cd build
+
+curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN:-$token}/sendDocument" \
+    -F "chat_id=${TG_CHAT_ID:-${chat_id:-68972553}}" \
+    -F document="@tdlua.so" \
+    -F "caption=$TDLUA_VERSION CALLS $TDLUA_CALLS"
 $LUA ../examples/uploadtravis.lua

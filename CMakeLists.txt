@@ -1,20 +1,70 @@
-cmake_minimum_required (VERSION 3.5)
-project (tdlua)
+cmake_minimum_required(VERSION 3.16)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/dist.info" _tdlua_dist_version_line
+     REGEX "^version[ \t]*=")
+string(REGEX MATCH "\"([0-9]+\\.[0-9]+)\""
+       _tdlua_dist_version_match "${_tdlua_dist_version_line}")
+if(NOT _tdlua_dist_version_match)
+  message(FATAL_ERROR "Unable to read TDLua version from dist.info")
+endif()
+set(_tdlua_base_version "${CMAKE_MATCH_1}")
+project(tdlua VERSION "${_tdlua_base_version}.0" LANGUAGES C CXX)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
+option(TDLUA_TD_STATIC "Link TDLua against the static TDLib JSON library" OFF)
+set(TDLUA_TDLIB_VERSION "")
+set(TDLUA_LUA_VERSION "" CACHE STRING "Lua version used for the module installation path")
+set(TDLUA_LUA_MODULE_DIR "" CACHE STRING "Installation directory for the tdlua Lua module")
 include(GNUInstallDirs)
 
+# TDLib has its own CTest and benchmark targets. TDLua controls its tests
+# below, so keep the vendored dependency from adding its full test tree.
+set(BUILD_TESTING OFF CACHE BOOL "Disable TDLib tests when building TDLua" FORCE)
+
+find_package(Lua REQUIRED)
+
 if(TDLUA_BUNDLED_TDLIB)
+  set(TD_INSTALL_STATIC_LIBRARIES OFF CACHE BOOL "" FORCE)
+  set(TD_INSTALL_SHARED_LIBRARIES ON CACHE BOOL "" FORCE)
   add_subdirectory(td)
 else()
   find_package(Td CONFIG REQUIRED)
 endif()
 
-if(NOT LUA_INCLUDE_DIR)
-  find_package(Lua REQUIRED)
+if(TDLUA_TDLIB_VERSION STREQUAL "")
+  if(TDLUA_BUNDLED_TDLIB AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt" _tdlib_project_line
+         REGEX "^project\\(TDLib VERSION ")
+    string(REGEX MATCH "VERSION ([0-9]+\\.[0-9]+\\.[0-9]+)"
+           _tdlib_project_match "${_tdlib_project_line}")
+    if(_tdlib_project_match)
+      set(TDLUA_TDLIB_VERSION "${CMAKE_MATCH_1}")
+    endif()
+  elseif(DEFINED TDLib_VERSION)
+    set(TDLUA_TDLIB_VERSION "${TDLib_VERSION}")
+  elseif(DEFINED Td_VERSION)
+    set(TDLUA_TDLIB_VERSION "${Td_VERSION}")
+  elseif(DEFINED Td_DIR AND EXISTS "${Td_DIR}/TdConfigVersion.cmake")
+    file(STRINGS "${Td_DIR}/TdConfigVersion.cmake" _tdlib_version_line
+         REGEX "^set\\(PACKAGE_VERSION ")
+    string(REGEX MATCH "\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+           _tdlib_version_match "${_tdlib_version_line}")
+    if(_tdlib_version_match)
+      set(TDLUA_TDLIB_VERSION "${CMAKE_MATCH_1}")
+    endif()
+  endif()
 endif()
-include_directories(${LUA_INCLUDE_DIR})
+if(TDLUA_TDLIB_VERSION STREQUAL "")
+  set(TDLUA_TDLIB_VERSION "unknown")
+endif()
+set(TDLUA_VERSION_STRING "${TDLUA_BASE_VERSION}-${TDLUA_TDLIB_VERSION}")
+message(STATUS "TDLua version: ${TDLUA_VERSION_STRING}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
+     "${TDLUA_VERSION_STRING}\n")
+
 list(APPEND tdlua_srcs
     "tdlua.cpp"
     "luajson.cpp"
@@ -353,8 +403,20 @@ endif()
 
 add_library (tdlua SHARED ${tdlua_srcs})
 
+target_include_directories(tdlua PRIVATE
+    "${LUA_INCLUDE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
+target_compile_features(tdlua PRIVATE cxx_std_11)
+target_compile_definitions(tdlua PRIVATE
+    "TDLUA_VERSION_STRING=\"${TDLUA_VERSION_STRING}\""
+    "TDLUA_BASE_VERSION=\"${TDLUA_BASE_VERSION}\""
+    "TDLUA_TDLIB_VERSION=\"${TDLUA_TDLIB_VERSION}\"")
+
 if(TDLUA_CALLS)
-    set_target_properties(tdlua PROPERTIES COMPILE_DEFINITIONS "TGVOIP_USE_CALLBACK_AUDIO_IO;WEBRTC_POSIX;TDLUA_CALLS")
+    target_compile_definitions(tdlua PRIVATE
+        TGVOIP_USE_CALLBACK_AUDIO_IO WEBRTC_POSIX TDLUA_CALLS)
     target_link_libraries (tdlua PRIVATE libtgvoip)
 endif()
 
@@ -364,11 +426,25 @@ if(TDLUA_TD_STATIC)
 else()
   target_link_libraries (tdlua PRIVATE Td::TdJson)
 endif()
-set_property (TARGET tdlua PROPERTY CXX_STANDARD 11)
+if(TDLUA_BUNDLED_TDLIB AND UNIX)
+  if(APPLE)
+    set_property(TARGET tdlua APPEND PROPERTY INSTALL_RPATH
+        "@loader_path;@loader_path/../..")
+  else()
+    set_property(TARGET tdlua APPEND PROPERTY INSTALL_RPATH
+        "$ORIGIN;$ORIGIN/../..")
+  endif()
+endif()
 
 if(NOT TDLUA_LUA_VERSION)
   if(LUA_VERSION_STRING)
-    set(TDLUA_LUA_VERSION "${LUA_VERSION_STRING}")
+    string(REGEX MATCH "^[0-9]+\\.[0-9]+" TDLUA_LUA_VERSION_MATCH
+           "${LUA_VERSION_STRING}")
+    if(TDLUA_LUA_VERSION_MATCH)
+      set(TDLUA_LUA_VERSION "${TDLUA_LUA_VERSION_MATCH}")
+    else()
+      set(TDLUA_LUA_VERSION "${LUA_VERSION_STRING}")
+    endif()
   else()
     string(REGEX MATCH "lua([0-9]+\\.[0-9]+)" TDLUA_LUA_VERSION_MATCH
            "${LUA_INCLUDE_DIR}")
@@ -379,12 +455,38 @@ if(NOT TDLUA_LUA_VERSION)
     endif()
   endif()
 endif()
-set(TDLUA_LUA_MODULE_DIR
-    "${CMAKE_INSTALL_LIBDIR}/lua/${TDLUA_LUA_VERSION}"
-    CACHE PATH "Installation directory for the tdlua Lua module")
+if(TDLUA_LUA_MODULE_DIR STREQUAL "")
+    set(TDLUA_LUA_MODULE_DIR
+        "${CMAKE_INSTALL_LIBDIR}/lua/${TDLUA_LUA_VERSION}"
+        CACHE STRING "Installation directory for the tdlua Lua module" FORCE)
+endif()
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/tdluaConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/tdluaConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tdlua"
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/tdluaConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+
 install(TARGETS tdlua
+    EXPORT TDLuaTargets
     LIBRARY DESTINATION "${TDLUA_LUA_MODULE_DIR}"
     RUNTIME DESTINATION "${TDLUA_LUA_MODULE_DIR}"
+)
+install(EXPORT TDLuaTargets
+    FILE TDLuaTargets.cmake
+    NAMESPACE TDLua::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tdlua"
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/tdluaConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/tdluaConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tdlua"
 )
 
 if(TDLUA_BUILD_TESTS)

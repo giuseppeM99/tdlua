@@ -16,9 +16,8 @@ int resume(lua_State *coroutine, lua_State *from, int arguments, int *results)
     (void)results;
     return lua_resume(coroutine, from, arguments);
 #else
-    (void)from;
     (void)results;
-    return lua_resume(coroutine, arguments);
+    return lua_resume(coroutine, from, arguments);
 #endif
 }
 

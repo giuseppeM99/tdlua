@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include <lua.hpp>
+#include "lua_compat.h"
 
 #include "json.hpp"
 #include "request_router.h"

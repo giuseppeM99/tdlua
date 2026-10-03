@@ -1,9 +1,12 @@
 local tdlua = require "tdlua"
 
-local api_id = os.getenv('TG_APP_ID')
+local api_id = tonumber(os.getenv('TG_APP_ID') or '')
 local api_hash = os.getenv('TG_APP_HASH')
+local bot_token = os.getenv('TG_BOT_TOKEN') or os.getenv('token')
+local configured_chat = os.getenv('TG_CHAT_ID') or os.getenv('chat_id')
 local dbpassword = ""
 local client = tdlua()
+local parameters_sent = false
 client:send(
     (
         {["@type"] = "getAuthorizationState"}
@@ -13,7 +16,8 @@ client:send(
 local function authstate(state)
     if state["@type"] == "authorizationStateClosed" then
         os.exit(0)
-    elseif state["@type"] == "authorizationStateWaitTdlibParameters" then
+    elseif state["@type"] == "authorizationStateWaitTdlibParameters" and not parameters_sent then
+        parameters_sent = true
         client:send({
                 ["@type"] = "setTdlibParameters",
                 use_message_database = true,
@@ -23,8 +27,6 @@ local function authstate(state)
                 device_model = "tdlua",
                 system_version = "unk",
                 application_version = "0.1",
-                enable_storage_optimizer = true,
-                use_pfs = true,
                 database_directory = "./tdlua"
             }
         )
@@ -37,11 +39,11 @@ local function authstate(state)
     elseif state["@type"] == "authorizationStateWaitPhoneNumber" then
         client:send({
                 ["@type"] = "checkAuthenticationBotToken",
-                token = os.getenv("token")
+                token = bot_token
             }
         )
     elseif state["@type"] == "authorizationStateReady" then
-        local chat = os.getenv("chat_id")
+        local chat = configured_chat
         if not chat:match("^%d+$") then
             local res = client:execute {
                 ["@type"] = "searchPublicChat",
@@ -54,8 +56,6 @@ local function authstate(state)
         end
         tdlua.setLogLevel(1)
         --local link = io.popen("curl --upload-file tdlua.so https://transfer.sh"):read("*all")
-        local version = client:getOption({name='version'}).value
-        local commit_hash = client:getOption({name='commit_hash'}).value
         local res = client:execute {
             ["@type"] = "sendMessage",
             chat_id = chat,
@@ -67,11 +67,7 @@ local function authstate(state)
                 },
                 caption = {
                     ["@type"] = "formattedText",
-                    text = "TDLua " .. version .. " commit " .. commit_hash..
-                    "\nMD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") ..
-                    "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+") ..
-                    (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings") ..
-                    "\n" .. _VERSION .. "\n\nFile sent with TDLua" .. "\nSupport me: https://giuseppem99.xyz/donate.html"
+                    text = "TDLua " .. (os.getenv("TDLUA_VERSION") or tdlua.version or "unknown") .. " MD5 ".. io.popen("md5sum tdlua.so"):read("*all"):match("^%w+") .. "\nSHA1 "..io.popen("sha1sum tdlua.so"):read("*all"):match("^%w+").. (os.getenv("TDLUA_CALLS") == '1' and "\nWith libtgvoip bindings" or "\nWithout libtgvoip bindings").."\n".._VERSION.."\n\nFile sent with TDLua"
                 }
             }
         }

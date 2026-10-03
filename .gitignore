@@ -1,6 +1,11 @@
 test/*
-cmake-build-debug/*
-build/*
+cmake-build-debug
+build
+build*
 *.so
 .idea/*
 examples/tdlua
+.*/
+!.github/*
+examples/*
+!examples/*.lua

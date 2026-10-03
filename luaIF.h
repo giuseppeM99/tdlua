@@ -5,7 +5,7 @@
  */
 
 #pragma once
-#include <lua.hpp>
+#include "lua_compat.h"
 
 static int tdclient_new(lua_State *L);
 static int tdclient_call(lua_State *L);

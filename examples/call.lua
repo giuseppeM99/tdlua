@@ -6,12 +6,13 @@ local function vardump(wut)
     print(serpent.block(wut, {comment=false}))
 end
 
-local api_id = os.getenv('TG_APP_ID')
+local api_id = tonumber(os.getenv('TG_APP_ID') or '')
 local api_hash = os.getenv('TG_APP_HASH')
 
 local dbpassword = ""
 tdlua.setLogLevel(2)
 local client = tdlua()
+local parameters_sent = false
 client:send(
     (
         {_ = "getAuthorizationState"}
@@ -21,10 +22,11 @@ local ready = false
 local function authstate(state)
     if state._ == "authorizationStateClosed" then
         os.exit(0)
-    elseif state._ == "authorizationStateWaitTdlibParameters" then
+    elseif state._ == "authorizationStateWaitTdlibParameters" and not parameters_sent then
+        parameters_sent = true
         if not api_id then
             print("Enter app id (take it from https://my.telegram.org/apps)")
-            api_id = io.read()
+            api_id = tonumber(io.read())
         end
 
         if not api_hash then
@@ -33,19 +35,14 @@ local function authstate(state)
         end
         client:send({
                 _ = "setTdlibParameters",
-                parameters = {
-                    _ = "setTdlibParameters",
-                    use_message_database = true,
-                    api_id = api_id,
-                    api_hash = api_hash,
-                    system_language_code = "en",
-                    device_model = "tdlua",
-                    system_version = "unk",
-                    application_version = "0.1",
-                    enable_storage_optimizer = true,
-                    use_pfs = true,
-                    database_directory = "./call"
-                }
+                use_message_database = true,
+                api_id = api_id,
+                api_hash = api_hash,
+                system_language_code = "en",
+                device_model = "tdlua",
+                system_version = "unk",
+                application_version = "0.1",
+                database_directory = "./call"
             }
         )
     elseif state._ == "authorizationStateWaitEncryptionKey" then

@@ -10,38 +10,40 @@ end
 tdlua.setLogLevel(6)
 local client = tdlua()
 
-client:send({['@type'] = 'getAuthorizationState', ['@extra'] = 1.01234})
+-- Legacy raw API: send() remains fire-and-forget and receive() pumps events.
+client:send({_ = 'getAuthorizationState', ['@extra'] = 1.01234})
 
 vardump(
     client:execute({
-        ['@type'] = 'getTextEntities', text = '@telegram /test_command https://telegram.org telegram.me',
+        _ = 'getTextEntities', text = '@telegram /test_command https://telegram.org telegram.me',
         ['@extra'] = {'5', 7.0},
     })
 )
 
---Same as
+-- Same request through the legacy dynamic helper.
 vardump(
     client:getTextEntities({
         text = '@telegram /test_command https://telegram.org telegram.me',
     })
 )
-client:sendMessage({['@extra'] = 'asd'})
+-- New asynchronous dynamic-helper API. The callback is detected by type.
+local callback_done = false
+client:getAuthorizationState(function(result, context)
+    print('callback from ' .. context.origin .. ': ' .. result._)
+    callback_done = true
+end, {origin = 'example.lua'})
+
 while true do
-    if not client then
-      break
-    end
-    local res = client:receive(1)
+    local res = client:poll(1.0)
     if res then
         vardump(res)
-        if res['@type'] == 'updateAuthorizationState' and
-        res['authorization_state']['@type'] == 'authorizationStateClosed' then
-            print('exiting')
+        if callback_done then
             break
         end
     else
-        print('res is nil')
-        client:close(true)
-        --Same as client:send({["@type"] = "close"})
+        print('timeout waiting for response')
         break
     end
 end
+
+client:close()

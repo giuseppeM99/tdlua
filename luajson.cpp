@@ -13,13 +13,13 @@ using json = nlohmann::json;
 
 static bool lua_isarray(lua_State *L)
 {
-    lua_Number k;
-    lua_Number max = 0;
+    lua_Integer k;
+    lua_Integer max = 0;
     lua_Integer size = 0;
     lua_pushnil(L);
     while (lua_next(L, -2) != 0) {
-        if (lua_type(L, -2) == LUA_TNUMBER && (k = lua_tonumber(L, -2))) {
-            if (floor(k) == k && k >= 1) {
+        if (tdlua_lua_key_integer_value(L, -2, k)) {
+            if (k >= 1) {
                 if (k > max)
                     max = k;
                 size++;
@@ -38,11 +38,11 @@ namespace {
 std::string lua_json_path_for_key(lua_State *L, int index, const std::string &path)
 {
     if (lua_type(L, index) == LUA_TNUMBER) {
-        const lua_Number number = lua_tonumber(L, index);
-        const lua_Integer integer = lua_tointeger(L, index);
-        if (number == integer) {
+        lua_Integer integer = 0;
+        if (tdlua_lua_key_integer_value(L, index, integer)) {
             return path + "[" + std::to_string(integer) + "]";
         }
+        const lua_Number number = lua_tonumber(L, index);
         return path + "[" + std::to_string(number) + "]";
     }
     if (lua_type(L, index) == LUA_TSTRING) {
@@ -54,12 +54,11 @@ std::string lua_json_path_for_key(lua_State *L, int index, const std::string &pa
 void lua_getjson_value(lua_State *L, json &j, const std::string &path)
 {
     if (lua_type(L, -1) == LUA_TNUMBER) {
-        auto x = lua_tonumber(L, -1);
-        auto xi = lua_tointeger(L, -1);
-        if (x == xi) {
-            j = xi;
+        lua_Integer integer = 0;
+        if (tdlua_lua_integer_value(L, -1, integer)) {
+            j = integer;
         } else {
-            j = x;
+            j = lua_tonumber(L, -1);
         }
         return;
     } else if (lua_isboolean(L, -1)) {
@@ -87,11 +86,10 @@ void lua_getjson_value(lua_State *L, json &j, const std::string &path)
                 lua_pop(L, 1);
             } else {
                 if (lua_type(L, -2) == LUA_TNUMBER) {
-                    const lua_Number number = lua_tonumber(L, -2);
-                    const lua_Integer integer = lua_tointeger(L, -2);
-                    const std::string key = number == integer
+                    lua_Integer integer = 0;
+                    const std::string key = tdlua_lua_key_integer_value(L, -2, integer)
                         ? std::to_string(integer)
-                        : std::to_string(number);
+                        : std::to_string(lua_tonumber(L, -2));
                     lua_getjson_value(L, j[key],
                                       lua_json_path_for_key(L, -2, path));
                 } else {
@@ -134,8 +132,12 @@ void lua_pushjson (lua_State *L, const json j) {
     } else if (j.is_number_integer()) {
         auto v = j.get<int64_t>();
 
-        if (v == static_cast<lua_Integer>(v)) {
+        if (tdlua_can_push_integer(v)) {
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
             lua_pushinteger(L, static_cast<lua_Integer>(v));
+#else
+            lua_pushnumber(L, static_cast<lua_Number>(v));
+#endif
         } else {
             std::string s = std::to_string(v);
             lua_pushlstring (L, s.c_str(), s.length());

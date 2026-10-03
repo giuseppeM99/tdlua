@@ -24,7 +24,8 @@ static TDLua * getTD(lua_State *L)
 
 bool my_lua_isinteger(lua_State *L, int x)
 {
-    return (lua_tonumber(L, x) == lua_tointeger(L, x));
+    lua_Integer value = 0;
+    return tdlua_lua_integer_value(L, x, value);
 }
 
 using json = nlohmann::json;
@@ -620,6 +621,16 @@ static luaL_Reg tdlua[] = {
         {nullptr, nullptr}
 };
 
+#ifndef TDLUA_VERSION_STRING
+#define TDLUA_VERSION_STRING "unknown"
+#endif
+#ifndef TDLUA_BASE_VERSION
+#define TDLUA_BASE_VERSION "unknown"
+#endif
+#ifndef TDLUA_TDLIB_VERSION
+#define TDLUA_TDLIB_VERSION "unknown"
+#endif
+
 extern "C" {
     LUALIB_API int luaopen_tdlua(lua_State *L) {
         luaL_newmetatable(L, "tdlua");
@@ -627,6 +638,12 @@ extern "C" {
         lua_pushcfunction(L, tdclient_new);
         lua_settable(L, -3);
         luaL_newlib(L, tdlua);
+        lua_pushstring(L, TDLUA_VERSION_STRING);
+        lua_setfield(L, -2, "version");
+        lua_pushstring(L, TDLUA_BASE_VERSION);
+        lua_setfield(L, -2, "api_version");
+        lua_pushstring(L, TDLUA_TDLIB_VERSION);
+        lua_setfield(L, -2, "tdlib_version");
         luaL_setmetatable(L, "tdlua");
         td_set_log_fatal_error_callback(tdclient_fatalerrorcb);
         return 1;

@@ -1,5 +1,5 @@
 #pragma once
-#include <lua.hpp>
+#include "lua_compat.h"
 #include <string>
 #include "json.hpp"
 void lua_pushjson(lua_State *L, const nlohmann::json j);
