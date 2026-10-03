@@ -5,30 +5,119 @@
  */
 
 #include "tdlua.h"
+#include <chrono>
 #include <iostream>
 #include <fstream>
+#include <map>
+#include <mutex>
+#include <queue>
 #include <td/telegram/td_json_client.h>
 
+namespace {
 
-TDLua::TDLua()
+using json = nlohmann::json;
+
+class JsonRuntime {
+public:
+    static JsonRuntime &instance()
+    {
+        static JsonRuntime runtime;
+        return runtime;
+    }
+
+    std::int32_t createClient()
+    {
+        return td_create_client_id();
+    }
+
+    void send(const std::int32_t client_id, const json &request)
+    {
+        const std::string serialized = request.dump();
+        td_send(client_id, serialized.c_str());
+    }
+
+    json execute(const json &request)
+    {
+        const std::string serialized = request.dump();
+        return parse(td_execute(serialized.c_str()), "execute");
+    }
+
+    json receive(const std::int32_t client_id, const double timeout)
+    {
+        std::lock_guard<std::mutex> lock(receive_mutex);
+        std::queue<json> &client_queue = pending[client_id];
+        if (!client_queue.empty()) {
+            json result = client_queue.front();
+            client_queue.pop();
+            return result;
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        while (true) {
+            const std::chrono::duration<double> elapsed =
+                std::chrono::steady_clock::now() - started;
+            const double remaining = timeout - elapsed.count();
+            if (remaining <= 0.0) {
+                return nullptr;
+            }
+
+            json result = parse(td_receive(remaining), "receive");
+            if (!result.is_object()) {
+                return nullptr;
+            }
+
+            const auto client_field = result.find("@client_id");
+            if (client_field == result.end() || !client_field->is_number_integer()) {
+                return result;
+            }
+
+            const std::int32_t result_client_id = client_field->get<std::int32_t>();
+            result.erase("@client_id");
+            if (result_client_id == client_id) {
+                return result;
+            }
+            pending[result_client_id].push(result);
+        }
+    }
+
+    void forget(const std::int32_t client_id)
+    {
+        std::lock_guard<std::mutex> lock(receive_mutex);
+        pending.erase(client_id);
+    }
+
+private:
+    static json parse(const char *serialized, const char *operation)
+    {
+        if (!serialized) {
+            return nullptr;
+        }
+        try {
+            return json::parse(serialized);
+        } catch (const json::parse_error &error) {
+            std::cerr << "[TDCLIENT " << operation << "] JSON parse error "
+                      << error.what() << "\n";
+            return nullptr;
+        }
+    }
+
+    std::mutex receive_mutex;
+    std::map<std::int32_t, std::queue<json> > pending;
+};
+
+}
+
+
+TDLua::TDLua(lua_State *lua)
+    : client_id(JsonRuntime::instance().createClient()),
+      next_request_id(1), updates(), dbpath(), _ready(false),
+      state(ClientState::Running), dispatcher_(lua)
 {
-    tdjson = td_json_client_create();
-    _ready = false;
 }
 
 TDLua::~TDLua()
 {
-    td_json_client_destroy(tdjson);
-}
-
-void TDLua::setTD(void* td)
-{
-    tdjson = td;
-}
-
-void* TDLua::getTD() const
-{
-    return tdjson;
+    close();
 }
 
 nlohmann::json TDLua::pop()
@@ -38,50 +127,70 @@ nlohmann::json TDLua::pop()
     return res;
 }
 
-void TDLua::setDB(const std::string path)
+void TDLua::setDB(const std::string &path)
 {
     dbpath = path;
+    if (dbpath.empty()) {
+        return;
+    }
     if (dbpath.back() != '/')
         dbpath += "/";
     dbpath += "tdlua.json";
 }
 
-void TDLua::send(const nlohmann::json json) const
+void TDLua::send(const nlohmann::json &json)
 {
-    td_json_client_send(tdjson, json.dump().c_str());
+    JsonRuntime::instance().send(client_id, json);
 }
 
-nlohmann::json TDLua::execute(const nlohmann::json json) const
+nlohmann::json TDLua::execute(const nlohmann::json &json)
 {
-    const char *res = td_json_client_execute(tdjson, json.dump().c_str());
-    if (!res) {
-        return nullptr;
-    }
-    nlohmann::json jres = nullptr;
-    try {
-        jres = nlohmann::json::parse(res);
-    } catch (nlohmann::json::parse_error &e) {
-        std::cout << "[TDCLIENT EXECUTE] JSON Parse error " << e.what() << "\n";
-    }
-    return jres;
+    return JsonRuntime::instance().execute(json);
 }
 
-nlohmann::json TDLua::receive(const size_t timeout) const
+nlohmann::json TDLua::receive(const double timeout)
 {
-    const char *res = td_json_client_receive(tdjson, timeout);
-    if (!res) {
-        return nullptr;
-    }
-    nlohmann::json jres = nullptr;
-    try {
-        jres = nlohmann::json::parse(res);
-    } catch (nlohmann::json::parse_error &e) {
-        std::cout << "[TDCLIENT RECEIVE] JSON Parse error " << e.what() << "\n";
-    }
-    return jres;
+    return JsonRuntime::instance().receive(client_id, timeout);
 }
 
-void TDLua::push(const nlohmann::json update)
+void TDLua::close()
+{
+    if (state == ClientState::Closed) {
+        JsonRuntime::instance().forget(client_id);
+        state = ClientState::Closed;
+        return;
+    }
+
+    if (state == ClientState::Running) {
+        send({{"@type", "close"}});
+        state = ClientState::Closing;
+    }
+
+    while (state != ClientState::Closed) {
+        nlohmann::json update = receive(1.0);
+        if (update.is_object()) {
+            checkAuthState(update);
+        }
+    }
+    JsonRuntime::instance().forget(client_id);
+}
+
+bool TDLua::closed() const
+{
+    return state == ClientState::Closed;
+}
+
+std::uint64_t TDLua::nextRequestId()
+{
+    return next_request_id++;
+}
+
+LuaDispatcher &TDLua::dispatcher()
+{
+    return dispatcher_;
+}
+
+void TDLua::push(const nlohmann::json &update)
 {
     updates.push(update);
 }
@@ -140,7 +249,13 @@ void TDLua::loadUpdatesBuffer()
     if (in && in.is_open()) {
         std::string buf;
         in.seekg(0, std::ios::end);
-        buf.resize(in.tellg());
+        const std::streamoff size = in.tellg();
+        if (size <= 0) {
+            in.close();
+            _ready = true;
+            return;
+        }
+        buf.resize(static_cast<std::size_t>(size));
         in.seekg(0, std::ios::beg);
         in.read(&buf[0], buf.size());
         in.close();
@@ -169,7 +284,7 @@ void TDLua::emptyUpdatesBuffer()
     }
 }
 
-void TDLua::checkAuthState(const nlohmann::json update)
+void TDLua::checkAuthState(const nlohmann::json &update)
 {
     if (update["@type"] == "updateAuthorizationState") {
         if (!ready() && update["authorization_state"]["@type"] == "authorizationStateReady") {
@@ -178,6 +293,7 @@ void TDLua::checkAuthState(const nlohmann::json update)
             saveUpdatesBuffer();
             emptyUpdatesBuffer();
             _ready = false;
+            state = ClientState::Closed;
         }
     }
 }

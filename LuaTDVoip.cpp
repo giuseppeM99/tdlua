@@ -11,6 +11,7 @@
 #include <fstream>
 
 #include "LuaTDVoip.h"
+#include <exception>
 #include "tdlua.h"
 #include "base64/base64.h"
 #include "libtgvoip/VoIPServerConfig.h"
@@ -254,7 +255,11 @@ static int onHold(lua_State *L)
 {
     if (lua_istable(L, -1)) {
         json list;
-        lua_getjson(L, list);
+        try {
+            lua_getjson(L, list);
+        } catch (const std::exception &error) {
+            return luaL_error(L, "%s", error.what());
+        }
         Call::getCall(L)->onHold(list);
     }
     lua_pushvalue(L, 1);

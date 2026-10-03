@@ -1,7 +1,16 @@
-project (tdlua)
 cmake_minimum_required (VERSION 3.5)
+project (tdlua)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-add_subdirectory(td)
+option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
+option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
+include(GNUInstallDirs)
+
+if(TDLUA_BUNDLED_TDLIB)
+  add_subdirectory(td)
+else()
+  find_package(Td CONFIG REQUIRED)
+endif()
+
 if(NOT LUA_INCLUDE_DIR)
   find_package(Lua REQUIRED)
 endif()
@@ -10,6 +19,8 @@ list(APPEND tdlua_srcs
     "tdlua.cpp"
     "luajson.cpp"
     "luaIF.cpp"
+    "request_router.cpp"
+    "lua_dispatcher.cpp"
 )
 if (TDLUA_CALLS)
     set(TARGET "libtgvoip")
@@ -354,3 +365,57 @@ else()
   target_link_libraries (tdlua PRIVATE Td::TdJson)
 endif()
 set_property (TARGET tdlua PROPERTY CXX_STANDARD 11)
+
+if(NOT TDLUA_LUA_VERSION)
+  if(LUA_VERSION_STRING)
+    set(TDLUA_LUA_VERSION "${LUA_VERSION_STRING}")
+  else()
+    string(REGEX MATCH "lua([0-9]+\\.[0-9]+)" TDLUA_LUA_VERSION_MATCH
+           "${LUA_INCLUDE_DIR}")
+    if(CMAKE_MATCH_1)
+      set(TDLUA_LUA_VERSION "${CMAKE_MATCH_1}")
+    else()
+      set(TDLUA_LUA_VERSION "generic")
+    endif()
+  endif()
+endif()
+set(TDLUA_LUA_MODULE_DIR
+    "${CMAKE_INSTALL_LIBDIR}/lua/${TDLUA_LUA_VERSION}"
+    CACHE PATH "Installation directory for the tdlua Lua module")
+install(TARGETS tdlua
+    LIBRARY DESTINATION "${TDLUA_LUA_MODULE_DIR}"
+    RUNTIME DESTINATION "${TDLUA_LUA_MODULE_DIR}"
+)
+
+if(TDLUA_BUILD_TESTS)
+    enable_testing()
+    add_executable(tdlua_codec_test
+        "tests/codec_test.cpp"
+        "luajson.cpp"
+    )
+    target_include_directories(tdlua_codec_test PRIVATE
+        ${LUA_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(tdlua_codec_test PRIVATE ${LUA_LIBRARIES})
+    set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
+    add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
+
+    if(LUA_EXECUTABLE)
+        set(TDLUA_LUA_EXECUTABLE "${LUA_EXECUTABLE}")
+    else()
+        find_program(TDLUA_LUA_EXECUTABLE NAMES lua5.3 lua5.2 lua5.4 lua)
+    endif()
+    if(TDLUA_LUA_EXECUTABLE)
+        add_test(NAME tdlua_lifecycle
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+        add_test(NAME tdlua_async
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/async.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+    endif()
+endif()

@@ -5,9 +5,12 @@
  */
 
 #pragma once
+#include <cstdint>
 #include <queue>
 #include <map>
+#include <string>
 #include "json.hpp"
+#include "lua_dispatcher.h"
 
 #ifdef TDLUA_CALLS
 #include "LuaTDVoip.h"
@@ -15,34 +18,47 @@
 
 class TDLua {
 private:
-    void *tdjson;
+    enum class ClientState {
+        Running,
+        Closing,
+        Closed
+    };
+
+    std::int32_t client_id;
+    std::uint64_t next_request_id;
     std::queue<nlohmann::json> updates;
     std::string dbpath;
     #ifdef TDLUA_CALLS
     std::map<int32_t, Call*> calls;
     #endif
     bool _ready;
+    ClientState state;
+    LuaDispatcher dispatcher_;
 public:
 
-    TDLua();
+    explicit TDLua(lua_State *lua);
 
     ~TDLua();
 
-    void setTD(void* td);
-
-    void* getTD() const;
-
     nlohmann::json pop();
 
-    void setDB(const std::string path);
+    void setDB(const std::string &path);
 
-    void send(const nlohmann::json json) const;
+    void send(const nlohmann::json &json);
 
-    nlohmann::json execute(const nlohmann::json json) const;
+    nlohmann::json execute(const nlohmann::json &json);
 
-    nlohmann::json receive(const size_t timeout = 10) const;
+    nlohmann::json receive(const double timeout = 10.0);
 
-    void push(const nlohmann::json update);
+    void close();
+
+    bool closed() const;
+
+    std::uint64_t nextRequestId();
+
+    LuaDispatcher &dispatcher();
+
+    void push(const nlohmann::json &update);
 
     bool empty() const;
 
@@ -64,7 +80,7 @@ public:
 
     void emptyUpdatesBuffer();
 
-    void checkAuthState(const nlohmann::json update);
+    void checkAuthState(const nlohmann::json &update);
 
     bool ready() const;
 

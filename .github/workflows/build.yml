@@ -12,23 +12,25 @@ jobs:
                 lua: [5.2, 5.3, 5.4]
 
         steps:
-            - name: Checkout current repo
+            - name: Checkout repository
               uses: actions/checkout@v4
               with:
                 submodules: true
 
             - name: Install dependencies
               run: |
-                  (apt-get update || true) 2>/dev/null
-                  (apt-get install -y sudo || true) 2>/dev/null
                   sudo apt-get update
-                  sudo apt-get install -y libssl-dev openssl zlib1g-dev gperf lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev
+                  sudo apt-get install -y cmake gperf libssl-dev openssl zlib1g-dev lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev
 
-            - name: Run compile script
-              run: bash compile.sh
-              env:
-                LUA: lua${{ matrix.lua }}
-                TG_APP_ID: ${{ secrets.TG_APP_ID }}
-                TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
-                token: ${{ secrets.token }}
-                chat_id: ${{ secrets.chat_id }}
+            - name: Configure
+              run: |
+                  cmake -S . -B build \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DTDLUA_BUILD_TESTS=ON \
+                    -DLUA_EXECUTABLE="$(command -v lua${{ matrix.lua }})"
+
+            - name: Build
+              run: cmake --build build --parallel 2
+
+            - name: Test
+              run: ctest --test-dir build --output-on-failure -R '^tdlua_'

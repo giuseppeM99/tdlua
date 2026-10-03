@@ -1,5 +1,8 @@
 #include "luajson.h"
 #include "json.hpp"
+#include <cmath>
+#include <stdexcept>
+#include <string>
 
 /*
     This code was originally wrote by vysheng for tdbot
@@ -30,7 +33,25 @@ static bool lua_isarray(lua_State *L)
     return max == size;
 }
 
-void lua_getjson(lua_State *L, json &j)
+namespace {
+
+std::string lua_json_path_for_key(lua_State *L, int index, const std::string &path)
+{
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        const lua_Number number = lua_tonumber(L, index);
+        const lua_Integer integer = lua_tointeger(L, index);
+        if (number == integer) {
+            return path + "[" + std::to_string(integer) + "]";
+        }
+        return path + "[" + std::to_string(number) + "]";
+    }
+    if (lua_type(L, index) == LUA_TSTRING) {
+        return path + "." + lua_tostring(L, index);
+    }
+    throw std::runtime_error("tdlua: object keys must be strings or numbers at " + path);
+}
+
+void lua_getjson_value(lua_State *L, json &j, const std::string &path)
 {
     if (lua_type(L, -1) == LUA_TNUMBER) {
         auto x = lua_tonumber(L, -1);
@@ -42,7 +63,8 @@ void lua_getjson(lua_State *L, json &j)
         }
         return;
     } else if (lua_isboolean(L, -1)) {
-        j = lua_toboolean(L, -1);
+        j = static_cast<bool>(lua_toboolean(L, -1));
+        return;
     } else if (lua_isstring(L, -1)) {
         size_t len;
         const char *s = lua_tolstring(L, -1, &len);
@@ -60,33 +82,45 @@ void lua_getjson(lua_State *L, json &j)
         while (lua_next(L, -2)) {
             if (arr) {
                 int x = (int)lua_tointeger(L, -2);
-                lua_getjson(L, j[x-1]);
+                lua_getjson_value(L, j[x-1],
+                                  path + "[" + std::to_string(x) + "]");
                 lua_pop(L, 1);
             } else {
-                size_t len;
-
                 if (lua_type(L, -2) == LUA_TNUMBER) {
-                    auto x = lua_tonumber(L, -2);
-                    auto x64 = lua_tointeger(L, -2);
-                    if (x == x64) {
-                        lua_getjson(L, j[std::to_string(x64-1)]);
-                    } else {
-                        lua_getjson(L, j[std::to_string(x)]);
-                    }
+                    const lua_Number number = lua_tonumber(L, -2);
+                    const lua_Integer integer = lua_tointeger(L, -2);
+                    const std::string key = number == integer
+                        ? std::to_string(integer)
+                        : std::to_string(number);
+                    lua_getjson_value(L, j[key],
+                                      lua_json_path_for_key(L, -2, path));
                 } else {
+                    size_t len;
                     const char *key = lua_tolstring(L, -2, &len);
-                    std::string k = std::string(key, len);
-                    lua_getjson(L, j[k]);
-                    if (k == "_" && j["@type"].empty())
+                    if (!key) {
+                        throw std::runtime_error(
+                            "tdlua: object keys must be strings or numbers at " + path);
+                    }
+                    std::string k(key, len);
+                    lua_getjson_value(L, j[k], path + "." + k);
+                    if (k == "_" && j.find("@type") == j.end())
                         j["@type"] = j["_"];
                 }
                 lua_pop(L, 1);
             }
         }
     } else {
-        j = false;
-        return;
+        const char *type = lua_typename(L, lua_type(L, -1));
+        throw std::runtime_error("tdlua: unsupported Lua type '" + std::string(type) +
+                                 "' at " + path);
     }
+}
+
+}
+
+void lua_getjson(lua_State *L, json &j)
+{
+    lua_getjson_value(L, j, "");
 }
 
 void lua_pushjson (lua_State *L, const json j) {
