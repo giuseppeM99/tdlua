@@ -177,6 +177,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.5 \
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
             -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"

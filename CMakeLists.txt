@@ -24,7 +24,27 @@ include(GNUInstallDirs)
 # below, so keep the vendored dependency from adding its full test tree.
 set(BUILD_TESTING OFF CACHE BOOL "Disable TDLib tests when building TDLua" FORCE)
 
-find_package(Lua REQUIRED)
+if(TDLUA_LUA_VERSION AND LUA_INCLUDE_DIR AND LUA_LIBRARY)
+  # Older CMake FindLua modules do not recognize Lua 5.5 headers. When the
+  # caller supplies an explicit Lua version and paths, use those paths
+  # directly and add the libraries needed by a static Lua build.
+  set(LUA_VERSION_STRING "${TDLUA_LUA_VERSION}")
+  set(LUA_INCLUDE_DIRS "${LUA_INCLUDE_DIR}")
+  set(LUA_LIBRARIES "${LUA_LIBRARY}")
+  if(UNIX AND NOT APPLE AND NOT BEOS)
+    find_library(LUA_MATH_LIBRARY m)
+    if(LUA_MATH_LIBRARY)
+      list(APPEND LUA_LIBRARIES "${LUA_MATH_LIBRARY}")
+    endif()
+    if(LUA_LIBRARY MATCHES "\\.a$" AND CMAKE_DL_LIBS)
+      list(APPEND LUA_LIBRARIES "${CMAKE_DL_LIBS}")
+    endif()
+  endif()
+elseif(TDLUA_LUA_VERSION)
+  find_package(Lua ${TDLUA_LUA_VERSION} EXACT REQUIRED)
+else()
+  find_package(Lua REQUIRED)
+endif()
 
 if(TDLUA_BUNDLED_TDLIB)
   set(TD_INSTALL_STATIC_LIBRARIES OFF CACHE BOOL "" FORCE)
