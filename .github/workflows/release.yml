@@ -42,11 +42,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_TD_STATIC=ON \
             -DLUA_EXECUTABLE="$(command -v lua5.3)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
             -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.3.so
           cmake --build build --target tdlua tdlua_codec_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+          if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
+            echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
 
       - name: Read TDLua version
         id: tdlua-version
@@ -72,6 +77,7 @@ jobs:
           tar -C release -czf "tdlua-${RELEASE_TAG}-source.tar.gz" "${root}"
 
           cp tdlua-scm-1.rockspec "tdlua-${RELEASE_TAG}.rockspec"
+          cp build/tdlua.so "tdlua-${RELEASE_TAG}-lua5.3-linux-x86_64.so"
           rock_version="${RELEASE_VERSION%%-*}-1"
           sed -i \
             -e "s/version = \"scm-1\"/version = \"${rock_version}\"/" \
@@ -85,3 +91,4 @@ jobs:
           files: |
             tdlua-${{ github.ref_name }}-source.tar.gz
             tdlua-${{ github.ref_name }}.rockspec
+            tdlua-${{ github.ref_name }}-lua5.3-linux-x86_64.so

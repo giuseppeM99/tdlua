@@ -11,8 +11,59 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: 2
 
 jobs:
-  bundled:
-    name: Lua ${{ matrix.lua }} / bundled TDLib
+  tdlib:
+    name: Build static TDLib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Configure static TDLib
+        run: |
+          cmake -S td -B td-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DTD_INSTALL_STATIC_LIBRARIES=ON \
+            -DTD_INSTALL_SHARED_LIBRARIES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/tdlib"
+
+      - name: Build static TDLib
+        run: cmake --build td-build --target tdjson_static
+
+      - name: Install static TDLib
+        run: |
+          cmake --install td-build
+          test -f "$RUNNER_TEMP/tdlib/lib/libtdjson_static.a"
+          tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
+          test -n "$tdlib_version"
+          printf '%s\n' "$tdlib_version" > "$RUNNER_TEMP/tdlib/tdlib-version.txt"
+          tar -C "$RUNNER_TEMP/tdlib" -czf "$RUNNER_TEMP/tdlib-static.tar.gz" .
+
+      - name: Upload static TDLib package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-static.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  lua:
+    name: Lua ${{ matrix.lua }} / static TDLib
+    needs: tdlib
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -22,8 +73,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies
         run: |
@@ -38,12 +87,26 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Configure
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      - name: Configure TDLua
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
             -DLUA_EXECUTABLE="$(command -v lua${{ matrix.lua }})" \
             -DLUA_INCLUDE_DIR="/usr/include/lua${{ matrix.lua }}" \
             -DLUA_LIBRARY="/usr/lib/x86_64-linux-gnu/liblua${{ matrix.lua }}.so"
@@ -51,12 +114,15 @@ jobs:
       - name: Build TDLua and regression tests
         run: cmake --build build --target tdlua tdlua_codec_test
 
-      - name: Verify bundled TDLib version
+      - name: Verify static TDLua and TDLib version
         run: |
           base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' dist.info)"
-          tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
+          tdlib_version="$(cat "$RUNNER_TEMP/tdlib/tdlib-version.txt")"
           test "$(cat build/tdlua-version.txt)" = "${base_version}-${tdlib_version}"
-          test -e "build/td/libtdjson.so.${tdlib_version}"
+          if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
+            echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
 
       - name: Run regression tests
         run: ctest --test-dir build --output-on-failure -R '^tdlua_'
@@ -72,7 +138,23 @@ jobs:
           cmake --install build --prefix "$RUNNER_TEMP/tdlua-install"
           test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
 
-      - name: Upload Lua build to Telegram
+      - name: Prepare static Lua artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-${{ matrix.lua }}-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+          echo "name=${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static Lua artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-lua${{ matrix.lua }}-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload static Lua build to Telegram
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         working-directory: build
         env:
@@ -80,6 +162,7 @@ jobs:
           TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
+          TDLUA_ARTIFACT: ${{ steps.artifact.outputs.name }}
         run: |
           if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
              [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
@@ -88,67 +171,16 @@ jobs:
           fi
           export TDLUA_VERSION="$(cat tdlua-version.txt)"
           LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
-          LD_LIBRARY_PATH="$PWD/td:${LD_LIBRARY_PATH:-}" \
             "lua${{ matrix.lua }}" ../examples/uploadtravis.lua
 
-  external-tdlib:
-    name: Lua 5.3 / installed TDLib
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            gperf \
-            liblua5.3-dev \
-            lua5.3 \
-            ninja-build \
-            openssl \
-            libssl-dev \
-            zlib1g-dev
-
-      - name: Build and install TDLib
-        run: |
-          cmake -S td -B td-build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTD_INSTALL_STATIC_LIBRARIES=OFF \
-            -DTD_INSTALL_SHARED_LIBRARIES=ON \
-            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/tdlib"
-          cmake --build td-build --target tdjson
-          cmake --install td-build
-
-      - name: Configure TDLua against installed TDLib
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=OFF \
-            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
-            -DLUA_EXECUTABLE="$(command -v lua5.3)" \
-            -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
-            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.3.so
-
-      - name: Build and test TDLua
-        run: |
-          cmake --build build --target tdlua tdlua_codec_test
-          ctest --test-dir build --output-on-failure -R '^tdlua_'
-
   lua55:
-    name: Lua 5.5 / bundled TDLib
+    name: Lua 5.5 / static TDLib
+    needs: tdlib
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies
         run: |
@@ -171,20 +203,54 @@ jobs:
           make -C lua-5.5.0 install \
             INSTALL_TOP="$RUNNER_TEMP/lua55"
 
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
       - name: Configure and test Lua 5.5
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
             -DTDLUA_LUA_VERSION=5.5 \
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
             -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
           cmake --build build --target tdlua tdlua_codec_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+          if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
+            echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
 
-      - name: Upload Lua 5.5 build to Telegram
+      - name: Prepare static Lua artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-5.5-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+          echo "name=${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static Lua artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-lua5.5-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload static Lua 5.5 build to Telegram
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         working-directory: build
         env:
@@ -192,6 +258,7 @@ jobs:
           TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
+          TDLUA_ARTIFACT: ${{ steps.artifact.outputs.name }}
         run: |
           if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
              [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
@@ -200,18 +267,16 @@ jobs:
           fi
           export TDLUA_VERSION="$(cat tdlua-version.txt)"
           LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
-          LD_LIBRARY_PATH="$PWD/td:${LD_LIBRARY_PATH:-}" \
             "$RUNNER_TEMP/lua55/bin/lua" ../examples/uploadtravis.lua
 
   luajit:
-    name: LuaJIT / bundled TDLib
+    name: LuaJIT / static TDLib
+    needs: tdlib
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies
         run: |
@@ -226,31 +291,64 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
       - name: Configure and test LuaJIT
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
             -DLUA_EXECUTABLE="$(command -v luajit)" \
             -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
             -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/libluajit-5.1.so
           cmake --build build --target tdlua tdlua_codec_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+          if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
+            echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
+
+      - name: Prepare static LuaJIT artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-luajit-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static LuaJIT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-luajit-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
 
   luarocks:
     name: LuaRocks package
+    needs: tdlib
     runs-on: ubuntu-24.04
     env:
-      # Building bundled TDLib with more than one compiler process can
-      # exhaust the memory available on the GitHub-hosted runner.
       CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CMAKE_PREFIX_PATH: ${{ runner.temp }}/tdlib
+      TDLUA_BUNDLED_TDLIB: OFF
+      TDLUA_TD_STATIC: ON
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies
         run: |
@@ -265,6 +363,18 @@ jobs:
             openssl \
             libssl-dev \
             zlib1g-dev
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
 
       - name: Validate rockspec
         run: luarocks --lua-version=5.3 lint tdlua-scm-1.rockspec

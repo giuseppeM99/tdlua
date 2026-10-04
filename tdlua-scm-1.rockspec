@@ -30,6 +30,9 @@ build = {
          -DCMAKE_BUILD_TYPE=Release \
          -DCMAKE_INSTALL_PREFIX="$(PREFIX)" \
          -DLUA_INCLUDE_DIR="$(LUA_INCDIR)" \
+         -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}" \
+         -DTDLUA_BUNDLED_TDLIB="${TDLUA_BUNDLED_TDLIB:-ON}" \
+         -DTDLUA_TD_STATIC="${TDLUA_TD_STATIC:-OFF}" \
          -U LUA_LIBRARY \
          -DTDLUA_LUA_MODULE_DIR=lib \
          -DTDLUA_BUNDLED_TDLIB=ON \
