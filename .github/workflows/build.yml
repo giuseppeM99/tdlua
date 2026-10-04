@@ -89,7 +89,7 @@ jobs:
           export TDLUA_VERSION="$(cat tdlua-version.txt)"
           LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
           LD_LIBRARY_PATH="$PWD/td:${LD_LIBRARY_PATH:-}" \
-            lua5.3 ../examples/uploadtravis.lua
+            "lua${{ matrix.lua }}" ../examples/uploadtravis.lua
 
   external-tdlib:
     name: Lua 5.3 / installed TDLib
