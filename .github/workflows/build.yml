@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lua: ["5.1", "5.2", "5.3", "5.4"]
+        lua: ["5.2", "5.3", "5.4"]
 
     steps:
       - name: Checkout repository
@@ -72,8 +72,8 @@ jobs:
           cmake --install build --prefix "$RUNNER_TEMP/tdlua-install"
           test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
 
-      - name: Upload Lua 5.3 build to Telegram
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.lua == '5.3'
+      - name: Upload Lua build to Telegram
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         working-directory: build
         env:
           TG_APP_ID: ${{ secrets.TG_APP_ID }}
@@ -182,6 +182,25 @@ jobs:
             -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
           cmake --build build --target tdlua tdlua_codec_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Upload Lua 5.5 build to Telegram
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        working-directory: build
+        env:
+          TG_APP_ID: ${{ secrets.TG_APP_ID }}
+          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
+        run: |
+          if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
+             [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Telegram upload secrets are not configured; skipping upload"
+            exit 0
+          fi
+          export TDLUA_VERSION="$(cat tdlua-version.txt)"
+          LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
+          LD_LIBRARY_PATH="$PWD/td:${LD_LIBRARY_PATH:-}" \
+            "$RUNNER_TEMP/lua55/bin/lua" ../examples/uploadtravis.lua
 
   luajit:
     name: LuaJIT / bundled TDLib
