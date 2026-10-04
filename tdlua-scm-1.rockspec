@@ -31,14 +31,13 @@ build = {
          -DCMAKE_INSTALL_PREFIX="$(PREFIX)" \
          -DLUA_INCLUDE_DIR="$(LUA_INCDIR)" \
          -U LUA_LIBRARY \
-         -DTDLUA_LUA_VERSION="$(LUA_VERSION)" \
          -DTDLUA_LUA_MODULE_DIR=lib \
          -DTDLUA_BUNDLED_TDLIB=ON \
          -DTDLUA_BUILD_TESTS=OFF \
          -DTDLUA_TD_STATIC=OFF \
          -DTD_INSTALL_STATIC_LIBRARIES=OFF \
          -DTD_INSTALL_SHARED_LIBRARIES=ON \
-      && cmake --build build.luarocks --target tdlua --parallel
+      && cmake --build build.luarocks --target tdlua --parallel 1
    ]],
    install_command = [[
       cmake --install build.luarocks \
