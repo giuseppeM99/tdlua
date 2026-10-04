@@ -35,11 +35,7 @@ build = {
          -DTDLUA_TD_STATIC="${TDLUA_TD_STATIC:-OFF}" \
          -U LUA_LIBRARY \
          -DTDLUA_LUA_MODULE_DIR=lib \
-         -DTDLUA_BUNDLED_TDLIB=ON \
          -DTDLUA_BUILD_TESTS=OFF \
-         -DTDLUA_TD_STATIC=OFF \
-         -DTD_INSTALL_STATIC_LIBRARIES=OFF \
-         -DTD_INSTALL_SHARED_LIBRARIES=ON \
       && cmake --build build.luarocks --target tdlua --parallel 1
    ]],
    install_command = [[

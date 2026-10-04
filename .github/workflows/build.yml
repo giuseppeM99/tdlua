@@ -154,25 +154,6 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
-      - name: Upload static Lua build to Telegram
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        working-directory: build
-        env:
-          TG_APP_ID: ${{ secrets.TG_APP_ID }}
-          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
-          TDLUA_ARTIFACT: ${{ steps.artifact.outputs.name }}
-        run: |
-          if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
-             [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "Telegram upload secrets are not configured; skipping upload"
-            exit 0
-          fi
-          export TDLUA_VERSION="$(cat tdlua-version.txt)"
-          LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
-            "lua${{ matrix.lua }}" ../examples/uploadtravis.lua
-
   lua55:
     name: Lua 5.5 / static TDLib
     needs: tdlib
@@ -249,25 +230,6 @@ jobs:
           name: tdlua-lua5.5-static
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
-
-      - name: Upload static Lua 5.5 build to Telegram
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        working-directory: build
-        env:
-          TG_APP_ID: ${{ secrets.TG_APP_ID }}
-          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
-          TDLUA_ARTIFACT: ${{ steps.artifact.outputs.name }}
-        run: |
-          if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
-             [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "Telegram upload secrets are not configured; skipping upload"
-            exit 0
-          fi
-          export TDLUA_VERSION="$(cat tdlua-version.txt)"
-          LUA_CPATH="$PWD/?.so;${LUA_CPATH:-}" \
-            "$RUNNER_TEMP/lua55/bin/lua" ../examples/uploadtravis.lua
 
   luajit:
     name: LuaJIT / static TDLib
@@ -390,3 +352,74 @@ jobs:
           eval "$(luarocks --lua-version=5.3 --tree=\"$RUNNER_TEMP/rocks\" path)"
           LUA_CPATH="$RUNNER_TEMP/rocks/lib/lua/5.3/?.so;$LUA_CPATH" \
             lua5.3 -e 'assert(require("tdlua"))'
+
+  telegram:
+    name: Telegram upload / Lua ${{ matrix.lua }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [lua, lua55]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        lua: ["5.2", "5.3", "5.4", "5.5"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install common dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Install Lua
+        if: matrix.lua != '5.5'
+        run: |
+          sudo apt-get install -y \
+            liblua${{ matrix.lua }}-dev \
+            lua${{ matrix.lua }}
+
+      - name: Build Lua 5.5
+        if: matrix.lua == '5.5'
+        run: |
+          curl -fsSL https://www.lua.org/ftp/lua-5.5.0.tar.gz | tar -xz
+          make -C lua-5.5.0 linux \
+            MYCFLAGS="-fPIC" \
+            MYLDFLAGS="-fPIC"
+          make -C lua-5.5.0 install \
+            INSTALL_TOP="$RUNNER_TEMP/lua55"
+
+      - name: Download static Lua artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlua-lua${{ matrix.lua }}-static
+          path: ${{ runner.temp }}/tdlua-artifact
+
+      - name: Upload static artifact to Telegram
+        env:
+          TG_APP_ID: ${{ secrets.TG_APP_ID }}
+          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || secrets.token }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.chat_id }}
+          TDLUA_DATABASE_DIR: ${{ runner.temp }}/tdlua-session-${{ matrix.lua }}
+        run: |
+          if [ -z "$TG_APP_ID" ] || [ -z "$TG_APP_HASH" ] || \
+             [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Telegram upload secrets are not configured; skipping upload"
+            exit 0
+          fi
+          artifact="$(find "$RUNNER_TEMP/tdlua-artifact" -type f -name '*.so' -print -quit)"
+          test -n "$artifact"
+          cp "$artifact" "$RUNNER_TEMP/tdlua-artifact/tdlua.so"
+          if [ "${{ matrix.lua }}" = "5.5" ]; then
+            lua_command="$RUNNER_TEMP/lua55/bin/lua"
+          else
+            lua_command="lua${{ matrix.lua }}"
+          fi
+          LUA_CPATH="$RUNNER_TEMP/tdlua-artifact/?.so" \
+          TDLUA_ARTIFACT="$artifact" \
+            "$lua_command" examples/uploadtravis.lua
