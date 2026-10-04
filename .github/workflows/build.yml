@@ -340,11 +340,6 @@ jobs:
     name: LuaRocks package
     needs: tdlib
     runs-on: ubuntu-24.04
-    env:
-      CMAKE_BUILD_PARALLEL_LEVEL: 1
-      CMAKE_PREFIX_PATH: ${{ runner.temp }}/tdlib
-      TDLUA_BUNDLED_TDLIB: OFF
-      TDLUA_TD_STATIC: ON
 
     steps:
       - name: Checkout repository
@@ -380,6 +375,11 @@ jobs:
         run: luarocks --lua-version=5.3 lint tdlua-scm-1.rockspec
 
       - name: Build and install rock
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 1
+          CMAKE_PREFIX_PATH: ${{ runner.temp }}/tdlib
+          TDLUA_BUNDLED_TDLIB: OFF
+          TDLUA_TD_STATIC: ON
         run: |
           luarocks --lua-version=5.3 \
             --tree="$RUNNER_TEMP/rocks" \
