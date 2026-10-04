@@ -241,6 +241,10 @@ jobs:
   luarocks:
     name: LuaRocks package
     runs-on: ubuntu-24.04
+    env:
+      # Building bundled TDLib with more than one compiler process can
+      # exhaust the memory available on the GitHub-hosted runner.
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
 
     steps:
       - name: Checkout repository
