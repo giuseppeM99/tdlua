@@ -582,6 +582,15 @@ if(TDLUA_BUILD_TESTS)
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
 
+    add_executable(tdlua_model_benchmark "tests/model_benchmark.cpp")
+    target_include_directories(tdlua_model_benchmark PRIVATE
+        ${LUA_INCLUDE_DIR}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/includes"
+    )
+    target_link_libraries(tdlua_model_benchmark PRIVATE ${LUA_LIBRARIES})
+    set_property(TARGET tdlua_model_benchmark PROPERTY CXX_STANDARD 11)
+
     if(LUA_EXECUTABLE)
         set(TDLUA_LUA_EXECUTABLE "${LUA_EXECUTABLE}")
     else()
@@ -601,6 +610,11 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_backend_parity
             COMMAND ${TDLUA_LUA_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/backend_parity.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+        add_test(NAME tdlua_e2e_smoke
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_smoke.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
     endif()
