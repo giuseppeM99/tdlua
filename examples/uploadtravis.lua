@@ -214,8 +214,12 @@ local upload_thread = coroutine.create(function()
         input_message_content = {
             _ = "inputMessageDocument",
             document = {
-                _ = "inputFileLocal",
-                path = artifact
+                _ = "inputDocument",
+                document = {
+                    _ = "inputFileLocal",
+                    path = artifact
+                },
+                disable_content_type_detection = false
             },
             caption = {
                 _ = "formattedText",
