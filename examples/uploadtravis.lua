@@ -29,9 +29,23 @@ local api_hash = optional_value(
     os.getenv("TG_APP_HASH") or os.getenv("TG_API_HASH") or os.getenv("TG_APP_TOKEN"))
 local bot_token = optional_value(os.getenv("TG_BOT_TOKEN") or os.getenv("token"))
 local configured_chat = optional_value(os.getenv("TG_CHAT_ID") or os.getenv("chat_id"))
-local artifact = os.getenv("TDLUA_ARTIFACT") or "tdlua.so"
+local artifact_spec = optional_value(os.getenv("TDLUA_ARTIFACTS"))
+    or os.getenv("TDLUA_ARTIFACT")
+    or "tdlua.so"
 local database_directory = os.getenv("TDLUA_DATABASE_DIR") or "./tdlua"
 local database_key = os.getenv("TDLUA_DATABASE_KEY") or ""
+
+local artifacts = {}
+for entry in artifact_spec:gmatch("[^,\n]+") do
+    local path = entry
+    path = path:gsub("^%s+", ""):gsub("%s+$", "")
+    if path ~= "" then
+        artifacts[#artifacts + 1] = path
+    end
+end
+if #artifacts == 0 then
+    error("at least one TDLUA_ARTIFACTS entry is required")
+end
 
 if not api_id then
     error("TG_APP_ID is required")
@@ -46,11 +60,13 @@ if not configured_chat then
     error("TG_CHAT_ID is required")
 end
 
-local artifact_file = io.open(artifact, "rb")
-if not artifact_file then
-    error("artifact not found: " .. artifact)
+for _, path in ipairs(artifacts) do
+    local artifact_file = io.open(path, "rb")
+    if not artifact_file then
+        error("artifact not found: " .. path)
+    end
+    artifact_file:close()
 end
-artifact_file:close()
 
 tdlua.setLogLevel(1)
 local client = tdlua()
@@ -194,45 +210,57 @@ local upload_thread = coroutine.create(function()
         chat_id = chat.id
     end
 
-    local version = os.getenv("TDLUA_VERSION") or tdlua.version or "unknown"
-    local calls = os.getenv("TDLUA_CALLS") == "1"
-        and "With libtgvoip bindings"
-        or "Without libtgvoip bindings"
-    local caption = table.concat({
-        "TDLua " .. version,
-        "MD5 " .. digest("md5sum", artifact),
-        "SHA1 " .. digest("sha1sum", artifact),
-        calls,
-        _VERSION,
-        "",
-        "File sent with TDLua"
-    }, "\n")
+    for _, artifact in ipairs(artifacts) do
+        upload_error = nil
+        upload_succeeded = false
 
-    local result = client:await({
-        _ = "sendMessage",
-        chat_id = chat_id,
-        input_message_content = {
-            _ = "inputMessageDocument",
-            document = {
-                _ = "inputDocument",
+        local version = os.getenv("TDLUA_VERSION") or tdlua.version or "unknown"
+        local calls = os.getenv("TDLUA_CALLS") == "1"
+            and "With libtgvoip bindings"
+            or "Without libtgvoip bindings"
+        local caption = table.concat({
+            "TDLua " .. version,
+            "MD5 " .. digest("md5sum", artifact),
+            "SHA1 " .. digest("sha1sum", artifact),
+            calls,
+            _VERSION,
+            "",
+            "File sent with TDLua"
+        }, "\n")
+
+        local result = client:await({
+            _ = "sendMessage",
+            chat_id = chat_id,
+            input_message_content = {
+                _ = "inputMessageDocument",
                 document = {
-                    _ = "inputFileLocal",
-                    path = artifact
+                    _ = "inputDocument",
+                    document = {
+                        _ = "inputFileLocal",
+                        path = artifact
+                    },
+                    disable_content_type_detection = false
                 },
-                disable_content_type_detection = false
-            },
-            caption = {
-                _ = "formattedText",
-                text = caption,
-                entities = {}
+                caption = {
+                    _ = "formattedText",
+                    text = caption,
+                    entities = {}
+                }
             }
-        }
-    })
+        })
 
-    if result._ == "error" then
-        upload_error = "sendMessage failed: " .. error_text(result)
-    else
-        print("Message accepted by TDLib")
+        if result._ == "error" then
+            upload_error = "sendMessage failed for " .. artifact .. ": " .. error_text(result)
+            return
+        end
+        print("Message accepted by TDLib for " .. artifact)
+
+        while not upload_error and not upload_succeeded do
+            client:poll(1.0)
+        end
+        if upload_error then
+            return
+        end
     end
 end)
 
@@ -245,10 +273,6 @@ while coroutine.status(upload_thread) ~= "dead" do
     if upload_error then
         break
     end
-    client:poll(1.0)
-end
-
-while not upload_error and not upload_succeeded do
     client:poll(1.0)
 end
 
