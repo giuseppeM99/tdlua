@@ -15,6 +15,7 @@ set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 option(TDLUA_TD_STATIC "Link TDLua against the static TDLib JSON library" OFF)
+option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)
 set(TDLUA_TDLIB_VERSION "")
 set(TDLUA_LUA_VERSION "" CACHE STRING "Lua version used for the module installation path")
 set(TDLUA_LUA_MODULE_DIR "" CACHE STRING "Installation directory for the tdlua Lua module")
@@ -54,6 +55,13 @@ else()
   find_package(Td CONFIG REQUIRED)
 endif()
 
+if(TDLUA_NATIVE_BACKEND AND NOT TDLUA_BUNDLED_TDLIB)
+  message(FATAL_ERROR "TDLUA_NATIVE_BACKEND currently requires TDLUA_BUNDLED_TDLIB=ON so the TDLib schema generator is available")
+endif()
+if(TDLUA_NATIVE_BACKEND AND TDLUA_CALLS)
+  message(FATAL_ERROR "TDLUA_CALLS is not yet available with TDLUA_NATIVE_BACKEND")
+endif()
+
 if(TDLUA_TDLIB_VERSION STREQUAL "")
   if(TDLUA_BUNDLED_TDLIB AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt")
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt" _tdlib_project_line
@@ -85,13 +93,48 @@ message(STATUS "TDLua version: ${TDLUA_VERSION_STRING}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
      "${TDLUA_VERSION_STRING}\n")
 
-list(APPEND tdlua_srcs
-    "src/tdlua.cpp"
-    "src/luajson.cpp"
-    "src/luaIF.cpp"
-    "src/request_router.cpp"
-    "src/lua_dispatcher.cpp"
-)
+if(TDLUA_NATIVE_BACKEND)
+  list(APPEND tdlua_srcs
+      "src/native_runtime.cpp"
+      "src/native_tdlua.cpp"
+      "src/native_dispatcher.cpp"
+      "src/native_luaIF.cpp"
+      "src/luajson.cpp"
+  )
+else()
+  list(APPEND tdlua_srcs
+      "src/tdlua.cpp"
+      "src/luajson.cpp"
+      "src/luaIF.cpp"
+      "src/request_router.cpp"
+      "src/lua_dispatcher.cpp"
+  )
+endif()
+
+if(TDLUA_NATIVE_BACKEND)
+  set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
+  set(TDLUA_NATIVE_GENERATED_HEADER "${TDLUA_NATIVE_GENERATED_DIR}/native_codec.h")
+  set(TDLUA_NATIVE_GENERATED_SOURCE "${TDLUA_NATIVE_GENERATED_DIR}/native_codec.cpp")
+  set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
+
+  add_executable(tdlua_native_generator src/native_generator.cpp)
+  target_link_libraries(tdlua_native_generator PRIVATE tdtl)
+
+  add_custom_command(
+      OUTPUT "${TDLUA_NATIVE_GENERATED_HEADER}" "${TDLUA_NATIVE_GENERATED_SOURCE}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${TDLUA_NATIVE_GENERATED_DIR}"
+      COMMAND tdlua_native_generator
+              "${TDLUA_TD_API_TLO}"
+              "${TDLUA_NATIVE_GENERATED_HEADER}"
+              "${TDLUA_NATIVE_GENERATED_SOURCE}"
+      DEPENDS tdlua_native_generator tl_generate_tlo "${TDLUA_TD_API_TLO}"
+      COMMENT "Generate TDLua native TDLib codec"
+      VERBATIM
+  )
+  add_custom_target(tdlua_native_generated
+      DEPENDS "${TDLUA_NATIVE_GENERATED_HEADER}" "${TDLUA_NATIVE_GENERATED_SOURCE}")
+  list(APPEND tdlua_srcs "${TDLUA_NATIVE_GENERATED_SOURCE}")
+endif()
 if (TDLUA_CALLS)
     set(TARGET "libtgvoip")
     list(APPEND libtgvoip__c_srcs
@@ -429,6 +472,10 @@ target_include_directories(tdlua PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/includes"
 )
+if(TDLUA_NATIVE_BACKEND)
+  target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
+  add_dependencies(tdlua tdlua_native_generated)
+endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
 target_compile_features(tdlua PRIVATE cxx_std_11)
 target_compile_definitions(tdlua PRIVATE
@@ -444,9 +491,17 @@ endif()
 
 set_target_properties(tdlua PROPERTIES PREFIX "")
 if(TDLUA_TD_STATIC)
-  target_link_libraries (tdlua PRIVATE Td::TdJsonStatic)
+  if(TDLUA_NATIVE_BACKEND)
+    target_link_libraries(tdlua PRIVATE Td::TdStatic)
+  else()
+    target_link_libraries (tdlua PRIVATE Td::TdJsonStatic)
+  endif()
 else()
-  target_link_libraries (tdlua PRIVATE Td::TdJson)
+  if(TDLUA_NATIVE_BACKEND)
+    target_link_libraries(tdlua PRIVATE Td::TdStatic)
+  else()
+    target_link_libraries (tdlua PRIVATE Td::TdJson)
+  endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX)
   if(APPLE)
