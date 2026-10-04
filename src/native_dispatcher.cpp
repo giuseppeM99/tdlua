@@ -214,7 +214,8 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
     if (has_pending) {
         release(pending);
     }
-    dispatchHandlers(L, response, extra_ref);
+    dispatchHandlers(L, response,
+                     extra_ref == LUA_NOREF ? response.extra_ref : extra_ref);
     return extra_ref;
 }
 

@@ -17,6 +17,17 @@
 #endif
 
 class TDLua {
+public:
+    struct QueuedUpdate {
+        nlohmann::json value;
+        bool dispatched;
+
+        QueuedUpdate(const nlohmann::json &value, const bool dispatched)
+            : value(value), dispatched(dispatched)
+        {
+        }
+    };
+
 private:
     enum class ClientState {
         Running,
@@ -26,7 +37,7 @@ private:
 
     std::int32_t client_id;
     std::uint64_t next_request_id;
-    std::queue<nlohmann::json> updates;
+    std::queue<QueuedUpdate> updates;
     std::string dbpath;
     #ifdef TDLUA_CALLS
     std::map<int32_t, Call*> calls;
@@ -40,7 +51,7 @@ public:
 
     ~TDLua();
 
-    nlohmann::json pop();
+    QueuedUpdate pop();
 
     void setDB(const std::string &path);
 
@@ -58,7 +69,7 @@ public:
 
     LuaDispatcher &dispatcher();
 
-    void push(const nlohmann::json &update);
+    void push(const nlohmann::json &update, bool dispatched = false);
 
     bool empty() const;
 

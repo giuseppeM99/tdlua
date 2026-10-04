@@ -82,10 +82,12 @@ static int tdclient_receive(lua_State *L)
         return luaL_error(L, "invalid tdlua client");
     }
     if (!td->empty()) {
-        json queued = td->pop();
-        td->checkAuthState(queued);
-        td->dispatcher().dispatch(queued);
-        lua_pushjson(L, queued);
+        TDLua::QueuedUpdate queued = td->pop();
+        if (!queued.dispatched) {
+            td->checkAuthState(queued.value);
+            td->dispatcher().dispatch(queued.value);
+        }
+        lua_pushjson(L, queued.value);
         return 1;
     }
     if (td->closed()) {
@@ -197,11 +199,12 @@ static int tdclient_execute(lua_State *L)
         if (res["@extra"].is_number_integer() &&
             nonce == res["@extra"].get<std::uint64_t>()) {
             res["@extra"] = extra;
+            td->dispatcher().dispatch(res);
             lua_pushjson(L, res);
             return 1;
-        } else {
-            td->push(res);
         }
+        td->dispatcher().dispatch(res);
+        td->push(res, true);
     }
     return 0;
 }

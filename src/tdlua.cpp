@@ -120,9 +120,9 @@ TDLua::~TDLua()
     close();
 }
 
-nlohmann::json TDLua::pop()
+TDLua::QueuedUpdate TDLua::pop()
 {
-    nlohmann::json res = updates.front();
+    QueuedUpdate res = updates.front();
     updates.pop();
     return res;
 }
@@ -190,9 +190,9 @@ LuaDispatcher &TDLua::dispatcher()
     return dispatcher_;
 }
 
-void TDLua::push(const nlohmann::json &update)
+void TDLua::push(const nlohmann::json &update, const bool dispatched)
 {
-    updates.push(update);
+    updates.push(QueuedUpdate(update, dispatched));
 }
 
 bool TDLua::empty() const
@@ -235,7 +235,7 @@ void TDLua::saveUpdatesBuffer()
     if (!_ready || dbpath.empty()) return;
     nlohmann::json jupdates = nlohmann::json::array();
     while(updates.size()) {
-        jupdates[updates.size()] = this->pop();
+        jupdates[updates.size()] = this->pop().value;
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();
@@ -263,7 +263,7 @@ void TDLua::loadUpdatesBuffer()
             nlohmann::json j = nlohmann::json::parse(buf);
             if (j.is_array() && !j.empty()) {
                 for (auto &elem : j) {
-                    updates.push(elem);
+                    updates.push(QueuedUpdate(elem, false));
                 }
             }
         } catch (nlohmann::json::parse_error &e){

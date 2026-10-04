@@ -206,11 +206,13 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
     if (!make_request(L, td, request_index, request, table_index, owned, error)) {
         return luaL_error(L, "%s", error.c_str());
     }
+    int execute_extra_ref = LUA_NOREF;
     try {
-        // Legacy execute() owns its receive loop. Keep unrelated responses
-        // queued for the next receive() call, as the JSON backend does,
-        // instead of dispatching callbacks while a blocking request waits.
+        // execute() waits for its own response but lets the dispatcher make
+        // progress on unrelated asynchronous responses in the same receive
+        // loop. This is the async-first behavior shared with the JSON path.
         const std::uint64_t id = td->nextRequestId();
+        execute_extra_ref = td->captureExtra(L, table_index);
         td->send(std::move(request), id);
         pop_owned(L, owned);
 
@@ -220,20 +222,29 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                 std::chrono::steady_clock::now() - started).count();
             const double remaining = static_cast<double>(timeout) - elapsed;
             if (remaining <= 0.0) {
+                td->releaseExtra(execute_extra_ref);
+                execute_extra_ref = LUA_NOREF;
                 return 0;
             }
             NativeResponse response = td->receiveBackend(remaining);
             if (!response.object) {
                 continue;
             }
-            td->checkAuthState(response);
             if (response.request_id == id) {
+                response.extra_ref = execute_extra_ref;
+            }
+            td->dispatch(response);
+            if (response.request_id == id) {
+                response.extra_ref = execute_extra_ref;
+                execute_extra_ref = LUA_NOREF;
                 return return_response(L, td, response);
             }
             td->push(std::move(response));
         }
+        td->releaseExtra(execute_extra_ref);
         return 0;
     } catch (const std::exception &exception) {
+        td->releaseExtra(execute_extra_ref);
         pop_owned(L, owned);
         return luaL_error(L, "%s", exception.what());
     }

@@ -42,6 +42,13 @@ assert_td_object(alias_response, "@type request")
 local string_response = client:execute('{"@type":"getAuthorizationState"}', 1.0)
 assert_td_object(string_response, "JSON string request")
 
+local execute_extra_response = client:execute({
+    _ = "getAuthorizationState",
+    ["@extra"] = {origin = "execute"}
+}, 1.0)
+assert_td_object(execute_extra_response, "execute @extra request")
+assert(execute_extra_response["@extra"].origin == "execute")
+
 local helper_response = client:getAuthorizationState()
 assert_td_object(helper_response, "legacy helper")
 
@@ -65,21 +72,36 @@ assert_td_object(sent_response, "send response")
 assert(response_handler_called == true, "response handler was not dispatched")
 client:off("authorizationStateWaitTdlibParameters")
 
--- A blocking execute must leave an unrelated asynchronous response queued.
+-- A blocking execute must still dispatch unrelated asynchronous work.
 local callback_called = false
-client:request({_ = "getAuthorizationState"}, function(result)
+local response_handler_count = 0
+client:on("authorizationStateWaitTdlibParameters", function(event)
+    if event["@extra"] == "async-extra" then
+        response_handler_count = response_handler_count + 1
+    end
+end)
+client:request({_ = "getAuthorizationState", ["@extra"] = "async-extra"}, function(result)
     callback_called = true
     assert_td_object(result, "request callback")
 end)
 local blocking_response = client:execute({_ = "getAuthorizationState"}, 1.0)
 assert_td_object(blocking_response, "blocking execute")
-assert(callback_called == false,
-       "execute dispatched an unrelated callback before returning")
+assert(callback_called == true,
+       "execute did not dispatch an unrelated callback before returning")
+assert(response_handler_count == 1,
+       "execute did not dispatch the unrelated response handler exactly once")
+local queued_response
 for _ = 1, 20 do
-    if callback_called then break end
-    client:receive(0.1)
+    local event = client:receive(0.1)
+    if event and event["@extra"] == "async-extra" then
+        queued_response = event
+        break
+    end
 end
-assert(callback_called == true, "queued callback was not dispatched by receive")
+assert_td_object(queued_response, "already dispatched response")
+assert(response_handler_count == 1,
+       "receive dispatched an execute-processed response twice")
+client:off("authorizationStateWaitTdlibParameters")
 
 -- Callback context and dynamic helpers must follow the same contract.
 local callback_result

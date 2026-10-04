@@ -70,7 +70,10 @@ void NativeTDLua::dispatch(NativeResponse &response)
         return;
     }
     checkAuthState(response);
-    response.extra_ref = dispatcher_.dispatch(lua_, response);
+    const int existing_extra_ref = response.extra_ref;
+    const int routed_extra_ref = dispatcher_.dispatch(lua_, response);
+    response.extra_ref = routed_extra_ref == LUA_NOREF
+        ? existing_extra_ref : routed_extra_ref;
     response.dispatched = true;
 }
 
