@@ -32,32 +32,54 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Restore TDLib build cache
+        id: tdlib-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            td-build
+            .ci/tdlib
+            .ci/tdlib-static.tar.gz
+          key: tdlib-static-${{ runner.os }}-${{ hashFiles('td/**') }}
+          restore-keys: |
+            tdlib-static-${{ runner.os }}-
+
       - name: Configure static TDLib
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
         run: |
           cmake -S td -B td-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DTD_INSTALL_STATIC_LIBRARIES=ON \
             -DTD_INSTALL_SHARED_LIBRARIES=OFF \
-            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/tdlib"
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/tdlib"
 
       - name: Build static TDLib
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
         run: cmake --build td-build --target tdjson_static
 
       - name: Install static TDLib
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
         run: |
           cmake --install td-build
-          test -f "$RUNNER_TEMP/tdlib/lib/libtdjson_static.a"
+          test -f "$GITHUB_WORKSPACE/.ci/tdlib/lib/libtdjson_static.a"
           tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
           test -n "$tdlib_version"
-          printf '%s\n' "$tdlib_version" > "$RUNNER_TEMP/tdlib/tdlib-version.txt"
-          tar -C "$RUNNER_TEMP/tdlib" -czf "$RUNNER_TEMP/tdlib-static.tar.gz" .
+          printf '%s\n' "$tdlib_version" > "$GITHUB_WORKSPACE/.ci/tdlib/tdlib-version.txt"
+          tar -C "$GITHUB_WORKSPACE/.ci/tdlib" \
+            -czf "$GITHUB_WORKSPACE/.ci/tdlib-static.tar.gz" .
+
+      - name: Verify static TDLib cache
+        run: |
+          test -f .ci/tdlib/lib/libtdjson_static.a
+          test -f .ci/tdlib/tdlib-version.txt
+          test -f .ci/tdlib-static.tar.gz
 
       - name: Upload static TDLib package
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-static
-          path: ${{ runner.temp }}/tdlib-static.tar.gz
+          path: .ci/tdlib-static.tar.gz
           if-no-files-found: error
           retention-days: 1
 
