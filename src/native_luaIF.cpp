@@ -207,7 +207,10 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
         return luaL_error(L, "%s", error.c_str());
     }
     try {
-        const std::uint64_t id = td->dispatcher().raw(L, table_index);
+        // Legacy execute() owns its receive loop. Keep unrelated responses
+        // queued for the next receive() call, as the JSON backend does,
+        // instead of dispatching callbacks while a blocking request waits.
+        const std::uint64_t id = td->nextRequestId();
         td->send(std::move(request), id);
         pop_owned(L, owned);
 
@@ -217,20 +220,18 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                 std::chrono::steady_clock::now() - started).count();
             const double remaining = static_cast<double>(timeout) - elapsed;
             if (remaining <= 0.0) {
-                td->dispatcher().cancel(id);
                 return 0;
             }
             NativeResponse response = td->receiveBackend(remaining);
             if (!response.object) {
                 continue;
             }
-            td->dispatch(response);
+            td->checkAuthState(response);
             if (response.request_id == id) {
                 return return_response(L, td, response);
             }
             td->push(std::move(response));
         }
-        td->dispatcher().cancel(id);
         return 0;
     } catch (const std::exception &exception) {
         pop_owned(L, owned);

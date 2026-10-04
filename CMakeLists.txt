@@ -598,5 +598,10 @@ if(TDLUA_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/async.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
+        add_test(NAME tdlua_backend_parity
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/backend_parity.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
     endif()
 endif()

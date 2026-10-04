@@ -132,6 +132,11 @@ void NativeTDLua::setDBIfParameters(lua_State *L, int request_index)
     const int absolute = lua_absindex(L, request_index);
     lua_getfield(L, absolute, "_");
     const char *type = lua_tostring(L, -1);
+    if (!type) {
+        lua_pop(L, 1);
+        lua_getfield(L, absolute, "@type");
+        type = lua_tostring(L, -1);
+    }
     const bool is_parameters = type && std::string(type) == "setTdlibParameters";
     lua_pop(L, 1);
     if (!is_parameters) {
@@ -184,11 +189,10 @@ void NativeTDLua::close()
         if (!response.object) {
             continue;
         }
-        dispatch(response);
-        if (response.extra_ref != LUA_NOREF) {
-            releaseExtra(response.extra_ref);
-            response.extra_ref = LUA_NOREF;
-        }
+        // close() is a lifecycle operation. Match the JSON backend by
+        // updating the lifecycle state without invoking user callbacks or
+        // event handlers while the client is being destroyed.
+        checkAuthState(response);
     }
     NativeRuntime::instance().forget(client_id_);
 }
