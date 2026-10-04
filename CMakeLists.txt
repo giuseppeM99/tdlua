@@ -86,11 +86,11 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
      "${TDLUA_VERSION_STRING}\n")
 
 list(APPEND tdlua_srcs
-    "tdlua.cpp"
-    "luajson.cpp"
-    "luaIF.cpp"
-    "request_router.cpp"
-    "lua_dispatcher.cpp"
+    "src/tdlua.cpp"
+    "src/luajson.cpp"
+    "src/luaIF.cpp"
+    "src/request_router.cpp"
+    "src/lua_dispatcher.cpp"
 )
 if (TDLUA_CALLS)
     set(TARGET "libtgvoip")
@@ -417,7 +417,7 @@ if (TDLUA_CALLS)
 
     list(APPEND tdlua_srcs
         "base64/base64.cpp"
-        "LuaTDVoip.cpp"
+        "src/LuaTDVoip.cpp"
     )
 endif()
 
@@ -425,7 +425,9 @@ add_library (tdlua SHARED ${tdlua_srcs})
 
 target_include_directories(tdlua PRIVATE
     "${LUA_INCLUDE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/includes"
 )
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
 target_compile_features(tdlua PRIVATE cxx_std_11)
@@ -513,11 +515,13 @@ if(TDLUA_BUILD_TESTS)
     enable_testing()
     add_executable(tdlua_codec_test
         "tests/codec_test.cpp"
-        "luajson.cpp"
+        "src/luajson.cpp"
     )
     target_include_directories(tdlua_codec_test PRIVATE
         ${LUA_INCLUDE_DIR}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
         ${CMAKE_CURRENT_SOURCE_DIR}
+        "${CMAKE_CURRENT_SOURCE_DIR}/includes"
     )
     target_link_libraries(tdlua_codec_test PRIVATE ${LUA_LIBRARIES})
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
