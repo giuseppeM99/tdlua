@@ -24,6 +24,17 @@ local function error_text(result)
     return tostring(result.code) .. ": " .. tostring(result.message)
 end
 
+local function artifact_lua_version(path)
+    local version = path:match("tdlua%-([0-9]+%.[0-9]+)%-")
+    if version then
+        return "Lua " .. version
+    end
+    if path:match("luajit") then
+        return "LuaJIT"
+    end
+    return _VERSION
+end
+
 local api_id = tonumber(os.getenv("TG_APP_ID") or os.getenv("TG_API_ID") or "")
 local api_hash = optional_value(
     os.getenv("TG_APP_HASH") or os.getenv("TG_API_HASH") or os.getenv("TG_APP_TOKEN"))
@@ -223,7 +234,7 @@ local upload_thread = coroutine.create(function()
             "MD5 " .. digest("md5sum", artifact),
             "SHA1 " .. digest("sha1sum", artifact),
             calls,
-            _VERSION,
+            artifact_lua_version(artifact),
             "",
             "File sent with TDLua"
         }, "\n")
