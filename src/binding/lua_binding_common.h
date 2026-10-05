@@ -5,9 +5,27 @@
 
 #include <cctype>
 #include <cstddef>
+#include <exception>
 #include <string>
+#include <stdexcept>
+#include <utility>
 
 namespace tdlua_binding {
+
+template <typename Function>
+int protected_call(lua_State *L, Function &&function)
+{
+    try {
+        return std::forward<Function>(function)();
+    } catch (const std::exception &error) {
+        lua_pushstring(L, error.what());
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+    }
+    // The lambda and all C++ objects created by it have already unwound.
+    // Keep the Lua longjmp at this single, thin boundary.
+    return lua_error(L);
+}
 
 using ClientHandle = void *;
 using ClientFactory = ClientHandle (*)(lua_State *);
@@ -162,68 +180,92 @@ inline bool handler_property(const char *name, std::string &type)
 inline int index(lua_State *L, ClientHandle client,
                  const ClientOperations &operations, lua_CFunction helper)
 {
-    const char *name = luaL_checkstring(L, 2);
-    std::string type;
-    if (client && handler_property(name, type)) {
-        if (operations.push_handler(client, L, type.c_str())) {
+    return protected_call(L, [&]() -> int {
+        if (!lua_isstring(L, 2)) {
+            throw std::runtime_error("tdlua: client property name must be a string");
+        }
+        const char *name = lua_tostring(L, 2);
+        std::string type;
+        if (client && handler_property(name, type)) {
+            if (operations.push_handler(client, L, type.c_str())) {
+                return 1;
+            }
+            lua_pushnil(L);
             return 1;
         }
-        lua_pushnil(L);
-        return 1;
-    }
 
-    luaL_getmetatable(L, "tdclient");
-    lua_getfield(L, -1, "__methods");
-    lua_getfield(L, -1, name);
-    if (!lua_isnil(L, -1)) {
-        lua_remove(L, -2);
-        lua_remove(L, -2);
-        return 1;
-    }
-    lua_pop(L, 3);
+        luaL_getmetatable(L, "tdclient");
+        lua_getfield(L, -1, "__methods");
+        lua_getfield(L, -1, name);
+        if (!lua_isnil(L, -1)) {
+            lua_remove(L, -2);
+            lua_remove(L, -2);
+            return 1;
+        }
+        lua_pop(L, 3);
 
-    lua_pushstring(L, name);
-    lua_pushcclosure(L, helper, 1);
-    return 1;
+        lua_pushstring(L, name);
+        lua_pushcclosure(L, helper, 1);
+        return 1;
+    });
 }
 
 inline int newindex(lua_State *L, ClientHandle client,
                     const ClientOperations &operations)
 {
-    const char *name = luaL_checkstring(L, 2);
-    std::string type;
-    if (!client || !handler_property(name, type)) {
-        return luaL_error(L, "tdlua: unsupported client property '%s'", name);
-    }
-    if (lua_isnil(L, 3)) {
-        operations.off(client, type.c_str());
-    } else {
-        luaL_checktype(L, 3, LUA_TFUNCTION);
-        operations.on(client, L, type.c_str(), 3);
-    }
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (!lua_isstring(L, 2)) {
+            throw std::runtime_error("tdlua: client property name must be a string");
+        }
+        const char *name = lua_tostring(L, 2);
+        std::string type;
+        if (!client || !handler_property(name, type)) {
+            throw std::runtime_error(std::string("tdlua: unsupported client property '") +
+                                     (name ? name : "") + "'");
+        }
+        if (lua_isnil(L, 3)) {
+            operations.off(client, type.c_str());
+        } else {
+            if (!lua_isfunction(L, 3)) {
+                throw std::runtime_error("tdlua: event handler must be a function");
+            }
+            operations.on(client, L, type.c_str(), 3);
+        }
+        return 0;
+    });
 }
 
 inline int on(lua_State *L, ClientHandle client,
               const ClientOperations &operations)
 {
-    if (!client) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    const char *type = luaL_checkstring(L, 2);
-    luaL_checktype(L, 3, LUA_TFUNCTION);
-    operations.on(client, L, type, 3);
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (!client) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        if (!lua_isstring(L, 2)) {
+            throw std::runtime_error("tdlua: event type must be a string");
+        }
+        if (!lua_isfunction(L, 3)) {
+            throw std::runtime_error("tdlua: event handler must be a function");
+        }
+        operations.on(client, L, lua_tostring(L, 2), 3);
+        return 0;
+    });
 }
 
 inline int off(lua_State *L, ClientHandle client,
                const ClientOperations &operations)
 {
-    if (!client) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    operations.off(client, luaL_checkstring(L, 2));
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (!client) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        if (!lua_isstring(L, 2)) {
+            throw std::runtime_error("tdlua: event type must be a string");
+        }
+        operations.off(client, lua_tostring(L, 2));
+        return 0;
+    });
 }
 
 inline int save(lua_State *, ClientHandle client,
@@ -256,21 +298,25 @@ inline int unload(lua_State *, ClientHandle client,
 inline int close(lua_State *L, ClientHandle client,
                  const ClientOperations &operations)
 {
-    if (!client) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    operations.close(client);
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (!client) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        operations.close(client);
+        return 0;
+    });
 }
 
 inline int is_closed(lua_State *L, ClientHandle client,
                      const ClientOperations &operations)
 {
-    if (!client) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    lua_pushboolean(L, operations.closed(client));
-    return 1;
+    return protected_call(L, [&]() -> int {
+        if (!client) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        lua_pushboolean(L, operations.closed(client));
+        return 1;
+    });
 }
 
 }  // namespace tdlua_binding

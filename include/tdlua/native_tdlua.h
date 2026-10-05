@@ -5,7 +5,7 @@
 #include <td/telegram/td_api.h>
 
 #include <cstdint>
-#include <queue>
+#include <deque>
 #include <string>
 
 class NativeTDLua final {
@@ -30,6 +30,7 @@ public:
     NativeDispatcher &dispatcher();
     void push(NativeResponse response);
     NativeResponse pop();
+    bool takeQueuedResponse(std::uint64_t request_id, NativeResponse &response);
     bool empty() const;
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     int captureExtra(lua_State *L, int request_index) const;
@@ -45,7 +46,7 @@ public:
 private:
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
-    std::queue<NativeResponse> updates_;
+    std::deque<NativeResponse> updates_;
     std::string dbpath_;
     bool ready_;
     bool closing_;

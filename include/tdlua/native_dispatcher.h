@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <map>
 #include <string>
-#include <vector>
 
 class NativeDispatcher final {
 public:
@@ -50,5 +49,5 @@ private:
     lua_State *owner_;
     std::uint64_t next_id_;
     std::map<std::uint64_t, PendingRequest> pending_;
-    std::map<std::string, std::vector<int> > handlers_;
+    std::map<std::string, int> handlers_;
 };

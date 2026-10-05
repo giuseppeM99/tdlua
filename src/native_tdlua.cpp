@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <chrono>
 
 NativeTDLua::NativeTDLua(lua_State *lua)
     : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
@@ -43,7 +44,7 @@ NativeResponse NativeTDLua::receive(double timeout)
     }
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
-        updates_.pop();
+        updates_.pop_front();
         return response;
     }
     return NativeRuntime::instance().receive(client_id_, timeout);
@@ -83,14 +84,28 @@ NativeDispatcher &NativeTDLua::dispatcher()
 
 void NativeTDLua::push(NativeResponse response)
 {
-    updates_.push(std::move(response));
+    updates_.push_back(std::move(response));
 }
 
 NativeResponse NativeTDLua::pop()
 {
     NativeResponse result(std::move(updates_.front()));
-    updates_.pop();
+    updates_.pop_front();
     return result;
+}
+
+bool NativeTDLua::takeQueuedResponse(std::uint64_t request_id,
+                                      NativeResponse &response)
+{
+    for (std::deque<NativeResponse>::iterator it = updates_.begin();
+         it != updates_.end(); ++it) {
+        if (it->request_id == request_id) {
+            response = std::move(*it);
+            updates_.erase(it);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool NativeTDLua::empty() const
@@ -167,8 +182,10 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
         loadUpdatesBuffer();
     } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosed::ID) {
-        saveUpdatesBuffer();
-        emptyUpdatesBuffer();
+        if (!closing_) {
+            saveUpdatesBuffer();
+            emptyUpdatesBuffer();
+        }
         ready_ = false;
         closed_ = true;
         closing_ = false;
@@ -181,13 +198,22 @@ void NativeTDLua::close()
         NativeRuntime::instance().forget(client_id_);
         return;
     }
+    const auto started = std::chrono::steady_clock::now();
+    const std::uint64_t close_request_id = nextRequestId();
     if (!closing_) {
         closing_ = true;
-        const std::uint64_t request_id = nextRequestId();
-        send(td::td_api::make_object<td::td_api::close>(), request_id);
+        send(td::td_api::make_object<td::td_api::close>(), close_request_id);
     }
     while (!closed_) {
-        NativeResponse response = receive(1.0);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        const double remaining = 5.0 - elapsed;
+        if (remaining <= 0.0) {
+            closed_ = true;
+            closing_ = false;
+            break;
+        }
+        NativeResponse response = receiveBackend(remaining);
         if (!response.object) {
             continue;
         }
@@ -195,7 +221,12 @@ void NativeTDLua::close()
         // updating the lifecycle state without invoking user callbacks or
         // event handlers while the client is being destroyed.
         checkAuthState(response);
+        if (!closed_ && response.request_id != close_request_id) {
+            updates_.push_back(std::move(response));
+        }
     }
+    saveUpdatesBuffer();
+    emptyUpdatesBuffer();
     NativeRuntime::instance().forget(client_id_);
 }
 
@@ -219,7 +250,7 @@ void NativeTDLua::saveUpdatesBuffer()
     nlohmann::json stored = nlohmann::json::array();
     while (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
-        updates_.pop();
+        updates_.pop_front();
         if (response.object) {
             pushResponse(lua_, response);
             nlohmann::json value;
@@ -268,7 +299,7 @@ void NativeTDLua::loadUpdatesBuffer()
             response.extra_ref = dispatcher_.captureExtra(lua_, table_index);
             response.object = tdlua_native::from_lua_object(
                 lua_, table_index, "updates[" + std::to_string(i + 1) + "]");
-            updates_.push(std::move(response));
+            updates_.push_back(std::move(response));
             lua_pop(lua_, 1);
         }
         lua_settop(lua_, stack_top);
@@ -284,7 +315,7 @@ void NativeTDLua::emptyUpdatesBuffer()
 {
     while (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
-        updates_.pop();
+        updates_.pop_front();
         releaseExtra(response.extra_ref);
     }
 }

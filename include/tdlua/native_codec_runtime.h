@@ -3,6 +3,7 @@
 #include "tdlua/lua_compat.h"
 
 #include <cmath>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -134,8 +135,9 @@ inline lua_Integer read_integer(lua_State *L, int index, const std::string &path
         if (text && length != 0) {
             char *end = nullptr;
             const std::string source(text, length);
+            errno = 0;
             const long long parsed = std::strtoll(source.c_str(), &end, 10);
-            if (end == source.c_str() + source.size() &&
+            if (errno != ERANGE && end == source.c_str() + source.size() &&
                 parsed >= minimum && parsed <= maximum) {
                 return static_cast<lua_Integer>(parsed);
             }
@@ -170,8 +172,9 @@ inline std::int64_t read_int64(lua_State *L, int index, const std::string &path)
         if (text && length != 0) {
             char *end = nullptr;
             const std::string source(text, length);
+            errno = 0;
             const long long parsed = std::strtoll(source.c_str(), &end, 10);
-            if (end == source.c_str() + source.size()) {
+            if (errno != ERANGE && end == source.c_str() + source.size()) {
                 return static_cast<std::int64_t>(parsed);
             }
         }

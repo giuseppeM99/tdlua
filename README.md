@@ -1,5 +1,5 @@
 # TDLUA
-**A basic Lua wrapper for TDLib's JSON interface**
+**A Lua binding for TDLib with JSON and native C++ backends**
 
 ## Installation
 You first need to install
@@ -12,6 +12,23 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build .
 ```
+
+The JSON backend is the default. The native backend can be selected with:
+
+```bash
+cmake -S . -B build-native \
+  -G Ninja \
+  -DTDLUA_BACKEND=native \
+  -DTDLUA_BUNDLED_TDLIB=ON
+cmake --build build-native
+```
+
+The generated native codec uses 16 translation units by default. This can be
+adjusted with `-DTDLUA_NATIVE_SHARDS=<count>` when tuning build parallelism.
+
+The native backend currently requires the bundled TDLib source because its
+codec is generated from TDLib's schema. It requires a C++23-capable compiler;
+the JSON backend can still be built with its existing C++11-compatible code.
 
 By default the repository builds its bundled TDLib copy. To use an installed
 TDLib instead, configure with:
@@ -32,21 +49,17 @@ cmake --install build --prefix /usr/local
 The default destination is `lib/lua/<lua-version>/tdlua.so` and can be changed
 with `-DTDLUA_LUA_MODULE_DIR=...`.
 
-The bundled TDLib build uses TDLib's current JSON interface internally. TDLua keeps
-the TDLib client identifier private and continues to expose the existing Lua request
-and update API.
+The bundled TDLib build uses TDLib's current JSON interface internally for the
+JSON backend. TDLua keeps the TDLib client identifier private and both backends
+expose the same Lua request and update API.
 
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
 Build with Lua 5.2 and the latest version of tdlib.
 
-Special thanks for @danogentili for his work on [php-libtgvoip](https://github.com/danog/php-libtgvoip/)
-Check out [MadelineProto](https://github.com/danog/MadelineProto), a pure MTProto client written in PHP
-
-*Since i didn't wrote an actual installation script you'll need to manually copy the file tdlua.so into the appropriate directory*
+VoIP bindings are currently not part of the native or JSON backend.
 
 ## Usage
-__See example.lua__
-__See call.lua for an example on VoIP Calls [BETA]__
+__See the examples directory for usage examples.__
 
 The Lua type alias `_` is accepted alongside `@type` and is emitted together with
 `@type` in decoded objects. Clients accept fractional receive and execute timeouts:

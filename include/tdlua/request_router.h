@@ -20,6 +20,7 @@ public:
     std::uint64_t addCallback(lua_State *L, nlohmann::json &request,
                               int callback_index, int context_index);
     std::uint64_t addAwaiter(lua_State *L, nlohmann::json &request);
+    void cancel(std::uint64_t request_id);
 
     bool dispatch(nlohmann::json &response);
     void clear();

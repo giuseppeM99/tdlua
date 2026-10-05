@@ -2,6 +2,8 @@
 
 #include "tdlua/native_codec.h"
 
+#include <stdexcept>
+
 namespace {
 
 std::string luaError(lua_State *L)
@@ -54,7 +56,9 @@ std::uint64_t NativeDispatcher::addPending(lua_State *L, int request_index,
     pending.coroutine = coroutine;
 
     if (callback_index != 0) {
-        luaL_checktype(L, callback_index, LUA_TFUNCTION);
+        if (!lua_isfunction(L, callback_index)) {
+            throw std::runtime_error("tdlua: request callback must be a function");
+        }
         lua_pushvalue(L, callback_index);
         pending.callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     }
@@ -96,7 +100,7 @@ std::uint64_t NativeDispatcher::await(lua_State *L, int request_index)
     const int is_main = lua_pushthread(L);
     if (is_main) {
         lua_pop(L, 1);
-        luaL_error(L, "tdlua: await() must run inside a coroutine");
+        throw std::runtime_error("tdlua: await() must run inside a coroutine");
     }
     lua_State *coroutine = lua_tothread(L, -1);
     const int coroutine_ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -137,15 +141,13 @@ void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &resp
     if (found == handlers_.end()) {
         return;
     }
-    for (std::vector<int>::const_iterator it = found->second.begin();
-         it != found->second.end(); ++it) {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, *it);
-        pushResponse(L, response, extra_ref);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            const std::string message = luaError(L);
-            lua_pop(L, 1);
-            luaL_error(L, "tdlua event handler failed: %s", message.c_str());
-        }
+    const int handler_ref = found->second;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, handler_ref);
+    pushResponse(L, response, extra_ref);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        const std::string message = luaError(L);
+        lua_pop(L, 1);
+        throw std::runtime_error("tdlua event handler failed: " + message);
     }
 }
 
@@ -180,7 +182,7 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
             if (extra_ref != LUA_NOREF) {
                 luaL_unref(owner_, LUA_REGISTRYINDEX, extra_ref);
             }
-            luaL_error(owner_, "tdlua request callback failed: %s", message.c_str());
+            throw std::runtime_error("tdlua request callback failed: " + message);
         }
     } else if (has_pending && pending.coroutine_ref != LUA_NOREF) {
         pushResponse(pending.coroutine, response, extra_ref);
@@ -191,7 +193,7 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
             if (extra_ref != LUA_NOREF) {
                 luaL_unref(owner_, LUA_REGISTRYINDEX, extra_ref);
             }
-            luaL_error(owner_, "tdlua await failed: %s", message.c_str());
+            throw std::runtime_error("tdlua await failed: " + message);
         }
     }
 
@@ -212,10 +214,12 @@ void NativeDispatcher::releaseExtra(int extra_ref)
 
 void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index)
 {
-    luaL_checktype(L, callback_index, LUA_TFUNCTION);
+    if (!lua_isfunction(L, callback_index)) {
+        throw std::runtime_error("tdlua: event handler must be a function");
+    }
     off(type);
     lua_pushvalue(L, callback_index);
-    handlers_[type].push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+    handlers_[type] = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
 void NativeDispatcher::off(const std::string &type)
@@ -224,20 +228,17 @@ void NativeDispatcher::off(const std::string &type)
     if (found == handlers_.end()) {
         return;
     }
-    for (std::vector<int>::const_iterator it = found->second.begin();
-         it != found->second.end(); ++it) {
-        luaL_unref(owner_, LUA_REGISTRYINDEX, *it);
-    }
+    luaL_unref(owner_, LUA_REGISTRYINDEX, found->second);
     handlers_.erase(found);
 }
 
 bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type) const
 {
     const auto found = handlers_.find(type);
-    if (found == handlers_.end() || found->second.empty()) {
+    if (found == handlers_.end()) {
         return false;
     }
-    lua_rawgeti(L, LUA_REGISTRYINDEX, found->second.front());
+    lua_rawgeti(L, LUA_REGISTRYINDEX, found->second);
     return true;
 }
 
@@ -266,9 +267,7 @@ void NativeDispatcher::clear()
     }
     pending_.clear();
     for (auto &entry : handlers_) {
-        for (int ref : entry.second) {
-            luaL_unref(owner_, LUA_REGISTRYINDEX, ref);
-        }
+        luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);
     }
     handlers_.clear();
 }

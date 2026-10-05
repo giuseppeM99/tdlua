@@ -253,6 +253,110 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
+  native:
+    name: Native backend / C++23 / Lua 5.5
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            curl \
+            gperf \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Build Lua 5.5
+        run: |
+          curl -fsSL https://www.lua.org/ftp/lua-5.5.0.tar.gz | tar -xz
+          make -C lua-5.5.0 linux \
+            MYCFLAGS="-fPIC" \
+            MYLDFLAGS="-fPIC"
+          make -C lua-5.5.0 install \
+            INSTALL_TOP="$RUNNER_TEMP/lua55"
+
+      - name: Configure native backend
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.5 \
+            -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
+            -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
+            -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
+
+      - name: Build and test native backend
+        run: |
+          cmake --build build --target tdlua tdlua_codec_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+  native-sanitizers:
+    name: Native backend / ASan + UBSan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            curl \
+            gperf \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Build Lua 5.5
+        run: |
+          curl -fsSL https://www.lua.org/ftp/lua-5.5.0.tar.gz | tar -xz
+          make -C lua-5.5.0 linux \
+            MYCFLAGS="-fPIC" \
+            MYLDFLAGS="-fPIC"
+          make -C lua-5.5.0 install \
+            INSTALL_TOP="$RUNNER_TEMP/lua55"
+
+      - name: Configure sanitized native backend
+        env:
+          SANITIZER_FLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$SANITIZER_FLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$SANITIZER_FLAGS" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.5 \
+            -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
+            -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
+            -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
+
+      - name: Build and test sanitized native backend
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          cmake --build build --target tdlua tdlua_codec_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
   luajit:
     name: LuaJIT / static TDLib
     needs: tdlib

@@ -2,6 +2,8 @@
 
 #include "tdlua/luajson.h"
 
+#include <stdexcept>
+
 namespace {
 
 const char *const kInternalRequestKey = "__tdlua_request";
@@ -35,7 +37,9 @@ std::uint64_t RequestRouter::addCallback(lua_State *L, nlohmann::json &request,
 {
     int callback_ref = LUA_NOREF;
     if (callback_index != 0) {
-        luaL_checktype(L, callback_index, LUA_TFUNCTION);
+        if (!lua_isfunction(L, callback_index)) {
+            throw std::runtime_error("tdlua: request callback must be a function");
+        }
         lua_pushvalue(L, callback_index);
         callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     }
@@ -54,13 +58,25 @@ std::uint64_t RequestRouter::addAwaiter(lua_State *L, nlohmann::json &request)
     const int is_main = lua_pushthread(L);
     if (is_main) {
         lua_pop(L, 1);
-        luaL_error(L, "tdlua: await() must run inside a coroutine");
+        throw std::runtime_error("tdlua: await() must run inside a coroutine");
     }
 
     lua_State *coroutine = lua_tothread(L, -1);
     const int coroutine_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     return addPending(request, LUA_NOREF, LUA_REFNIL,
                       coroutine_ref, coroutine);
+}
+
+void RequestRouter::cancel(std::uint64_t request_id)
+{
+    const std::map<std::uint64_t, PendingRequest>::iterator found =
+        pending_.find(request_id);
+    if (found == pending_.end()) {
+        return;
+    }
+    PendingRequest pending = found->second;
+    pending_.erase(found);
+    release(pending);
 }
 
 std::uint64_t RequestRouter::addPending(nlohmann::json &request,
@@ -163,7 +179,7 @@ bool RequestRouter::dispatch(nlohmann::json &response)
             const std::string message = luaError(owner_);
             lua_pop(owner_, 1);
             release(pending);
-            luaL_error(owner_, "tdlua request callback failed: %s", message.c_str());
+            throw std::runtime_error("tdlua request callback failed: " + message);
         }
     } else if (pending.coroutine_ref != LUA_NOREF) {
         lua_pushjson(pending.coroutine, response);
@@ -171,7 +187,7 @@ bool RequestRouter::dispatch(nlohmann::json &response)
         if (status != LUA_OK && status != LUA_YIELD) {
             const std::string message = luaError(pending.coroutine);
             release(pending);
-            luaL_error(owner_, "tdlua await failed: %s", message.c_str());
+            throw std::runtime_error("tdlua await failed: " + message);
         }
     }
 

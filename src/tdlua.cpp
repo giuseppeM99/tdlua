@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <td/telegram/td_json_client.h>
 
 namespace {
@@ -27,7 +28,10 @@ public:
 
     std::int32_t createClient()
     {
-        return td_create_client_id();
+        const std::int32_t client_id = td_create_client_id();
+        std::lock_guard<std::mutex> lock(receive_mutex);
+        active_clients.insert(client_id);
+        return client_id;
     }
 
     void send(const std::int32_t client_id, const json &request)
@@ -45,10 +49,14 @@ public:
     json receive(const std::int32_t client_id, const double timeout)
     {
         std::lock_guard<std::mutex> lock(receive_mutex);
-        std::queue<json> &client_queue = pending[client_id];
-        if (!client_queue.empty()) {
-            json result = client_queue.front();
-            client_queue.pop();
+        if (active_clients.find(client_id) == active_clients.end()) {
+            return nullptr;
+        }
+        const std::map<std::int32_t, std::queue<json> >::iterator queued =
+            pending.find(client_id);
+        if (queued != pending.end() && !queued->second.empty()) {
+            json result = queued->second.front();
+            queued->second.pop();
             return result;
         }
 
@@ -76,13 +84,16 @@ public:
             if (result_client_id == client_id) {
                 return result;
             }
-            pending[result_client_id].push(result);
+            if (active_clients.find(result_client_id) != active_clients.end()) {
+                pending[result_client_id].push(result);
+            }
         }
     }
 
     void forget(const std::int32_t client_id)
     {
         std::lock_guard<std::mutex> lock(receive_mutex);
+        active_clients.erase(client_id);
         pending.erase(client_id);
     }
 
@@ -103,6 +114,7 @@ private:
 
     std::mutex receive_mutex;
     std::map<std::int32_t, std::queue<json> > pending;
+    std::set<std::int32_t> active_clients;
 };
 
 }
@@ -166,8 +178,16 @@ void TDLua::close()
         state = ClientState::Closing;
     }
 
+    const auto started = std::chrono::steady_clock::now();
     while (state != ClientState::Closed) {
-        nlohmann::json update = receive(1.0);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        const double remaining = 5.0 - elapsed;
+        if (remaining <= 0.0) {
+            state = ClientState::Closed;
+            break;
+        }
+        nlohmann::json update = receive(remaining);
         if (update.is_object()) {
             checkAuthState(update);
         }

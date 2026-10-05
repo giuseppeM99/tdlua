@@ -2,6 +2,7 @@
 #include "td/tl/tl_simple.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -38,13 +39,10 @@ public:
     void write(const std::string &header_path, const std::string &source_directory,
                std::size_t shard_count)
     {
-        std::ofstream header(header_path.c_str());
-        if (!header) {
-            throw std::runtime_error("unable to open native codec output files");
-        }
-
         collect_vectors();
+        std::ostringstream header;
         write_header(header);
+        write_if_different(header_path, header.str());
 
         std::ostringstream source;
         write_source(source);
@@ -226,6 +224,57 @@ private:
         return definitions;
     }
 
+    static std::uint64_t stable_hash(const std::string &value)
+    {
+        // FNV-1a is deliberately used instead of std::hash: generated shard
+        // assignment must be identical across standard libraries and hosts.
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (unsigned char character : value) {
+            hash ^= character;
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    static std::string definition_symbol(const std::string &definition)
+    {
+        const std::size_t open = definition.find('(');
+        if (open == std::string::npos) {
+            return definition;
+        }
+        const std::size_t end = definition.find_last_not_of(" \t\n", open - 1);
+        const std::size_t begin = definition.find_last_of(" \t\n:*", end);
+        return definition.substr(begin == std::string::npos ? 0 : begin + 1,
+                                 end - (begin == std::string::npos ? 0 : begin + 1) + 1);
+    }
+
+    static bool is_dispatch_symbol(const std::string &symbol)
+    {
+        return symbol == "read_function" || symbol == "push_object" ||
+               symbol == "from_lua" || symbol == "from_lua_object";
+    }
+
+    static void write_if_different(const std::string &path, const std::string &contents)
+    {
+        std::ifstream input(path.c_str(), std::ios::binary);
+        if (input) {
+            std::ostringstream existing;
+            existing << input.rdbuf();
+            if (existing.str() == contents) {
+                return;
+            }
+        }
+
+        std::ofstream output(path.c_str(), std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("unable to open native codec output file: " + path);
+        }
+        output << contents;
+        if (!output) {
+            throw std::runtime_error("unable to write native codec output file: " + path);
+        }
+    }
+
     void write_shards(const std::string &source, const std::string &directory,
                       std::size_t shard_count) const
     {
@@ -235,25 +284,38 @@ private:
         std::string preamble;
         std::vector<std::string> definitions = split_definitions(source, preamble);
         std::vector<std::vector<std::string>> shards(shard_count);
-        std::vector<std::size_t> sizes(shard_count, 0);
+        std::vector<std::string> dispatch;
         for (const std::string &definition : definitions) {
+            const std::string symbol = definition_symbol(definition);
+            if (is_dispatch_symbol(symbol)) {
+                dispatch.push_back(definition);
+                continue;
+            }
             const std::size_t target = static_cast<std::size_t>(
-                std::min_element(sizes.begin(), sizes.end()) - sizes.begin());
+                stable_hash(symbol) % shard_count);
             shards[target].push_back(definition);
-            sizes[target] += definition.size();
         }
 
         for (std::size_t shard = 0; shard < shard_count; ++shard) {
-            std::ofstream output((directory + "/native_codec_" + std::to_string(shard) + ".cpp").c_str());
-            if (!output) {
-                throw std::runtime_error("unable to open native codec shard output");
-            }
+            std::ostringstream output;
             output << preamble;
             for (const std::string &definition : shards[shard]) {
                 output << definition << '\n';
             }
             output << "}  // namespace tdlua_native\n";
+            write_if_different(directory + "/native_codec_" +
+                                   std::to_string(shard) + ".cpp",
+                               output.str());
         }
+
+        std::ostringstream dispatch_output;
+        dispatch_output << preamble;
+        for (const std::string &definition : dispatch) {
+            dispatch_output << definition << '\n';
+        }
+        dispatch_output << "}  // namespace tdlua_native\n";
+        write_if_different(directory + "/native_codec_dispatch.cpp",
+                           dispatch_output.str());
     }
 
     void write_header(std::ostream &out) const

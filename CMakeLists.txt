@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/dist.info" _tdlua_dist_version_line
      REGEX "^version[ \t]*=")
@@ -11,14 +11,22 @@ set(_tdlua_base_version "${CMAKE_MATCH_1}")
 project(tdlua VERSION "${_tdlua_base_version}.0" LANGUAGES C CXX)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Generate compilation database for editors")
+# Keep the compilation database enabled for clangd and static analysis. This
+# is a project setting rather than a user-selectable backend option.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)
+set(_tdlua_backend_was_requested FALSE)
+if(DEFINED TDLUA_BACKEND)
+  set(_tdlua_backend_was_requested TRUE)
+endif()
 set(TDLUA_BACKEND "json" CACHE STRING
     "TDLua backend to build (json or native)")
 set_property(CACHE TDLUA_BACKEND PROPERTY STRINGS json native)
+set(TDLUA_NATIVE_SHARDS "16" CACHE STRING
+    "Number of generated native codec translation units")
 option(TDLUA_JSON_STATIC
        "Link the JSON backend against the static TDLib JSON library" OFF)
 option(TDLUA_TD_STATIC "Legacy alias for TDLUA_JSON_STATIC" OFF)
@@ -26,16 +34,27 @@ option(TDLUA_TD_STATIC "Legacy alias for TDLUA_JSON_STATIC" OFF)
 # TDLUA_NATIVE_BACKEND is retained for existing build scripts. The explicit
 # backend option is the canonical interface for new builds.
 if(TDLUA_NATIVE_BACKEND)
-  set(TDLUA_BACKEND "native" CACHE STRING
-      "TDLua backend to build (json or native)" FORCE)
+  message(DEPRECATION
+          "TDLUA_NATIVE_BACKEND is deprecated; use -DTDLUA_BACKEND=native")
 endif()
-if(TDLUA_BACKEND STREQUAL "native")
-  set(TDLUA_NATIVE_BACKEND ON)
-elseif(TDLUA_BACKEND STREQUAL "json")
-  set(TDLUA_NATIVE_BACKEND OFF)
+if(_tdlua_backend_was_requested)
+  set(_tdlua_backend "${TDLUA_BACKEND}")
+elseif(TDLUA_NATIVE_BACKEND)
+  set(_tdlua_backend "native")
+else()
+  set(_tdlua_backend "json")
+endif()
+if(_tdlua_backend STREQUAL "native")
+  set(_tdlua_native_backend ON)
+elseif(_tdlua_backend STREQUAL "json")
+  set(_tdlua_native_backend OFF)
 else()
   message(FATAL_ERROR
           "TDLUA_BACKEND must be either 'json' or 'native'")
+endif()
+
+if(NOT TDLUA_NATIVE_SHARDS MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "TDLUA_NATIVE_SHARDS must be a positive integer")
 endif()
 
 if(TDLUA_TD_STATIC)
@@ -43,15 +62,17 @@ if(TDLUA_TD_STATIC)
     message(STATUS
             "TDLUA_TD_STATIC is deprecated; enabling TDLUA_JSON_STATIC")
   endif()
-  set(TDLUA_JSON_STATIC ON CACHE BOOL
-      "Link the JSON backend against the static TDLib JSON library" FORCE)
+  set(_tdlua_legacy_json_static ON)
 endif()
 
-if(TDLUA_BACKEND STREQUAL "native" AND TDLUA_JSON_STATIC)
+set(_tdlua_json_static "${TDLUA_JSON_STATIC}")
+if(DEFINED _tdlua_legacy_json_static)
+  set(_tdlua_json_static ON)
+endif()
+if(_tdlua_backend STREQUAL "native" AND TDLUA_JSON_STATIC)
   message(WARNING
           "TDLUA_JSON_STATIC is ignored for the native backend; native is always static")
-  set(TDLUA_JSON_STATIC OFF CACHE BOOL
-      "Link the JSON backend against the static TDLib JSON library" FORCE)
+  set(_tdlua_json_static OFF)
 endif()
 
 set(TDLUA_TDLIB_VERSION "")
@@ -91,7 +112,7 @@ endif()
 if(TDLUA_BUNDLED_TDLIB)
   # TDLib defines both targets internally, but install only the library form
   # needed by the selected backend.
-  if(TDLUA_BACKEND STREQUAL "json" AND NOT TDLUA_JSON_STATIC)
+  if(_tdlua_backend STREQUAL "json" AND NOT _tdlua_json_static)
     set(TD_INSTALL_SHARED_LIBRARIES ON CACHE BOOL "" FORCE)
     set(TD_INSTALL_STATIC_LIBRARIES OFF CACHE BOOL "" FORCE)
   else()
@@ -103,7 +124,7 @@ else()
   find_package(Td CONFIG REQUIRED)
 endif()
 
-if(TDLUA_NATIVE_BACKEND AND NOT TDLUA_BUNDLED_TDLIB)
+if(_tdlua_native_backend AND NOT TDLUA_BUNDLED_TDLIB)
   message(FATAL_ERROR "TDLUA_NATIVE_BACKEND currently requires TDLUA_BUNDLED_TDLIB=ON so the TDLib schema generator is available")
 endif()
 if(TDLUA_CALLS)
@@ -141,7 +162,7 @@ message(STATUS "TDLua version: ${TDLUA_VERSION_STRING}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
      "${TDLUA_VERSION_STRING}\n")
 
-if(TDLUA_BACKEND STREQUAL "native")
+if(_tdlua_backend STREQUAL "native")
   list(APPEND tdlua_srcs
       "src/native_runtime.cpp"
       "src/native_tdlua.cpp"
@@ -159,24 +180,28 @@ else()
   )
 endif()
 
-if(TDLUA_BACKEND STREQUAL "native")
+if(_tdlua_backend STREQUAL "native")
   set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
   set(TDLUA_NATIVE_GENERATED_HEADER "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.h")
-  set(TDLUA_NATIVE_SHARD_COUNT 16)
+  set(TDLUA_NATIVE_SHARD_COUNT "${TDLUA_NATIVE_SHARDS}")
   set(TDLUA_NATIVE_GENERATED_PARTS)
-  foreach(part RANGE 0 15)
+  math(EXPR _tdlua_last_shard "${TDLUA_NATIVE_SHARDS} - 1")
+  foreach(part RANGE 0 ${_tdlua_last_shard})
     list(APPEND TDLUA_NATIVE_GENERATED_PARTS
         "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_${part}.cpp")
   endforeach()
+  set(TDLUA_NATIVE_DISPATCH
+      "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_dispatch.cpp")
   set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
 
   add_executable(tdlua_native_generator src/native_generator.cpp)
   target_link_libraries(tdlua_native_generator PRIVATE tdtl)
-  target_compile_features(tdlua_native_generator PRIVATE cxx_std_26)
+  target_compile_features(tdlua_native_generator PRIVATE cxx_std_23)
 
   add_custom_command(
       OUTPUT "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.stamp"
       BYPRODUCTS "${TDLUA_NATIVE_GENERATED_HEADER}" ${TDLUA_NATIVE_GENERATED_PARTS}
+                "${TDLUA_NATIVE_DISPATCH}"
       COMMAND ${CMAKE_COMMAND} -E make_directory "${TDLUA_NATIVE_GENERATED_DIR}"
       COMMAND tdlua_native_generator
               "${TDLUA_TD_API_TLO}"
@@ -184,13 +209,14 @@ if(TDLUA_BACKEND STREQUAL "native")
               "${TDLUA_NATIVE_GENERATED_DIR}"
               "${TDLUA_NATIVE_SHARD_COUNT}"
       COMMAND ${CMAKE_COMMAND} -E touch "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.stamp"
-      DEPENDS tdlua_native_generator tl_generate_tlo "${TDLUA_TD_API_TLO}"
+      DEPENDS tdlua_native_generator tl_generate_tlo
+              "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/scheme/td_api.tl"
       COMMENT "Generate sharded TDLua native TDLib codec"
       VERBATIM
   )
   add_custom_target(tdlua_native_generated
       DEPENDS "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.stamp")
-  list(APPEND tdlua_srcs ${TDLUA_NATIVE_GENERATED_PARTS})
+  list(APPEND tdlua_srcs ${TDLUA_NATIVE_GENERATED_PARTS} "${TDLUA_NATIVE_DISPATCH}")
 endif()
 
 add_library (tdlua SHARED ${tdlua_srcs})
@@ -199,13 +225,13 @@ target_include_directories(tdlua PRIVATE
     ${LUA_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-if(TDLUA_BACKEND STREQUAL "native")
+if(_tdlua_backend STREQUAL "native")
   target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
-if(TDLUA_BACKEND STREQUAL "native")
-  target_compile_features(tdlua PRIVATE cxx_std_26)
+if(_tdlua_backend STREQUAL "native")
+  target_compile_features(tdlua PRIVATE cxx_std_23)
 else()
   target_compile_features(tdlua PRIVATE cxx_std_11)
 endif()
@@ -213,7 +239,7 @@ target_compile_definitions(tdlua PRIVATE
     "TDLUA_VERSION_STRING=\"${TDLUA_VERSION_STRING}\""
     "TDLUA_BASE_VERSION=\"${TDLUA_BASE_VERSION}\""
     "TDLUA_TDLIB_VERSION=\"${TDLUA_TDLIB_VERSION}\"")
-if(TDLUA_BACKEND STREQUAL "json")
+if(_tdlua_backend STREQUAL "json")
   target_compile_definitions(tdlua PRIVATE TDLUA_JSON_BACKEND)
 else()
   target_compile_definitions(tdlua PRIVATE TDLUA_NATIVE_BACKEND)
@@ -221,17 +247,17 @@ endif()
 
 
 set_target_properties(tdlua PROPERTIES PREFIX "")
-if(TDLUA_BACKEND STREQUAL "native")
+if(_tdlua_backend STREQUAL "native")
   # The native backend is tied to the TDLib C++ ABI and is always static.
   target_link_libraries(tdlua PRIVATE Td::TdStatic)
-elseif(TDLUA_JSON_STATIC)
+elseif(_tdlua_json_static)
   target_link_libraries(tdlua PRIVATE Td::TdJsonStatic)
 else()
   # The JSON backend uses TDLib's stable C ABI and is replaceable at runtime.
   target_link_libraries(tdlua PRIVATE Td::TdJson)
 endif()
-if(TDLUA_BUNDLED_TDLIB AND UNIX AND TDLUA_BACKEND STREQUAL "json"
-   AND NOT TDLUA_JSON_STATIC)
+if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
+   AND NOT _tdlua_json_static)
   if(APPLE)
     set_property(TARGET tdlua APPEND PROPERTY INSTALL_RPATH
         "@loader_path;@loader_path/../..")

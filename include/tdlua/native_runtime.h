@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 
 struct NativeResponse {
     td::ClientManager::ClientId client_id;
@@ -44,4 +45,5 @@ private:
     td::ClientManager manager_;
     std::mutex receive_mutex_;
     std::map<td::ClientManager::ClientId, std::queue<NativeResponse> > pending_;
+    std::set<td::ClientManager::ClientId> active_clients_;
 };

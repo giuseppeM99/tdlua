@@ -52,6 +52,11 @@ assert(execute_extra_response["@extra"].origin == "execute")
 local helper_response = client:getAuthorizationState()
 assert_td_object(helper_response, "legacy helper")
 
+-- A string is accepted as helper parameters for compatibility.  It is
+-- parsed before the generated request table is built.
+local string_helper_response = client:getAuthorizationState("{}")
+assert_td_object(string_helper_response, "string helper")
+
 -- Both backends must recursively accept nested TDLib objects. The request
 -- returns an error before authorization, which is sufficient to exercise the
 -- full Lua -> TDLib codec path.

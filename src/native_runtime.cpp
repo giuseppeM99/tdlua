@@ -35,13 +35,17 @@ NativeRuntime &NativeRuntime::instance()
     return *runtime;
 }
 
-NativeRuntime::NativeRuntime() : manager_(), receive_mutex_(), pending_()
+NativeRuntime::NativeRuntime()
+    : manager_(), receive_mutex_(), pending_(), active_clients_()
 {
 }
 
 td::ClientManager::ClientId NativeRuntime::create_client()
 {
-    return manager_.create_client_id();
+    const td::ClientManager::ClientId client_id = manager_.create_client_id();
+    std::lock_guard<std::mutex> lock(receive_mutex_);
+    active_clients_.insert(client_id);
+    return client_id;
 }
 
 void NativeRuntime::send(td::ClientManager::ClientId client_id,
@@ -55,10 +59,14 @@ NativeResponse NativeRuntime::receive(td::ClientManager::ClientId client_id,
                                       double timeout)
 {
     std::lock_guard<std::mutex> lock(receive_mutex_);
-    std::queue<NativeResponse> &queue = pending_[client_id];
-    if (!queue.empty()) {
-        NativeResponse result(std::move(queue.front()));
-        queue.pop();
+    if (active_clients_.find(client_id) == active_clients_.end()) {
+        return NativeResponse();
+    }
+    const std::map<td::ClientManager::ClientId, std::queue<NativeResponse> >::iterator queued =
+        pending_.find(client_id);
+    if (queued != pending_.end() && !queued->second.empty()) {
+        NativeResponse result(std::move(queued->second.front()));
+        queued->second.pop();
         return result;
     }
 
@@ -83,7 +91,9 @@ NativeResponse NativeRuntime::receive(td::ClientManager::ClientId client_id,
         if (result.client_id == client_id) {
             return result;
         }
-        pending_[result.client_id].push(std::move(result));
+        if (active_clients_.find(result.client_id) != active_clients_.end()) {
+            pending_[result.client_id].push(std::move(result));
+        }
     }
 }
 
@@ -96,5 +106,6 @@ td::td_api::object_ptr<td::td_api::Object> NativeRuntime::execute(
 void NativeRuntime::forget(td::ClientManager::ClientId client_id)
 {
     std::lock_guard<std::mutex> lock(receive_mutex_);
+    active_clients_.erase(client_id);
     pending_.erase(client_id);
 }
