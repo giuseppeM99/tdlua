@@ -127,6 +127,7 @@ static int tdclient_receive(lua_State *L)
         }
         if (!td->empty()) {
             TDLua::QueuedUpdate queued = td->pop();
+            td->restoreTimedOutExecuteExtra(queued.value);
             if (!queued.dispatched) {
                 td->checkAuthState(queued.value);
                 td->dispatcher().dispatch(queued.value);
@@ -146,6 +147,7 @@ static int tdclient_receive(lua_State *L)
         if (result.empty()) {
             lua_pushnil(L);
         } else {
+            td->restoreTimedOutExecuteExtra(result);
             td->checkAuthState(result);
             td->dispatcher().dispatch(result);
             lua_pushjson(L, result);
@@ -203,7 +205,8 @@ static int tdclient_execute(lua_State *L)
         }
         const std::uint64_t nonce = td->nextRequestId();
         json extra = j["@extra"];
-        j["@extra"] = nonce;
+        const json marker = {{"__tdlua_execute", nonce}};
+        j["@extra"] = marker;
         if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
         }
@@ -227,16 +230,17 @@ static int tdclient_execute(lua_State *L)
                 continue;
             }
             td->checkAuthState(res);
-            if (res["@extra"].is_number_integer() &&
-                nonce == res["@extra"].get<std::uint64_t>()) {
+            if (res["@extra"] == marker) {
                 res["@extra"] = extra;
                 td->dispatcher().dispatch(res);
                 lua_pushjson(L, res);
                 return 1;
             }
+            td->restoreTimedOutExecuteExtra(res);
             td->dispatcher().dispatch(res);
             td->push(res, true);
         }
+        td->rememberTimedOutExecuteExtra(nonce, std::move(extra));
         return 0;
     });
 }

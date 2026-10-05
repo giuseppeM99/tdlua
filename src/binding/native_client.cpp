@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <utility>
 
 static NativeTDLua *getTD(lua_State *L)
 {
@@ -269,7 +270,7 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                 std::chrono::steady_clock::now() - started).count();
             const double remaining = static_cast<double>(timeout) - elapsed;
             if (remaining <= 0.0) {
-                td->releaseExtra(execute_extra_ref);
+                td->rememberTimedOutExecuteExtra(id, execute_extra_ref);
                 execute_extra_ref = LUA_NOREF;
                 return 0;
             }
@@ -281,12 +282,10 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                 continue;
             }
             if (response.request_id == id) {
-                response.extra_ref = execute_extra_ref;
+                response.extra_ref = std::exchange(execute_extra_ref, LUA_NOREF);
             }
             td->dispatch(response);
             if (response.request_id == id) {
-                response.extra_ref = execute_extra_ref;
-                execute_extra_ref = LUA_NOREF;
                 return return_response(L, td, response);
             }
             td->push(std::move(response));

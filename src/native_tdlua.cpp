@@ -13,7 +13,7 @@
 NativeTDLua::NativeTDLua(lua_State *lua)
     : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
       updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
-      dispatcher_(lua)
+      timed_out_execute_extras_(), dispatcher_(lua)
 {
 }
 
@@ -45,9 +45,12 @@ NativeResponse NativeTDLua::receive(double timeout)
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
+        restoreTimedOutExecuteExtra(response);
         return response;
     }
-    return NativeRuntime::instance().receive(client_id_, timeout);
+    NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
+    restoreTimedOutExecuteExtra(response);
+    return response;
 }
 
 NativeResponse NativeTDLua::receiveBackend(double timeout)
@@ -55,7 +58,9 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
     if (closed_) {
         return NativeResponse();
     }
-    return NativeRuntime::instance().receive(client_id_, timeout);
+    NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
+    restoreTimedOutExecuteExtra(response);
+    return response;
 }
 
 td::td_api::object_ptr<td::td_api::Object> NativeTDLua::executeSync(
@@ -102,10 +107,47 @@ bool NativeTDLua::takeQueuedResponse(std::uint64_t request_id,
         if (it->request_id == request_id) {
             response = std::move(*it);
             updates_.erase(it);
+            restoreTimedOutExecuteExtra(response);
             return true;
         }
     }
     return false;
+}
+
+void NativeTDLua::rememberTimedOutExecuteExtra(std::uint64_t request_id,
+                                               int extra_ref)
+{
+    if (extra_ref == LUA_NOREF || extra_ref == LUA_REFNIL) {
+        return;
+    }
+    const auto found = timed_out_execute_extras_.find(request_id);
+    if (found != timed_out_execute_extras_.end()) {
+        releaseExtra(found->second);
+        found->second = extra_ref;
+        return;
+    }
+    timed_out_execute_extras_.emplace(request_id, extra_ref);
+}
+
+void NativeTDLua::restoreTimedOutExecuteExtra(NativeResponse &response)
+{
+    if (response.request_id == 0 || response.extra_ref != LUA_NOREF) {
+        return;
+    }
+    const auto found = timed_out_execute_extras_.find(response.request_id);
+    if (found == timed_out_execute_extras_.end()) {
+        return;
+    }
+    response.extra_ref = found->second;
+    timed_out_execute_extras_.erase(found);
+}
+
+void NativeTDLua::clearTimedOutExecuteExtras()
+{
+    for (const auto &entry : timed_out_execute_extras_) {
+        releaseExtra(entry.second);
+    }
+    timed_out_execute_extras_.clear();
 }
 
 bool NativeTDLua::empty() const
@@ -193,6 +235,7 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
 void NativeTDLua::close()
 {
     if (closed_) {
+        clearTimedOutExecuteExtras();
         NativeRuntime::instance().forget(client_id_);
         return;
     }
@@ -225,6 +268,7 @@ void NativeTDLua::close()
     }
     saveUpdatesBuffer();
     emptyUpdatesBuffer();
+    clearTimedOutExecuteExtras();
     NativeRuntime::instance().forget(client_id_);
 }
 

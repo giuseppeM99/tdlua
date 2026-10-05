@@ -127,6 +127,7 @@ assert(callback_called == true,
        "execute did not dispatch an unrelated callback before returning")
 assert(response_handler_count == 1,
        "execute did not dispatch the unrelated response handler exactly once")
+
 local queued_response
 for _ = 1, 20 do
     local event = client:receive(0.1)
@@ -139,6 +140,23 @@ assert_td_object(queued_response, "already dispatched response")
 assert(response_handler_count == 1,
        "receive dispatched an execute-processed response twice")
 client:off("authorizationStateWaitTdlibParameters")
+
+-- A timed-out blocking request remains observable through receive(), with its
+-- original @extra restored when the backend eventually returns the response.
+local timed_out = client:execute({
+    _ = "getAuthorizationState",
+    ["@extra"] = {token = "timed-out"}
+}, 0.0)
+assert(timed_out == nil, "zero-timeout execute unexpectedly returned a response")
+local late_response
+for _ = 1, 20 do
+    local event = client:receive(0.1)
+    if event and event["@extra"] and event["@extra"].token == "timed-out" then
+        late_response = event
+        break
+    end
+end
+assert_td_object(late_response, "late timed-out response")
 
 -- An event handler may replace or remove itself while it is running. The
 -- dispatcher must keep the callback already copied to the Lua stack valid.
@@ -242,6 +260,22 @@ local handler_error_ok = pcall(function()
 end)
 assert(not handler_error_ok, "handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
+
+-- An error in a handler for the response currently awaited by execute() must
+-- release its @extra exactly once and leave the client reusable.
+local execute_handler_error_ok = pcall(function()
+    client:on("authorizationStateWaitTdlibParameters", function()
+        error("execute handler failure")
+    end)
+    client:execute({
+        _ = "getAuthorizationState",
+        ["@extra"] = {token = "execute-handler-error"}
+    }, 1.0)
+end)
+assert(not execute_handler_error_ok, "execute handler failure was swallowed")
+client:off("authorizationStateWaitTdlibParameters")
+local recovered_response = client:execute({_ = "getAuthorizationState"}, 1.0)
+assert_td_object(recovered_response, "execute after handler failure")
 
 local await_error_thread = coroutine.create(function()
     client:await({_ = "getAuthorizationState"})

@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 using td::tl::simple::Constructor;
@@ -279,7 +283,14 @@ private:
             throw std::runtime_error("unable to write native codec output file: " + path);
         }
         output.close();
+#ifdef _WIN32
+        const BOOL replaced = MoveFileExA(
+            temporary_path.c_str(), path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (!replaced) {
+#else
         if (std::rename(temporary_path.c_str(), path.c_str()) != 0) {
+#endif
             std::remove(temporary_path.c_str());
             throw std::runtime_error("unable to replace native codec output file: " + path);
         }
