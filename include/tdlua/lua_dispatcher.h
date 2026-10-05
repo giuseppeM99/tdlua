@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
 
@@ -17,6 +18,7 @@ public:
                           int callback_index, int context_index);
     std::uint64_t await(lua_State *L, nlohmann::json &request);
     void cancel(std::uint64_t request_id);
+    std::size_t pendingCount() const;
     void on(lua_State *L, const std::string &type, int callback_index);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type) const;

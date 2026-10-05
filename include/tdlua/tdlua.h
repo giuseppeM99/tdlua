@@ -6,7 +6,7 @@
 
 #pragma once
 #include <cstdint>
-#include <queue>
+#include <deque>
 #include <map>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -34,7 +34,7 @@ private:
 
     std::int32_t client_id;
     std::uint64_t next_request_id;
-    std::queue<QueuedUpdate> updates;
+    std::deque<QueuedUpdate> updates;
     std::string dbpath;
     bool _ready;
     ClientState state;
@@ -54,6 +54,8 @@ public:
     nlohmann::json execute(const nlohmann::json &json);
 
     nlohmann::json receive(const double timeout = 10.0);
+
+    bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 
     void close();
 

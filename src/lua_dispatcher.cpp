@@ -43,6 +43,11 @@ void LuaDispatcher::cancel(std::uint64_t request_id)
     router_.cancel(request_id);
 }
 
+std::size_t LuaDispatcher::pendingCount() const
+{
+    return router_.pendingCount();
+}
+
 void LuaDispatcher::on(lua_State *L, const std::string &type, int callback_index)
 {
     if (!lua_isfunction(L, callback_index)) {

@@ -79,6 +79,11 @@ void RequestRouter::cancel(std::uint64_t request_id)
     release(pending);
 }
 
+std::size_t RequestRouter::pendingCount() const
+{
+    return pending_.size();
+}
+
 std::uint64_t RequestRouter::addPending(nlohmann::json &request,
                                         int callback_ref, int context_ref,
                                         int coroutine_ref, lua_State *coroutine)

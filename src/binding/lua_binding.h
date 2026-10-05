@@ -24,6 +24,9 @@ static int tdclient_request(lua_State *L);
 static int tdclient_await(lua_State *L);
 static int tdclient_on(lua_State *L);
 static int tdclient_off(lua_State *L);
+#ifdef TDLUA_TESTING
+static int tdclient_pending_count(lua_State *L);
+#endif
 static int tdclient_setlogpath(lua_State *L);
 static int tdclient_setlogmaxsize(lua_State *L);
 static int tdclient_setlogverbosity(lua_State *L);
@@ -46,6 +49,9 @@ static luaL_Reg mt[] = {
         {"save", tdclient_save},
         {"clearBuffer", tdclient_clear},
         {"getCall", tdclient_getcall},
+#ifdef TDLUA_TESTING
+        {"pendingCount", tdclient_pending_count},
+#endif
         {NULL, NULL}
 };
 

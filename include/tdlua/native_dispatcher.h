@@ -3,6 +3,7 @@
 #include "tdlua/lua_compat.h"
 #include "tdlua/native_runtime.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -17,6 +18,7 @@ public:
     std::uint64_t await(lua_State *L, int request_index);
     std::uint64_t raw(lua_State *L, int request_index);
     void cancel(std::uint64_t request_id);
+    std::size_t pendingCount() const;
 
     int dispatch(lua_State *L, NativeResponse &response);
     void pushResponse(lua_State *L, const NativeResponse &response, int extra_ref) const;

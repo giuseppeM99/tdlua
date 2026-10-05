@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <map>
 #include <string>
 
@@ -21,6 +22,7 @@ public:
                               int callback_index, int context_index);
     std::uint64_t addAwaiter(lua_State *L, nlohmann::json &request);
     void cancel(std::uint64_t request_id);
+    std::size_t pendingCount() const;
 
     bool dispatch(nlohmann::json &response);
     void clear();

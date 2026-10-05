@@ -210,6 +210,11 @@ static int tdclient_execute(lua_State *L)
         td->send(j);
         const auto started = std::chrono::steady_clock::now();
         while (!td->closed()) {
+            TDLua::QueuedUpdate queued_response(j, true);
+            if (td->takeQueuedResponse(nonce, queued_response)) {
+                lua_pushjson(L, queued_response.value);
+                return 1;
+            }
             const std::chrono::duration<double> elapsed =
                 std::chrono::steady_clock::now() - started;
             const double remaining = timeout - elapsed.count();
@@ -461,6 +466,20 @@ static int tdclient_isclosed(lua_State *L)
 {
     return tdlua_binding::is_closed(L, getTD(L), json_operations);
 }
+
+#ifdef TDLUA_TESTING
+static int tdclient_pending_count(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        TDLua *td = getTD(L);
+        if (!td) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        lua_pushinteger(L, static_cast<lua_Integer>(td->dispatcher().pendingCount()));
+        return 1;
+    });
+}
+#endif
 
 static int tdclient_getcall(lua_State *L)
 {

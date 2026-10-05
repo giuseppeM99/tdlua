@@ -532,6 +532,20 @@ static int tdclient_isclosed(lua_State *L)
     return tdlua_binding::is_closed(L, getTD(L), native_operations);
 }
 
+#ifdef TDLUA_TESTING
+static int tdclient_pending_count(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        NativeTDLua *td = getTD(L);
+        if (!td) {
+            throw std::runtime_error("invalid tdlua client");
+        }
+        lua_pushinteger(L, static_cast<lua_Integer>(td->dispatcher().pendingCount()));
+        return 1;
+    });
+}
+#endif
+
 static int tdclient_getcall(lua_State *L)
 {
     (void)L;

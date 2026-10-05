@@ -12,6 +12,7 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <utility>
 #include <td/telegram/td_json_client.h>
 
 namespace {
@@ -135,7 +136,7 @@ TDLua::~TDLua()
 TDLua::QueuedUpdate TDLua::pop()
 {
     QueuedUpdate res = updates.front();
-    updates.pop();
+    updates.pop_front();
     return res;
 }
 
@@ -163,6 +164,32 @@ nlohmann::json TDLua::execute(const nlohmann::json &json)
 nlohmann::json TDLua::receive(const double timeout)
 {
     return JsonRuntime::instance().receive(client_id, timeout);
+}
+
+bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
+                               QueuedUpdate &response)
+{
+    for (std::deque<QueuedUpdate>::iterator it = updates.begin();
+         it != updates.end(); ++it) {
+        if (!it->dispatched || !it->value.is_object()) {
+            continue;
+        }
+        const nlohmann::json::const_iterator extra = it->value.find("@extra");
+        if (extra == it->value.end() ||
+            (!extra->is_number_unsigned() && !extra->is_number_integer())) {
+            continue;
+        }
+        if (extra->is_number_integer() && extra->get<std::int64_t>() < 0) {
+            continue;
+        }
+        if (extra->get<std::uint64_t>() != request_id) {
+            continue;
+        }
+        response = std::move(*it);
+        updates.erase(it);
+        return true;
+    }
+    return false;
 }
 
 void TDLua::close()
@@ -212,7 +239,7 @@ LuaDispatcher &TDLua::dispatcher()
 
 void TDLua::push(const nlohmann::json &update, const bool dispatched)
 {
-    updates.push(QueuedUpdate(update, dispatched));
+    updates.push_back(QueuedUpdate(update, dispatched));
 }
 
 bool TDLua::empty() const
@@ -254,7 +281,7 @@ void TDLua::loadUpdatesBuffer()
             nlohmann::json j = nlohmann::json::parse(buf);
             if (j.is_array() && !j.empty()) {
                 for (auto &elem : j) {
-                    updates.push(QueuedUpdate(elem, false));
+                    updates.push_back(QueuedUpdate(elem, false));
                 }
             }
         } catch (nlohmann::json::parse_error &e){
@@ -271,7 +298,7 @@ void TDLua::loadUpdatesBuffer()
 void TDLua::emptyUpdatesBuffer()
 {
     while (!updates.empty()) {
-        updates.pop();
+        updates.pop_front();
     }
 }
 

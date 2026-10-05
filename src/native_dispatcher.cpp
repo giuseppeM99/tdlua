@@ -95,6 +95,11 @@ void NativeDispatcher::cancel(std::uint64_t request_id)
     release(pending);
 }
 
+std::size_t NativeDispatcher::pendingCount() const
+{
+    return pending_.size();
+}
+
 std::uint64_t NativeDispatcher::await(lua_State *L, int request_index)
 {
     const int is_main = lua_pushthread(L);

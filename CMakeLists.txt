@@ -322,6 +322,7 @@ install(FILES
 
 if(TDLUA_BUILD_TESTS)
     enable_testing()
+    target_compile_definitions(tdlua PRIVATE TDLUA_TESTING)
     add_executable(tdlua_codec_test
         "tests/codec_test.cpp"
         "src/luajson.cpp"
@@ -333,6 +334,19 @@ if(TDLUA_BUILD_TESTS)
     target_link_libraries(tdlua_codec_test PRIVATE ${LUA_LIBRARIES})
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
+
+    if(_tdlua_backend STREQUAL "native")
+        add_executable(tdlua_native_codec_test
+            "tests/native_codec_test.cpp"
+        )
+        target_include_directories(tdlua_native_codec_test PRIVATE
+            ${LUA_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(tdlua_native_codec_test PRIVATE ${LUA_LIBRARIES})
+        target_compile_features(tdlua_native_codec_test PRIVATE cxx_std_23)
+        add_test(NAME tdlua_native_codec COMMAND tdlua_native_codec_test)
+    endif()
 
     add_executable(tdlua_model_benchmark "tests/model_benchmark.cpp")
     target_include_directories(tdlua_model_benchmark PRIVATE
