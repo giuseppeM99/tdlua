@@ -18,10 +18,6 @@ set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)
-set(_tdlua_backend_was_requested FALSE)
-if(DEFINED TDLUA_BACKEND)
-  set(_tdlua_backend_was_requested TRUE)
-endif()
 set(TDLUA_BACKEND "json" CACHE STRING
     "TDLua backend to build (json or native)")
 set_property(CACHE TDLUA_BACKEND PROPERTY STRINGS json native)
@@ -36,13 +32,14 @@ option(TDLUA_TD_STATIC "Legacy alias for TDLUA_JSON_STATIC" OFF)
 if(TDLUA_NATIVE_BACKEND)
   message(DEPRECATION
           "TDLUA_NATIVE_BACKEND is deprecated; use -DTDLUA_BACKEND=native")
-endif()
-if(_tdlua_backend_was_requested)
-  set(_tdlua_backend "${TDLUA_BACKEND}")
-elseif(TDLUA_NATIVE_BACKEND)
+  if(DEFINED TDLUA_BACKEND AND NOT TDLUA_BACKEND STREQUAL "native")
+    message(WARNING
+            "TDLUA_NATIVE_BACKEND=ON overrides TDLUA_BACKEND=${TDLUA_BACKEND}; "
+            "use TDLUA_BACKEND=native explicitly")
+  endif()
   set(_tdlua_backend "native")
 else()
-  set(_tdlua_backend "json")
+  set(_tdlua_backend "${TDLUA_BACKEND}")
 endif()
 if(_tdlua_backend STREQUAL "native")
   set(_tdlua_native_backend ON)
@@ -346,6 +343,18 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_native_codec_test PRIVATE ${LUA_LIBRARIES})
         target_compile_features(tdlua_native_codec_test PRIVATE cxx_std_23)
         add_test(NAME tdlua_native_codec COMMAND tdlua_native_codec_test)
+
+        add_executable(tdlua_native_schema_test
+            "tests/native_schema_test.cpp"
+        )
+        target_link_libraries(tdlua_native_schema_test PRIVATE tdtl)
+        target_compile_features(tdlua_native_schema_test PRIVATE cxx_std_23)
+        add_dependencies(tdlua_native_schema_test tdlua_native_generated)
+        add_test(NAME tdlua_native_schema
+            COMMAND tdlua_native_schema_test
+                    "${TDLUA_TD_API_TLO}"
+                    "${TDLUA_NATIVE_GENERATED_DIR}"
+                    "${TDLUA_NATIVE_SHARD_COUNT}")
     endif()
 
     add_executable(tdlua_model_benchmark "tests/model_benchmark.cpp")

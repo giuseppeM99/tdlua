@@ -182,10 +182,8 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
         loadUpdatesBuffer();
     } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosed::ID) {
-        if (!closing_) {
-            saveUpdatesBuffer();
-            emptyUpdatesBuffer();
-        }
+        saveUpdatesBuffer();
+        emptyUpdatesBuffer();
         ready_ = false;
         closed_ = true;
         closing_ = false;

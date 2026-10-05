@@ -212,6 +212,7 @@ static int tdclient_execute(lua_State *L)
         while (!td->closed()) {
             TDLua::QueuedUpdate queued_response(j, true);
             if (td->takeQueuedResponse(nonce, queued_response)) {
+                queued_response.value["@extra"] = extra;
                 lua_pushjson(L, queued_response.value);
                 return 1;
             }

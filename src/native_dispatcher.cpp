@@ -55,21 +55,27 @@ std::uint64_t NativeDispatcher::addPending(lua_State *L, int request_index,
     pending.coroutine_ref = coroutine_ref;
     pending.coroutine = coroutine;
 
-    if (callback_index != 0) {
-        if (!lua_isfunction(L, callback_index)) {
-            throw std::runtime_error("tdlua: request callback must be a function");
+    try {
+        if (callback_index != 0) {
+            if (!lua_isfunction(L, callback_index)) {
+                throw std::runtime_error("tdlua: request callback must be a function");
+            }
+            lua_pushvalue(L, callback_index);
+            pending.callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         }
-        lua_pushvalue(L, callback_index);
-        pending.callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
-    if (context_index != 0) {
-        lua_pushvalue(L, context_index);
-        pending.context_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
+        if (context_index != 0) {
+            lua_pushvalue(L, context_index);
+            pending.context_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
 
-    const std::uint64_t id = nextRequestId();
-    pending_[id] = pending;
-    return id;
+        const std::uint64_t id = nextRequestId();
+        pending_[id] = pending;
+        return id;
+    } catch (...) {
+        releaseExtra(pending.extra_ref);
+        release(pending);
+        throw;
+    }
 }
 
 std::uint64_t NativeDispatcher::request(lua_State *L, int request_index,
@@ -92,6 +98,7 @@ void NativeDispatcher::cancel(std::uint64_t request_id)
     }
     PendingRequest pending = found->second;
     pending_.erase(found);
+    releaseExtra(pending.extra_ref);
     release(pending);
 }
 
@@ -171,6 +178,15 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
         }
     }
 
+    const auto release_dispatch_extra = [&]() {
+        if (extra_ref != LUA_NOREF && extra_ref != LUA_REFNIL) {
+            if (extra_ref == response.extra_ref) {
+                response.extra_ref = LUA_NOREF;
+            }
+            releaseExtra(extra_ref);
+        }
+    };
+
     if (has_pending && pending.callback_ref != LUA_NOREF) {
         lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
         pushResponse(owner_, response, extra_ref);
@@ -184,9 +200,7 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
             const std::string message = luaError(owner_);
             lua_pop(owner_, 1);
             release(pending);
-            if (extra_ref != LUA_NOREF) {
-                luaL_unref(owner_, LUA_REGISTRYINDEX, extra_ref);
-            }
+            release_dispatch_extra();
             throw std::runtime_error("tdlua request callback failed: " + message);
         }
     } else if (has_pending && pending.coroutine_ref != LUA_NOREF) {
@@ -195,9 +209,7 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
         if (status != LUA_OK && status != LUA_YIELD) {
             const std::string message = luaError(pending.coroutine);
             release(pending);
-            if (extra_ref != LUA_NOREF) {
-                luaL_unref(owner_, LUA_REGISTRYINDEX, extra_ref);
-            }
+            release_dispatch_extra();
             throw std::runtime_error("tdlua await failed: " + message);
         }
     }
@@ -205,8 +217,16 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
     if (has_pending) {
         release(pending);
     }
-    dispatchHandlers(L, response,
-                     extra_ref == LUA_NOREF ? response.extra_ref : extra_ref);
+    try {
+        dispatchHandlers(L, response,
+                         extra_ref == LUA_NOREF ? response.extra_ref : extra_ref);
+    } catch (...) {
+        if (extra_ref == LUA_NOREF) {
+            extra_ref = response.extra_ref;
+        }
+        release_dispatch_extra();
+        throw;
+    }
     return extra_ref;
 }
 

@@ -2,6 +2,7 @@
 #include "td/tl/tl_simple.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -265,13 +266,22 @@ private:
             }
         }
 
-        std::ofstream output(path.c_str(), std::ios::binary | std::ios::trunc);
+        const std::string temporary_path = path + ".tmp";
+        std::ofstream output(temporary_path.c_str(),
+                             std::ios::binary | std::ios::trunc);
         if (!output) {
             throw std::runtime_error("unable to open native codec output file: " + path);
         }
         output << contents;
         if (!output) {
+            output.close();
+            std::remove(temporary_path.c_str());
             throw std::runtime_error("unable to write native codec output file: " + path);
+        }
+        output.close();
+        if (std::rename(temporary_path.c_str(), path.c_str()) != 0) {
+            std::remove(temporary_path.c_str());
+            throw std::runtime_error("unable to replace native codec output file: " + path);
         }
     }
 

@@ -298,7 +298,8 @@ jobs:
 
       - name: Build and test native backend
         run: |
-          cmake --build build --target tdlua tdlua_codec_test tdlua_native_codec_test
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
   native-sanitizers:
@@ -354,7 +355,8 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1
         run: |
-          cmake --build build --target tdlua tdlua_codec_test tdlua_native_codec_test
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
   luajit:

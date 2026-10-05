@@ -115,8 +115,13 @@ client:request({_ = "getAuthorizationState", ["@extra"] = "async-extra"}, functi
     assert_td_object(result, "request callback")
     nested_response = client:execute({_ = "getAuthorizationState"}, 1.0)
 end)
-local blocking_response = client:execute({_ = "getAuthorizationState"}, 1.0)
+local blocking_response = client:execute({
+    _ = "getAuthorizationState",
+    ["@extra"] = {token = "outer"}
+}, 1.0)
 assert_td_object(blocking_response, "blocking execute")
+assert(blocking_response["@extra"].token == "outer",
+       "nested execute did not restore the outer @extra")
 assert_td_object(nested_response, "nested execute from callback")
 assert(callback_called == true,
        "execute did not dispatch an unrelated callback before returning")
