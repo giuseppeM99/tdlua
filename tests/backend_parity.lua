@@ -52,6 +52,22 @@ assert(execute_extra_response["@extra"].origin == "execute")
 local helper_response = client:getAuthorizationState()
 assert_td_object(helper_response, "legacy helper")
 
+-- Both backends must recursively accept nested TDLib objects. The request
+-- returns an error before authorization, which is sufficient to exercise the
+-- full Lua -> TDLib codec path.
+local nested_response
+client:getChats({
+    chat_list = {_ = "chatListMain"},
+    limit = 1
+}, function(result)
+    nested_response = result
+end)
+for _ = 1, 20 do
+    client:poll(0.1)
+    if nested_response then break end
+end
+assert_td_object(nested_response, "nested helper")
+
 -- send()/receive() must preserve the public @extra value and dispatch the
 -- response through both the raw receive path and the registered handler.
 local response_handler_called = false

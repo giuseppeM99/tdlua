@@ -4,10 +4,10 @@
 #include <string>
 #include <vector>
 
-#include "lua_compat.h"
+#include "tdlua/lua_compat.h"
 
-#include "json.hpp"
-#include "request_router.h"
+#include <nlohmann/json.hpp>
+#include "tdlua/request_router.h"
 
 class LuaDispatcher {
 public:

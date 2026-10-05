@@ -4,7 +4,7 @@
  * This file is under GPLv3 license see LICENCE
  */
 
-#include "tdlua.h"
+#include "tdlua/tdlua.h"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -200,35 +200,6 @@ bool TDLua::empty() const
     return updates.empty();
 }
 
-#ifdef TDLUA_CALLS
-void TDLua::setCall(const int32_t id, const Call* call)
-{
-    calls[id] = (Call*) call;
-}
-
-void TDLua::delCall(const int32_t id)
-{
-    calls.erase(id);
-}
-
-Call* TDLua::getCall(const int32_t id) const
-{
-    return calls.at(id);
-}
-
-void TDLua::deinitAllCalls()
-{
-    for (auto call : calls)
-    {
-        call.second->closeCall();
-    }
-}
-
-uint64_t TDLua::runningCalls()
-{
-    return calls.size();
-}
-#endif
 
 void TDLua::saveUpdatesBuffer()
 {

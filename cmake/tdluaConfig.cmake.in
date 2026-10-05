@@ -6,4 +6,9 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../Td/TdConfig.cmake")
     set(Td_DIR "${CMAKE_CURRENT_LIST_DIR}/../Td")
 endif()
 find_dependency(Td CONFIG REQUIRED)
+
+set(TDLUA_BACKEND "@TDLUA_BACKEND@")
+set(TDLUA_TDLIB_VERSION "@TDLUA_TDLIB_VERSION@")
+set(TDLUA_JSON_STATIC "@TDLUA_JSON_STATIC@")
+
 include("${CMAKE_CURRENT_LIST_DIR}/TDLuaTargets.cmake")

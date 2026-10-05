@@ -1,23 +1,10 @@
-#include "native_dispatcher.h"
+#include "tdlua/native_dispatcher.h"
 
-#include "native_codec_runtime.h"
+#include "tdlua/native_codec_runtime.h"
 
 #include <sstream>
 
 namespace {
-
-int resume(lua_State *coroutine, lua_State *from, int arguments, int *results)
-{
-#if LUA_VERSION_NUM >= 504
-    return lua_resume(coroutine, from, arguments, results);
-#elif LUA_VERSION_NUM >= 502
-    (void)results;
-    return lua_resume(coroutine, from, arguments);
-#else
-    (void)results;
-    return lua_resume(coroutine, from, arguments);
-#endif
-}
 
 std::string luaError(lua_State *L)
 {
@@ -199,8 +186,7 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
         }
     } else if (has_pending && pending.coroutine_ref != LUA_NOREF) {
         pushResponse(pending.coroutine, response, extra_ref);
-        int results = 0;
-        const int status = resume(pending.coroutine, owner_, 1, &results);
+        const int status = tdlua_lua_resume(pending.coroutine, owner_, 1);
         if (status != LUA_OK && status != LUA_YIELD) {
             const std::string message = luaError(pending.coroutine);
             release(pending);

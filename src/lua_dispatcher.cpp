@@ -1,6 +1,6 @@
-#include "lua_dispatcher.h"
+#include "tdlua/lua_dispatcher.h"
 
-#include "luajson.h"
+#include "tdlua/luajson.h"
 
 namespace {
 

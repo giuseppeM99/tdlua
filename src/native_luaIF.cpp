@@ -1,9 +1,9 @@
-#include "luaIF.h"
+#include "tdlua/luaIF.h"
 
-#include "luajson.h"
-#include "native_codec.h"
-#include "native_codec_runtime.h"
-#include "native_tdlua.h"
+#include "tdlua/luajson.h"
+#include "tdlua/native_codec.h"
+#include "tdlua/native_codec_runtime.h"
+#include "tdlua/native_tdlua.h"
 
 #include <td/telegram/Log.h>
 
@@ -555,7 +555,7 @@ static int tdclient_isclosed(lua_State *L)
 static int tdclient_getcall(lua_State *L)
 {
     (void)L;
-    return luaL_error(L, "TDLUA was not compiled with libtgvoip");
+    return luaL_error(L, "TDLua VoIP support has been removed");
 }
 
 static void tdclient_fatalerrorcb(const char *error)

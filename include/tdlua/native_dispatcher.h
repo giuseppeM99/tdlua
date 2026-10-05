@@ -1,7 +1,7 @@
 #pragma once
 
-#include "lua_compat.h"
-#include "native_runtime.h"
+#include "tdlua/lua_compat.h"
+#include "tdlua/native_runtime.h"
 
 #include <cstdint>
 #include <map>

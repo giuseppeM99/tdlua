@@ -4,9 +4,9 @@
  * This file is under GPLv3 license see LICENCE
  */
 
-#include "luaIF.h"
-#include "tdlua.h"
-#include "luajson.h"
+#include "tdlua/luaIF.h"
+#include "tdlua/tdlua.h"
+#include "tdlua/luajson.h"
 #include <td/telegram/td_log.h>
 #include <chrono>
 #include <exception>
@@ -105,25 +105,6 @@ static int tdclient_receive(lua_State *L)
         td->checkAuthState(result);
         td->dispatcher().dispatch(result);
         lua_pushjson(L, result);
-        #ifdef TDLUA_CALLS
-        if (result["@type"] == "updateCall") {
-            std::string callState = result["call"]["state"]["@type"];
-            if (callState == "callStateReady") {
-                lua_getfield(L, -1, "call");
-                Call* call = Call::NewLua(L, result["call"], td);
-                lua_remove(L, -2);
-                td->setCall(result["call"]["id"], call);
-                lua_setfield(L, -2, "call");
-            } else if (callState == "callStateDiscarded") {
-                std::string reason = result["call"]["state"]["reason"]["@type"];
-                if (reason == "callDiscardReasonHungUp" || reason == "callDiscardReasonDisconnected") {
-                    Call* call = td->getCall(result["call"]["id"]);
-                    delete call;
-                    td->delCall(result["call"]["id"]);
-                }
-            }
-        }
-        #endif
     }
     return 1;
 }
@@ -525,12 +506,6 @@ static int tdclient_unload(lua_State *L)
     if (!td) {
         return 0;
     }
-    #ifdef TDLUA_CALLS
-    td->deinitAllCalls();
-    while (td->runningCalls()) {
-        tdclient_receive(L);
-    }
-    #endif
     td->close();
     delete td;
     return 0;
@@ -559,23 +534,7 @@ static int tdclient_isclosed(lua_State *L)
 
 static int tdclient_getcall(lua_State *L)
 {
-    #ifdef TDLUA_CALLS
-    TDLua *td = getTD(L);
-    if (my_lua_isinteger(L, 2)) {
-        int32_t callID = lua_tointeger(L, 2);
-        Call* call = td->getCall(callID);
-        if (call) {
-            json j = call->getTDCall();
-            lua_pushjson(L, j);
-            *((Call**) lua_newuserdata(L, sizeof(void**))) = call;
-            Call::setMeta(L);
-            return 1;
-        }
-    }
-    return 0;
-    #else
-    return luaL_error(L, "TDLUA was not compiled with libtgvoip");
-    #endif
+    return luaL_error(L, "TDLua VoIP support has been removed");
 }
 
 static void tdclient_fatalerrorcb(const char *error)

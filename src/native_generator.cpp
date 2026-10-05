@@ -1,9 +1,11 @@
 #include "td/tl/tl_generate.h"
 #include "td/tl/tl_simple.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -33,17 +35,20 @@ public:
         }
     }
 
-    void write(const std::string &header_path, const std::string &source_path)
+    void write(const std::string &header_path, const std::string &source_directory,
+               std::size_t shard_count)
     {
         std::ofstream header(header_path.c_str());
-        std::ofstream source(source_path.c_str());
-        if (!header || !source) {
+        if (!header) {
             throw std::runtime_error("unable to open native codec output files");
         }
 
         collect_vectors();
         write_header(header);
+
+        std::ostringstream source;
         write_source(source);
+        write_shards(source.str(), source_directory, shard_count);
     }
 
 private:
@@ -147,7 +152,110 @@ private:
         }
     }
 
-    void write_header(std::ofstream &out) const
+    static bool is_definition_start(const std::string &line)
+    {
+        const std::size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) {
+            return false;
+        }
+        std::string candidate = line.substr(first);
+        if (candidate.compare(0, 7, "static ") == 0) {
+            candidate.erase(0, 7);
+        }
+        const bool result = candidate.compare(0, 4, "td::") == 0 ||
+               candidate.compare(0, 5, "std::") == 0 ||
+               candidate.compare(0, 5, "void ") == 0;
+        return result;
+    }
+
+    static std::vector<std::string> split_definitions(const std::string &source,
+                                                       std::string &preamble)
+    {
+        std::vector<std::string> definitions;
+        std::size_t line_start = 0;
+        std::size_t gap_start = 0;
+
+        while (line_start < source.size()) {
+            const std::size_t line_end = source.find('\n', line_start);
+            const std::size_t end = line_end == std::string::npos ? source.size() : line_end + 1;
+            const std::string line = source.substr(line_start, end - line_start);
+            if (is_definition_start(line) && line.find('{') != std::string::npos) {
+                preamble += source.substr(gap_start, line_start - gap_start);
+                std::size_t brace = source.find('{', line_start);
+                int depth = 0;
+                bool in_string = false;
+                char quote = '\0';
+                for (std::size_t i = brace; i < source.size(); ++i) {
+                    const char character = source[i];
+                    if (in_string) {
+                        if (character == '\\') {
+                            ++i;
+                        } else if (character == quote) {
+                            in_string = false;
+                        }
+                        continue;
+                    }
+                    if (character == '\"' || character == '\'') {
+                        in_string = true;
+                        quote = character;
+                    } else if (character == '{') {
+                        ++depth;
+                    } else if (character == '}' && --depth == 0) {
+                        const std::size_t definition_end =
+                            source.find('\n', i) == std::string::npos ? source.size()
+                                                                       : source.find('\n', i) + 1;
+                        definitions.push_back(source.substr(line_start, definition_end - line_start));
+                        gap_start = definition_end;
+                        line_start = definition_end;
+                        break;
+                    }
+                }
+                continue;
+            }
+            line_start = end;
+        }
+        preamble += source.substr(gap_start);
+        const std::string namespace_end = "\n}  // namespace tdlua_native\n";
+        const std::size_t namespace_position = preamble.rfind(namespace_end);
+        if (namespace_position != std::string::npos) {
+            preamble.erase(namespace_position);
+        }
+        if (definitions.empty()) {
+            throw std::runtime_error("native generator emitted no codec definitions");
+        }
+        return definitions;
+    }
+
+    void write_shards(const std::string &source, const std::string &directory,
+                      std::size_t shard_count) const
+    {
+        if (shard_count == 0) {
+            throw std::runtime_error("native codec shard count must be positive");
+        }
+        std::string preamble;
+        std::vector<std::string> definitions = split_definitions(source, preamble);
+        std::vector<std::vector<std::string>> shards(shard_count);
+        std::vector<std::size_t> sizes(shard_count, 0);
+        for (const std::string &definition : definitions) {
+            const auto target = std::min_element(sizes.begin(), sizes.end()) - sizes.begin();
+            shards[target].push_back(definition);
+            sizes[target] += definition.size();
+        }
+
+        for (std::size_t shard = 0; shard < shard_count; ++shard) {
+            std::ofstream output((directory + "/native_codec_" + std::to_string(shard) + ".cpp").c_str());
+            if (!output) {
+                throw std::runtime_error("unable to open native codec shard output");
+            }
+            output << preamble;
+            for (const std::string &definition : shards[shard]) {
+                output << definition << '\n';
+            }
+            output << "}  // namespace tdlua_native\n";
+        }
+    }
+
+    void write_header(std::ostream &out) const
     {
         out << "#pragma once\n\n"
             << "#include <td/telegram/td_api.h>\n\n"
@@ -162,10 +270,10 @@ private:
             << "}  // namespace tdlua_native\n";
     }
 
-    void write_source(std::ofstream &out)
+    void write_source(std::ostream &out)
     {
-        out << "#include \"native_codec.h\"\n"
-            << "#include \"native_codec_runtime.h\"\n\n"
+        out << "#include \"tdlua/native_codec.h\"\n"
+            << "#include \"tdlua/native_codec_runtime.h\"\n\n"
             << "#include <td/telegram/td_api.hpp>\n\n"
             << "#include <cstdint>\n"
             << "#include <string>\n"
@@ -189,21 +297,23 @@ private:
         out << "\n}  // namespace tdlua_native\n";
     }
 
-    void write_forward_declarations(std::ofstream &out) const
+    void write_forward_declarations(std::ostream &out) const
     {
         for (const CustomType *type : custom_types_) {
-            out << "static td::td_api::object_ptr<td::td_api::" << native_type_name(type)
+            out << "td::td_api::object_ptr<td::td_api::" << native_type_name(type)
                 << "> read_" << type_name(type)
                 << "(lua_State *L, int index, const std::string &path);\n";
         }
         for (const Function *function : schema_.functions) {
-            out << "static td::td_api::object_ptr<td::td_api::" << function_name(function)
+            out << "td::td_api::object_ptr<td::td_api::" << function_name(function)
                 << "> read_" << function_name(function)
                 << "(lua_State *L, int index, const std::string &path);\n";
         }
+        out << "td::td_api::object_ptr<td::td_api::Function> read_function("
+            << "lua_State *L, int index, const std::string &path);\n";
         for (const CustomType *type : custom_types_) {
             for (const Constructor *constructor : type->constructors) {
-                out << "static td::td_api::object_ptr<td::td_api::" << constructor_name(constructor)
+                out << "td::td_api::object_ptr<td::td_api::" << constructor_name(constructor)
                     << "> read_" << constructor_name(constructor)
                     << "(lua_State *L, int index, const std::string &path);\n";
             }
@@ -211,26 +321,26 @@ private:
         out << "\n";
     }
 
-    void write_vector_declarations(std::ofstream &out) const
+    void write_vector_declarations(std::ostream &out) const
     {
         for (const Type *type : vectors_) {
-            out << "static " << cpp_type(type) << " " << vector_names_.find(vector_token(type))->second
+            out << cpp_type(type) << " " << vector_names_.find(vector_token(type))->second
                 << "(lua_State *L, int index, const std::string &path);\n";
         }
         out << "\n";
     }
 
-    void write_push_forward_declarations(std::ofstream &out) const
+    void write_push_forward_declarations(std::ostream &out) const
     {
         for (const Type *type : vectors_) {
-            out << "static void push_" << vector_token(type) << "(lua_State *L, const "
+            out << "void push_" << vector_token(type) << "(lua_State *L, const "
                 << cpp_type(type) << " &value);\n";
         }
         for (const CustomType *type : custom_types_) {
-            out << "static void push_" << type_name(type) << "(lua_State *L, const td::td_api::"
+            out << "void push_" << type_name(type) << "(lua_State *L, const td::td_api::"
                 << native_type_name(type) << " &value);\n";
             for (const Constructor *constructor : type->constructors) {
-                out << "static void push_" << constructor_name(constructor)
+                out << "void push_" << constructor_name(constructor)
                     << "(lua_State *L, const td::td_api::" << constructor_name(constructor)
                     << " &value);\n";
             }
@@ -286,12 +396,12 @@ private:
         throw std::runtime_error("internal error: unknown push type");
     }
 
-    void write_constructor_readers(std::ofstream &out) const
+    void write_constructor_readers(std::ostream &out) const
     {
         for (const CustomType *type : custom_types_) {
             for (const Constructor *constructor : type->constructors) {
                 const std::string ctor = constructor_name(constructor);
-                out << "static td::td_api::object_ptr<td::td_api::" << ctor << "> read_" << ctor
+                out << "td::td_api::object_ptr<td::td_api::" << ctor << "> read_" << ctor
                     << "(lua_State *L, int index, const std::string &path) {\n"
                     << "    tdlua_native::require_table(L, index, path);\n"
                     << "    auto result = td::td_api::make_object<td::td_api::" << ctor << ">();\n";
@@ -310,10 +420,10 @@ private:
         }
     }
 
-    void write_custom_readers(std::ofstream &out) const
+    void write_custom_readers(std::ostream &out) const
     {
         for (const CustomType *type : custom_types_) {
-            out << "static td::td_api::object_ptr<td::td_api::" << native_type_name(type)
+            out << "td::td_api::object_ptr<td::td_api::" << native_type_name(type)
                 << "> read_" << type_name(type)
                 << "(lua_State *L, int index, const std::string &path) {\n"
                 << "    if (lua_isnil(L, index)) {\n"
@@ -331,11 +441,11 @@ private:
         }
     }
 
-    void write_function_readers(std::ofstream &out) const
+    void write_function_readers(std::ostream &out) const
     {
         for (const Function *function : schema_.functions) {
             const std::string name = function_name(function);
-            out << "static td::td_api::object_ptr<td::td_api::" << name << "> read_" << name
+            out << "td::td_api::object_ptr<td::td_api::" << name << "> read_" << name
                 << "(lua_State *L, int index, const std::string &path) {\n"
                 << "    tdlua_native::require_table(L, index, path);\n"
                 << "    auto result = td::td_api::make_object<td::td_api::" << name << ">();\n";
@@ -353,9 +463,9 @@ private:
         }
     }
 
-    void write_function_reader(std::ofstream &out) const
+    void write_function_reader(std::ostream &out) const
     {
-        out << "static td::td_api::object_ptr<td::td_api::Function> read_function("
+        out << "td::td_api::object_ptr<td::td_api::Function> read_function("
             << "lua_State *L, int index, const std::string &path) {\n"
             << "    const std::string type = tdlua_native::type_name(L, index, path);\n";
         for (const Function *function : schema_.functions) {
@@ -367,7 +477,7 @@ private:
         out << "    throw tdlua_native::CodecError(\"tdlua: unknown function '\" + type + \"' at \" + path);\n}\n\n";
     }
 
-    void write_vector_definitions(std::ofstream &out) const
+    void write_vector_definitions(std::ostream &out) const
     {
         for (const Type *type : vectors_) {
             out << cpp_type(type) << " " << vector_names_.find(vector_token(type))->second
@@ -385,12 +495,12 @@ private:
         }
     }
 
-    void write_constructor_pushers(std::ofstream &out) const
+    void write_constructor_pushers(std::ostream &out) const
     {
         for (const CustomType *type : custom_types_) {
             for (const Constructor *constructor : type->constructors) {
                 const std::string ctor = constructor_name(constructor);
-                out << "static void push_" << ctor << "(lua_State *L, const td::td_api::" << ctor
+                out << "void push_" << ctor << "(lua_State *L, const td::td_api::" << ctor
                     << " &value) {\n"
                     << "    lua_newtable(L);\n"
                     << "    tdlua_native::push_type(L, \"" << constructor->name << "\");\n";
@@ -413,10 +523,10 @@ private:
         }
     }
 
-    void write_vector_pushers(std::ofstream &out) const
+    void write_vector_pushers(std::ostream &out) const
     {
         for (const Type *type : vectors_) {
-            out << "static void push_" << vector_token(type) << "(lua_State *L, const "
+            out << "void push_" << vector_token(type) << "(lua_State *L, const "
                 << cpp_type(type) << " &value) {\n"
                 << "    lua_newtable(L);\n"
                 << "    for (std::size_t i = 0; i < value.size(); ++i) {\n"
@@ -436,10 +546,10 @@ private:
         }
     }
 
-    void write_custom_pushers(std::ofstream &out) const
+    void write_custom_pushers(std::ostream &out) const
     {
         for (const CustomType *type : custom_types_) {
-            out << "static void push_" << type_name(type) << "(lua_State *L, const td::td_api::"
+            out << "void push_" << type_name(type) << "(lua_State *L, const td::td_api::"
                 << native_type_name(type) << " &value) {\n";
             if (type->constructors.size() == 1) {
                 const std::string ctor = constructor_name(type->constructors.front());
@@ -461,7 +571,7 @@ private:
         }
     }
 
-    void write_object_pusher(std::ofstream &out) const
+    void write_object_pusher(std::ostream &out) const
     {
         out << "void push_object(lua_State *L, const td::td_api::Object &value) {\n"
             << "    switch (value.get_id()) {\n";
@@ -479,7 +589,7 @@ private:
             << "    }\n}\n\n";
     }
 
-    void write_public_functions(std::ofstream &out) const
+    void write_public_functions(std::ostream &out) const
     {
         out << "td::td_api::object_ptr<td::td_api::Function> from_lua("
             << "lua_State *L, int index, const std::string &path) {\n"
@@ -504,15 +614,15 @@ private:
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        std::cerr << "usage: native_generator <td_api.tlo> <header> <source>\n";
+    if (argc != 5) {
+        std::cerr << "usage: native_generator <td_api.tlo> <header> <shard-directory> <shard-count>\n";
         return 2;
     }
     try {
         const auto config = td::tl::read_tl_config_from_file(argv[1]);
         const td::tl::simple::Schema schema(config);
         Generator generator(schema);
-        generator.write(argv[2], argv[3]);
+        generator.write(argv[2], argv[3], static_cast<std::size_t>(std::stoul(argv[4])));
     } catch (const std::exception &error) {
         std::cerr << "native_generator: " << error.what() << "\n";
         return 1;

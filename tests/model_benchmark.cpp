@@ -1,4 +1,4 @@
-#include "lua_compat.h"
+#include "tdlua/lua_compat.h"
 
 #include <chrono>
 #include <cstdio>

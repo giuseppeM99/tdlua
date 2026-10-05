@@ -1,10 +1,24 @@
 #pragma once
 
-#include "compat-5.3.h"
+#include <compat-5.3/compat-5.3.h>
 
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
+
+/* Resume on the calling thread. Return the Lua status and leave yielded
+ * values, return values, or the error on the coroutine's stack. */
+inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments)
+{
+#if LUA_VERSION_NUM >= 504
+    int results = 0;
+    return lua_resume(coroutine, from, arguments, &results);
+#else
+    // compat-5.3 adapts the three-argument call for Lua 5.1 and LuaJIT.
+    return lua_resume(coroutine, from, arguments);
+#endif
+}
 
 /* Lua 5.3 introduced a distinct integer value type.  Lua 5.1, Lua 5.2 and
  * LuaJIT expose lua_Integer in the C API, but their regular numeric values do
@@ -87,5 +101,21 @@ inline bool tdlua_can_push_integer(std::int64_t value)
 #else
     const lua_Number number = static_cast<lua_Number>(value);
     return static_cast<long double>(number) == static_cast<long double>(value);
+#endif
+}
+
+/* Push exactly one value. Use a Lua integer where available, an exact number
+ * on older Lua versions, or a decimal string rather than rounding an int64. */
+inline void tdlua_lua_push_integer(lua_State *L, std::int64_t value)
+{
+    if (!tdlua_can_push_integer(value)) {
+        const std::string text = std::to_string(value);
+        lua_pushlstring(L, text.c_str(), text.size());
+        return;
+    }
+#if LUA_VERSION_NUM >= 503
+    lua_pushinteger(L, static_cast<lua_Integer>(value));
+#else
+    lua_pushnumber(L, static_cast<lua_Number>(value));
 #endif
 }

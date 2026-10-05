@@ -9,12 +9,9 @@
 #include <queue>
 #include <map>
 #include <string>
-#include "json.hpp"
-#include "lua_dispatcher.h"
+#include <nlohmann/json.hpp>
+#include "tdlua/lua_dispatcher.h"
 
-#ifdef TDLUA_CALLS
-#include "LuaTDVoip.h"
-#endif
 
 class TDLua {
 public:
@@ -39,9 +36,6 @@ private:
     std::uint64_t next_request_id;
     std::queue<QueuedUpdate> updates;
     std::string dbpath;
-    #ifdef TDLUA_CALLS
-    std::map<int32_t, Call*> calls;
-    #endif
     bool _ready;
     ClientState state;
     LuaDispatcher dispatcher_;
@@ -73,17 +67,6 @@ public:
 
     bool empty() const;
 
-    #ifdef TDLUA_CALLS
-    void setCall(const int32_t id, const Call* call);
-
-    void delCall(const int32_t id);
-
-    Call* getCall(const int32_t id) const;
-
-    void deinitAllCalls();
-    #endif
-
-    uint64_t runningCalls();
 
     void saveUpdatesBuffer();
 

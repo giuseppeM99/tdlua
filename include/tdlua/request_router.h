@@ -4,9 +4,9 @@
 #include <map>
 #include <string>
 
-#include "lua_compat.h"
+#include "tdlua/lua_compat.h"
 
-#include "json.hpp"
+#include <nlohmann/json.hpp>
 
 #ifndef LUA_OK
 #define LUA_OK 0

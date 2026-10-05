@@ -1,6 +1,5 @@
-#include "luajson.h"
-#include "json.hpp"
-#include <cmath>
+#include "tdlua/luajson.h"
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -130,18 +129,7 @@ void lua_pushjson (lua_State *L, const json j) {
         auto s = j.get<std::string>();
         lua_pushlstring(L, s.c_str(), s.length());
     } else if (j.is_number_integer()) {
-        auto v = j.get<int64_t>();
-
-        if (tdlua_can_push_integer(v)) {
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
-            lua_pushinteger(L, static_cast<lua_Integer>(v));
-#else
-            lua_pushnumber(L, static_cast<lua_Number>(v));
-#endif
-        } else {
-            std::string s = std::to_string(v);
-            lua_pushlstring (L, s.c_str(), s.length());
-        }
+        tdlua_lua_push_integer(L, j.get<std::int64_t>());
     } else if (j.is_number_float()) {
         auto v = j.get<double>();
         lua_pushnumber(L, v);

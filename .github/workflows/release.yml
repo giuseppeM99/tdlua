@@ -70,7 +70,7 @@ jobs:
           root="tdlua-${RELEASE_TAG}"
           mkdir -p "release/${root}"
           git archive HEAD | tar -x -C "release/${root}"
-          for module in td base64 libtgvoip; do
+          for module in td base64; do
             mkdir -p "release/${root}/${module}"
             git -C "${module}" archive HEAD | tar -x -C "release/${root}/${module}"
           done

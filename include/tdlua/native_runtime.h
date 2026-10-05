@@ -1,7 +1,7 @@
 #pragma once
 
-#include "native_codec.h"
-#include "lua_compat.h"
+#include "tdlua/native_codec.h"
+#include "tdlua/lua_compat.h"
 
 #include <td/telegram/Client.h>
 

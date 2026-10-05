@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lua_compat.h"
+#include "tdlua/lua_compat.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace tdlua_native {
 
@@ -19,6 +20,12 @@ public:
 inline std::string path_field(const std::string &path, const char *field)
 {
     return path.empty() ? std::string(".") + field : path + "." + field;
+}
+
+inline std::string path_field(const std::string &path, std::string_view field)
+{
+    return path.empty() ? std::string(".") + std::string(field)
+                        : path + "." + std::string(field);
 }
 
 inline std::string path_index(const std::string &path, lua_Integer index)
@@ -229,25 +236,12 @@ inline void push_type(lua_State *L, const char *type)
 
 inline void push_int32(lua_State *L, std::int32_t value)
 {
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
-    lua_pushinteger(L, static_cast<lua_Integer>(value));
-#else
-    lua_pushnumber(L, static_cast<lua_Number>(value));
-#endif
+    tdlua_lua_push_integer(L, value);
 }
 
 inline void push_integer(lua_State *L, std::int64_t value)
 {
-    if (tdlua_can_push_integer(value)) {
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
-        lua_pushinteger(L, static_cast<lua_Integer>(value));
-#else
-        lua_pushnumber(L, static_cast<lua_Number>(value));
-#endif
-    } else {
-        const std::string text = std::to_string(value);
-        lua_pushlstring(L, text.c_str(), text.size());
-    }
+    tdlua_lua_push_integer(L, value);
 }
 
 inline void push_double(lua_State *L, double value)

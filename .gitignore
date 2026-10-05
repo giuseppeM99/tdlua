@@ -2,7 +2,10 @@ test/*
 cmake-build-debug
 build
 build*
+compile_commands.json
 *.so
+__pycache__/
+*.pyc
 .idea/*
 examples/tdlua
 .*/

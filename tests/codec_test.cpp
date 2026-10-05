@@ -1,5 +1,5 @@
-#include "luajson.h"
-#include "lua_compat.h"
+#include "tdlua/luajson.h"
+#include "tdlua/lua_compat.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -113,6 +113,68 @@ static void test_unsupported_value(lua_State *L)
     lua_settop(L, 0);
 }
 
+static void test_resume(lua_State *L)
+{
+    lua_State *coroutine = lua_newthread(L);
+    require(luaL_loadstring(coroutine,
+                "local value = coroutine.yield(11, 22); return value, 33") == LUA_OK,
+            "unable to load coroutine");
+    require(tdlua_lua_resume(coroutine, L, 0) == LUA_YIELD,
+            "resume did not report yield");
+    require(lua_gettop(coroutine) == 2 && lua_tointeger(coroutine, 1) == 11 &&
+                lua_tointeger(coroutine, 2) == 22,
+            "resume did not preserve yielded values");
+    lua_settop(coroutine, 0);
+    lua_pushinteger(coroutine, 44);
+    require(tdlua_lua_resume(coroutine, L, 1) == LUA_OK,
+            "resume did not complete coroutine");
+    require(lua_gettop(coroutine) == 2 && lua_tointeger(coroutine, 1) == 44 &&
+                lua_tointeger(coroutine, 2) == 33,
+            "resume did not preserve arguments and returned values");
+    lua_pop(L, 1);
+
+    coroutine = lua_newthread(L);
+    require(luaL_loadstring(coroutine, "error('resume failure')") == LUA_OK,
+            "unable to load failing coroutine");
+    const int status = tdlua_lua_resume(coroutine, L, 0);
+    require(status != LUA_OK && status != LUA_YIELD,
+            "resume did not report coroutine error");
+    const char *message = lua_tostring(coroutine, -1);
+    require(message && std::string(message).find("resume failure") != std::string::npos,
+            "resume did not preserve error message");
+    lua_pop(L, 1);
+}
+
+static void test_push_integer(lua_State *L)
+{
+    const std::int64_t values[] = {
+        0, -42, 9007199254740992LL, 9007199254740993LL,
+        (std::numeric_limits<std::int64_t>::min)(),
+        (std::numeric_limits<std::int64_t>::max)()
+    };
+    for (const std::int64_t value : values) {
+        const int before = lua_gettop(L);
+        tdlua_lua_push_integer(L, value);
+        require(lua_gettop(L) == before + 1, "integer helper must push one value");
+#if LUA_VERSION_NUM >= 503
+        require(lua_isinteger(L, -1) && lua_tointeger(L, -1) == value,
+                "integer helper changed an int64");
+#else
+        if (value == 9007199254740993LL ||
+            value == (std::numeric_limits<std::int64_t>::max)()) {
+            require(lua_type(L, -1) == LUA_TSTRING &&
+                        lua_tostring(L, -1) == std::to_string(value),
+                    "integer helper rounded an int64 instead of using a string");
+        } else {
+            require(lua_type(L, -1) == LUA_TNUMBER &&
+                        static_cast<long double>(lua_tonumber(L, -1)) == value,
+                    "integer helper changed an exactly representable number");
+        }
+#endif
+        lua_pop(L, 1);
+    }
+}
+
 int main()
 {
     lua_State *L = luaL_newstate();
@@ -127,6 +189,8 @@ int main()
         test_values(L);
         test_number_types(L);
         test_unsupported_value(L);
+        test_resume(L);
+        test_push_integer(L);
     } catch (const std::exception &error) {
         std::cerr << error.what() << "\n";
         lua_close(L);

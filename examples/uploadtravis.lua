@@ -226,14 +226,10 @@ local upload_thread = coroutine.create(function()
         upload_succeeded = false
 
         local version = os.getenv("TDLUA_VERSION") or tdlua.version or "unknown"
-        local calls = os.getenv("TDLUA_CALLS") == "1"
-            and "With libtgvoip bindings"
-            or "Without libtgvoip bindings"
         local caption = table.concat({
             "TDLua " .. version,
             "MD5 " .. digest("md5sum", artifact),
             "SHA1 " .. digest("sha1sum", artifact),
-            calls,
             artifact_lua_version(artifact),
             "",
             "File sent with TDLua"
