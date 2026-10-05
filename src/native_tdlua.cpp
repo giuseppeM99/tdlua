@@ -5,7 +5,6 @@
 #include "tdlua/native_runtime.h"
 #include "tdlua/luajson.h"
 
-#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <iterator>

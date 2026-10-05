@@ -2,8 +2,6 @@
 
 #include "tdlua/luajson.h"
 
-#include <sstream>
-
 namespace {
 
 const char *const kInternalRequestKey = "__tdlua_request";

@@ -1,8 +1,6 @@
 #include "tdlua/native_dispatcher.h"
 
-#include "tdlua/native_codec_runtime.h"
-
-#include <sstream>
+#include "tdlua/native_codec.h"
 
 namespace {
 

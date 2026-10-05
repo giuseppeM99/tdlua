@@ -2,8 +2,6 @@
 #include "lua_binding_common.h"
 
 #include "tdlua/luajson.h"
-#include "tdlua/native_codec.h"
-#include "tdlua/native_codec_runtime.h"
 #include "tdlua/native_tdlua.h"
 
 #include <td/telegram/Log.h>
