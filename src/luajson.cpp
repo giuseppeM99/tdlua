@@ -79,8 +79,13 @@ void lua_getjson_value(lua_State *L, json &j, const std::string &path)
         lua_pushnil(L);
         while (lua_next(L, -2)) {
             if (arr) {
-                int x = (int)lua_tointeger(L, -2);
-                lua_getjson_value(L, j[x-1],
+                lua_Integer x = 0;
+                if (!tdlua_lua_key_integer_value(L, -2, x) || x < 1) {
+                    throw std::runtime_error("tdlua: array keys must be positive integers at " + path);
+                }
+                const json::size_type array_index =
+                    static_cast<json::size_type>(x - 1);
+                lua_getjson_value(L, j[array_index],
                                   path + "[" + std::to_string(x) + "]");
                 lua_pop(L, 1);
             } else {

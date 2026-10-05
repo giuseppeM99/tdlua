@@ -8,7 +8,6 @@
 #include "tdlua/lua_compat.h"
 
 static int tdclient_new(lua_State *L);
-static int tdclient_call(lua_State *L);
 static int tdclient_send(lua_State *L);
 static int tdclient_save(lua_State *L);
 static int tdclient_clear(lua_State *L);
@@ -29,8 +28,6 @@ static int tdclient_setlogpath(lua_State *L);
 static int tdclient_setlogmaxsize(lua_State *L);
 static int tdclient_setlogverbosity(lua_State *L);
 static void tdclient_fatalerrorcb(const char *error);
-
-bool my_lua_isinteger(lua_State *L, int x);
 
 static luaL_Reg mt[] = {
         {"receive", tdclient_receive},

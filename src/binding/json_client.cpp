@@ -1,32 +1,85 @@
 /**
  * @author Giuseppe Marino
- * ©Giuseppe Marino 2018 - 2018
+ * © Giuseppe Marino 2018 - 2026
  * This file is under GPLv3 license see LICENCE
  */
 
-#include "tdlua/luaIF.h"
+#include "lua_binding.h"
+#include "lua_binding_common.h"
 #include "tdlua/tdlua.h"
 #include "tdlua/luajson.h"
 #include <td/telegram/td_log.h>
 #include <chrono>
 #include <exception>
-#include <cctype>
 #include <iostream>
 #include <string>
 
 static TDLua * getTD(lua_State *L)
 {
-    if (lua_type(L, 1) == LUA_TUSERDATA) {
-        return (TDLua*) *((void**)lua_touserdata(L,1));
-    }
-    return nullptr;
+    return static_cast<TDLua *>(tdlua_binding::get_client(L));
 }
 
-bool my_lua_isinteger(lua_State *L, int x)
+static void *createTD(lua_State *L)
 {
-    lua_Integer value = 0;
-    return tdlua_lua_integer_value(L, x, value);
+    return new TDLua(L);
 }
+
+static bool json_push_handler(tdlua_binding::ClientHandle client,
+                              lua_State *L, const char *type)
+{
+    return static_cast<TDLua *>(client)->dispatcher().pushHandler(L, type);
+}
+
+static void json_on(tdlua_binding::ClientHandle client, lua_State *L,
+                    const char *type, int callback_index)
+{
+    static_cast<TDLua *>(client)->dispatcher().on(L, type, callback_index);
+}
+
+static void json_off(tdlua_binding::ClientHandle client, const char *type)
+{
+    static_cast<TDLua *>(client)->dispatcher().off(type);
+}
+
+static void json_save_updates(tdlua_binding::ClientHandle client)
+{
+    static_cast<TDLua *>(client)->saveUpdatesBuffer();
+}
+
+static void json_clear_updates(tdlua_binding::ClientHandle client)
+{
+    static_cast<TDLua *>(client)->emptyUpdatesBuffer();
+}
+
+static void json_unload(tdlua_binding::ClientHandle client)
+{
+    TDLua *td = static_cast<TDLua *>(client);
+    td->close();
+    delete td;
+}
+
+static void json_close(tdlua_binding::ClientHandle client)
+{
+    TDLua *td = static_cast<TDLua *>(client);
+    td->close();
+    td->dispatcher().clear();
+}
+
+static bool json_closed(tdlua_binding::ClientHandle client)
+{
+    return static_cast<TDLua *>(client)->closed();
+}
+
+static const tdlua_binding::ClientOperations json_operations = {
+    json_push_handler,
+    json_on,
+    json_off,
+    json_save_updates,
+    json_clear_updates,
+    json_unload,
+    json_close,
+    json_closed
+};
 
 using json = nlohmann::json;
 
@@ -60,19 +113,8 @@ static bool lua_to_json(lua_State *L, int index, json &result, std::string &erro
 
 static int tdclient_new(lua_State *L)
 {
-    luaL_newmetatable(L, "tdclient");
-    luaL_newlib(L, mt);
-    lua_setfield(L, -2, "__methods");
-    lua_pushcfunction(L, tdclient_index);
-    lua_setfield(L, -2, "__index");
-    lua_pushcfunction(L, tdclient_newindex);
-    lua_setfield(L, -2, "__newindex");
-    lua_pushcfunction(L, tdclient_unload);
-    lua_setfield(L, -2, "__gc");
-    TDLua **client = (TDLua**)(lua_newuserdata(L, sizeof(void*)));
-    *client = new TDLua(L);
-    luaL_setmetatable(L, "tdclient");
-    return 1;
+    return tdlua_binding::new_client(
+        L, createTD, tdclient_index, tdclient_newindex, tdclient_unload, mt);
 }
 
 static int tdclient_receive(lua_State *L)
@@ -200,61 +242,15 @@ static int call(lua_State *L)
         return luaL_error(L, "tdlua client is closed");
     }
 
-    const int top = lua_gettop(L);
-    int params_index = 0;
-    int callback_index = 0;
-    int context_index = 0;
-    bool fire_and_forget = false;
-
-    if (top >= 2) {
-        const int first_type = lua_type(L, 2);
-        if (first_type == LUA_TFUNCTION) {
-            callback_index = 2;
-            if (top >= 3) {
-                context_index = 3;
-            }
-            if (top > 3) {
-                return luaL_error(L, "too many arguments for asynchronous helper");
-            }
-        } else if (first_type == LUA_TBOOLEAN) {
-            if (top > 2) {
-                return luaL_error(L, "legacy send flag must be the last argument");
-            }
-            fire_and_forget = lua_toboolean(L, 2) != 0;
-        } else if (first_type == LUA_TTABLE || first_type == LUA_TSTRING) {
-            params_index = 2;
-            if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
-                callback_index = 3;
-                if (top >= 4) {
-                    context_index = 4;
-                }
-                if (top > 4) {
-                    return luaL_error(L, "too many arguments for asynchronous helper");
-                }
-            } else if (top >= 3 && lua_type(L, 3) == LUA_TBOOLEAN) {
-                if (top > 3) {
-                    return luaL_error(L, "legacy send flag must be the last argument");
-                }
-                fire_and_forget = lua_toboolean(L, 3) != 0;
-            } else if (top > 2) {
-                return luaL_error(L, "expected callback function or legacy boolean");
-            }
-        } else if (first_type == LUA_TNIL) {
-            if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
-                callback_index = 3;
-                if (top >= 4) {
-                    context_index = 4;
-                }
-                if (top > 4) {
-                    return luaL_error(L, "too many arguments for asynchronous helper");
-                }
-            } else if (top > 2) {
-                return luaL_error(L, "nil parameters must be followed by a callback");
-            }
-        } else {
-            return luaL_error(L, "expected params table, callback function, or legacy boolean");
-        }
+    tdlua_binding::HelperArguments arguments;
+    std::string argument_error;
+    if (!tdlua_binding::parse_helper_arguments(L, arguments, argument_error)) {
+        return luaL_error(L, "%s", argument_error.c_str());
     }
+    const int params_index = arguments.params_index;
+    const int callback_index = arguments.callback_index;
+    const int context_index = arguments.context_index;
+    const bool fire_and_forget = arguments.fire_and_forget;
 
     json request = json::object();
     if (params_index != 0) {
@@ -305,67 +301,14 @@ static int call(lua_State *L)
     return tdclient_execute(L);
 }
 
-static int tdclient_call(lua_State *L)
-{
-    lua_pushcclosure(L, call, 1);
-    return 1;
-}
-
-static bool handler_property(const char *name, std::string &type)
-{
-    if (!name || name[0] != 'o' || name[1] != 'n' || name[2] == '\0' ||
-        !std::isupper(static_cast<unsigned char>(name[2]))) {
-        return false;
-    }
-    type.assign(name + 2);
-    type[0] = static_cast<char>(std::tolower(
-        static_cast<unsigned char>(type[0])));
-    return true;
-}
-
 static int tdclient_index(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    const char *name = luaL_checkstring(L, 2);
-    std::string type;
-    if (td && handler_property(name, type)) {
-        if (td->dispatcher().pushHandler(L, type)) {
-            return 1;
-        }
-        lua_pushnil(L);
-        return 1;
-    }
-
-    luaL_getmetatable(L, "tdclient");
-    lua_getfield(L, -1, "__methods");
-    lua_getfield(L, -1, name);
-    if (!lua_isnil(L, -1)) {
-        lua_remove(L, -2);
-        lua_remove(L, -2);
-        return 1;
-    }
-    lua_pop(L, 3);
-
-    lua_pushstring(L, name);
-    lua_pushcclosure(L, call, 1);
-    return 1;
+    return tdlua_binding::index(L, getTD(L), json_operations, call);
 }
 
 static int tdclient_newindex(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    const char *name = luaL_checkstring(L, 2);
-    std::string type;
-    if (!td || !handler_property(name, type)) {
-        return luaL_error(L, "tdlua: unsupported client property '%s'", name);
-    }
-    if (lua_isnil(L, 3)) {
-        td->dispatcher().off(type);
-    } else {
-        luaL_checktype(L, 3, LUA_TFUNCTION);
-        td->dispatcher().on(L, type, 3);
-    }
-    return 0;
+    return tdlua_binding::newindex(L, getTD(L), json_operations);
 }
 
 static int tdclient_rawexecute(lua_State *L)
@@ -465,71 +408,37 @@ static int tdclient_await(lua_State *L)
 
 static int tdclient_on(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if (!td) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    const char *type = luaL_checkstring(L, 2);
-    luaL_checktype(L, 3, LUA_TFUNCTION);
-    td->dispatcher().on(L, type, 3);
-    return 0;
+    return tdlua_binding::on(L, getTD(L), json_operations);
 }
 
 static int tdclient_off(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if (!td) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    const char *type = luaL_checkstring(L, 2);
-    td->dispatcher().off(type);
-    return 0;
+    return tdlua_binding::off(L, getTD(L), json_operations);
 }
 
 static int tdclient_save(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    td->saveUpdatesBuffer();
-    return 0;
+    return tdlua_binding::save(L, getTD(L), json_operations);
 }
 
 static int tdclient_clear(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    td->emptyUpdatesBuffer();
-    return 0;
+    return tdlua_binding::clear(L, getTD(L), json_operations);
 }
 
 static int tdclient_unload(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if (!td) {
-        return 0;
-    }
-    td->close();
-    delete td;
-    return 0;
+    return tdlua_binding::unload(L, getTD(L), json_operations);
 }
 
 static int tdclient_close(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if (!td) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    td->close();
-    td->dispatcher().clear();
-    return 0;
+    return tdlua_binding::close(L, getTD(L), json_operations);
 }
 
 static int tdclient_isclosed(lua_State *L)
 {
-    TDLua *td = getTD(L);
-    if (!td) {
-        return luaL_error(L, "invalid tdlua client");
-    }
-    lua_pushboolean(L, td->closed());
-    return 1;
+    return tdlua_binding::is_closed(L, getTD(L), json_operations);
 }
 
 static int tdclient_getcall(lua_State *L)
@@ -565,7 +474,7 @@ static int tdclient_setlogmaxsize(lua_State *L)
 
 static int tdclient_setlogverbosity(lua_State *L)
 {
-    if (my_lua_isinteger(L, 1)) {
+    if (tdlua_binding::is_integer(L, 1)) {
         td_set_log_verbosity_level(static_cast<int>(lua_tointeger(L, 1)));
         lua_pushboolean(L, 1);
     } else {

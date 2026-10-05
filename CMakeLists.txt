@@ -146,14 +146,14 @@ if(TDLUA_BACKEND STREQUAL "native")
       "src/native_runtime.cpp"
       "src/native_tdlua.cpp"
       "src/native_dispatcher.cpp"
-      "src/native_luaIF.cpp"
+      "src/binding/native_client.cpp"
       "src/luajson.cpp"
   )
 else()
   list(APPEND tdlua_srcs
       "src/tdlua.cpp"
       "src/luajson.cpp"
-      "src/luaIF.cpp"
+      "src/binding/json_client.cpp"
       "src/request_router.cpp"
       "src/lua_dispatcher.cpp"
   )

@@ -237,7 +237,8 @@ private:
         std::vector<std::vector<std::string>> shards(shard_count);
         std::vector<std::size_t> sizes(shard_count, 0);
         for (const std::string &definition : definitions) {
-            const auto target = std::min_element(sizes.begin(), sizes.end()) - sizes.begin();
+            const std::size_t target = static_cast<std::size_t>(
+                std::min_element(sizes.begin(), sizes.end()) - sizes.begin());
             shards[target].push_back(definition);
             sizes[target] += definition.size();
         }
@@ -504,6 +505,9 @@ private:
                     << " &value) {\n"
                     << "    lua_newtable(L);\n"
                     << "    tdlua_native::push_type(L, \"" << constructor->name << "\");\n";
+                if (constructor->args.empty()) {
+                    out << "    (void)value;\n";
+                }
                 for (const auto &argument : constructor->args) {
                     const std::string field = td::tl::simple::gen_cpp_field_name(argument.name);
                     out << "    lua_pushstring(L, \"" << argument.name << "\");\n";

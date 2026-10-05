@@ -12,3 +12,4 @@ examples/tdlua
 !.github/*
 examples/*
 !examples/*.lua
+experiments
