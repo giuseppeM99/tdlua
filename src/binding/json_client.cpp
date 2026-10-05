@@ -240,7 +240,9 @@ static int tdclient_execute(lua_State *L)
             td->dispatcher().dispatch(res);
             td->push(res, true);
         }
-        td->rememberTimedOutExecuteExtra(nonce, std::move(extra));
+        if (!td->closed()) {
+            td->rememberTimedOutExecuteExtra(nonce, std::move(extra));
+        }
         return 0;
     });
 }
