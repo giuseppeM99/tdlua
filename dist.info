@@ -1,5 +1,5 @@
 name = "tdlua"
-version = "0.2"
+version = "0.3"
 desc = "A basic interface between tdlib and lua"
 author = "Giuseppe Marino"
 maintainer = "Giuseppe Marino"
