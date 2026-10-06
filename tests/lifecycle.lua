@@ -26,7 +26,7 @@ local sync_response = client:executeSync({
 })
 assert(type(sync_response) == "table")
 
-local dynamic_response = client:getAuthorizationState()
+local dynamic_response = client:getAuthorizationState():wait()
 assert(type(dynamic_response) == "table")
 
 local first = tdlua()

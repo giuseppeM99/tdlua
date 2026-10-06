@@ -63,6 +63,16 @@ struct Fake {
             {"@extra", {{"__tdlua_request_id", id}}}
         });
     }
+
+    void errorResponse(std::uint64_t id)
+    {
+        incoming.push_back({
+            {"@type", "error"},
+            {"code", 400},
+            {"message", "fake error"},
+            {"@extra", {{"__tdlua_request_id", id}}}
+        });
+    }
 };
 
 void runLua(lua_State *L, const char *source)
@@ -166,6 +176,80 @@ void testAwaitAndSynchronousCalls(lua_State *L, Fake &fake)
            "assert(not pcall(c.request, c, {_='getMe', _request_id=1}))");
 }
 
+void testManagedFutureAndTasks(lua_State *L, Fake &fake)
+{
+    runLua(L,
+           "first = c:getMe(); second = c:getMe(); "
+           "assert(type(first) == 'userdata' and type(second) == 'userdata'); "
+           "assert(first._request_id ~= second._request_id); "
+           "assert(not first:ready() and not second:ready())");
+    const auto first_id = fake.sent[fake.sent.size() - 2].first;
+    const auto second_id = fake.sent[fake.sent.size() - 1].first;
+    fake.response(second_id, 22);
+    fake.response(first_id, 11);
+    runLua(L,
+           "assert(second:wait().value == 22); "
+           "assert(first.value == 11 and first:ready()); "
+           "assert(first:wait()._request_id == first._request_id)");
+
+    runLua(L,
+           "external = c:getMe(); "
+           "external_co = coroutine.create(function() external_value = external.value end); "
+           "assert(coroutine.resume(external_co)); "
+           "assert(coroutine.status(external_co) == 'suspended')");
+    const auto external_id = fake.sent.back().first;
+    fake.response(external_id, 33);
+    runLua(L,
+           "c:receive(0); assert(external_value == 33 and "
+           "coroutine.status(external_co) == 'dead')");
+
+    runLua(L,
+           "marker = {}; task = c:getMe(function(result, extra) "
+           "assert(extra == marker); return false, result.value end, marker); "
+           "assert(not task:ready())");
+    const auto task_id = fake.sent.back().first;
+    fake.response(task_id, 44);
+    runLua(L,
+           "c:receive(0); local ordinary, value = task:wait(); "
+           "assert(task:ready() and ordinary == false and value == 44)");
+
+    runLua(L,
+           "thread_task_co = coroutine.create(function(result, extra) "
+           "return result.value, extra end); "
+           "thread_task = c:getMe(thread_task_co, marker)");
+    const auto thread_task_id = fake.sent.back().first;
+    fake.response(thread_task_id, 55);
+    runLua(L,
+           "c:receive(0); local value, extra = thread_task:wait(); "
+           "assert(value == 55 and extra == marker and coroutine.status(thread_task_co) == 'dead')");
+
+    runLua(L,
+           "nested_task = c:getMe(function(result) "
+           "local nested = c:getMe(); return nested.value end)");
+    const auto outer_id = fake.sent.back().first;
+    fake.response(outer_id, 66);
+    runLua(L, "c:receive(0); assert(not nested_task:ready())");
+    const auto nested_id = fake.sent.back().first;
+    fake.response(nested_id, 77);
+    runLua(L, "c:receive(0); assert(nested_task:wait() == 77)");
+
+    runLua(L, "bad_task = c:getMe(function() error('task boom') end)");
+    const auto bad_id = fake.sent.back().first;
+    fake.response(bad_id, 88);
+    runLua(L,
+           "c:receive(0); assert(bad_task:ready()); "
+           "local ok, message = pcall(function() bad_task:wait() end); "
+           "assert(not ok and message:find('task boom'))");
+
+    runLua(L, "local dropped = c:getMe(); dropped_id = dropped._request_id");
+    const auto dropped_id = fake.sent.back().first;
+    runLua(L, "dropped = nil; collectgarbage('collect')");
+    fake.errorResponse(dropped_id);
+    runLua(L, "c:receive(0)");
+
+    runLua(L, "closing = c:getMe()");
+}
+
 void testRollbackAndCallbackErrors(lua_State *L, TDLua *client, Fake &fake)
 {
     const auto pending_before_failure = client->dispatcher().pendingCount();
@@ -218,6 +302,8 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
            "do local value = {}; weak[2] = value; "
            "c:request({_='getMe'}, function() return value end) end; "
            "c:close(); c:close(); "
+           "local ok, message = pcall(function() closing:wait() end); "
+           "assert(not ok and message:find('client closed')); "
            "assert(c:isClosed() and c:pendingCount() == 0); "
            "collectgarbage('collect'); assert(weak[2] == nil); "
            "assert(d:pendingCount() == 1)");
@@ -238,6 +324,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testPublicRequests(L, fake);
     testResponses(L, fake);
     testAwaitAndSynchronousCalls(L, fake);
+    testManagedFutureAndTasks(L, fake);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
     testCloseAndClientIsolation(L, fake, second);

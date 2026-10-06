@@ -55,6 +55,11 @@ json json_transport_execute_sync(void *context, json request)
     return static_cast<TDLua *>(context)->execute(std::move(request));
 }
 
+bool json_transport_pump(void *context, double timeout)
+{
+    return static_cast<TDLua *>(context)->pump(timeout);
+}
+
 void json_transport_close(void *context)
 {
     static_cast<TDLua *>(context)->close();
@@ -180,6 +185,7 @@ TDLua::TDLua(lua_State *lua)
       updates(), dbpath(), _ready(false), state(ClientState::Running),
       dispatcher_(lua)
 {
+    dispatcher_.setPump(this, json_transport_pump);
 }
 
 TDLua::~TDLua()
@@ -225,6 +231,33 @@ nlohmann::json TDLua::execute(const nlohmann::json &json)
 nlohmann::json TDLua::receive(const double timeout)
 {
     return transport().receive(timeout);
+}
+
+bool TDLua::pump(const double timeout)
+{
+    if (closed()) {
+        return false;
+    }
+    nlohmann::json value;
+    if (!updates.empty() && !updates.front().dispatched) {
+        QueuedUpdate queued = pop();
+        value = std::move(queued.value);
+    } else {
+        // Use the configured non-owning transport, including deterministic
+        // test transports injected below the common router.
+        value = transport().receive(timeout);
+    }
+    if (!value.is_object() || value.empty()) {
+        return false;
+    }
+    checkAuthState(value);
+    const tdlua::RouteKind route = dispatcher_.dispatch(value);
+    if (route == tdlua::RouteKind::Raw ||
+        route == tdlua::RouteKind::Unknown ||
+        route == tdlua::RouteKind::Update) {
+        push(value, true);
+    }
+    return true;
 }
 
 nlohmann::json TDLua::receiveBackend(const double timeout)

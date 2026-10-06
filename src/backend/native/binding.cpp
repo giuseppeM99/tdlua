@@ -339,13 +339,18 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
 static int tdclient_execute(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
-        lua_Number timeout = 10.0;
-        bool fire_and_forget = false;
-        int request_index = 2;
-        if (lua_type(L, 3) == LUA_TNUMBER) {
-            timeout = lua_tonumber(L, 3);
-        } else if (lua_type(L, 3) == LUA_TBOOLEAN) {
-            fire_and_forget = lua_toboolean(L, 3) != 0;
+        const int request_index = 2;
+        const int top = lua_gettop(L);
+        if (top < 2 || top > 4) {
+            throw std::runtime_error("tdlua: invalid execute arity");
+        }
+        const int control_index = top >= 3 ? 3 : 0;
+        const int extra_index = top >= 4 ? 4 : 0;
+        const int control_type = control_index ? lua_type(L, control_index) : LUA_TNIL;
+        if (extra_index && control_type != LUA_TFUNCTION &&
+            control_type != LUA_TTHREAD) {
+            throw std::runtime_error(
+                "tdlua: callback extra requires a function or coroutine control");
         }
         // Preserve the historical JSON execute() behavior for a valid JSON
         // string whose root is not an object: it returns no result. Other
@@ -369,14 +374,69 @@ static int tdclient_execute(lua_State *L)
         if (td->closed()) {
             throw std::runtime_error("tdlua client is closed");
         }
-        return execute_request(L, td, request_index, timeout, fire_and_forget);
+        if (control_type == LUA_TNUMBER) {
+            return execute_request(L, td, request_index,
+                                   lua_tonumber(L, control_index), false);
+        }
+        if (control_type == LUA_TBOOLEAN && lua_toboolean(L, control_index)) {
+            return execute_request(L, td, request_index, 0.0, true);
+        }
+        if (control_type != LUA_TNIL && control_type != LUA_TBOOLEAN &&
+            control_type != LUA_TFUNCTION && control_type != LUA_TTHREAD) {
+            throw std::runtime_error(
+                std::string("tdlua: execute control type '") +
+                lua_typename(L, control_type) + "' is not supported");
+        }
+
+        std::string error;
+        int table_index = 0;
+        bool owned = false;
+        td::td_api::object_ptr<td::td_api::Function> request;
+        bool codec_error = false;
+        if (!make_request(L, td, request_index, request, table_index, owned,
+                          codec_error, error)) {
+            if (!codec_error) {
+                pop_owned(L, owned);
+                throw std::runtime_error(error);
+            }
+            request = codec_error_request(error);
+        }
+        std::shared_ptr<tdlua::ManagedState> state;
+        try {
+            if (control_type == LUA_TFUNCTION || control_type == LUA_TTHREAD) {
+                state = td->dispatcher().task(
+                    L, control_index, extra_index,
+                    control_type == LUA_TTHREAD);
+            } else {
+                state = td->dispatcher().future();
+            }
+            tdlua::submit(td->dispatcher(), td->transport(),
+                          state->request_id, std::move(request));
+            pop_owned(L, owned);
+            if (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index)) {
+                const std::uint64_t request_id = state->request_id;
+                state.reset();
+                return td->dispatcher().waitById(L, request_id, false, 0.0);
+            }
+            tdlua::pushManagedHandle(
+                L, state,
+                (control_type == LUA_TFUNCTION || control_type == LUA_TTHREAD)
+                    ? "tdlua.task"
+                    : "tdlua.future");
+            return 1;
+        } catch (...) {
+            if (state) {
+                td->dispatcher().cancel(state->request_id);
+            }
+            pop_owned(L, owned);
+            throw;
+        }
     });
 }
 
 static int call(lua_State *L)
 {
-    bool yield_after_submit = false;
-    const int result = tdlua_binding::protected_call(L, [&]() -> int {
+    return tdlua_binding::protected_call(L, [&]() -> int {
         NativeTDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("invalid tdlua client is closed");
@@ -397,22 +457,6 @@ static int call(lua_State *L)
         if (!helper_request(L, params_index, lua_tostring(L, lua_upvalueindex(1)),
                             request_index, owned, error)) {
             throw std::runtime_error(error);
-        }
-
-        const int is_main = lua_pushthread(L);
-        lua_pop(L, 1);
-        if (!fire_and_forget && callback_index == 0 && is_main) {
-            const int result = execute_request(L, td, request_index, 10.0, false);
-            if (owned) {
-                if (result != 0) {
-                    // execute_request leaves its result above the helper's
-                    // temporary request table. Remove the table without
-                    // accidentally returning the result to Lua's caller.
-                    lua_insert(L, -2);
-                }
-                lua_pop(L, 1);
-            }
-            return result;
         }
 
         td::td_api::object_ptr<td::td_api::Function> request =
@@ -436,23 +480,43 @@ static int call(lua_State *L)
             return 1;
         }
         if (callback_index != 0) {
-            const std::uint64_t id = td->dispatcher().request(
-                L, encoded_table_index, callback_index, context_index);
-            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
+            const auto state = td->dispatcher().task(
+                L, callback_index, context_index, arguments.supplied_thread);
+            try {
+                tdlua::submit(td->dispatcher(), td->transport(),
+                              state->request_id, std::move(request));
+            } catch (...) {
+                td->dispatcher().cancel(state->request_id);
+                pop_owned(L, owned);
+                pop_owned(L, encoded_owned);
+                throw;
+            }
             pop_owned(L, owned);
-            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            pop_owned(L, encoded_owned);
+            tdlua::pushManagedHandle(L, state, "tdlua.task");
             return 1;
         }
-        if (!is_main) {
-            const std::uint64_t id = td->dispatcher().await(L, encoded_table_index);
-            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
+
+        auto state = td->dispatcher().future();
+        try {
+            tdlua::submit(td->dispatcher(), td->transport(),
+                          state->request_id, std::move(request));
+        } catch (...) {
+            td->dispatcher().cancel(state->request_id);
             pop_owned(L, owned);
-            yield_after_submit = true;
-            return 0;
+            pop_owned(L, encoded_owned);
+            throw;
         }
-        throw std::runtime_error("tdlua: invalid helper execution state");
+        pop_owned(L, owned);
+        pop_owned(L, encoded_owned);
+        if (arguments.explicit_wait) {
+            const std::uint64_t request_id = state->request_id;
+            state.reset();
+            return td->dispatcher().waitById(L, request_id, false, 0.0);
+        }
+        tdlua::pushManagedHandle(L, state, "tdlua.future");
+        return 1;
     });
-    return yield_after_submit ? lua_yield(L, 0) : result;
 }
 
 static int tdclient_rawexecute(lua_State *L)
@@ -521,8 +585,7 @@ static int tdclient_request(lua_State *L)
 
 static int tdclient_await(lua_State *L)
 {
-    bool yield_after_submit = false;
-    const int result = tdlua_binding::protected_call(L, [&]() -> int {
+    return tdlua_binding::protected_call(L, [&]() -> int {
         NativeTDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
@@ -539,13 +602,20 @@ static int tdclient_await(lua_State *L)
             }
             request = codec_error_request(error);
         }
-        const std::uint64_t id = td->dispatcher().await(L, table_index);
-        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
+        auto state = td->dispatcher().awaitState(L);
+        const std::uint64_t request_id = state->request_id;
+        try {
+            tdlua::submit(td->dispatcher(), td->transport(),
+                          request_id, std::move(request));
+        } catch (...) {
+            td->dispatcher().cancel(state->request_id);
+            pop_owned(L, owned);
+            throw;
+        }
         pop_owned(L, owned);
-        yield_after_submit = true;
-        return 0;
+        state.reset();
+        return td->dispatcher().waitById(L, request_id, false, 0.0);
     });
-    return yield_after_submit ? lua_yield(L, 0) : result;
 }
 
 #ifdef TDLUA_TESTING

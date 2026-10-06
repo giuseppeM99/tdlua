@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <memory>
 
 class NativeDispatcher final {
 public:
@@ -20,12 +21,25 @@ public:
     std::uint64_t request(lua_State *L, int request_index,
                           int callback_index, int context_index);
     std::uint64_t await(lua_State *L, int request_index);
+    std::shared_ptr<tdlua::ManagedState> future();
+    std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
+                                              int context_index,
+                                              bool supplied_thread);
+    std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
+    int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
+             bool has_timeout, double timeout,
+             tdlua::WaitKind kind = tdlua::WaitKind::Result,
+             const std::string &field = std::string());
+    int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
+                 double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
+                 const std::string &field = std::string());
+    void setPump(void *context, tdlua::RequestRouter::Pump pump);
     std::uint64_t raw(lua_State *L, int request_index);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
 
-    int dispatch(lua_State *L, NativeResponse &response);
+    tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response);
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();
 

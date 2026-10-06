@@ -41,6 +41,42 @@ std::uint64_t LuaDispatcher::await(lua_State *L, nlohmann::json &request)
     return router_.addAwaiter(L, request);
 }
 
+std::shared_ptr<tdlua::ManagedState> LuaDispatcher::future()
+{
+    return router_.future();
+}
+
+std::shared_ptr<tdlua::ManagedState> LuaDispatcher::task(
+    lua_State *L, int callback_index, int context_index, bool supplied_thread)
+{
+    return router_.task(L, callback_index, context_index, supplied_thread);
+}
+
+std::shared_ptr<tdlua::ManagedState> LuaDispatcher::awaitState(lua_State *L)
+{
+    return router_.awaitState(L);
+}
+
+int LuaDispatcher::wait(lua_State *L,
+                        const std::shared_ptr<tdlua::ManagedState> &state,
+                        bool has_timeout, double timeout, tdlua::WaitKind kind,
+                        const std::string &field)
+{
+    return router_.wait(L, state, has_timeout, timeout, kind, field);
+}
+
+int LuaDispatcher::waitById(lua_State *L, std::uint64_t request_id,
+                            bool has_timeout, double timeout,
+                            tdlua::WaitKind kind, const std::string &field)
+{
+    return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
+}
+
+void LuaDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
+{
+    router_.setPump(context, pump);
+}
+
 std::uint64_t LuaDispatcher::raw(nlohmann::json &request)
 {
     return router_.addRaw(request);
@@ -123,14 +159,28 @@ void LuaDispatcher::dispatchHandlers(nlohmann::json &event)
     }
 }
 
-void LuaDispatcher::dispatch(nlohmann::json &event)
+tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event)
 {
-    router_.dispatch(event);
-    dispatchHandlers(event);
+    std::uint64_t id = 0;
+    const bool correlated = RequestRouter::responseRequestId(event, id);
+    event.erase("@extra");
+    if (correlated) {
+        event["_request_id"] = id;
+    }
+    const tdlua::RouteKind route = router_.dispatchRoute(id, [&](lua_State *L) {
+        lua_pushjson(L, event);
+    });
+    if (route == tdlua::RouteKind::Raw ||
+        route == tdlua::RouteKind::Task ||
+        route == tdlua::RouteKind::Update) {
+        dispatchHandlers(event);
+    }
+    return route;
 }
 
 void LuaDispatcher::clear()
 {
+    router_.closePending();
     router_.clear();
     for (std::map<std::string, int>::iterator map_it = handlers_.begin();
          map_it != handlers_.end(); ++map_it) {

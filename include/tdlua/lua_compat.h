@@ -23,6 +23,20 @@ inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments
 #endif
 }
 
+/* Lua 5.3 made yieldability observable.  Older versions supported by the
+ * compatibility layer do not expose the query, so conservatively use the
+ * non-yieldable path there.  Future/Task code must never infer this from who
+ * created the coroutine. */
+inline bool tdlua_lua_is_yieldable(lua_State *L)
+{
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+    return lua_isyieldable(L) != 0;
+#else
+    (void)L;
+    return false;
+#endif
+}
+
 /* Lua 5.3 introduced a distinct integer value type.  Lua 5.1, Lua 5.2 and
  * LuaJIT expose lua_Integer in the C API, but their regular numeric values do
  * not provide the same reliable type distinction. */

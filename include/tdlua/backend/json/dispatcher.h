@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <map>
 #include <string>
+#include <memory>
 
 #include "tdlua/lua_compat.h"
 
@@ -20,6 +21,19 @@ public:
     std::uint64_t request(lua_State *L, nlohmann::json &request,
                           int callback_index, int context_index);
     std::uint64_t await(lua_State *L, nlohmann::json &request);
+    std::shared_ptr<tdlua::ManagedState> future();
+    std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
+                                              int context_index,
+                                              bool supplied_thread);
+    std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
+    int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
+             bool has_timeout, double timeout,
+             tdlua::WaitKind kind = tdlua::WaitKind::Result,
+             const std::string &field = std::string());
+    int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
+                 double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
+                 const std::string &field = std::string());
+    void setPump(void *context, tdlua::RequestRouter::Pump pump);
     std::uint64_t raw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
@@ -29,7 +43,7 @@ public:
     void on(lua_State *L, const std::string &type, int callback_index);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type) const;
-    void dispatch(nlohmann::json &event);
+    tdlua::RouteKind dispatch(nlohmann::json &event);
     void clear();
 
 private:

@@ -60,6 +60,11 @@ NativeResponse native_transport_execute_sync(
     return response;
 }
 
+bool native_transport_pump(void *context, double timeout)
+{
+    return static_cast<NativeTDLua *>(context)->pump(timeout);
+}
+
 void native_transport_close(void *context)
 {
     static_cast<NativeTDLua *>(context)->close();
@@ -85,6 +90,7 @@ NativeTDLua::NativeTDLua(lua_State *lua)
       updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
       dispatcher_(lua)
 {
+    dispatcher_.setPump(this, native_transport_pump);
 }
 
 NativeTDLua::~NativeTDLua()
@@ -128,6 +134,31 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
     }
     NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
     return response;
+}
+
+bool NativeTDLua::pump(const double timeout)
+{
+    if (closed_) {
+        return false;
+    }
+    NativeResponse response;
+    if (!updates_.empty() && !updates_.front().dispatched) {
+        response = pop();
+    } else {
+        response = receiveBackend(timeout);
+    }
+    if (!response.object) {
+        return false;
+    }
+    checkAuthState(response);
+    const tdlua::RouteKind route = dispatcher_.dispatch(lua_, response);
+    if (route == tdlua::RouteKind::Raw ||
+        route == tdlua::RouteKind::Unknown ||
+        route == tdlua::RouteKind::Update) {
+        response.dispatched = true;
+        push(std::move(response));
+    }
+    return true;
 }
 
 NativeTDLua::Transport NativeTDLua::transport()

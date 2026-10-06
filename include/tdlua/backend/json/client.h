@@ -59,6 +59,7 @@ public:
     nlohmann::json execute(const nlohmann::json &json);
 
     nlohmann::json receive(const double timeout = 10.0);
+    bool pump(double timeout);
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 

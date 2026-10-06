@@ -35,6 +35,42 @@ std::uint64_t NativeDispatcher::await(lua_State *L, int)
     return router_.await(L);
 }
 
+std::shared_ptr<tdlua::ManagedState> NativeDispatcher::future()
+{
+    return router_.future();
+}
+
+std::shared_ptr<tdlua::ManagedState> NativeDispatcher::task(
+    lua_State *L, int callback_index, int context_index, bool supplied_thread)
+{
+    return router_.task(L, callback_index, context_index, supplied_thread);
+}
+
+std::shared_ptr<tdlua::ManagedState> NativeDispatcher::awaitState(lua_State *L)
+{
+    return router_.awaitState(L);
+}
+
+int NativeDispatcher::wait(lua_State *L,
+                           const std::shared_ptr<tdlua::ManagedState> &state,
+                           bool has_timeout, double timeout, tdlua::WaitKind kind,
+                           const std::string &field)
+{
+    return router_.wait(L, state, has_timeout, timeout, kind, field);
+}
+
+int NativeDispatcher::waitById(lua_State *L, std::uint64_t request_id,
+                               bool has_timeout, double timeout,
+                               tdlua::WaitKind kind, const std::string &field)
+{
+    return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
+}
+
+void NativeDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
+{
+    router_.setPump(context, pump);
+}
+
 void NativeDispatcher::cancel(std::uint64_t id)
 {
     router_.cancel(id);
@@ -88,13 +124,18 @@ void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &resp
     }
 }
 
-int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
+tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
 {
-    router_.dispatch(response.request_id, [&](lua_State *target) {
+    const tdlua::RouteKind route = router_.dispatchRoute(response.request_id,
+                                                         [&](lua_State *target) {
         pushResponse(target, response);
     });
-    dispatchHandlers(L, response);
-    return 0;
+    if (route == tdlua::RouteKind::Raw ||
+        route == tdlua::RouteKind::Task ||
+        route == tdlua::RouteKind::Update) {
+        dispatchHandlers(L, response);
+    }
+    return route;
 }
 
 void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index)
@@ -124,6 +165,7 @@ bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type) const
 }
 void NativeDispatcher::clear()
 {
+    router_.closePending();
     router_.clear();
     for (auto &entry : handlers_) {
         luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);

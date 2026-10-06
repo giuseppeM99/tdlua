@@ -5,6 +5,7 @@
 #define TDLUA_LUA_BINDING_COMMON_H
 
 #include "tdlua/lua_compat.h"
+#include "tdlua/common/request_router.h"
 
 #include <cctype>
 #include <cstddef>
@@ -64,6 +65,8 @@ struct HelperArguments final {
     int callback_index = 0;
     int context_index = 0;
     bool fire_and_forget = false;
+    bool explicit_wait = false;
+    bool supplied_thread = false;
 };
 
 inline bool is_integer(lua_State *L, int index)
@@ -79,7 +82,8 @@ inline void validate_execute_control(lua_State *L)
     }
 
     const int type = lua_type(L, 3);
-    if (type == LUA_TNIL || type == LUA_TBOOLEAN || type == LUA_TNUMBER) {
+    if (type == LUA_TNIL || type == LUA_TBOOLEAN || type == LUA_TNUMBER ||
+        type == LUA_TFUNCTION || type == LUA_TTHREAD) {
         return;
     }
 
@@ -146,8 +150,9 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
     }
 
     const int first_type = lua_type(L, 2);
-    if (first_type == LUA_TFUNCTION) {
+    if (first_type == LUA_TFUNCTION || first_type == LUA_TTHREAD) {
         arguments.callback_index = 2;
+        arguments.supplied_thread = first_type == LUA_TTHREAD;
         if (top >= 3) {
             arguments.context_index = 3;
         }
@@ -164,13 +169,16 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
             return false;
         }
         arguments.fire_and_forget = lua_toboolean(L, 2) != 0;
+        arguments.explicit_wait = !arguments.fire_and_forget;
         return true;
     }
 
     if (first_type == LUA_TTABLE || first_type == LUA_TSTRING) {
         arguments.params_index = 2;
-        if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
+        if (top >= 3 && (lua_type(L, 3) == LUA_TFUNCTION ||
+                         lua_type(L, 3) == LUA_TTHREAD)) {
             arguments.callback_index = 3;
+            arguments.supplied_thread = lua_type(L, 3) == LUA_TTHREAD;
             if (top >= 4) {
                 arguments.context_index = 4;
             }
@@ -186,6 +194,7 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
                 return false;
             }
             arguments.fire_and_forget = lua_toboolean(L, 3) != 0;
+            arguments.explicit_wait = !arguments.fire_and_forget;
             return true;
         }
         if (top > 2) {
@@ -196,8 +205,10 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
     }
 
     if (first_type == LUA_TNIL) {
-        if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
+        if (top >= 3 && (lua_type(L, 3) == LUA_TFUNCTION ||
+                         lua_type(L, 3) == LUA_TTHREAD)) {
             arguments.callback_index = 3;
+            arguments.supplied_thread = lua_type(L, 3) == LUA_TTHREAD;
             if (top >= 4) {
                 arguments.context_index = 4;
             }

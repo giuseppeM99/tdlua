@@ -21,7 +21,7 @@ client:request({_ = "getAuthorizationState"}, function(result)
 end)
 
 for _ = 1, 30 do
-    client:poll(0.1)
+    client:receive(0.1)
     if initial_state then break end
 end
 assert(type(initial_state) == "table")

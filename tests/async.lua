@@ -28,16 +28,19 @@ assert(type(callback_result) == "table")
 assert(callback_context.origin == "callback-test")
 
 local dynamic_result
-local dynamic_id = client:getAuthorizationState(function(result, extra)
+local dynamic_task = client:getAuthorizationState(function(result, extra)
     dynamic_result = result
     assert(extra.origin == "dynamic-helper")
 end, {origin = "dynamic-helper"})
-assert(type(dynamic_id) == "number")
+assert(type(dynamic_task) == "userdata")
+local dynamic_id = dynamic_task._request_id
 for _ = 1, 20 do
-    client:poll(0.1)
+    client:receive(0.1)
     if dynamic_result then break end
 end
 assert(type(dynamic_result) == "table")
+assert(dynamic_task:ready())
+assert(dynamic_task:wait() == nil)
 
 -- Dynamic helpers use the same callback and context contract as async
 -- requests. getMe may return an authorization error before login, but it
@@ -45,14 +48,15 @@ assert(type(dynamic_result) == "table")
 local get_me_result
 local get_me_context
 local get_me_response_id
-local get_me_id = client:getMe(function(result, context)
+local get_me_task = client:getMe(function(result, context)
     get_me_result = result
     get_me_context = context
     get_me_response_id = result._request_id
     assert(type(result) == "table")
     assert(context.origin == "get-me-helper")
 end, {origin = "get-me-helper"})
-assert(type(get_me_id) == "number")
+assert(type(get_me_task) == "userdata")
+local get_me_id = get_me_task._request_id
 for _ = 1, 20 do
     client:receive(0.1)
     if get_me_result then break end
@@ -93,12 +97,12 @@ end
 assert(coroutine.status(thread) == "dead")
 
 local implicit_thread = coroutine.create(function()
-    local result = client:getAuthorizationState()
+    local result = client:getAuthorizationState():wait()
     assert(type(result) == "table")
 end)
 assert(coroutine.resume(implicit_thread))
 for _ = 1, 20 do
-    client:poll(0.1)
+    client:receive(0.1)
     if coroutine.status(implicit_thread) == "dead" then break end
 end
 assert(coroutine.status(implicit_thread) == "dead")
