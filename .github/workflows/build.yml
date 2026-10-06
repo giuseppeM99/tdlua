@@ -302,6 +302,21 @@ jobs:
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      - name: Prepare native Lua 5.5 artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-5.5-native-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native Lua 5.5 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-native-lua5.5-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
   native-lua53:
     name: Native backend / C++23 / Lua 5.3
     runs-on: ubuntu-24.04
@@ -342,6 +357,21 @@ jobs:
           cmake --build build --target tdlua tdlua_codec_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Prepare native Lua 5.3 artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-5.3-native-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native Lua 5.3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-native-lua5.3-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
 
   native-sanitizers:
     name: Native backend / TDLua ASan + UBSan
@@ -521,7 +551,7 @@ jobs:
   telegram:
     name: Telegram upload
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [lua, lua55]
+    needs: [native, native-lua53]
     runs-on: ubuntu-24.04
 
     steps:
@@ -537,10 +567,10 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Download all static Lua artifacts
+      - name: Download all native static Lua artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: tdlua-lua5.*-static
+          pattern: tdlua-native-lua5.*-static
           path: ${{ runner.temp }}/tdlua-artifacts
           merge-multiple: true
 
@@ -558,12 +588,12 @@ jobs:
             exit 0
           fi
           module="$(find "$RUNNER_TEMP/tdlua-artifacts" \
-            -type f -name 'tdlua-5.3-*.so' -print -quit)"
+            -type f -name 'tdlua-5.3-native-*.so' -print -quit)"
           test -n "$module"
           mkdir -p "$RUNNER_TEMP/tdlua-module"
           cp "$module" "$RUNNER_TEMP/tdlua-module/tdlua.so"
           artifacts="$(find "$RUNNER_TEMP/tdlua-artifacts" \
-            -type f -name 'tdlua-*.so' -print | sort | paste -sd, -)"
+            -type f -name 'tdlua-*-native-*.so' -print | sort | paste -sd, -)"
           test -n "$artifacts"
           LUA_CPATH="$RUNNER_TEMP/tdlua-module/?.so" \
           TDLUA_ARTIFACTS="$artifacts" \

@@ -155,7 +155,7 @@ auth_thread = coroutine.create(function(state)
                 system_language_code = "en",
                 device_model = "tdlua",
                 system_version = "tdlua",
-                application_version = "json"
+                application_version = "native"
             })
         elseif state._ == "authorizationStateWaitEncryptionKey" then
             submit_once("checkDatabaseEncryptionKey", {
