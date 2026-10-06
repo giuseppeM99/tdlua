@@ -269,8 +269,8 @@ void TDLua::saveUpdatesBuffer()
 {
     if (!_ready || dbpath.empty()) return;
     nlohmann::json jupdates = nlohmann::json::array();
-    while(updates.size()) {
-        jupdates[updates.size()] = this->pop().value;
+    while (!updates.empty()) {
+        jupdates.push_back(this->pop().value);
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();

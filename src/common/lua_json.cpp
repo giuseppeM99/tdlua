@@ -151,18 +151,9 @@ void lua_pushjson (lua_State *L, const json j) {
         for (auto it = j.begin(); it != j.end(); it++) {
             auto s = it.key();
 
-            //if (s == "@type") lua_pushstring(L, "_"); else
             lua_pushlstring(L, s.c_str(), s.length());
             lua_pushjson(L, it.value());
             lua_settable(L, -3);
-            //*
-            if (s == "@type") {
-                lua_pushstring(L, "_");
-                lua_pushstring(L, "@type");
-                lua_gettable(L, -3);
-                lua_settable(L, -3);
-            }
-            //*/
         }
     } else {
         lua_pushnil(L);

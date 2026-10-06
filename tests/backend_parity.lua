@@ -35,6 +35,63 @@ local function assert_td_error(value, label)
     assert(value.code == 400, label .. " must return error code 400")
 end
 
+-- Unsupported execute controls must be rejected before either backend can
+-- allocate a request or submit it. Numeric, boolean and nil controls remain
+-- the historical compatibility forms.
+local control_probe = tdlua.new()
+local invalid_controls = {
+    {label = "string", value = "invalid"},
+    {label = "table", value = {}},
+    {label = "function", value = function() end},
+    {label = "thread", value = coroutine.create(function() end)},
+}
+for _, control in ipairs(invalid_controls) do
+    local ok, error_message = pcall(function()
+        return control_probe:execute({_ = "getAuthorizationState"}, control.value)
+    end)
+    assert(not ok, control.label .. " execute control was accepted")
+    assert(type(error_message) == "string" and
+           error_message:find("execute", 1, true),
+           control.label .. " execute error was not descriptive")
+    assert(control_probe:pendingCount() == 0,
+           control.label .. " control submitted a request")
+end
+
+local dynamic_number_ok = pcall(function()
+    control_probe:getMe(1.0)
+end)
+assert(not dynamic_number_ok, "numeric dynamic shortcall control was accepted")
+assert(control_probe:pendingCount() == 0)
+local dynamic_params_number_ok = pcall(function()
+    control_probe:getChat({chat_id = 1}, 1.0)
+end)
+assert(not dynamic_params_number_ok,
+       "numeric dynamic shortcall timeout was accepted")
+assert(control_probe:pendingCount() == 0)
+
+local nil_control_response = control_probe:execute(
+    {_ = "getAuthorizationState"}, nil)
+assert_td_object(nil_control_response, "nil execute control")
+local false_control_response = control_probe:execute(
+    {_ = "getAuthorizationState"}, false)
+assert_td_object(false_control_response, "false execute control")
+local numeric_control_response = control_probe:execute(
+    {_ = "getAuthorizationState"}, 1.0)
+assert_td_object(numeric_control_response, "numeric execute control")
+local true_control_id = control_probe:execute(
+    {_ = "getAuthorizationState"}, true)
+assert(type(true_control_id) == "number")
+local true_control_response
+for _ = 1, 20 do
+    local event = control_probe:receive(0.1)
+    if event and event._request_id == true_control_id then
+        true_control_response = event
+        break
+    end
+end
+assert_td_object(true_control_response, "true execute control")
+control_probe:close()
+
 -- Legacy blocking APIs must have the same response shape.
 local response = client:execute({_ = "getAuthorizationState"}, 1.0)
 assert_td_object(response, "execute")

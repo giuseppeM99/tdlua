@@ -39,6 +39,28 @@ for _ = 1, 20 do
 end
 assert(type(dynamic_result) == "table")
 
+-- Dynamic helpers use the same callback and context contract as async
+-- requests. getMe may return an authorization error before login, but it
+-- must still be delivered as a normal response with the request ID attached.
+local get_me_result
+local get_me_context
+local get_me_response_id
+local get_me_id = client:getMe(function(result, context)
+    get_me_result = result
+    get_me_context = context
+    get_me_response_id = result._request_id
+    assert(type(result) == "table")
+    assert(context.origin == "get-me-helper")
+end, {origin = "get-me-helper"})
+assert(type(get_me_id) == "number")
+for _ = 1, 20 do
+    client:receive(0.1)
+    if get_me_result then break end
+end
+assert(type(get_me_result) == "table")
+assert(get_me_context.origin == "get-me-helper")
+assert(get_me_response_id == get_me_id)
+
 local property_handler = function() end
 client.onUpdateAuthorizationState = property_handler
 assert(client.onUpdateAuthorizationState == property_handler)

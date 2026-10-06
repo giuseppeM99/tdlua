@@ -189,7 +189,7 @@ static int tdclient_execute(lua_State *L)
             fire_and_forget = lua_toboolean(L, -1) != 0;
             lua_pop(L, 1);
         }
-        const int request_index = lua_gettop(L);
+        const int request_index = 2;
         if (lua_type(L, request_index) == LUA_TSTRING ||
             lua_type(L, request_index) == LUA_TTABLE) {
             std::string error;

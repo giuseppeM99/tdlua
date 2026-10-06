@@ -72,6 +72,22 @@ inline bool is_integer(lua_State *L, int index)
     return tdlua_lua_integer_value(L, index, value);
 }
 
+inline void validate_execute_control(lua_State *L)
+{
+    if (lua_gettop(L) < 3) {
+        return;
+    }
+
+    const int type = lua_type(L, 3);
+    if (type == LUA_TNIL || type == LUA_TBOOLEAN || type == LUA_TNUMBER) {
+        return;
+    }
+
+    throw std::runtime_error(
+        std::string("tdlua: execute control type '") +
+        lua_typename(L, type) + "' is not supported");
+}
+
 inline void reject_reserved_request_fields(lua_State *L, int index)
 {
     if (!lua_istable(L, index)) {

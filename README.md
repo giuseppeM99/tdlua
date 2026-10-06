@@ -95,13 +95,13 @@ Asynchronous requests keep the raw `send`/`receive` API available while adding
 callbacks and update handlers:
 
 ```lua
-client:request({_ = "getMe"}, function(result, context)
-    print(result.first_name, context.origin)
-end, {origin = "startup"})
-
 client:on("updateNewMessage", function(update)
     print(update.message.id)
 end)
+
+client:getMe(function(result, context)
+    print(result.first_name, context.origin)
+end, {origin = "startup"})
 
 client:receive(1.0)
 ```

@@ -401,6 +401,32 @@ if(TDLUA_BUILD_TESTS)
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
 
+    add_executable(tdlua_persistence_test
+        "tests/persistence_test.cpp"
+    )
+    target_include_directories(tdlua_persistence_test PRIVATE
+        ${LUA_INCLUDE_DIRS}
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(tdlua_persistence_test PRIVATE tdlua ${LUA_LIBRARIES})
+    target_compile_features(tdlua_persistence_test PRIVATE cxx_std_23)
+    tdlua_enable_sanitizers(tdlua_persistence_test)
+    if(_tdlua_backend STREQUAL "native")
+        target_compile_definitions(tdlua_persistence_test PRIVATE TDLUA_NATIVE_BACKEND)
+        target_include_directories(tdlua_persistence_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/td"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${TDLUA_NATIVE_GENERATED_DIR}"
+        )
+        add_dependencies(tdlua_persistence_test tdlua_native_generated)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(tdlua_persistence_test PRIVATE -fno-sanitize=vptr)
+        endif()
+    else()
+        target_compile_definitions(tdlua_persistence_test PRIVATE TDLUA_JSON_BACKEND)
+    endif()
+    add_test(NAME tdlua_persistence COMMAND tdlua_persistence_test)
+
     if(_tdlua_backend STREQUAL "native")
         add_executable(tdlua_native_codec_test
             "tests/native_codec_test.cpp"

@@ -21,7 +21,13 @@ static int tdclient_new(lua_State *L);
 
 static int tdclient_receive(lua_State *L) { return operations().receive(L); }
 static int tdclient_send(lua_State *L) { return operations().send(L); }
-static int tdclient_execute(lua_State *L) { return operations().execute(L); }
+static int tdclient_execute(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        tdlua_binding::validate_execute_control(L);
+        return operations().execute(L);
+    });
+}
 static int tdclient_call(lua_State *L) { return operations().call(L); }
 static int tdclient_rawexecute(lua_State *L)
 {
