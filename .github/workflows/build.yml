@@ -344,7 +344,7 @@ jobs:
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
   native-sanitizers:
-    name: Native backend / ASan + UBSan
+    name: Native backend / TDLua ASan + UBSan
     runs-on: ubuntu-24.04
 
     steps:
@@ -375,16 +375,12 @@ jobs:
             INSTALL_TOP="$RUNNER_TEMP/lua55"
 
       - name: Configure sanitized native backend
-        env:
-          SANITIZER_FLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
-            -DCMAKE_EXE_LINKER_FLAGS="$SANITIZER_FLAGS" \
-            -DCMAKE_SHARED_LINKER_FLAGS="$SANITIZER_FLAGS" \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_ENABLE_SANITIZERS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
             -DTDLUA_LUA_VERSION=5.5 \
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \

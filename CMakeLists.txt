@@ -18,6 +18,57 @@ set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)
+option(TDLUA_ENABLE_SANITIZERS
+       "Enable AddressSanitizer and UndefinedBehaviorSanitizer for TDLua targets"
+       OFF)
+
+function(tdlua_enable_sanitizers target)
+  if(TDLUA_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      message(FATAL_ERROR
+              "TDLUA_ENABLE_SANITIZERS requires a GCC- or Clang-compatible compiler")
+    endif()
+    target_compile_options(${target} PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize=vptr)
+    target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+  endif()
+endfunction()
+
+if(TDLUA_ENABLE_SANITIZERS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  execute_process(
+      COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libasan.so
+      OUTPUT_VARIABLE _tdlua_asan_runtime
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _tdlua_asan_result)
+  execute_process(
+      COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libubsan.so
+      OUTPUT_VARIABLE _tdlua_ubsan_runtime
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _tdlua_ubsan_result)
+  if(NOT _tdlua_asan_result EQUAL 0
+     OR NOT _tdlua_ubsan_result EQUAL 0
+     OR NOT IS_ABSOLUTE "${_tdlua_asan_runtime}"
+     OR NOT IS_ABSOLUTE "${_tdlua_ubsan_runtime}")
+    message(FATAL_ERROR
+            "Unable to locate ASan/UBSan runtimes for sanitized Lua tests")
+  endif()
+  set(_tdlua_sanitizer_test_environment
+      "LD_PRELOAD=${_tdlua_asan_runtime}:${_tdlua_ubsan_runtime}")
+endif()
+
+function(tdlua_enable_sanitizer_test_runtime)
+  if(_tdlua_sanitizer_test_environment)
+    set_tests_properties(${ARGV}
+        PROPERTIES ENVIRONMENT "${_tdlua_sanitizer_test_environment}")
+  endif()
+endfunction()
+
+set(_tdlua_backend_was_defined FALSE)
+if(DEFINED TDLUA_BACKEND)
+  set(_tdlua_backend_was_defined TRUE)
+endif()
 set(TDLUA_BACKEND "json" CACHE STRING
     "TDLua backend to build (json or native)")
 set_property(CACHE TDLUA_BACKEND PROPERTY STRINGS json native)
@@ -32,7 +83,7 @@ option(TDLUA_TD_STATIC "Legacy alias for TDLUA_JSON_STATIC" OFF)
 if(TDLUA_NATIVE_BACKEND)
   message(DEPRECATION
           "TDLUA_NATIVE_BACKEND is deprecated; use -DTDLUA_BACKEND=native")
-  if(DEFINED TDLUA_BACKEND AND NOT TDLUA_BACKEND STREQUAL "native")
+  if(_tdlua_backend_was_defined AND NOT TDLUA_BACKEND STREQUAL "native")
     message(WARNING
             "TDLUA_NATIVE_BACKEND=ON overrides TDLUA_BACKEND=${TDLUA_BACKEND}; "
             "use TDLUA_BACKEND=native explicitly")
@@ -41,6 +92,10 @@ if(TDLUA_NATIVE_BACKEND)
 else()
   set(_tdlua_backend "${TDLUA_BACKEND}")
 endif()
+# Keep the cache and generated package metadata aligned with the effective
+# backend, including when the deprecated native alias selected it.
+set(TDLUA_BACKEND "${_tdlua_backend}" CACHE STRING
+    "TDLua backend to build (json or native)" FORCE)
 if(_tdlua_backend STREQUAL "native")
   set(_tdlua_native_backend ON)
 elseif(_tdlua_backend STREQUAL "json")
@@ -71,6 +126,7 @@ if(_tdlua_backend STREQUAL "native" AND TDLUA_JSON_STATIC)
           "TDLUA_JSON_STATIC is ignored for the native backend; native is always static")
   set(_tdlua_json_static OFF)
 endif()
+set(TDLUA_JSON_STATIC "${_tdlua_json_static}")
 
 set(TDLUA_TDLIB_VERSION "")
 set(TDLUA_LUA_VERSION "" CACHE STRING "Lua version used for the module installation path")
@@ -106,6 +162,11 @@ if(NOT LUA_INCLUDE_DIRS)
   set(LUA_INCLUDE_DIRS "${LUA_INCLUDE_DIR}")
 endif()
 
+if(_tdlua_native_backend AND NOT TDLUA_BUNDLED_TDLIB)
+  message(FATAL_ERROR
+          "TDLUA_BACKEND=native requires TDLUA_BUNDLED_TDLIB=ON because the native codec is generated from TDLib's schema")
+endif()
+
 if(TDLUA_BUNDLED_TDLIB)
   # TDLib defines both targets internally, but install only the library form
   # needed by the selected backend.
@@ -121,9 +182,6 @@ else()
   find_package(Td CONFIG REQUIRED)
 endif()
 
-if(_tdlua_native_backend AND NOT TDLUA_BUNDLED_TDLIB)
-  message(FATAL_ERROR "TDLUA_NATIVE_BACKEND currently requires TDLUA_BUNDLED_TDLIB=ON so the TDLib schema generator is available")
-endif()
 if(TDLUA_CALLS)
   message(FATAL_ERROR "VoIP bindings have been removed; TDLUA_CALLS is no longer supported")
 endif()
@@ -227,8 +285,12 @@ if(_tdlua_backend STREQUAL "native")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
+tdlua_enable_sanitizers(tdlua)
 if(_tdlua_backend STREQUAL "native")
   target_compile_features(tdlua PRIVATE cxx_std_23)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(tdlua PRIVATE -fno-sanitize=vptr)
+  endif()
 else()
   target_compile_features(tdlua PRIVATE cxx_std_11)
 endif()
@@ -329,6 +391,7 @@ if(TDLUA_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
     target_link_libraries(tdlua_codec_test PRIVATE ${LUA_LIBRARIES})
+    tdlua_enable_sanitizers(tdlua_codec_test)
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
 
@@ -339,9 +402,17 @@ if(TDLUA_BUILD_TESTS)
         target_include_directories(tdlua_native_codec_test PRIVATE
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${TDLUA_NATIVE_GENERATED_DIR}"
         )
-        target_link_libraries(tdlua_native_codec_test PRIVATE ${LUA_LIBRARIES})
+        target_link_libraries(tdlua_native_codec_test PRIVATE tdlua ${LUA_LIBRARIES})
         target_compile_features(tdlua_native_codec_test PRIVATE cxx_std_23)
+        tdlua_enable_sanitizers(tdlua_native_codec_test)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(tdlua_native_codec_test PRIVATE -fno-sanitize=vptr)
+        endif()
+        add_dependencies(tdlua_native_codec_test tdlua_native_generated)
         add_test(NAME tdlua_native_codec COMMAND tdlua_native_codec_test)
 
         add_executable(tdlua_native_schema_test
@@ -349,6 +420,10 @@ if(TDLUA_BUILD_TESTS)
         )
         target_link_libraries(tdlua_native_schema_test PRIVATE tdtl)
         target_compile_features(tdlua_native_schema_test PRIVATE cxx_std_23)
+        tdlua_enable_sanitizers(tdlua_native_schema_test)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(tdlua_native_schema_test PRIVATE -fno-sanitize=vptr)
+        endif()
         add_dependencies(tdlua_native_schema_test tdlua_native_generated)
         add_test(NAME tdlua_native_schema
             COMMAND tdlua_native_schema_test
@@ -363,6 +438,7 @@ if(TDLUA_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
     target_link_libraries(tdlua_model_benchmark PRIVATE ${LUA_LIBRARIES})
+    tdlua_enable_sanitizers(tdlua_model_benchmark)
     set_property(TARGET tdlua_model_benchmark PROPERTY CXX_STANDARD 11)
 
     if(LUA_EXECUTABLE)
@@ -391,6 +467,12 @@ if(TDLUA_BUILD_TESTS)
             COMMAND ${TDLUA_LUA_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_smoke.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
+        )
+        tdlua_enable_sanitizer_test_runtime(
+            tdlua_lifecycle
+            tdlua_async
+            tdlua_backend_parity
+            tdlua_e2e_smoke
         )
     endif()
 endif()
