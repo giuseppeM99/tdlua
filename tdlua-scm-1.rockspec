@@ -1,6 +1,3 @@
-# Copyright (c) 2018-2026 Giuseppe Marino
-# SPDX-License-Identifier: BSD-3-Clause
-
 rockspec_format = "3.0"
 
 package = "tdlua"
