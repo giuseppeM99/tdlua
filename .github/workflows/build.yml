@@ -373,6 +373,118 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
+  native-lua52:
+    name: Native backend / C++23 / Lua 5.2
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            liblua5.2-dev \
+            lua5.2 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Configure native backend
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.2 \
+            -DLUA_EXECUTABLE="$(command -v lua5.2)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.2 \
+            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.2.so
+
+      - name: Build and test native backend
+        run: |
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_native_codec_test tdlua_native_schema_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Prepare native Lua 5.2 artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-5.2-native-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native Lua 5.2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-native-lua5.2-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
+  native-lua54:
+    name: Native backend / C++23 / Lua 5.4
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            gperf \
+            liblua5.4-dev \
+            lua5.4 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Configure native backend
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.4.so
+
+      - name: Build and test native backend
+        run: |
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_native_codec_test tdlua_native_schema_test
+          ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Prepare native Lua 5.4 artifact
+        id: artifact
+        run: |
+          version="$(cat build/tdlua-version.txt)"
+          artifact="tdlua-5.4-native-${version}-linux-x86_64.so"
+          cp build/tdlua.so "build/${artifact}"
+          echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native Lua 5.4 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlua-native-lua5.4-static
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
   native-sanitizers:
     name: Native backend / TDLua ASan + UBSan
     runs-on: ubuntu-24.04
@@ -551,7 +663,7 @@ jobs:
   telegram:
     name: Telegram upload
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [native, native-lua53]
+    needs: [native, native-lua52, native-lua53, native-lua54]
     runs-on: ubuntu-24.04
 
     steps:
