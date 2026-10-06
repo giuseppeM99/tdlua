@@ -219,19 +219,21 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
 
 if(_tdlua_backend STREQUAL "native")
   list(APPEND tdlua_srcs
-      "src/native_runtime.cpp"
-      "src/native_tdlua.cpp"
-      "src/native_dispatcher.cpp"
-      "src/binding/native_client.cpp"
-      "src/luajson.cpp"
+      "src/binding/client.cpp"
+      "src/backend/native/runtime.cpp"
+      "src/backend/native/client.cpp"
+      "src/backend/native/dispatcher.cpp"
+      "src/backend/native/binding.cpp"
+      "src/common/lua_json.cpp"
   )
 else()
   list(APPEND tdlua_srcs
-      "src/tdlua.cpp"
-      "src/luajson.cpp"
-      "src/binding/json_client.cpp"
-      "src/request_router.cpp"
-      "src/lua_dispatcher.cpp"
+      "src/binding/client.cpp"
+      "src/backend/json/client.cpp"
+      "src/common/lua_json.cpp"
+      "src/backend/json/binding.cpp"
+      "src/backend/json/request_router.cpp"
+      "src/backend/json/dispatcher.cpp"
   )
 endif()
 
@@ -249,7 +251,7 @@ if(_tdlua_backend STREQUAL "native")
       "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_dispatch.cpp")
   set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
 
-  add_executable(tdlua_native_generator src/native_generator.cpp)
+  add_executable(tdlua_native_generator src/backend/native/generator.cpp)
   target_link_libraries(tdlua_native_generator PRIVATE tdtl)
   target_compile_features(tdlua_native_generator PRIVATE cxx_std_23)
 
@@ -279,6 +281,7 @@ add_library (tdlua SHARED ${tdlua_srcs})
 target_include_directories(tdlua PRIVATE
     ${LUA_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 if(_tdlua_backend STREQUAL "native")
   target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
@@ -384,7 +387,7 @@ if(TDLUA_BUILD_TESTS)
     target_compile_definitions(tdlua PRIVATE TDLUA_TESTING)
     add_executable(tdlua_codec_test
         "tests/codec_test.cpp"
-        "src/luajson.cpp"
+        "src/common/lua_json.cpp"
     )
     target_include_directories(tdlua_codec_test PRIVATE
         ${LUA_INCLUDE_DIRS}

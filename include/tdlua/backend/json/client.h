@@ -9,7 +9,7 @@
 #include <deque>
 #include <string>
 #include <nlohmann/json.hpp>
-#include "tdlua/lua_dispatcher.h"
+#include "tdlua/backend/json/dispatcher.h"
 
 
 class TDLua {

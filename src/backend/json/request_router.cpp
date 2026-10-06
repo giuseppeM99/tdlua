@@ -1,7 +1,8 @@
-#include "tdlua/request_router.h"
+#include "tdlua/backend/json/request_router.h"
 
-#include "tdlua/luajson.h"
+#include "tdlua/common/lua_json.h"
 
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -82,6 +83,16 @@ void RequestRouter::cancel(std::uint64_t request_id)
     PendingRequest pending = found->second;
     pending_.erase(found);
     release(pending);
+}
+
+void RequestRouter::observeRequestId(const std::uint64_t request_id)
+{
+    if (request_id == 0 || request_id < next_id_) {
+        return;
+    }
+    next_id_ = request_id == std::numeric_limits<std::uint64_t>::max()
+        ? request_id
+        : request_id + 1;
 }
 
 std::size_t RequestRouter::pendingCount() const

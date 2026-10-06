@@ -23,6 +23,7 @@ public:
     std::uint64_t addAwaiter(lua_State *L, nlohmann::json &request);
     std::uint64_t addRaw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
+    void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
 
     static bool responseRequestId(const nlohmann::json &response,

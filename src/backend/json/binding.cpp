@@ -4,10 +4,10 @@
  * This file is under GPLv3 license see LICENCE
  */
 
-#include "lua_binding.h"
-#include "lua_binding_common.h"
-#include "tdlua/tdlua.h"
-#include "tdlua/luajson.h"
+#include "binding/lua_binding.h"
+#include "binding/lua_binding_common.h"
+#include "tdlua/backend/json/client.h"
+#include "tdlua/common/lua_json.h"
 #include <td/telegram/td_log.h>
 #include <chrono>
 #include <exception>
@@ -71,17 +71,6 @@ static bool json_closed(tdlua_binding::ClientHandle client)
     return static_cast<TDLua *>(client)->closed();
 }
 
-static const tdlua_binding::ClientOperations json_operations = {
-    json_push_handler,
-    json_on,
-    json_off,
-    json_save_updates,
-    json_clear_updates,
-    json_unload,
-    json_close,
-    json_closed
-};
-
 using json = nlohmann::json;
 
 static bool lua_to_json(lua_State *L, int index, json &result, std::string &error)
@@ -124,12 +113,6 @@ static void reject_reserved_json_fields(const json &request)
         throw std::runtime_error(
             "tdlua: request field '_request_id' is reserved");
     }
-}
-
-static int tdclient_new(lua_State *L)
-{
-    return tdlua_binding::new_client(
-        L, createTD, tdclient_index, tdclient_newindex, tdclient_unload, mt);
 }
 
 static int tdclient_receive(lua_State *L)
@@ -364,16 +347,6 @@ static int call(lua_State *L)
     return yield_after_submit ? lua_yield(L, 0) : result;
 }
 
-static int tdclient_index(lua_State *L)
-{
-    return tdlua_binding::index(L, getTD(L), json_operations, call);
-}
-
-static int tdclient_newindex(lua_State *L)
-{
-    return tdlua_binding::newindex(L, getTD(L), json_operations);
-}
-
 static int tdclient_rawexecute(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
@@ -480,41 +453,6 @@ static int tdclient_await(lua_State *L)
     return yield_after_submit ? lua_yield(L, 0) : result;
 }
 
-static int tdclient_on(lua_State *L)
-{
-    return tdlua_binding::on(L, getTD(L), json_operations);
-}
-
-static int tdclient_off(lua_State *L)
-{
-    return tdlua_binding::off(L, getTD(L), json_operations);
-}
-
-static int tdclient_save(lua_State *L)
-{
-    return tdlua_binding::save(L, getTD(L), json_operations);
-}
-
-static int tdclient_clear(lua_State *L)
-{
-    return tdlua_binding::clear(L, getTD(L), json_operations);
-}
-
-static int tdclient_unload(lua_State *L)
-{
-    return tdlua_binding::unload(L, getTD(L), json_operations);
-}
-
-static int tdclient_close(lua_State *L)
-{
-    return tdlua_binding::close(L, getTD(L), json_operations);
-}
-
-static int tdclient_isclosed(lua_State *L)
-{
-    return tdlua_binding::is_closed(L, getTD(L), json_operations);
-}
-
 #ifdef TDLUA_TESTING
 static int tdclient_pending_count(lua_State *L)
 {
@@ -529,10 +467,6 @@ static int tdclient_pending_count(lua_State *L)
 }
 #endif
 
-static int tdclient_getcall(lua_State *L)
-{
-    return luaL_error(L, "TDLua VoIP support has been removed");
-}
 
 static void tdclient_fatalerrorcb(const char *error)
 {
@@ -571,40 +505,34 @@ static int tdclient_setlogverbosity(lua_State *L)
     return 1;
 }
 
-//Open Lib
-static luaL_Reg tdlua[] = {
-        {"new", tdclient_new},
-        {"setLogPath", tdclient_setlogpath},
-        {"setLogMaxSize", tdclient_setlogmaxsize},
-        {"setLogLevel", tdclient_setlogverbosity},
-        {nullptr, nullptr}
+
+static const tdlua_binding::ClientOperations json_operations = {
+    createTD,
+    tdclient_receive,
+    tdclient_send,
+    tdclient_execute,
+    call,
+    tdclient_rawexecute,
+    tdclient_request,
+    tdclient_await,
+    json_push_handler,
+    json_on,
+    json_off,
+    json_save_updates,
+    json_clear_updates,
+    json_unload,
+    json_close,
+    json_closed,
+#ifdef TDLUA_TESTING
+    tdclient_pending_count,
+#endif
+    tdclient_setlogpath,
+    tdclient_setlogmaxsize,
+    tdclient_setlogverbosity,
+    []() { td_set_log_fatal_error_callback(tdclient_fatalerrorcb); }
 };
 
-#ifndef TDLUA_VERSION_STRING
-#define TDLUA_VERSION_STRING "unknown"
-#endif
-#ifndef TDLUA_BASE_VERSION
-#define TDLUA_BASE_VERSION "unknown"
-#endif
-#ifndef TDLUA_TDLIB_VERSION
-#define TDLUA_TDLIB_VERSION "unknown"
-#endif
-
-extern "C" {
-    LUALIB_API int luaopen_tdlua(lua_State *L) {
-        luaL_newmetatable(L, "tdlua");
-        lua_pushstring(L, "__call");
-        lua_pushcfunction(L, tdclient_new);
-        lua_settable(L, -3);
-        luaL_newlib(L, tdlua);
-        lua_pushstring(L, TDLUA_VERSION_STRING);
-        lua_setfield(L, -2, "version");
-        lua_pushstring(L, TDLUA_BASE_VERSION);
-        lua_setfield(L, -2, "api_version");
-        lua_pushstring(L, TDLUA_TDLIB_VERSION);
-        lua_setfield(L, -2, "tdlib_version");
-        luaL_setmetatable(L, "tdlua");
-        td_set_log_fatal_error_callback(tdclient_fatalerrorcb);
-        return 1;
-    }
+const tdlua_binding::ClientOperations &tdlua_backend_operations()
+{
+    return json_operations;
 }

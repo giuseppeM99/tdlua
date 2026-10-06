@@ -63,6 +63,26 @@ for _, field in ipairs({"@extra", "_request_id"}) do
         client:request({_ = "getAuthorizationState", [field] = 2}, function() end)
     end)
     assert(not request_ok, "reserved field was accepted by request: " .. field)
+
+    local json_send_ok = pcall(function()
+        client:send('{"@type":"getAuthorizationState","' .. field .. '":null}')
+    end)
+    assert(not json_send_ok,
+           "reserved JSON-string field was accepted by send: " .. field)
+    local json_execute_ok = pcall(function()
+        client:execute(
+            '{"@type":"getAuthorizationState","' .. field .. '":null}',
+            0.1)
+    end)
+    assert(not json_execute_ok,
+           "reserved JSON-string field was accepted by execute: " .. field)
+    local json_request_ok = pcall(function()
+        client:request(
+            '{"@type":"getAuthorizationState","' .. field .. '":null}',
+            function() end)
+    end)
+    assert(not json_request_ok,
+           "reserved JSON-string field was accepted by request: " .. field)
 end
 
 -- A send response must use the same per-client request-id namespace as an

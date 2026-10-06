@@ -1,5 +1,5 @@
-#include "tdlua/native_codec_runtime.h"
-#include "tdlua/native_codec.h"
+#include "tdlua/backend/native/codec_runtime.h"
+#include "tdlua/backend/native/codec.h"
 
 #include <td/telegram/td_api.hpp>
 

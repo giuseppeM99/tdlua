@@ -1,7 +1,7 @@
 #pragma once
 
 #include "tdlua/lua_compat.h"
-#include "tdlua/native_runtime.h"
+#include "tdlua/backend/native/runtime.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +18,7 @@ public:
     std::uint64_t await(lua_State *L, int request_index);
     std::uint64_t raw(lua_State *L, int request_index);
     void cancel(std::uint64_t request_id);
+    void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
 
     int dispatch(lua_State *L, NativeResponse &response);

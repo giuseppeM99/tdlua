@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tdlua/native_dispatcher.h"
+#include "tdlua/backend/native/dispatcher.h"
 
 #include <td/telegram/td_api.h>
 

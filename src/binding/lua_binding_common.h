@@ -31,6 +31,14 @@ using ClientHandle = void *;
 using ClientFactory = ClientHandle (*)(lua_State *);
 
 struct ClientOperations final {
+    ClientFactory factory;
+    lua_CFunction receive;
+    lua_CFunction send;
+    lua_CFunction execute;
+    lua_CFunction call;
+    lua_CFunction raw_execute;
+    lua_CFunction request;
+    lua_CFunction await;
     bool (*push_handler)(ClientHandle, lua_State *, const char *);
     void (*on)(ClientHandle, lua_State *, const char *, int);
     void (*off)(ClientHandle, const char *);
@@ -39,6 +47,13 @@ struct ClientOperations final {
     void (*unload)(ClientHandle);
     void (*close)(ClientHandle);
     bool (*closed)(ClientHandle);
+#ifdef TDLUA_TESTING
+    lua_CFunction pending_count;
+#endif
+    lua_CFunction set_log_path;
+    lua_CFunction set_log_max_size;
+    lua_CFunction set_log_level;
+    void (*initialize_logging)();
 };
 
 struct HelperArguments final {

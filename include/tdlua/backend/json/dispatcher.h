@@ -7,7 +7,7 @@
 #include "tdlua/lua_compat.h"
 
 #include <nlohmann/json.hpp>
-#include "tdlua/request_router.h"
+#include "tdlua/backend/json/request_router.h"
 
 class LuaDispatcher {
 public:
@@ -19,6 +19,7 @@ public:
     std::uint64_t await(lua_State *L, nlohmann::json &request);
     std::uint64_t raw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
+    void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
     static bool responseRequestId(const nlohmann::json &response,
                                   std::uint64_t &request_id);

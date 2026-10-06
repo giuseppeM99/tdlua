@@ -1,6 +1,6 @@
-#include "tdlua/lua_dispatcher.h"
+#include "tdlua/backend/json/dispatcher.h"
 
-#include "tdlua/luajson.h"
+#include "tdlua/common/lua_json.h"
 
 #include <stdexcept>
 
@@ -52,6 +52,11 @@ bool LuaDispatcher::responseRequestId(const nlohmann::json &response,
 void LuaDispatcher::cancel(std::uint64_t request_id)
 {
     router_.cancel(request_id);
+}
+
+void LuaDispatcher::observeRequestId(const std::uint64_t request_id)
+{
+    router_.observeRequestId(request_id);
 }
 
 std::size_t LuaDispatcher::pendingCount() const

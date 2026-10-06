@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tdlua/native_codec.h"
+#include "tdlua/backend/native/codec.h"
 #include "tdlua/lua_compat.h"
 
 #include <td/telegram/Client.h>

@@ -1,4 +1,4 @@
-#include "tdlua/luajson.h"
+#include "tdlua/common/lua_json.h"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>

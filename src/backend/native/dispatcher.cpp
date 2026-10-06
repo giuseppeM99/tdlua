@@ -1,7 +1,8 @@
-#include "tdlua/native_dispatcher.h"
+#include "tdlua/backend/native/dispatcher.h"
 
-#include "tdlua/native_codec.h"
+#include "tdlua/backend/native/codec.h"
 
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -87,6 +88,16 @@ void NativeDispatcher::cancel(std::uint64_t request_id)
     PendingRequest pending = found->second;
     pending_.erase(found);
     release(pending);
+}
+
+void NativeDispatcher::observeRequestId(const std::uint64_t request_id)
+{
+    if (request_id == 0 || request_id < next_id_) {
+        return;
+    }
+    next_id_ = request_id == std::numeric_limits<std::uint64_t>::max()
+        ? request_id
+        : request_id + 1;
 }
 
 std::size_t NativeDispatcher::pendingCount() const

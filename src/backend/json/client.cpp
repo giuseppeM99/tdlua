@@ -4,7 +4,7 @@
  * This file is under GPLv3 license see LICENCE
  */
 
-#include "tdlua/tdlua.h"
+#include "tdlua/backend/json/client.h"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -17,6 +17,30 @@
 namespace {
 
 using json = nlohmann::json;
+
+bool persistedRequestId(const json &value, std::uint64_t &request_id)
+{
+    if (!value.is_object()) {
+        return false;
+    }
+    const json::const_iterator field = value.find("_request_id");
+    if (field == value.end()) {
+        return false;
+    }
+    if (field->is_number_unsigned()) {
+        request_id = field->get<std::uint64_t>();
+        return request_id != 0;
+    }
+    if (!field->is_number_integer()) {
+        return false;
+    }
+    const std::int64_t signed_id = field->get<std::int64_t>();
+    if (signed_id <= 0) {
+        return false;
+    }
+    request_id = static_cast<std::uint64_t>(signed_id);
+    return true;
+}
 
 class JsonRuntime {
 public:
@@ -277,6 +301,10 @@ void TDLua::loadUpdatesBuffer()
             nlohmann::json j = nlohmann::json::parse(buf);
             if (j.is_array() && !j.empty()) {
                 for (auto &elem : j) {
+                    std::uint64_t request_id = 0;
+                    if (persistedRequestId(elem, request_id)) {
+                        dispatcher_.observeRequestId(request_id);
+                    }
                     updates.push_back(QueuedUpdate(elem, false));
                 }
             }

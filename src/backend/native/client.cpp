@@ -1,14 +1,42 @@
-#include "tdlua/native_tdlua.h"
+#include "tdlua/backend/native/client.h"
 
-#include "tdlua/native_codec.h"
-#include "tdlua/native_codec_runtime.h"
-#include "tdlua/native_runtime.h"
-#include "tdlua/luajson.h"
+#include "tdlua/backend/native/codec.h"
+#include "tdlua/backend/native/codec_runtime.h"
+#include "tdlua/backend/native/runtime.h"
+#include "tdlua/common/lua_json.h"
 
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <chrono>
+
+namespace {
+
+bool persistedRequestId(const nlohmann::json &value, std::uint64_t &request_id)
+{
+    if (!value.is_object()) {
+        return false;
+    }
+    const nlohmann::json::const_iterator field = value.find("_request_id");
+    if (field == value.end()) {
+        return false;
+    }
+    if (field->is_number_unsigned()) {
+        request_id = field->get<std::uint64_t>();
+        return request_id != 0;
+    }
+    if (!field->is_number_integer()) {
+        return false;
+    }
+    const std::int64_t signed_id = field->get<std::int64_t>();
+    if (signed_id <= 0) {
+        return false;
+    }
+    request_id = static_cast<std::uint64_t>(signed_id);
+    return true;
+}
+
+}
 
 NativeTDLua::NativeTDLua(lua_State *lua)
     : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
@@ -283,7 +311,10 @@ void NativeTDLua::loadUpdatesBuffer()
             const int table_index = lua_gettop(lua_);
             NativeResponse response;
             response.client_id = client_id_;
-            response.request_id = 0;
+            persistedRequestId(stored[i], response.request_id);
+            if (response.request_id != 0) {
+                dispatcher_.observeRequestId(response.request_id);
+            }
             response.object = tdlua_native::from_lua_object(
                 lua_, table_index, "updates[" + std::to_string(i + 1) + "]");
             updates_.push_back(std::move(response));

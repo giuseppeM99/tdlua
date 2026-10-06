@@ -357,8 +357,8 @@ private:
 
     void write_source(std::ostream &out)
     {
-        out << "#include \"tdlua/native_codec.h\"\n"
-            << "#include \"tdlua/native_codec_runtime.h\"\n\n"
+        out << "#include \"tdlua/backend/native/codec.h\"\n"
+            << "#include \"tdlua/backend/native/codec_runtime.h\"\n\n"
             << "#include <td/telegram/td_api.hpp>\n\n"
             << "#include <cstdint>\n"
             << "#include <string>\n"
