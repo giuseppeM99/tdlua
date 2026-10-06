@@ -49,7 +49,8 @@ jobs:
             -DLUA_EXECUTABLE="$(command -v lua5.3)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
             -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.3.so
-          cmake --build build --target tdlua tdlua_codec_test
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_fake_client_test tdlua_persistence_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"

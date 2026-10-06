@@ -5,19 +5,19 @@ cmake_minimum_required(VERSION 3.20)
 
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/dist.info" _tdlua_dist_version_line
      REGEX "^version[ \t]*=")
-string(REGEX MATCH "\"([0-9]+\\.[0-9]+)(\\.[0-9]+)?\""
+string(REGEX MATCH "\"([0-9]+\\.[0-9]+(\\.[0-9]+)?)\""
        _tdlua_dist_version_match "${_tdlua_dist_version_line}")
 if(NOT _tdlua_dist_version_match)
   message(FATAL_ERROR "Unable to read TDLua version from dist.info")
 endif()
 set(_tdlua_base_version "${CMAKE_MATCH_1}")
-project(tdlua VERSION "${_tdlua_base_version}.0" LANGUAGES C CXX)
+project(tdlua VERSION "${_tdlua_base_version}" LANGUAGES C CXX)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Keep the compilation database enabled for clangd and static analysis. This
 # is a project setting rather than a user-selectable backend option.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(TDLUA_BASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+set(TDLUA_BASE_VERSION "${PROJECT_VERSION}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)

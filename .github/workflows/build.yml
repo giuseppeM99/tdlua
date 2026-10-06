@@ -137,7 +137,9 @@ jobs:
             -DLUA_LIBRARY="/usr/lib/x86_64-linux-gnu/liblua${{ matrix.lua }}.so"
 
       - name: Build TDLua and regression tests
-        run: cmake --build build --target tdlua tdlua_codec_test
+        run: >-
+          cmake --build build --target tdlua tdlua_codec_test
+          tdlua_common_router_test tdlua_fake_client_test tdlua_persistence_test
 
       - name: Verify static TDLua and TDLib version
         run: |
@@ -233,7 +235,8 @@ jobs:
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
             -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
-          cmake --build build --target tdlua tdlua_codec_test
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_fake_client_test tdlua_persistence_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"
@@ -302,6 +305,7 @@ jobs:
       - name: Build and test native backend
         run: |
           cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_persistence_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
@@ -358,6 +362,7 @@ jobs:
       - name: Build and test native backend
         run: |
           cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_persistence_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
@@ -414,6 +419,7 @@ jobs:
       - name: Build and test native backend
         run: |
           cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_persistence_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
@@ -470,6 +476,7 @@ jobs:
       - name: Build and test native backend
         run: |
           cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_persistence_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
@@ -538,6 +545,7 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1
         run: |
           cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_persistence_test \
             tdlua_native_codec_test tdlua_native_schema_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
@@ -586,7 +594,8 @@ jobs:
             -DLUA_EXECUTABLE="$(command -v luajit)" \
             -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
             -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/libluajit-5.1.so
-          cmake --build build --target tdlua tdlua_codec_test
+          cmake --build build --target tdlua tdlua_codec_test \
+            tdlua_common_router_test tdlua_fake_client_test tdlua_persistence_test
           ctest --test-dir build --output-on-failure -R '^tdlua_'
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"
