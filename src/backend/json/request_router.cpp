@@ -122,6 +122,7 @@ tdlua::RouteKind RequestRouter::dispatchRoute(nlohmann::json &response)
 bool RequestRouter::dispatch(nlohmann::json &response)
 {
     const tdlua::RouteKind route = dispatchRoute(response);
+    router_.tick();
     return route != tdlua::RouteKind::Unknown &&
            route != tdlua::RouteKind::Update;
 }

@@ -444,7 +444,8 @@ static int tdclient_execute(lua_State *L)
         }
     });
     if (wait_for_result) {
-        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+        return tdlua::finishManagedWait(
+            L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
     return result;
 }
@@ -538,7 +539,8 @@ static int call(lua_State *L)
         return 1;
     });
     if (wait_for_result) {
-        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+        return tdlua::finishManagedWait(
+            L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
     return result;
 }
@@ -647,7 +649,8 @@ static int tdclient_await(lua_State *L)
         return 0;
     });
     if (wait_for_result) {
-        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+        return tdlua::finishManagedWait(
+            L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
     return result;
 }

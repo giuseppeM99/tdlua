@@ -361,7 +361,7 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
     runLua(L,
            "c:receive(0); assert(coroutine.status(close_co) == 'dead' and "
            "coroutine.status(other_co) == 'dead' and close_value.value == 105 and "
-           "not other_ok and other_value == nil and other_error:find('client closed'))");
+           "other_ok and other_value.value == 105 and other_error == nil)");
 
     runLua(L,
            "c:close(); c:close(); "
@@ -374,7 +374,15 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
     second.response(second.sent.front().first, 5);
     runLua(L,
            "assert(d:receive(0).value == 5); "
-           "d:close(); c = nil; d = nil; "
+           "running_task = d:getMe(function(result) "
+           "  d:close(); return result.value, 123 end)");
+    const auto running_id = second.sent.back().first;
+    second.response(running_id, 106);
+    runLua(L,
+           "assert(d:receive(0).value == 106); "
+           "local first, second = running_task:wait(); "
+           "assert(first == 106 and second == 123 and running_task:ready()); "
+           "c = nil; d = nil; "
            "collectgarbage('collect')");
 }
 

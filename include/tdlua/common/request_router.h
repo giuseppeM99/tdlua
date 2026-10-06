@@ -196,6 +196,7 @@ class RequestRouter {
     bool (*pump_)(void *, double) = nullptr;
     bool draining_ = false;
     bool clearing_ = false;
+    bool cleanup_deferred_ = false;
 
     static constexpr double default_wait_timeout_ = 10.0;
 
@@ -426,6 +427,19 @@ class RequestRouter {
             }
         }
         retire(state);
+        if (!clearing_ && cleanup_deferred_ && running_tasks_.empty() &&
+            waiters_.empty()) {
+            bool ready_task = false;
+            for (const State &ready : ready_) {
+                if (taskLike(ready.get()) && ready->status == ManagedStatus::Pending) {
+                    ready_task = true;
+                    break;
+                }
+            }
+            if (!ready_task) {
+                finalizeClear();
+            }
+        }
     }
 
     void runTask(const State &state)
@@ -676,6 +690,61 @@ class RequestRouter {
         draining_ = false;
     }
 
+    bool hasReadyTask() const
+    {
+        for (const State &state : ready_) {
+            if (taskLike(state.get()) && state->status == ManagedStatus::Pending) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void wakeTerminalWaiters()
+    {
+        std::vector<lua_State *> terminal_waiters;
+        for (const auto &entry : waiters_) {
+            if (entry.second->dependency && terminal(entry.second->dependency)) {
+                terminal_waiters.push_back(entry.first);
+            }
+        }
+        for (lua_State *coroutine : terminal_waiters) {
+            const auto found = waiters_.find(coroutine);
+            if (found == waiters_.end() || !found->second->dependency ||
+                !terminal(found->second->dependency)) {
+                continue;
+            }
+            const State dependency = found->second->dependency;
+            resumeWaiter(found->second, dependency,
+                         dependency->status == ManagedStatus::Failed
+                             ? WaitOutcome::Failed
+                             : WaitOutcome::Success);
+        }
+    }
+
+    void finalizeClear()
+    {
+        waiters_.clear();
+        for (auto &entry : pending_) {
+            releaseStateReferences(entry.second.state);
+            entry.second.state->router = nullptr;
+        }
+        for (auto &entry : live_states_) {
+            if (entry.second->handle_count == 0 &&
+                entry.second->waiter_count == 0) {
+                releaseStateReferences(entry.second);
+            }
+            entry.second->router = nullptr;
+        }
+        pending_.clear();
+        live_states_.clear();
+        ready_.clear();
+        running_tasks_.clear();
+        pump_ = nullptr;
+        pump_context_ = nullptr;
+        cleanup_deferred_ = false;
+    }
+
     State stateReference(ManagedState *state) const
     {
         for (const auto &entry : pending_) {
@@ -800,7 +869,8 @@ class RequestRouter {
                 wait_lease = false;
                 retire(state);
                 if (kind == WaitKind::Field) {
-                    return luaL_error(L, "tdlua: Future wait timeout");
+                    lua_pushliteral(L, "tdlua: Future wait timeout");
+                    return -1;
                 }
                 lua_pushnil(L);
                 lua_pushliteral(L, "timeout");
@@ -813,7 +883,8 @@ class RequestRouter {
                     releaseWaitLease(state);
                 }
                 retire(state);
-                return luaL_error(L, "%s", state->error.c_str());
+                lua_pushstring(L, state->error.c_str());
+                return -1;
             }
             lua_rawgeti(L, LUA_REGISTRYINDEX, state->response_ref);
             lua_getfield(L, -1, field ? field : "");
@@ -835,7 +906,8 @@ class RequestRouter {
                 releaseWaitLease(state);
             }
             retire(state);
-            return luaL_error(L, "%s", error.what());
+            lua_pushstring(L, error.what());
+            return -1;
         }
     }
 
@@ -1163,41 +1235,22 @@ public:
         }
         clearing_ = true;
         try {
+            cleanup_deferred_ = true;
             closePending();
-            std::vector<lua_State *> waiting_coroutines;
-            for (const auto &entry : waiters_) {
-                waiting_coroutines.push_back(entry.first);
-            }
-            for (lua_State *coroutine : waiting_coroutines) {
-                const auto found = waiters_.find(coroutine);
-                if (found == waiters_.end()) {
-                    continue;
+            wakeTerminalWaiters();
+            if (!running_tasks_.empty() || !waiters_.empty() || hasReadyTask()) {
+                if (!draining_) {
+                    clearing_ = false;
+                    drainReady();
+                    if (running_tasks_.empty() && !hasReadyTask()) {
+                        finalizeClear();
+                    }
+                    return;
                 }
-                // A client close must wake waiters even when their dependency
-                // already resolved and therefore no longer appears in pending_.
-                // resumeWaiter removes the map entry before entering Lua, so a
-                // reentrant close cannot retain a dangling WaitToken pointer.
-                resumeWaiter(found->second, found->second->dependency,
-                             WaitOutcome::Failed);
+                clearing_ = false;
+                return;
             }
-            waiters_.clear();
-            for (auto &entry : pending_) {
-                releaseStateReferences(entry.second.state);
-                entry.second.state->router = nullptr;
-            }
-            for (auto &entry : live_states_) {
-                if (entry.second->handle_count == 0 &&
-                    entry.second->waiter_count == 0) {
-                    releaseStateReferences(entry.second);
-                }
-                entry.second->router = nullptr;
-            }
-            pending_.clear();
-            live_states_.clear();
-            ready_.clear();
-            running_tasks_.clear();
-            pump_ = nullptr;
-            pump_context_ = nullptr;
+            finalizeClear();
             clearing_ = false;
         } catch (...) {
             clearing_ = false;
@@ -1263,20 +1316,23 @@ inline int taskReady(lua_State *L)
 }
 
 inline int pushDetachedManagedResult(lua_State *L,
-                                     const std::shared_ptr<ManagedState> &state)
+                                      const std::shared_ptr<ManagedState> &state)
 {
     if (!state) {
-        return luaL_error(L, "tdlua: invalid managed handle");
+        lua_pushliteral(L, "tdlua: invalid managed handle");
+        return -1;
     }
     if (state->status == ManagedStatus::Failed) {
-        return luaL_error(L, "%s", state->error.empty()
-                                      ? "tdlua: managed operation failed"
-                                      : state->error.c_str());
+        lua_pushstring(L, state->error.empty()
+                                  ? "tdlua: managed operation failed"
+                                  : state->error.c_str());
+        return -1;
     }
     if (state->kind == RequestKind::Future ||
         state->kind == RequestKind::LegacyAwait) {
         if (state->response_ref == LUA_NOREF) {
-            return luaL_error(L, "tdlua: missing managed response");
+            lua_pushliteral(L, "tdlua: missing managed response");
+            return -1;
         }
         lua_rawgeti(L, LUA_REGISTRYINDEX, state->response_ref);
         return 1;
@@ -1312,6 +1368,11 @@ inline bool optionalTimeout(lua_State *L, int index, bool &present,
     return true;
 }
 
+inline int finishManagedWait(lua_State *L, int result)
+{
+    return result < 0 ? lua_error(L) : result;
+}
+
 inline int futureWait(lua_State *L)
 {
     ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
@@ -1320,14 +1381,19 @@ inline int futureWait(lua_State *L)
     if (!optionalTimeout(L, 2, present, timeout)) {
         return luaL_error(L, "tdlua: Future:wait timeout must be a number");
     }
+    int result = 0;
+    bool failed = false;
     try {
         if (!handle->state->router) {
-            return pushDetachedManagedResult(L, handle->state);
+            result = pushDetachedManagedResult(L, handle->state);
+        } else {
+            result = handle->state->router->wait(L, handle->state, present, timeout);
         }
-        return handle->state->router->wait(L, handle->state, present, timeout);
     } catch (const std::exception &error) {
-        return luaL_error(L, "%s", error.what());
+        lua_pushstring(L, error.what());
+        failed = true;
     }
+    return failed ? lua_error(L) : finishManagedWait(L, result);
 }
 
 inline int taskWait(lua_State *L)
@@ -1338,14 +1404,19 @@ inline int taskWait(lua_State *L)
     if (!optionalTimeout(L, 2, present, timeout)) {
         return luaL_error(L, "tdlua: Task:wait timeout must be a number");
     }
+    int result = 0;
+    bool failed = false;
     try {
         if (!handle->state->router) {
-            return pushDetachedManagedResult(L, handle->state);
+            result = pushDetachedManagedResult(L, handle->state);
+        } else {
+            result = handle->state->router->wait(L, handle->state, present, timeout);
         }
-        return handle->state->router->wait(L, handle->state, present, timeout);
     } catch (const std::exception &error) {
-        return luaL_error(L, "%s", error.what());
+        lua_pushstring(L, error.what());
+        failed = true;
     }
+    return failed ? lua_error(L) : finishManagedWait(L, result);
 }
 
 inline int futureIndex(lua_State *L)
@@ -1368,22 +1439,29 @@ inline int futureIndex(lua_State *L)
                                static_cast<std::int64_t>(handle->state->request_id));
         return 1;
     }
+    int result = 0;
+    bool failed = false;
     try {
         if (!handle->state->router) {
             if (handle->state->status == ManagedStatus::Failed) {
-                return luaL_error(L, "%s", handle->state->error.empty()
-                                                 ? "tdlua: managed operation failed"
-                                                 : handle->state->error.c_str());
+                lua_pushstring(L, handle->state->error.empty()
+                                      ? "tdlua: managed operation failed"
+                                      : handle->state->error.c_str());
+                failed = true;
+            } else {
+                lua_rawgeti(L, LUA_REGISTRYINDEX, handle->state->response_ref);
+                lua_getfield(L, -1, key);
+                result = 1;
             }
-            lua_rawgeti(L, LUA_REGISTRYINDEX, handle->state->response_ref);
-            lua_getfield(L, -1, key);
-            return 1;
+        } else {
+            result = handle->state->router->wait(L, handle->state, false, 0.0,
+                                                 WaitKind::Field, key);
         }
-        return handle->state->router->wait(L, handle->state, false, 0.0,
-                                           WaitKind::Field, key);
     } catch (const std::exception &error) {
-        return luaL_error(L, "%s", error.what());
+        lua_pushstring(L, error.what());
+        failed = true;
     }
+    return failed ? lua_error(L) : finishManagedWait(L, result);
 }
 
 inline int taskIndex(lua_State *L)
