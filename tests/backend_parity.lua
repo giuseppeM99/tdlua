@@ -26,6 +26,12 @@ local function assert_td_object(value, label)
     assert(value._ == value["@type"], label .. " must expose matching type aliases")
 end
 
+local function assert_td_error(value, label)
+    assert_td_object(value, label)
+    assert(value._ == "error", label .. " must return a TDLib error")
+    assert(value.code == 400, label .. " must return error code 400")
+end
+
 -- Legacy blocking APIs must have the same response shape.
 local response = client:execute({_ = "getAuthorizationState"}, 1.0)
 assert_td_object(response, "execute")
@@ -81,6 +87,63 @@ for _ = 1, 20 do
 end
 assert_td_object(nested_response, "nested helper")
 
+-- Exercise real TDLib methods with nested constructors. These requests are
+-- intentionally made before setTdlibParameters: TDLib validates the complete
+-- request and then returns its initialization error, so the test needs no
+-- credentials or network session.
+local real_get_chat = client:execute({_ = "getChat", chat_id = 42}, 1.0)
+assert_td_object(real_get_chat, "real getChat")
+assert(real_get_chat._ == "error" or real_get_chat._ == "chat")
+
+local real_get_chat_string = client:execute(
+    {_ = "getChat", chat_id = "42"}, 1.0)
+assert_td_object(real_get_chat_string, "real getChat int53 string")
+assert(real_get_chat_string._ == "error" or real_get_chat_string._ == "chat")
+
+local real_send_message = client:execute({
+    _ = "sendMessage",
+    chat_id = 42,
+    input_message_content = {
+        _ = "inputMessageText",
+        text = {
+            _ = "formattedText",
+            text = "tdlua real method test",
+            entities = {}
+        }
+    }
+}, 1.0)
+assert_td_object(real_send_message, "real sendMessage")
+assert(real_send_message._ == "error" or real_send_message._ == "message")
+
+-- A malformed numeric string must become a TDLib error and leave the client
+-- usable for the following real request.
+local invalid_real_get_chat_ok, invalid_real_get_chat = pcall(function()
+    return client:execute({_ = "getChat", chat_id = "42suffix"}, 1.0)
+end)
+assert(invalid_real_get_chat_ok, "invalid real getChat raised a Lua error")
+assert_td_error(invalid_real_get_chat, "invalid real getChat response")
+local real_get_chat_after_invalid = client:execute({_ = "getChat", chat_id = 42}, 1.0)
+assert_td_object(real_get_chat_after_invalid, "real getChat after invalid request")
+
+local real_double = client:execute({_ = "setAlarm", seconds = 1.25}, 2.0)
+assert_td_object(real_double, "real double method")
+assert(real_double._ == "error" or real_double._ == "ok")
+local real_double_string_ok, real_double_string = pcall(function()
+    return client:execute({_ = "setAlarm", seconds = "1.25"}, 1.0)
+end)
+assert(real_double_string_ok, "string double raised a Lua error")
+assert_td_error(real_double_string, "real double string")
+
+local real_bool = client:execute(
+    {_ = "getInstalledBackgrounds", for_dark_theme = "1"}, 1.0)
+assert_td_object(real_bool, "real bool string method")
+assert(real_bool._ == "error" or real_bool._ == "backgrounds")
+local real_bool_invalid_ok, real_bool_invalid = pcall(function()
+    return client:execute({_ = "getInstalledBackgrounds", for_dark_theme = "no"}, 1.0)
+end)
+assert(real_bool_invalid_ok, "invalid bool raised a Lua error")
+assert_td_error(real_bool_invalid, "real invalid bool")
+
 -- TDLib's JSON parser accepts omitted fields and initializes them through the
 -- generated constructor. The native codec must preserve the same behavior,
 -- including for nested objects and explicit JSON null values.
@@ -113,8 +176,7 @@ local unknown_field = client:execute({
 assert_td_object(unknown_field, "unknown field")
 assert(unknown_field.value == "known")
 
--- Invalid fields must remain visible to Lua. JSON returns a TDLib error,
--- while native may reject the request before sending it.
+-- Invalid schema fields must remain visible to Lua as TDLib error objects.
 local invalid_requests = {
     {name = "nested missing type", request = {
         _ = "testCallVectorIntObject", x = {{}}
@@ -130,18 +192,82 @@ for _, invalid in ipairs(invalid_requests) do
     local ok, result = pcall(function()
         return client:execute(invalid.request, 1.0)
     end)
-    if ok and result ~= nil then
-        assert(type(result) == "table" and result._ == "error",
-            invalid.name .. " returned an unexpected result")
+    assert(ok, invalid.name .. " raised a Lua error")
+    assert_td_error(result, invalid.name)
+end
+
+local malformed_json_ok = pcall(function()
+    client:execute("{", 1.0)
+end)
+assert(not malformed_json_ok, "malformed JSON payload was accepted")
+
+local non_object_ok, non_object_result = pcall(function()
+    return client:execute("[]", 1.0)
+end)
+if non_object_ok and non_object_result ~= nil then
+    assert(non_object_result._ == "error",
+        "non-object JSON payload returned an unexpected result")
+end
+
+local unsupported_value_ok = pcall(function()
+    client:execute({_ = "testCallString", x = function() end}, 1.0)
+end)
+assert(not unsupported_value_ok, "unsupported Lua payload was accepted")
+
+-- TDLib accepts both JSON numbers and decimal strings for integer fields.
+local integer_from_string = client:execute({_ = "testSquareInt", x = "42"}, 1.0)
+assert_td_object(integer_from_string, "integer string payload")
+assert(integer_from_string.value == 1764)
+
+local integer_from_number = client:execute({_ = "testSquareInt", x = 42}, 1.0)
+assert_td_object(integer_from_number, "integer number payload")
+assert(integer_from_number.value == 1764)
+
+local string_from_string = client:execute({_ = "testCallString", x = "42"}, 1.0)
+assert_td_object(string_from_string, "string payload")
+assert(string_from_string.value == "42")
+
+local number_for_string_ok, number_for_string = pcall(function()
+    return client:execute({_ = "testCallString", x = 42}, 1.0)
+end)
+assert(number_for_string_ok, "number for string field raised a Lua error")
+assert_td_error(number_for_string, "number for string field")
+
+-- Conversion failures must use the normal request router for asynchronous
+-- APIs too, so callbacks and raw send/receive observe the same TDLib error.
+local invalid_callback_result
+local invalid_callback_id = client:request(
+    {_ = "testCallString", x = 42},
+    function(result)
+        invalid_callback_result = result
+    end)
+assert(type(invalid_callback_id) == "number")
+for _ = 1, 20 do
+    client:poll(0.1)
+    if invalid_callback_result then break end
+end
+assert_td_error(invalid_callback_result, "invalid request callback")
+
+client:send({
+    _ = "testCallString",
+    x = 42,
+    ["@extra"] = "codec-error-send"
+})
+local invalid_send_result
+for _ = 1, 20 do
+    local event = client:receive(0.1)
+    if event and event["@extra"] == "codec-error-send" then
+        invalid_send_result = event
+        break
     end
 end
+assert_td_error(invalid_send_result, "invalid send response")
 
 local missing_type_ok, missing_type_result = pcall(function()
     return client:execute({}, 1.0)
 end)
 if missing_type_ok and missing_type_result ~= nil then
-    assert(missing_type_result._ == "error",
-        "missing request type returned an unexpected result")
+    assert_td_error(missing_type_result, "missing request type")
 end
 
 -- send()/receive() must preserve the public @extra value and dispatch the
@@ -302,6 +428,19 @@ end
 assert(coroutine.status(thread) == "dead")
 assert_td_object(coroutine_result, "await")
 
+local await_codec_result
+local codec_thread = coroutine.create(function()
+    await_codec_result = client:await({_ = "testCallString", x = 42})
+end)
+local codec_started, codec_start_error = coroutine.resume(codec_thread)
+assert(codec_started, codec_start_error)
+for _ = 1, 20 do
+    client:receive(0.1)
+    if coroutine.status(codec_thread) == "dead" then break end
+end
+assert(coroutine.status(codec_thread) == "dead")
+assert_td_error(await_codec_result, "invalid await request")
+
 -- Lua failures raised from callbacks, handlers, and resumed awaiters must
 -- cross the binding boundary without leaving pending requests behind.
 local callback_error_ok = pcall(function()
@@ -364,11 +503,8 @@ assert(client:pendingCount() == 0)
 local unknown_ok, unknown_result = pcall(function()
     return client:execute({_ = "tdluaDefinitelyUnknownFunction"}, 0.1)
 end)
-if unknown_ok then
-    assert_td_object(unknown_result, "unknown constructor response")
-    assert(unknown_result._ == "error",
-           "unknown constructor did not produce a TDLib error")
-end
+assert(unknown_ok, "unknown constructor raised a Lua error")
+assert_td_error(unknown_result, "unknown constructor response")
 assert(client:pendingCount() == 0)
 
 -- Both dispatcher registration forms expose the same lookup behavior.

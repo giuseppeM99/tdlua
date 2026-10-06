@@ -196,8 +196,10 @@ static int tdclient_receive(lua_State *L)
 
 static bool make_request(lua_State *L, NativeTDLua *td, int index,
                          td::td_api::object_ptr<td::td_api::Function> &request,
-                         int &table_index, bool &owned, std::string &error)
+                         int &table_index, bool &owned, bool &codec_error,
+                         std::string &error)
 {
+    codec_error = false;
     if (!request_table(L, index, table_index, owned, error)) {
         return false;
     }
@@ -205,12 +207,18 @@ static bool make_request(lua_State *L, NativeTDLua *td, int index,
         td->setDBIfParameters(L, table_index);
         request = td->makeRequest(L, table_index);
     } catch (const std::exception &exception) {
+        codec_error = true;
         error = exception.what();
-        pop_owned(L, owned);
-        owned = false;
         return false;
     }
     return true;
+}
+
+static td::td_api::object_ptr<td::td_api::Function> codec_error_request(
+    const std::string &message)
+{
+    auto error = td::td_api::make_object<td::td_api::error>(400, message);
+    return td::td_api::make_object<td::td_api::testReturnError>(std::move(error));
 }
 
 static int tdclient_send(lua_State *L)
@@ -224,7 +232,25 @@ static int tdclient_send(lua_State *L)
         td::td_api::object_ptr<td::td_api::Function> request;
         int table_index = 0;
         bool owned = false;
-        if (!make_request(L, td, 2, request, table_index, owned, error)) {
+        bool codec_error = false;
+        if (!make_request(L, td, 2, request, table_index, owned, codec_error,
+                          error)) {
+            if (codec_error) {
+                std::uint64_t id = 0;
+                try {
+                    id = td->dispatcher().raw(L, table_index);
+                    td->send(codec_error_request(error), id);
+                    pop_owned(L, owned);
+                    return 0;
+                } catch (...) {
+                    if (id != 0) {
+                        td->dispatcher().cancel(id);
+                    }
+                    pop_owned(L, owned);
+                    throw;
+                }
+            }
+            pop_owned(L, owned);
             throw std::runtime_error(error);
         }
         try {
@@ -251,8 +277,15 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
     td::td_api::object_ptr<td::td_api::Function> request;
     int table_index = 0;
     bool owned = false;
-    if (!make_request(L, td, request_index, request, table_index, owned, error)) {
-        throw std::runtime_error(error);
+    bool codec_error = false;
+    if (!make_request(L, td, request_index, request, table_index, owned,
+                      codec_error, error)) {
+        if (codec_error) {
+            request = codec_error_request(error);
+        } else {
+            pop_owned(L, owned);
+            throw std::runtime_error(error);
+        }
     }
     int execute_extra_ref = LUA_NOREF;
     try {
@@ -343,11 +376,38 @@ static int call(lua_State *L)
                             request_index, owned, error)) {
             throw std::runtime_error(error);
         }
+
+        const int is_main = lua_pushthread(L);
+        lua_pop(L, 1);
+        if (!fire_and_forget && callback_index == 0 && is_main) {
+            const int result = execute_request(L, td, request_index, 10.0);
+            if (owned) {
+                if (result != 0) {
+                    // execute_request leaves its result above the helper's
+                    // temporary request table. Remove the table without
+                    // accidentally returning the result to Lua's caller.
+                    lua_insert(L, -2);
+                }
+                lua_pop(L, 1);
+            }
+            return result;
+        }
+
         td::td_api::object_ptr<td::td_api::Function> request =
-            td->makeRequest(L, request_index);
-        td->setDBIfParameters(L, request_index);
+            nullptr;
+        int encoded_table_index = 0;
+        bool encoded_owned = false;
+        bool codec_error = false;
+        if (!make_request(L, td, request_index, request, encoded_table_index,
+                          encoded_owned, codec_error, error)) {
+            if (!codec_error) {
+                pop_owned(L, owned);
+                throw std::runtime_error(error);
+            }
+            request = codec_error_request(error);
+        }
         if (fire_and_forget) {
-            const std::uint64_t id = td->dispatcher().raw(L, request_index);
+            const std::uint64_t id = td->dispatcher().raw(L, encoded_table_index);
             try {
                 td->send(std::move(request), id);
             } catch (...) {
@@ -359,7 +419,7 @@ static int call(lua_State *L)
         }
         if (callback_index != 0) {
             const std::uint64_t id = td->dispatcher().request(
-                L, request_index, callback_index, context_index);
+                L, encoded_table_index, callback_index, context_index);
             try {
                 td->send(std::move(request), id);
             } catch (...) {
@@ -370,10 +430,8 @@ static int call(lua_State *L)
             lua_pushinteger(L, static_cast<lua_Integer>(id));
             return 1;
         }
-        const int is_main = lua_pushthread(L);
-        lua_pop(L, 1);
         if (!is_main) {
-            const std::uint64_t id = td->dispatcher().await(L, request_index);
+            const std::uint64_t id = td->dispatcher().await(L, encoded_table_index);
             try {
                 td->send(std::move(request), id);
             } catch (...) {
@@ -384,7 +442,7 @@ static int call(lua_State *L)
             yield_after_submit = true;
             return 0;
         }
-        return execute_request(L, td, request_index, 10.0);
+        throw std::runtime_error("tdlua: invalid helper execution state");
     });
     return yield_after_submit ? lua_yield(L, 0) : result;
 }
@@ -408,13 +466,17 @@ static int tdclient_rawexecute(lua_State *L)
         std::string error;
         int table_index = 0;
         bool owned = false;
-        if (!request_table(L, 2, table_index, owned, error)) {
-            throw std::runtime_error(error);
-        }
         int extra_ref = LUA_NOREF;
         try {
-            td::td_api::object_ptr<td::td_api::Function> request = td->makeRequest(L, table_index);
-            td->setDBIfParameters(L, table_index);
+            td::td_api::object_ptr<td::td_api::Function> request;
+            bool codec_error = false;
+            if (!make_request(L, td, 2, request, table_index, owned,
+                              codec_error, error)) {
+                if (!codec_error) {
+                    throw std::runtime_error(error);
+                }
+                request = codec_error_request(error);
+            }
             extra_ref = td->captureExtra(L, table_index);
             td::td_api::object_ptr<td::td_api::Object> result = td->executeSync(std::move(request));
             NativeResponse response;
@@ -442,11 +504,16 @@ static int tdclient_request(lua_State *L)
         std::string error;
         int table_index = 0;
         bool owned = false;
-        if (!request_table(L, 2, table_index, owned, error)) {
-            throw std::runtime_error(error);
+        td::td_api::object_ptr<td::td_api::Function> request;
+        bool codec_error = false;
+        if (!make_request(L, td, 2, request, table_index, owned, codec_error,
+                          error)) {
+            if (!codec_error) {
+                pop_owned(L, owned);
+                throw std::runtime_error(error);
+            }
+            request = codec_error_request(error);
         }
-        td::td_api::object_ptr<td::td_api::Function> request = td->makeRequest(L, table_index);
-        td->setDBIfParameters(L, table_index);
         const int callback_index = lua_gettop(L) >= 3 && !lua_isnil(L, 3) ? 3 : 0;
         const int context_index = callback_index && lua_gettop(L) >= 4 ? 4 : 0;
         if (callback_index && !lua_isfunction(L, callback_index)) {
@@ -477,11 +544,16 @@ static int tdclient_await(lua_State *L)
         std::string error;
         int table_index = 0;
         bool owned = false;
-        if (!request_table(L, 2, table_index, owned, error)) {
-            throw std::runtime_error(error);
+        td::td_api::object_ptr<td::td_api::Function> request;
+        bool codec_error = false;
+        if (!make_request(L, td, 2, request, table_index, owned, codec_error,
+                          error)) {
+            if (!codec_error) {
+                pop_owned(L, owned);
+                throw std::runtime_error(error);
+            }
+            request = codec_error_request(error);
         }
-        td::td_api::object_ptr<td::td_api::Function> request = td->makeRequest(L, table_index);
-        td->setDBIfParameters(L, table_index);
         const std::uint64_t id = td->dispatcher().await(L, table_index);
         try {
             td->send(std::move(request), id);
