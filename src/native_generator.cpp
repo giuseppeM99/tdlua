@@ -234,7 +234,8 @@ private:
         // FNV-1a is deliberately used instead of std::hash: generated shard
         // assignment must be identical across standard libraries and hosts.
         std::uint64_t hash = 14695981039346656037ULL;
-        for (unsigned char character : value) {
+        for (const char raw_character : value) {
+            const auto character = static_cast<unsigned char>(raw_character);
             hash ^= character;
             hash *= 1099511628211ULL;
         }
@@ -495,8 +496,10 @@ private:
                     const std::string field_path = "tdlua_native::path_field(path, \"" + lua_field + "\")";
                     out << "    {\n"
                         << "        tdlua_native::Field field(L, index, \"" << lua_field << "\");\n"
-                        << "        result->" << field << " = "
+                        << "        if (field.has_value()) {\n"
+                        << "            result->" << field << " = "
                         << read_expression(argument.type, "field.index()", field_path) << ";\n"
+                        << "        }\n"
                         << "    }\n";
                 }
                 out << "    return result;\n}\n\n";
@@ -539,8 +542,10 @@ private:
                 const std::string field_path = "tdlua_native::path_field(path, \"" + lua_field + "\")";
                 out << "    {\n"
                     << "        tdlua_native::Field field(L, index, \"" << lua_field << "\");\n"
-                    << "        result->" << field << " = "
+                    << "        if (field.has_value()) {\n"
+                    << "            result->" << field << " = "
                     << read_expression(argument.type, "field.index()", field_path) << ";\n"
+                    << "        }\n"
                     << "    }\n";
             }
             out << "    return result;\n}\n\n";

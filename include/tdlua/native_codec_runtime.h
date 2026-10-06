@@ -63,6 +63,7 @@ public:
     }
 
     int index() const { return -1; }
+    bool has_value() const { return !lua_isnil(L_, -1); }
 
 private:
     lua_State *L_;
@@ -184,7 +185,7 @@ inline std::int64_t read_int64(lua_State *L, int index, const std::string &path)
 
 inline double read_double(lua_State *L, int index, const std::string &path)
 {
-    if (!lua_isnumber(L, index)) {
+    if (lua_type(L, index) != LUA_TNUMBER) {
         throw CodecError("tdlua: expected number at " + path);
     }
     const double value = static_cast<double>(lua_tonumber(L, index));
@@ -196,15 +197,19 @@ inline double read_double(lua_State *L, int index, const std::string &path)
 
 inline bool read_bool(lua_State *L, int index, const std::string &path)
 {
-    if (!lua_isboolean(L, index)) {
-        throw CodecError("tdlua: expected boolean at " + path);
+    if (lua_isboolean(L, index)) {
+        return lua_toboolean(L, index) != 0;
     }
-    return lua_toboolean(L, index) != 0;
+    if (lua_type(L, index) == LUA_TNUMBER || lua_type(L, index) == LUA_TSTRING) {
+        return read_integer(L, index, path, std::numeric_limits<std::int32_t>::min(),
+                            std::numeric_limits<std::int32_t>::max()) != 0;
+    }
+    throw CodecError("tdlua: expected boolean at " + path);
 }
 
 inline std::string read_string(lua_State *L, int index, const std::string &path)
 {
-    if (!lua_isstring(L, index)) {
+    if (lua_type(L, index) != LUA_TSTRING) {
         throw CodecError("tdlua: expected string at " + path);
     }
     size_t length = 0;
@@ -215,16 +220,26 @@ inline std::string read_string(lua_State *L, int index, const std::string &path)
 inline lua_Integer array_length(lua_State *L, int index, const std::string &path)
 {
     require_array(L, index, path);
-    const lua_Integer length = static_cast<lua_Integer>(lua_rawlen(L, index));
-    for (lua_Integer i = 1; i <= length; ++i) {
-        lua_rawgeti(L, index, i);
-        const bool missing = lua_isnil(L, -1);
-        lua_pop(L, 1);
-        if (missing) {
-            throw CodecError("tdlua: sparse array at " + path);
+    const int absolute = lua_absindex(L, index);
+    lua_Integer maximum = 0;
+    lua_Integer count = 0;
+    lua_pushnil(L);
+    while (lua_next(L, absolute) != 0) {
+        lua_Integer key = 0;
+        if (!tdlua_lua_key_integer_value(L, -2, key) || key < 1) {
+            lua_pop(L, 2);
+            throw CodecError("tdlua: array keys must be positive integers at " + path);
         }
+        if (key > maximum) {
+            maximum = key;
+        }
+        ++count;
+        lua_pop(L, 1);
     }
-    return length;
+    if (maximum != count) {
+        throw CodecError("tdlua: sparse array at " + path);
+    }
+    return maximum;
 }
 
 inline void push_type(lua_State *L, const char *type)

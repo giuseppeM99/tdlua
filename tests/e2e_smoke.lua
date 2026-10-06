@@ -34,19 +34,11 @@ local api_id = tonumber(os.getenv("TDLUA_E2E_API_ID") or "1")
 local api_hash = os.getenv("TDLUA_E2E_API_HASH") or "tdlua-e2e-smoke"
 client:request({
     _ = "setTdlibParameters",
-    use_test_dc = true,
     database_directory = database_directory,
-    files_directory = database_directory,
-    database_encryption_key = "",
-    use_file_database = false,
-    use_chat_info_database = false,
-    use_message_database = false,
-    use_secret_chats = false,
     api_id = api_id,
     api_hash = api_hash,
     system_language_code = "en",
     device_model = "tdlua-e2e",
-    system_version = "test",
     application_version = "test"
 }, function(result)
     parameter_result = result
@@ -61,6 +53,10 @@ for _ = 1, 10 do
 end
 assert(type(parameter_result) == "table")
 assert(type(parameter_result._) == "string")
+if parameter_result._ == "error" then
+    assert(not tostring(parameter_result.message):match("Failed to parse JSON object as TDLib request"),
+        "TDLib rejected omitted fields while parsing setTdlibParameters")
+end
 
 client:close()
 assert(client:isClosed())

@@ -1,4 +1,7 @@
 #include "tdlua/native_codec_runtime.h"
+#include "tdlua/native_codec.h"
+
+#include <td/telegram/td_api.hpp>
 
 #include <cstdint>
 #include <iostream>
@@ -36,6 +39,40 @@ void expect_invalid_int64(lua_State *L, const char *source)
     require(failed, "invalid int64 value was accepted: " + std::string(source));
 }
 
+void expect_omitted_set_tdlib_parameters(lua_State *L)
+{
+    lua_newtable(L);
+    lua_pushstring(L, "setTdlibParameters");
+    lua_setfield(L, -2, "_");
+    lua_pushinteger(L, 5);
+    lua_setfield(L, -2, "api_id");
+    lua_pushstring(L, "api-hash");
+    lua_setfield(L, -2, "api_hash");
+    lua_pushstring(L, "en");
+    lua_setfield(L, -2, "system_language_code");
+    lua_pushstring(L, "tdlua-test");
+    lua_setfield(L, -2, "device_model");
+    lua_pushstring(L, "test");
+    lua_setfield(L, -2, "system_version");
+    lua_pushstring(L, "test");
+    lua_setfield(L, -2, "application_version");
+    lua_pushstring(L, "up");
+    lua_setfield(L, -2, "database_directory");
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "use_message_database");
+
+    auto function = tdlua_native::from_lua(L, -1, "request");
+    require(function && function->get_id() == td::td_api::setTdlibParameters::ID,
+            "setTdlibParameters was not decoded");
+    const auto &parameters = static_cast<const td::td_api::setTdlibParameters &>(*function);
+            require(!parameters.use_test_dc_ && parameters.files_directory_.empty() &&
+                parameters.database_encryption_key_.empty() &&
+                !parameters.use_file_database_ && !parameters.use_chat_info_database_ &&
+                parameters.use_message_database_ && !parameters.use_secret_chats_,
+            "omitted setTdlibParameters fields did not preserve TDLib defaults");
+    lua_pop(L, 1);
+}
+
 }  // namespace
 
 int main()
@@ -56,6 +93,7 @@ int main()
         expect_invalid_int64(L, "-9223372036854775809");
         expect_invalid_int64(L, "123suffix");
         expect_invalid_int64(L, "");
+        expect_omitted_set_tdlib_parameters(L);
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         lua_close(L);

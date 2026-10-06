@@ -81,6 +81,69 @@ for _ = 1, 20 do
 end
 assert_td_object(nested_response, "nested helper")
 
+-- TDLib's JSON parser accepts omitted fields and initializes them through the
+-- generated constructor. The native codec must preserve the same behavior,
+-- including for nested objects and explicit JSON null values.
+local missing_string = client:execute({_ = "testCallString"}, 1.0)
+assert_td_object(missing_string, "missing string field")
+assert(missing_string.value == "")
+
+local null_string = client:execute(
+    '{"@type":"testCallString","x":null}', 1.0)
+assert_td_object(null_string, "null string field")
+assert(null_string.value == "")
+
+local missing_vector = client:execute({_ = "testCallVectorInt"}, 1.0)
+assert_td_object(missing_vector, "missing vector field")
+assert(type(missing_vector.value) == "table")
+assert(#missing_vector.value == 0)
+
+local nested_missing = client:execute({
+    _ = "testCallVectorIntObject",
+    x = {{_ = "testInt"}}
+}, 1.0)
+assert_td_object(nested_missing, "missing nested field")
+assert(nested_missing.value[1].value == 0)
+
+local unknown_field = client:execute({
+    _ = "testCallString",
+    x = "known",
+    unknown = true
+}, 1.0)
+assert_td_object(unknown_field, "unknown field")
+assert(unknown_field.value == "known")
+
+-- Invalid fields must remain visible to Lua. JSON returns a TDLib error,
+-- while native may reject the request before sending it.
+local invalid_requests = {
+    {name = "nested missing type", request = {
+        _ = "testCallVectorIntObject", x = {{}}
+    }},
+    {name = "wrong field type", request = {
+        _ = "testCallString", x = 7
+    }},
+    {name = "sparse vector", request = {
+        _ = "testCallVectorInt", x = {[1] = 1, [3] = 3}
+    }},
+}
+for _, invalid in ipairs(invalid_requests) do
+    local ok, result = pcall(function()
+        return client:execute(invalid.request, 1.0)
+    end)
+    if ok and result ~= nil then
+        assert(type(result) == "table" and result._ == "error",
+            invalid.name .. " returned an unexpected result")
+    end
+end
+
+local missing_type_ok, missing_type_result = pcall(function()
+    return client:execute({}, 1.0)
+end)
+if missing_type_ok and missing_type_result ~= nil then
+    assert(missing_type_result._ == "error",
+        "missing request type returned an unexpected result")
+end
+
 -- send()/receive() must preserve the public @extra value and dispatch the
 -- response through both the raw receive path and the registered handler.
 local response_handler_called = false
@@ -295,6 +358,19 @@ end
 assert(await_error_seen, "await failure was swallowed")
 assert(client:pendingCount() == 0)
 
+-- Unknown constructors are rejected by the native schema codec. The JSON
+-- backend may send them to TDLib and return a normal TDLib error object; both
+-- outcomes must remain Lua-visible and must not corrupt the client state.
+local unknown_ok, unknown_result = pcall(function()
+    return client:execute({_ = "tdluaDefinitelyUnknownFunction"}, 0.1)
+end)
+if unknown_ok then
+    assert_td_object(unknown_result, "unknown constructor response")
+    assert(unknown_result._ == "error",
+           "unknown constructor did not produce a TDLib error")
+end
+assert(client:pendingCount() == 0)
+
 -- Both dispatcher registration forms expose the same lookup behavior.
 local handler = function() end
 client:on("updateAuthorizationState", handler)
@@ -314,4 +390,28 @@ assert(client:pendingCount() == 0)
 assert(not pending_callback_called, "pending callback ran during close")
 assert(client:isClosed() == true)
 assert(client:receive(0.01) == nil)
+
+-- Closed clients must reject repeated submissions without retaining callback
+-- references or creating phantom pending requests.
+for i = 1, 200 do
+    local send_ok = pcall(function()
+        client:send({_ = "getAuthorizationState", ["@extra"] = i})
+    end)
+    assert(not send_ok, "send unexpectedly succeeded on a closed client")
+
+    local request_ok = pcall(function()
+        client:request({_ = "getAuthorizationState"}, function() end)
+    end)
+    assert(not request_ok, "request unexpectedly succeeded on a closed client")
+end
+assert(client:pendingCount() == 0)
 client:destroy()
+
+-- Repeated construction and explicit close must leave each client reusable
+-- independently and must not depend on the previous client's registry slot.
+for _ = 1, 20 do
+    local repeated = tdlua.new()
+    repeated:close()
+    assert(repeated:isClosed() == true)
+    repeated:destroy()
+end
