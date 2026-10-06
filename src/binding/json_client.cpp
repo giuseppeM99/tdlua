@@ -112,6 +112,20 @@ static bool lua_to_json(lua_State *L, int index, json &result, std::string &erro
     return false;
 }
 
+static void reject_reserved_json_fields(const json &request)
+{
+    if (!request.is_object()) {
+        return;
+    }
+    if (request.contains("@extra")) {
+        throw std::runtime_error("tdlua: request field '@extra' is reserved");
+    }
+    if (request.contains("_request_id")) {
+        throw std::runtime_error(
+            "tdlua: request field '_request_id' is reserved");
+    }
+}
+
 static int tdclient_new(lua_State *L)
 {
     return tdlua_binding::new_client(
@@ -127,7 +141,6 @@ static int tdclient_receive(lua_State *L)
         }
         if (!td->empty()) {
             TDLua::QueuedUpdate queued = td->pop();
-            td->restoreTimedOutExecuteExtra(queued.value);
             if (!queued.dispatched) {
                 td->checkAuthState(queued.value);
                 td->dispatcher().dispatch(queued.value);
@@ -147,7 +160,6 @@ static int tdclient_receive(lua_State *L)
         if (result.empty()) {
             lua_pushnil(L);
         } else {
-            td->restoreTimedOutExecuteExtra(result);
             td->checkAuthState(result);
             td->dispatcher().dispatch(result);
             lua_pushjson(L, result);
@@ -166,12 +178,20 @@ static int tdclient_send(lua_State *L)
         if (!lua_to_json(L, 2, j, error)) {
             throw std::runtime_error(error);
         }
+        reject_reserved_json_fields(j);
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
         if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
         }
-        td->send(j);
-        return 0;
+        const std::uint64_t id = td->dispatcher().raw(j);
+        try {
+            td->send(j);
+        } catch (...) {
+            td->dispatcher().cancel(id);
+            throw;
+        }
+        tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+        return 1;
     });
 }
 
@@ -180,13 +200,19 @@ static int tdclient_execute(lua_State *L)
     return tdlua_binding::protected_call(L, [&]() -> int {
         json j;
         lua_Number timeout = 10.0;
+        bool fire_and_forget = false;
         if (lua_type(L, -1) == LUA_TNUMBER) {
             timeout = lua_tonumber(L, -1);
             lua_pop(L, 1);
+        } else if (lua_type(L, -1) == LUA_TBOOLEAN) {
+            fire_and_forget = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
         }
-        if (lua_type(L, -1) == LUA_TSTRING || lua_type(L, -1) == LUA_TTABLE) {
+        const int request_index = lua_gettop(L);
+        if (lua_type(L, request_index) == LUA_TSTRING ||
+            lua_type(L, request_index) == LUA_TTABLE) {
             std::string error;
-            if (!lua_to_json(L, -1, j, error)) {
+            if (!lua_to_json(L, request_index, j, error)) {
                 throw std::runtime_error(error);
             }
         } else {
@@ -196,6 +222,7 @@ static int tdclient_execute(lua_State *L)
         if (!j.is_object()) {
             return 0;
         }
+        reject_reserved_json_fields(j);
         TDLua *td = getTD(L);
         if (!td) {
             throw std::runtime_error("invalid tdlua client");
@@ -203,19 +230,24 @@ static int tdclient_execute(lua_State *L)
         if (td->closed()) {
             throw std::runtime_error("tdlua client is closed");
         }
-        const std::uint64_t nonce = td->nextRequestId();
-        json extra = j["@extra"];
-        const json marker = {{"__tdlua_execute", nonce}};
-        j["@extra"] = marker;
+        const std::uint64_t id = td->dispatcher().raw(j);
         if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
         }
-        td->send(j);
+        try {
+            td->send(j);
+        } catch (...) {
+            td->dispatcher().cancel(id);
+            throw;
+        }
+        if (fire_and_forget) {
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            return 1;
+        }
         const auto started = std::chrono::steady_clock::now();
         while (!td->closed()) {
             TDLua::QueuedUpdate queued_response(j, true);
-            if (td->takeQueuedResponse(nonce, queued_response)) {
-                queued_response.value["@extra"] = extra;
+            if (td->takeQueuedResponse(id, queued_response)) {
                 lua_pushjson(L, queued_response.value);
                 return 1;
             }
@@ -230,18 +262,15 @@ static int tdclient_execute(lua_State *L)
                 continue;
             }
             td->checkAuthState(res);
-            if (res["@extra"] == marker) {
-                res["@extra"] = extra;
+            std::uint64_t response_id = 0;
+            if (LuaDispatcher::responseRequestId(res, response_id) &&
+                response_id == id) {
                 td->dispatcher().dispatch(res);
                 lua_pushjson(L, res);
                 return 1;
             }
-            td->restoreTimedOutExecuteExtra(res);
             td->dispatcher().dispatch(res);
             td->push(res, true);
-        }
-        if (!td->closed()) {
-            td->rememberTimedOutExecuteExtra(nonce, std::move(extra));
         }
         return 0;
     });
@@ -274,6 +303,7 @@ static int call(lua_State *L)
             if (!request.is_object()) {
                 throw std::runtime_error("helper params must be a JSON object");
             }
+            reject_reserved_json_fields(request);
         }
         request["@type"] = lua_tostring(L, lua_upvalueindex(1));
 
@@ -282,8 +312,15 @@ static int call(lua_State *L)
                 request["database_directory"].is_string()) {
                 td->setDB(request["database_directory"]);
             }
-            td->send(request);
-            return 0;
+            const std::uint64_t id = td->dispatcher().raw(request);
+            try {
+                td->send(request);
+            } catch (...) {
+                td->dispatcher().cancel(id);
+                throw;
+            }
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            return 1;
         }
 
         if (callback_index != 0) {
@@ -299,7 +336,7 @@ static int call(lua_State *L)
                 td->dispatcher().cancel(id);
                 throw;
             }
-            lua_pushinteger(L, static_cast<lua_Integer>(id));
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
 
@@ -349,6 +386,7 @@ static int tdclient_rawexecute(lua_State *L)
         } else {
             throw std::runtime_error("request must be a JSON string or table");
         }
+        reject_reserved_json_fields(j);
         TDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
@@ -356,6 +394,7 @@ static int tdclient_rawexecute(lua_State *L)
         if (result.empty()) {
             lua_pushnil(L);
         } else {
+            result.erase("@extra");
             lua_pushjson(L, result);
         }
         return 1;
@@ -377,6 +416,7 @@ static int tdclient_request(lua_State *L)
         if (!request.is_object()) {
             throw std::runtime_error("request must be a JSON object");
         }
+        reject_reserved_json_fields(request);
 
         int callback_index = 0;
         int context_index = 0;
@@ -400,7 +440,7 @@ static int tdclient_request(lua_State *L)
             td->dispatcher().cancel(id);
             throw;
         }
-        lua_pushinteger(L, static_cast<lua_Integer>(id));
+        tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
     });
 }
@@ -421,6 +461,7 @@ static int tdclient_await(lua_State *L)
         if (!request.is_object()) {
             throw std::runtime_error("request must be a JSON object");
         }
+        reject_reserved_json_fields(request);
 
         const std::uint64_t id = td->dispatcher().await(L, request);
         if (!td->ready() && request["@type"] == "setTdlibParameters" &&

@@ -54,6 +54,24 @@ inline bool is_integer(lua_State *L, int index)
     return tdlua_lua_integer_value(L, index, value);
 }
 
+inline void reject_reserved_request_fields(lua_State *L, int index)
+{
+    if (!lua_istable(L, index)) {
+        return;
+    }
+    const int absolute = lua_absindex(L, index);
+    const char *const reserved[] = {"@extra", "_request_id"};
+    for (const char *field : reserved) {
+        lua_getfield(L, absolute, field);
+        const bool present = !lua_isnil(L, -1);
+        lua_pop(L, 1);
+        if (present) {
+            throw std::runtime_error(std::string("tdlua: request field '") +
+                                     field + "' is reserved");
+        }
+    }
+}
+
 inline ClientHandle get_client(lua_State *L)
 {
     if (lua_type(L, 1) != LUA_TUSERDATA) {

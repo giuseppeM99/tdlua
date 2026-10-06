@@ -6,13 +6,13 @@ local client = tdlua()
 
 local callback_result
 local callback_context
-local callback_id = client:request({
-    _ = "getAuthorizationState",
-    ["@extra"] = "legacy-extra"
+local callback_id
+callback_id = client:request({
+    _ = "getAuthorizationState"
 }, function(result, context)
     callback_result = result
     callback_context = context
-    assert(result["@extra"] == "legacy-extra")
+    assert(result._request_id == callback_id)
     assert(context.origin == "callback-test")
 end, {origin = "callback-test"})
 

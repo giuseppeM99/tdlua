@@ -153,16 +153,10 @@ static void pop_owned(lua_State *L, bool owned)
 static int return_response(lua_State *L, NativeTDLua *td, NativeResponse &response)
 {
     if (!response.object) {
-        if (response.extra_ref != LUA_NOREF) {
-            td->releaseExtra(response.extra_ref);
-            response.extra_ref = LUA_NOREF;
-        }
         lua_pushnil(L);
         return 1;
     }
     td->pushResponse(L, response);
-    td->releaseExtra(response.extra_ref);
-    response.extra_ref = LUA_NOREF;
     return 1;
 }
 
@@ -203,6 +197,9 @@ static bool make_request(lua_State *L, NativeTDLua *td, int index,
     if (!request_table(L, index, table_index, owned, error)) {
         return false;
     }
+    // Request identity fields belong to the TDLua API. Reject them before
+    // schema conversion so they remain Lua API errors.
+    tdlua_binding::reject_reserved_request_fields(L, table_index);
     try {
         td->setDBIfParameters(L, table_index);
         request = td->makeRequest(L, table_index);
@@ -241,7 +238,8 @@ static int tdclient_send(lua_State *L)
                     id = td->dispatcher().raw(L, table_index);
                     td->send(codec_error_request(error), id);
                     pop_owned(L, owned);
-                    return 0;
+                    tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+                    return 1;
                 } catch (...) {
                     if (id != 0) {
                         td->dispatcher().cancel(id);
@@ -262,7 +260,8 @@ static int tdclient_send(lua_State *L)
                 throw;
             }
             pop_owned(L, owned);
-            return 0;
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            return 1;
         } catch (...) {
             pop_owned(L, owned);
             throw;
@@ -271,7 +270,7 @@ static int tdclient_send(lua_State *L)
 }
 
 static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
-                           lua_Number timeout)
+                           lua_Number timeout, bool fire_and_forget)
 {
     std::string error;
     td::td_api::object_ptr<td::td_api::Function> request;
@@ -287,15 +286,23 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
             throw std::runtime_error(error);
         }
     }
-    int execute_extra_ref = LUA_NOREF;
     try {
         // execute() waits for its own response but lets the dispatcher make
         // progress on unrelated asynchronous responses in the same receive
         // loop. This is the async-first behavior shared with the JSON path.
-        const std::uint64_t id = td->nextRequestId();
-        execute_extra_ref = td->captureExtra(L, table_index);
-        td->send(std::move(request), id);
+        const std::uint64_t id = td->dispatcher().raw(L, table_index);
+        try {
+            td->send(std::move(request), id);
+        } catch (...) {
+            td->dispatcher().cancel(id);
+            throw;
+        }
         pop_owned(L, owned);
+
+        if (fire_and_forget) {
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            return 1;
+        }
 
         const auto started = std::chrono::steady_clock::now();
         while (!td->closed()) {
@@ -303,8 +310,6 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                 std::chrono::steady_clock::now() - started).count();
             const double remaining = static_cast<double>(timeout) - elapsed;
             if (remaining <= 0.0) {
-                td->rememberTimedOutExecuteExtra(id, execute_extra_ref);
-                execute_extra_ref = LUA_NOREF;
                 return 0;
             }
             NativeResponse response;
@@ -314,19 +319,14 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
             if (!response.object) {
                 continue;
             }
-            if (response.request_id == id) {
-                response.extra_ref = std::exchange(execute_extra_ref, LUA_NOREF);
-            }
             td->dispatch(response);
             if (response.request_id == id) {
                 return return_response(L, td, response);
             }
             td->push(std::move(response));
         }
-        td->releaseExtra(execute_extra_ref);
         return 0;
     } catch (...) {
-        td->releaseExtra(execute_extra_ref);
         pop_owned(L, owned);
         throw;
     }
@@ -336,9 +336,27 @@ static int tdclient_execute(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
         lua_Number timeout = 10.0;
+        bool fire_and_forget = false;
         int request_index = 2;
         if (lua_type(L, 3) == LUA_TNUMBER) {
             timeout = lua_tonumber(L, 3);
+        } else if (lua_type(L, 3) == LUA_TBOOLEAN) {
+            fire_and_forget = lua_toboolean(L, 3) != 0;
+        }
+        // Preserve the historical JSON execute() behavior for a valid JSON
+        // string whose root is not an object: it returns no result. Other
+        // entry points keep their stricter request-object validation.
+        if (lua_type(L, 2) == LUA_TSTRING) {
+            try {
+                const nlohmann::json value =
+                    nlohmann::json::parse(lua_tostring(L, 2));
+                if (!value.is_object()) {
+                    return 0;
+                }
+            } catch (const nlohmann::json::parse_error &exception) {
+                throw std::runtime_error(
+                    std::string("Malformed JSON: ") + exception.what());
+            }
         }
         NativeTDLua *td = getTD(L);
         if (!td) {
@@ -347,7 +365,7 @@ static int tdclient_execute(lua_State *L)
         if (td->closed()) {
             throw std::runtime_error("tdlua client is closed");
         }
-        return execute_request(L, td, request_index, timeout);
+        return execute_request(L, td, request_index, timeout, fire_and_forget);
     });
 }
 
@@ -380,7 +398,7 @@ static int call(lua_State *L)
         const int is_main = lua_pushthread(L);
         lua_pop(L, 1);
         if (!fire_and_forget && callback_index == 0 && is_main) {
-            const int result = execute_request(L, td, request_index, 10.0);
+            const int result = execute_request(L, td, request_index, 10.0, false);
             if (owned) {
                 if (result != 0) {
                     // execute_request leaves its result above the helper's
@@ -415,7 +433,8 @@ static int call(lua_State *L)
                 throw;
             }
             pop_owned(L, owned);
-            return 0;
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+            return 1;
         }
         if (callback_index != 0) {
             const std::uint64_t id = td->dispatcher().request(
@@ -427,7 +446,7 @@ static int call(lua_State *L)
                 throw;
             }
             pop_owned(L, owned);
-            lua_pushinteger(L, static_cast<lua_Integer>(id));
+            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
         if (!is_main) {
@@ -466,7 +485,6 @@ static int tdclient_rawexecute(lua_State *L)
         std::string error;
         int table_index = 0;
         bool owned = false;
-        int extra_ref = LUA_NOREF;
         try {
             td::td_api::object_ptr<td::td_api::Function> request;
             bool codec_error = false;
@@ -477,18 +495,13 @@ static int tdclient_rawexecute(lua_State *L)
                 }
                 request = codec_error_request(error);
             }
-            extra_ref = td->captureExtra(L, table_index);
             td::td_api::object_ptr<td::td_api::Object> result = td->executeSync(std::move(request));
             NativeResponse response;
             response.object = std::move(result);
-            response.extra_ref = extra_ref;
             td->pushResponse(L, response);
-            td->releaseExtra(extra_ref);
-            extra_ref = LUA_NOREF;
             pop_owned(L, owned);
             return 1;
         } catch (...) {
-            td->releaseExtra(extra_ref);
             pop_owned(L, owned);
             throw;
         }
@@ -529,7 +542,7 @@ static int tdclient_request(lua_State *L)
             throw;
         }
         pop_owned(L, owned);
-        lua_pushinteger(L, static_cast<lua_Integer>(id));
+        tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
     });
 }

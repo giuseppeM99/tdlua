@@ -6,7 +6,7 @@
 
 namespace {
 
-const char *const kInternalRequestKey = "__tdlua_request";
+const char *const kInternalRequestKey = "__tdlua_request_id";
 
 std::string luaError(lua_State *L)
 {
@@ -17,8 +17,8 @@ std::string luaError(lua_State *L)
 }
 
 RequestRouter::PendingRequest::PendingRequest()
-    : has_extra(false), extra(), callback_ref(LUA_NOREF),
-      context_ref(LUA_NOREF), coroutine_ref(LUA_NOREF), coroutine(nullptr)
+    : callback_ref(LUA_NOREF), context_ref(LUA_NOREF),
+      coroutine_ref(LUA_NOREF), coroutine(nullptr)
 {
 }
 
@@ -67,6 +67,11 @@ std::uint64_t RequestRouter::addAwaiter(lua_State *L, nlohmann::json &request)
                       coroutine_ref, coroutine);
 }
 
+std::uint64_t RequestRouter::addRaw(nlohmann::json &request)
+{
+    return addPending(request, LUA_NOREF, LUA_REFNIL, LUA_NOREF, nullptr);
+}
+
 void RequestRouter::cancel(std::uint64_t request_id)
 {
     const std::map<std::uint64_t, PendingRequest>::iterator found =
@@ -89,11 +94,6 @@ std::uint64_t RequestRouter::addPending(nlohmann::json &request,
                                         int coroutine_ref, lua_State *coroutine)
 {
     PendingRequest pending;
-    const nlohmann::json::const_iterator extra = request.find("@extra");
-    if (extra != request.end()) {
-        pending.has_extra = true;
-        pending.extra = *extra;
-    }
     pending.callback_ref = callback_ref;
     pending.context_ref = context_ref;
     pending.coroutine_ref = coroutine_ref;
@@ -107,13 +107,22 @@ std::uint64_t RequestRouter::addPending(nlohmann::json &request,
     return id;
 }
 
-bool RequestRouter::requestId(const nlohmann::json &extra, std::uint64_t &id)
+bool RequestRouter::responseRequestId(const nlohmann::json &response,
+                                      std::uint64_t &id)
 {
-    if (!extra.is_object()) {
+    const nlohmann::json::const_iterator extra = response.find("@extra");
+    if (extra == response.end() || !extra->is_object()) {
         return false;
     }
-    const nlohmann::json::const_iterator marker = extra.find(kInternalRequestKey);
-    if (marker == extra.end() || !marker->is_number_integer()) {
+    const nlohmann::json::const_iterator marker = extra->find(kInternalRequestKey);
+    if (marker == extra->end()) {
+        return false;
+    }
+    if (marker->is_number_unsigned()) {
+        id = marker->get<std::uint64_t>();
+        return true;
+    }
+    if (!marker->is_number_integer()) {
         return false;
     }
     const std::int64_t signed_id = marker->get<std::int64_t>();
@@ -122,16 +131,6 @@ bool RequestRouter::requestId(const nlohmann::json &extra, std::uint64_t &id)
     }
     id = static_cast<std::uint64_t>(signed_id);
     return true;
-}
-
-void RequestRouter::restoreExtra(nlohmann::json &response,
-                                 const PendingRequest &pending)
-{
-    if (pending.has_extra) {
-        response["@extra"] = pending.extra;
-    } else {
-        response.erase("@extra");
-    }
 }
 
 void RequestRouter::release(PendingRequest &pending)
@@ -152,15 +151,14 @@ void RequestRouter::release(PendingRequest &pending)
 
 bool RequestRouter::dispatch(nlohmann::json &response)
 {
-    const nlohmann::json::const_iterator extra = response.find("@extra");
-    if (extra == response.end()) {
+    std::uint64_t id = 0;
+    if (!responseRequestId(response, id)) {
+        response.erase("@extra");
         return false;
     }
 
-    std::uint64_t id = 0;
-    if (!requestId(*extra, id)) {
-        return false;
-    }
+    response.erase("@extra");
+    response["_request_id"] = id;
 
     const std::map<std::uint64_t, PendingRequest>::iterator found = pending_.find(id);
     if (found == pending_.end()) {
@@ -169,7 +167,6 @@ bool RequestRouter::dispatch(nlohmann::json &response)
 
     PendingRequest pending = found->second;
     pending_.erase(found);
-    restoreExtra(response, pending);
 
     if (pending.callback_ref != LUA_NOREF) {
         lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);

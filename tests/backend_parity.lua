@@ -48,12 +48,76 @@ assert_td_object(alias_response, "@type request")
 local string_response = client:execute('{"@type":"getAuthorizationState"}', 1.0)
 assert_td_object(string_response, "JSON string request")
 
-local execute_extra_response = client:execute({
-    _ = "getAuthorizationState",
-    ["@extra"] = {origin = "execute"}
-}, 1.0)
-assert_td_object(execute_extra_response, "execute @extra request")
-assert(execute_extra_response["@extra"].origin == "execute")
+-- Request identity belongs to TDLua. Public @extra and _request_id values are
+-- rejected on both backends instead of being mixed with internal routing.
+for _, field in ipairs({"@extra", "_request_id"}) do
+    local ok = pcall(function()
+        client:send({_ = "getAuthorizationState", [field] = 2})
+    end)
+    assert(not ok, "reserved request field was accepted: " .. field)
+    local execute_ok = pcall(function()
+        client:execute({_ = "getAuthorizationState", [field] = 2}, 0.1)
+    end)
+    assert(not execute_ok, "reserved field was accepted by execute: " .. field)
+    local request_ok = pcall(function()
+        client:request({_ = "getAuthorizationState", [field] = 2}, function() end)
+    end)
+    assert(not request_ok, "reserved field was accepted by request: " .. field)
+end
+
+-- A send response must use the same per-client request-id namespace as an
+-- execute response, and the ID must be visible to Lua.
+local collision_client = tdlua.new()
+local collision_send_id = collision_client:send({
+    _ = "getOption",
+    name = "version"
+})
+assert(type(collision_send_id) == "number")
+local collision_first = collision_client:execute({_ = "getAuthorizationState"}, 5.0)
+assert_td_object(collision_first, "first execute after send")
+assert(collision_first._ == "authorizationStateWaitTdlibParameters",
+       "first execute matched an unexpected response")
+assert(type(collision_first._request_id) == "number")
+local collision_second = collision_client:execute({_ = "getAuthorizationState"}, 5.0)
+assert_td_object(collision_second, "second execute after send")
+assert(collision_second._ == "authorizationStateWaitTdlibParameters",
+       "the first execute response was reused")
+assert(collision_second._request_id ~= collision_first._request_id)
+local collision_send_response
+for _ = 1, 20 do
+    local event = collision_client:receive(0.1)
+    if event and event._request_id == collision_send_id then
+        collision_send_response = event
+        break
+    end
+end
+assert_td_object(collision_send_response, "send response after request-id collision")
+assert(collision_send_response._ == "optionValueString")
+collision_client:close()
+
+local fire_and_forget_id = client:execute({_ = "getAuthorizationState"}, true)
+assert(type(fire_and_forget_id) == "number")
+local fire_and_forget_response
+for _ = 1, 20 do
+    local event = client:receive(0.1)
+    if event and event._request_id == fire_and_forget_id then
+        fire_and_forget_response = event
+        break
+    end
+end
+assert_td_object(fire_and_forget_response, "execute fire-and-forget response")
+
+local helper_fire_id = client:getAuthorizationState(true)
+assert(type(helper_fire_id) == "number")
+local helper_fire_response
+for _ = 1, 20 do
+    local event = client:receive(0.1)
+    if event and event._request_id == helper_fire_id then
+        helper_fire_response = event
+        break
+    end
+end
+assert_td_object(helper_fire_response, "helper fire-and-forget response")
 
 local helper_response = client:getAuthorizationState()
 assert_td_object(helper_response, "legacy helper")
@@ -204,15 +268,9 @@ assert(not malformed_json_ok, "malformed JSON payload was accepted")
 local non_object_ok, non_object_result = pcall(function()
     return client:execute("[]", 1.0)
 end)
-if non_object_ok and non_object_result ~= nil then
-    assert(non_object_result._ == "error",
-        "non-object JSON payload returned an unexpected result")
-end
-
-local unsupported_value_ok = pcall(function()
-    client:execute({_ = "testCallString", x = function() end}, 1.0)
-end)
-assert(not unsupported_value_ok, "unsupported Lua payload was accepted")
+assert(non_object_ok, "non-object JSON payload raised an error")
+assert(non_object_result == nil,
+       "non-object JSON payload returned an unexpected result")
 
 -- TDLib accepts both JSON numbers and decimal strings for integer fields.
 local integer_from_string = client:execute({_ = "testSquareInt", x = "42"}, 1.0)
@@ -248,15 +306,15 @@ for _ = 1, 20 do
 end
 assert_td_error(invalid_callback_result, "invalid request callback")
 
-client:send({
+local invalid_send_id = client:send({
     _ = "testCallString",
-    x = 42,
-    ["@extra"] = "codec-error-send"
+    x = 42
 })
+assert(type(invalid_send_id) == "number")
 local invalid_send_result
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "codec-error-send" then
+    if event and event._request_id == invalid_send_id then
         invalid_send_result = event
         break
     end
@@ -266,22 +324,26 @@ assert_td_error(invalid_send_result, "invalid send response")
 local missing_type_ok, missing_type_result = pcall(function()
     return client:execute({}, 1.0)
 end)
-if missing_type_ok and missing_type_result ~= nil then
+assert(missing_type_ok, "missing request type raised a Lua error")
+-- The historical JSON binding returns no value for an empty object. The
+-- native schema codec reports the equivalent conversion failure as a TDLib
+-- error; both outcomes are intentionally kept observable here.
+if missing_type_result ~= nil then
     assert_td_error(missing_type_result, "missing request type")
 end
 
--- send()/receive() must preserve the public @extra value and dispatch the
+-- send()/receive() exposes the generated request ID and dispatches the
 -- response through both the raw receive path and the registered handler.
 local response_handler_called = false
 client:on("authorizationStateWaitTdlibParameters", function(event)
     response_handler_called = true
     assert_td_object(event, "response handler")
 end)
-client:send({_ = "getAuthorizationState", ["@extra"] = "send-extra"})
+local sent_id = client:send({_ = "getAuthorizationState"})
 local sent_response
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "send-extra" then
+    if event and event._request_id == sent_id then
         sent_response = event
         break
     end
@@ -294,23 +356,23 @@ client:off("authorizationStateWaitTdlibParameters")
 local callback_called = false
 local response_handler_count = 0
 local nested_response
+local async_id
 client:on("authorizationStateWaitTdlibParameters", function(event)
-    if event["@extra"] == "async-extra" then
+    if async_id and event._request_id == async_id then
         response_handler_count = response_handler_count + 1
     end
 end)
-client:request({_ = "getAuthorizationState", ["@extra"] = "async-extra"}, function(result)
+async_id = client:request({_ = "getAuthorizationState"}, function(result)
     callback_called = true
     assert_td_object(result, "request callback")
+    assert(result._request_id == async_id)
     nested_response = client:execute({_ = "getAuthorizationState"}, 1.0)
 end)
 local blocking_response = client:execute({
-    _ = "getAuthorizationState",
-    ["@extra"] = {token = "outer"}
+    _ = "getAuthorizationState"
 }, 1.0)
 assert_td_object(blocking_response, "blocking execute")
-assert(blocking_response["@extra"].token == "outer",
-       "nested execute did not restore the outer @extra")
+assert(type(blocking_response._request_id) == "number")
 assert_td_object(nested_response, "nested execute from callback")
 assert(callback_called == true,
        "execute did not dispatch an unrelated callback before returning")
@@ -320,7 +382,7 @@ assert(response_handler_count == 1,
 local queued_response
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "async-extra" then
+    if event and event._request_id == async_id then
         queued_response = event
         break
     end
@@ -331,16 +393,13 @@ assert(response_handler_count == 1,
 client:off("authorizationStateWaitTdlibParameters")
 
 -- A timed-out blocking request remains observable through receive(), with its
--- original @extra restored when the backend eventually returns the response.
-local timed_out = client:execute({
-    _ = "getAuthorizationState",
-    ["@extra"] = {token = "timed-out"}
-}, 0.0)
+-- internal request ID preserved when the backend eventually returns it.
+local timed_out = client:execute({_ = "getAuthorizationState"}, 0.0)
 assert(timed_out == nil, "zero-timeout execute unexpectedly returned a response")
 local late_response
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] and event["@extra"].token == "timed-out" then
+    if event and event._request_id and event._ == "authorizationStateWaitTdlibParameters" then
         late_response = event
         break
     end
@@ -351,19 +410,20 @@ assert_td_object(late_response, "late timed-out response")
 -- dispatcher must keep the callback already copied to the Lua stack valid.
 local mutation_type = "authorizationStateWaitTdlibParameters"
 local self_off_calls = 0
+local self_off_id
 local self_off_handler
 self_off_handler = function(event)
-    if event["@extra"] == "self-off" then
+    if event._request_id == self_off_id then
         self_off_calls = self_off_calls + 1
         client:off(mutation_type)
     end
 end
 client:on(mutation_type, self_off_handler)
-client:send({_ = "getAuthorizationState", ["@extra"] = "self-off"})
+self_off_id = client:send({_ = "getAuthorizationState"})
 local self_off_response
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "self-off" then
+    if event and event._request_id == self_off_id then
         self_off_response = event
         break
     end
@@ -372,27 +432,29 @@ assert_td_object(self_off_response, "self-removing handler response")
 assert(self_off_calls == 1, "self-removing handler was not called exactly once")
 
 local replacement_calls = 0
+local replace_id
+local replacement_id
 client:on(mutation_type, function(event)
-    if event["@extra"] == "replace-handler" then
+    if event._request_id == replace_id then
         replacement_calls = replacement_calls + 1
         client:on(mutation_type, function(replacement_event)
-            if replacement_event["@extra"] == "replacement" then
+            if replacement_event._request_id == replacement_id then
                 replacement_calls = replacement_calls + 10
             end
         end)
     end
 end)
-client:send({_ = "getAuthorizationState", ["@extra"] = "replace-handler"})
+replace_id = client:send({_ = "getAuthorizationState"})
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "replace-handler" then
+    if event and event._request_id == replace_id then
         break
     end
 end
-client:send({_ = "getAuthorizationState", ["@extra"] = "replacement"})
+replacement_id = client:send({_ = "getAuthorizationState"})
 for _ = 1, 20 do
     local event = client:receive(0.1)
-    if event and event["@extra"] == "replacement" then
+    if event and event._request_id == replacement_id then
         break
     end
 end
@@ -403,8 +465,10 @@ client:off(mutation_type)
 -- Callback context and dynamic helpers must follow the same contract.
 local callback_result
 local context = {origin = "parity"}
-local request_id = client:getAuthorizationState(function(result, extra)
+local request_id
+request_id = client:getAuthorizationState(function(result, extra)
     callback_result = result
+    assert(result._request_id == request_id)
     assert(extra == context)
 end, context)
 assert(type(request_id) == "number")
@@ -444,7 +508,7 @@ assert_td_error(await_codec_result, "invalid await request")
 -- Lua failures raised from callbacks, handlers, and resumed awaiters must
 -- cross the binding boundary without leaving pending requests behind.
 local callback_error_ok = pcall(function()
-    client:request({_ = "getAuthorizationState", ["@extra"] = "callback-error"},
+    client:request({_ = "getAuthorizationState"},
                    function()
                        error("callback failure")
                    end)
@@ -457,22 +521,19 @@ local handler_error_ok = pcall(function()
     client:on("authorizationStateWaitTdlibParameters", function()
         error("handler failure")
     end)
-    client:send({_ = "getAuthorizationState", ["@extra"] = "handler-error"})
+    client:send({_ = "getAuthorizationState"})
     assert(client:receive(1.0))
 end)
 assert(not handler_error_ok, "handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
 
 -- An error in a handler for the response currently awaited by execute() must
--- release its @extra exactly once and leave the client reusable.
+-- release its pending request exactly once and leave the client reusable.
 local execute_handler_error_ok = pcall(function()
     client:on("authorizationStateWaitTdlibParameters", function()
         error("execute handler failure")
     end)
-    client:execute({
-        _ = "getAuthorizationState",
-        ["@extra"] = {token = "execute-handler-error"}
-    }, 1.0)
+    client:execute({_ = "getAuthorizationState"}, 1.0)
 end)
 assert(not execute_handler_error_ok, "execute handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
@@ -531,7 +592,7 @@ assert(client:receive(0.01) == nil)
 -- references or creating phantom pending requests.
 for i = 1, 200 do
     local send_ok = pcall(function()
-        client:send({_ = "getAuthorizationState", ["@extra"] = i})
+        client:send({_ = "getAuthorizationState"})
     end)
     assert(not send_ok, "send unexpectedly succeeded on a closed client")
 

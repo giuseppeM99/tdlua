@@ -38,6 +38,17 @@ std::uint64_t LuaDispatcher::await(lua_State *L, nlohmann::json &request)
     return router_.addAwaiter(L, request);
 }
 
+std::uint64_t LuaDispatcher::raw(nlohmann::json &request)
+{
+    return router_.addRaw(request);
+}
+
+bool LuaDispatcher::responseRequestId(const nlohmann::json &response,
+                                      std::uint64_t &request_id)
+{
+    return RequestRouter::responseRequestId(response, request_id);
+}
+
 void LuaDispatcher::cancel(std::uint64_t request_id)
 {
     router_.cancel(request_id);

@@ -15,8 +15,8 @@ std::string luaError(lua_State *L)
 }
 
 NativeDispatcher::PendingRequest::PendingRequest()
-    : extra_ref(LUA_NOREF), callback_ref(LUA_NOREF),
-      context_ref(LUA_NOREF), coroutine_ref(LUA_NOREF), coroutine(nullptr)
+    : callback_ref(LUA_NOREF), context_ref(LUA_NOREF),
+      coroutine_ref(LUA_NOREF), coroutine(nullptr)
 {
 }
 
@@ -35,23 +35,12 @@ std::uint64_t NativeDispatcher::nextRequestId()
     return next_id_++;
 }
 
-int NativeDispatcher::captureExtra(lua_State *L, int request_index) const
-{
-    const int absolute = lua_absindex(L, request_index);
-    lua_getfield(L, absolute, "@extra");
-    if (lua_isnil(L, -1)) {
-        lua_pop(L, 1);
-        return LUA_NOREF;
-    }
-    return luaL_ref(L, LUA_REGISTRYINDEX);
-}
-
 std::uint64_t NativeDispatcher::addPending(lua_State *L, int request_index,
                                            int callback_index, int context_index,
                                            int coroutine_ref, lua_State *coroutine)
 {
+    (void)request_index;
     PendingRequest pending;
-    pending.extra_ref = captureExtra(L, request_index);
     pending.coroutine_ref = coroutine_ref;
     pending.coroutine = coroutine;
 
@@ -72,7 +61,6 @@ std::uint64_t NativeDispatcher::addPending(lua_State *L, int request_index,
         pending_[id] = pending;
         return id;
     } catch (...) {
-        releaseExtra(pending.extra_ref);
         release(pending);
         throw;
     }
@@ -98,7 +86,6 @@ void NativeDispatcher::cancel(std::uint64_t request_id)
     }
     PendingRequest pending = found->second;
     pending_.erase(found);
-    releaseExtra(pending.extra_ref);
     release(pending);
 }
 
@@ -119,28 +106,28 @@ std::uint64_t NativeDispatcher::await(lua_State *L, int request_index)
     return addPending(L, request_index, 0, 0, coroutine_ref, coroutine);
 }
 
-void NativeDispatcher::pushResponse(lua_State *L, const NativeResponse &response,
-                                     int extra_ref) const
+void NativeDispatcher::pushResponse(lua_State *L, const NativeResponse &response) const
 {
     if (!response.object) {
         lua_pushnil(L);
         return;
     }
     tdlua_native::push_object(L, *response.object);
-    if (extra_ref != LUA_NOREF && extra_ref != LUA_REFNIL) {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, extra_ref);
-        lua_setfield(L, -2, "@extra");
+    if (response.request_id != 0) {
+        tdlua_lua_push_integer(
+            L, static_cast<std::int64_t>(response.request_id));
+        lua_setfield(L, -2, "_request_id");
     }
 }
 
-void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &response,
-                                        int extra_ref)
+void NativeDispatcher::dispatchHandlers(lua_State *L,
+                                        const NativeResponse &response)
 {
     if (!response.object) {
         return;
     }
 
-    pushResponse(L, response, extra_ref);
+    pushResponse(L, response);
     lua_getfield(L, -1, "_");
     const char *type_name = lua_tostring(L, -1);
     const std::string type = type_name ? type_name : "";
@@ -155,7 +142,7 @@ void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &resp
     }
     const int handler_ref = found->second;
     lua_rawgeti(L, LUA_REGISTRYINDEX, handler_ref);
-    pushResponse(L, response, extra_ref);
+    pushResponse(L, response);
     if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
         const std::string message = luaError(L);
         lua_pop(L, 1);
@@ -165,7 +152,6 @@ void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &resp
 
 int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
 {
-    int extra_ref = LUA_NOREF;
     PendingRequest pending;
     bool has_pending = false;
     if (response.request_id != 0) {
@@ -173,23 +159,13 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
         if (found != pending_.end()) {
             pending = found->second;
             pending_.erase(found);
-            extra_ref = pending.extra_ref;
             has_pending = true;
         }
     }
 
-    const auto release_dispatch_extra = [&]() {
-        if (extra_ref != LUA_NOREF && extra_ref != LUA_REFNIL) {
-            if (extra_ref == response.extra_ref) {
-                response.extra_ref = LUA_NOREF;
-            }
-            releaseExtra(extra_ref);
-        }
-    };
-
     if (has_pending && pending.callback_ref != LUA_NOREF) {
         lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
-        pushResponse(owner_, response, extra_ref);
+        pushResponse(owner_, response);
         if (pending.context_ref == LUA_NOREF || pending.context_ref == LUA_REFNIL) {
             lua_pushnil(owner_);
         } else {
@@ -200,16 +176,14 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
             const std::string message = luaError(owner_);
             lua_pop(owner_, 1);
             release(pending);
-            release_dispatch_extra();
             throw std::runtime_error("tdlua request callback failed: " + message);
         }
     } else if (has_pending && pending.coroutine_ref != LUA_NOREF) {
-        pushResponse(pending.coroutine, response, extra_ref);
+        pushResponse(pending.coroutine, response);
         const int status = tdlua_lua_resume(pending.coroutine, owner_, 1);
         if (status != LUA_OK && status != LUA_YIELD) {
             const std::string message = luaError(pending.coroutine);
             release(pending);
-            release_dispatch_extra();
             throw std::runtime_error("tdlua await failed: " + message);
         }
     }
@@ -218,23 +192,11 @@ int NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
         release(pending);
     }
     try {
-        dispatchHandlers(L, response,
-                         extra_ref == LUA_NOREF ? response.extra_ref : extra_ref);
+        dispatchHandlers(L, response);
     } catch (...) {
-        if (extra_ref == LUA_NOREF) {
-            extra_ref = response.extra_ref;
-        }
-        release_dispatch_extra();
         throw;
     }
-    return extra_ref;
-}
-
-void NativeDispatcher::releaseExtra(int extra_ref)
-{
-    if (extra_ref != LUA_NOREF && extra_ref != LUA_REFNIL) {
-        luaL_unref(owner_, LUA_REGISTRYINDEX, extra_ref);
-    }
+    return 0;
 }
 
 void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index)
@@ -287,7 +249,6 @@ void NativeDispatcher::clear()
 {
     for (auto &entry : pending_) {
         PendingRequest pending = entry.second;
-        releaseExtra(pending.extra_ref);
         release(pending);
     }
     pending_.clear();

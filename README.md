@@ -53,6 +53,22 @@ The bundled TDLib build uses TDLib's current JSON interface internally for the
 JSON backend. TDLua keeps the TDLib client identifier private and both backends
 expose the same Lua request and update API.
 
+The two backends share the public Lua API, but their validation happens at
+different layers. The native backend validates requests against the generated
+TDLib schema and routes schema conversion failures through TDLib `error`
+objects. Omitted scalar, string, bytes, and vector fields use the same zero,
+empty, or false defaults as the JSON interface. For portable code, use explicit
+Lua strings for TDLib string fields and numeric values for numeric fields.
+
+The native codec is generated from the bundled TDLib schema, so native builds
+currently require `TDLUA_BUNDLED_TDLIB=ON`. The JSON backend can instead link
+against an installed TDLib with `TDLUA_BUNDLED_TDLIB=OFF`; its C JSON ABI is
+the replaceable backend boundary.
+
+Both backends treat an `execute(request, timeout)` timeout as a timeout of the
+caller, not cancellation of the TDLib request. A response that arrives later
+can still be returned by `receive()` with its TDLua `_request_id`.
+
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
 Build with Lua 5.2 and the latest version of tdlib.
 
@@ -100,9 +116,11 @@ client:receive(1.0)
 ```
 
 The callback context is kept locally by TDLua and is never sent to TDLib.
-Internal request markers are removed before the response is exposed to Lua;
-the caller's original `@extra` is restored. `_execute` remains available as a
-legacy alias, while `executeSync` names the direct TDLib `td_execute` call.
+`send`, fire-and-forget `execute(request, true)`, callbacks, and responses use
+one request-id namespace per client. Responses expose `_request_id`; updates
+do not. `@extra` and `_request_id` are reserved request fields. `_execute`
+remains available as a legacy alias, while `executeSync` names the direct
+TDLib `td_execute` call.
 
 Dynamic TDLib helpers also accept the asynchronous form. A callback is detected
 by its Lua function type:

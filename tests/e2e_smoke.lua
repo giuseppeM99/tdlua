@@ -10,6 +10,7 @@ local update_count = 0
 client:on("updateAuthorizationState", function(update)
     update_count = update_count + 1
     assert(type(update.authorization_state) == "table")
+    assert(update._request_id == nil)
 end)
 
 client:request({_ = "getAuthorizationState"}, function(result)

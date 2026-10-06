@@ -4,13 +4,13 @@
 #include <utility>
 
 NativeResponse::NativeResponse()
-    : client_id(0), request_id(0), object(nullptr), extra_ref(LUA_NOREF), dispatched(false)
+    : client_id(0), request_id(0), object(nullptr), dispatched(false)
 {
 }
 
 NativeResponse::NativeResponse(NativeResponse &&other) noexcept
     : client_id(other.client_id), request_id(other.request_id),
-      object(std::move(other.object)), extra_ref(other.extra_ref), dispatched(other.dispatched)
+      object(std::move(other.object)), dispatched(other.dispatched)
 {
 }
 
@@ -20,7 +20,6 @@ NativeResponse &NativeResponse::operator=(NativeResponse &&other) noexcept
         client_id = other.client_id;
         request_id = other.request_id;
         object = std::move(other.object);
-        extra_ref = other.extra_ref;
         dispatched = other.dispatched;
     }
     return *this;

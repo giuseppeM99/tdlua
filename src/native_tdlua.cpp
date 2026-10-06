@@ -13,7 +13,7 @@
 NativeTDLua::NativeTDLua(lua_State *lua)
     : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
       updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
-      timed_out_execute_extras_(), dispatcher_(lua)
+      dispatcher_(lua)
 {
 }
 
@@ -45,11 +45,9 @@ NativeResponse NativeTDLua::receive(double timeout)
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
-        restoreTimedOutExecuteExtra(response);
         return response;
     }
     NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
-    restoreTimedOutExecuteExtra(response);
     return response;
 }
 
@@ -59,7 +57,6 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
         return NativeResponse();
     }
     NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
-    restoreTimedOutExecuteExtra(response);
     return response;
 }
 
@@ -75,10 +72,7 @@ void NativeTDLua::dispatch(NativeResponse &response)
         return;
     }
     checkAuthState(response);
-    const int existing_extra_ref = response.extra_ref;
-    const int routed_extra_ref = dispatcher_.dispatch(lua_, response);
-    response.extra_ref = routed_extra_ref == LUA_NOREF
-        ? existing_extra_ref : routed_extra_ref;
+    dispatcher_.dispatch(lua_, response);
     response.dispatched = true;
 }
 
@@ -107,47 +101,10 @@ bool NativeTDLua::takeQueuedResponse(std::uint64_t request_id,
         if (it->request_id == request_id) {
             response = std::move(*it);
             updates_.erase(it);
-            restoreTimedOutExecuteExtra(response);
             return true;
         }
     }
     return false;
-}
-
-void NativeTDLua::rememberTimedOutExecuteExtra(std::uint64_t request_id,
-                                               int extra_ref)
-{
-    if (extra_ref == LUA_NOREF || extra_ref == LUA_REFNIL) {
-        return;
-    }
-    const auto found = timed_out_execute_extras_.find(request_id);
-    if (found != timed_out_execute_extras_.end()) {
-        releaseExtra(found->second);
-        found->second = extra_ref;
-        return;
-    }
-    timed_out_execute_extras_.emplace(request_id, extra_ref);
-}
-
-void NativeTDLua::restoreTimedOutExecuteExtra(NativeResponse &response)
-{
-    if (response.request_id == 0 || response.extra_ref != LUA_NOREF) {
-        return;
-    }
-    const auto found = timed_out_execute_extras_.find(response.request_id);
-    if (found == timed_out_execute_extras_.end()) {
-        return;
-    }
-    response.extra_ref = found->second;
-    timed_out_execute_extras_.erase(found);
-}
-
-void NativeTDLua::clearTimedOutExecuteExtras()
-{
-    for (const auto &entry : timed_out_execute_extras_) {
-        releaseExtra(entry.second);
-    }
-    timed_out_execute_extras_.clear();
 }
 
 bool NativeTDLua::empty() const
@@ -157,17 +114,7 @@ bool NativeTDLua::empty() const
 
 void NativeTDLua::pushResponse(lua_State *L, const NativeResponse &response) const
 {
-    dispatcher_.pushResponse(L, response, response.extra_ref);
-}
-
-int NativeTDLua::captureExtra(lua_State *L, int request_index) const
-{
-    return dispatcher_.captureExtra(L, request_index);
-}
-
-void NativeTDLua::releaseExtra(int extra_ref)
-{
-    dispatcher_.releaseExtra(extra_ref);
+    dispatcher_.pushResponse(L, response);
 }
 
 std::uint64_t NativeTDLua::nextRequestId()
@@ -235,7 +182,7 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
 void NativeTDLua::close()
 {
     if (closed_) {
-        clearTimedOutExecuteExtras();
+        dispatcher_.clear();
         NativeRuntime::instance().forget(client_id_);
         return;
     }
@@ -268,7 +215,7 @@ void NativeTDLua::close()
     }
     saveUpdatesBuffer();
     emptyUpdatesBuffer();
-    clearTimedOutExecuteExtras();
+    dispatcher_.clear();
     NativeRuntime::instance().forget(client_id_);
 }
 
@@ -300,7 +247,6 @@ void NativeTDLua::saveUpdatesBuffer()
             lua_pop(lua_, 1);
             stored.push_back(std::move(value));
         }
-        releaseExtra(response.extra_ref);
     }
     lua_settop(lua_, stack_top);
 
@@ -338,7 +284,6 @@ void NativeTDLua::loadUpdatesBuffer()
             NativeResponse response;
             response.client_id = client_id_;
             response.request_id = 0;
-            response.extra_ref = dispatcher_.captureExtra(lua_, table_index);
             response.object = tdlua_native::from_lua_object(
                 lua_, table_index, "updates[" + std::to_string(i + 1) + "]");
             updates_.push_back(std::move(response));
@@ -358,6 +303,5 @@ void NativeTDLua::emptyUpdatesBuffer()
     while (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
-        releaseExtra(response.extra_ref);
     }
 }

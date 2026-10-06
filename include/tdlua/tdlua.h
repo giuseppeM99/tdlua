@@ -7,7 +7,6 @@
 #pragma once
 #include <cstdint>
 #include <deque>
-#include <map>
 #include <string>
 #include <nlohmann/json.hpp>
 #include "tdlua/lua_dispatcher.h"
@@ -33,9 +32,7 @@ private:
     };
 
     std::int32_t client_id;
-    std::uint64_t next_request_id;
     std::deque<QueuedUpdate> updates;
-    std::map<std::uint64_t, nlohmann::json> timed_out_execute_extras;
     std::string dbpath;
     bool _ready;
     ClientState state;
@@ -57,16 +54,10 @@ public:
     nlohmann::json receive(const double timeout = 10.0);
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
-    void rememberTimedOutExecuteExtra(std::uint64_t request_id,
-                                      nlohmann::json extra);
-    void restoreTimedOutExecuteExtra(nlohmann::json &response);
-    void clearTimedOutExecuteExtras();
 
     void close();
 
     bool closed() const;
-
-    std::uint64_t nextRequestId();
 
     LuaDispatcher &dispatcher();
 

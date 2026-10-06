@@ -32,13 +32,8 @@ public:
     void push(NativeResponse response);
     NativeResponse pop();
     bool takeQueuedResponse(std::uint64_t request_id, NativeResponse &response);
-    void rememberTimedOutExecuteExtra(std::uint64_t request_id, int extra_ref);
-    void restoreTimedOutExecuteExtra(NativeResponse &response);
-    void clearTimedOutExecuteExtras();
     bool empty() const;
     void pushResponse(lua_State *L, const NativeResponse &response) const;
-    int captureExtra(lua_State *L, int request_index) const;
-    void releaseExtra(int extra_ref);
 
     std::uint64_t nextRequestId();
     void setDB(const std::string &path);
@@ -55,6 +50,5 @@ private:
     bool ready_;
     bool closing_;
     bool closed_;
-    std::map<std::uint64_t, int> timed_out_execute_extras_;
     NativeDispatcher dispatcher_;
 };

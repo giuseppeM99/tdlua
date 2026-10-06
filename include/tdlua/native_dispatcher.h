@@ -21,9 +21,7 @@ public:
     std::size_t pendingCount() const;
 
     int dispatch(lua_State *L, NativeResponse &response);
-    void pushResponse(lua_State *L, const NativeResponse &response, int extra_ref) const;
-    void releaseExtra(int extra_ref);
-    int captureExtra(lua_State *L, int request_index) const;
+    void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();
 
     void on(lua_State *L, const std::string &type, int callback_index);
@@ -33,7 +31,6 @@ public:
 
 private:
     struct PendingRequest {
-        int extra_ref;
         int callback_ref;
         int context_ref;
         int coroutine_ref;
@@ -46,7 +43,7 @@ private:
                              int callback_index, int context_index,
                              int coroutine_ref, lua_State *coroutine);
     void release(PendingRequest &pending);
-    void dispatchHandlers(lua_State *L, const NativeResponse &response, int extra_ref);
+    void dispatchHandlers(lua_State *L, const NativeResponse &response);
 
     lua_State *owner_;
     std::uint64_t next_id_;

@@ -28,13 +28,15 @@ assert(type(dynamic_response) == "table")
 
 local first = tdlua()
 local second = tdlua()
-first:send({_ = "getAuthorizationState", ["@extra"] = "first"})
-second:send({_ = "getAuthorizationState", ["@extra"] = "second"})
+local first_id = first:send({_ = "getAuthorizationState"})
+local second_id = second:send({_ = "getAuthorizationState"})
+assert(first_id == 1)
+assert(second_id == 1)
 
-local function wait_for_extra(sender, expected)
+local function wait_for_id(sender, expected)
     for _ = 1, 10 do
         local event = sender:receive(0.5)
-        if event and event["@extra"] == expected then
+        if event and event._request_id == expected then
             assert(event["@client_id"] == nil)
             return event
         end
@@ -42,8 +44,8 @@ local function wait_for_extra(sender, expected)
     return nil
 end
 
-assert(wait_for_extra(first, "first"))
-assert(wait_for_extra(second, "second"))
+assert(wait_for_id(first, first_id))
+assert(wait_for_id(second, second_id))
 
 first:close()
 second:close()

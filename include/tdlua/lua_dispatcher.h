@@ -17,8 +17,11 @@ public:
     std::uint64_t request(lua_State *L, nlohmann::json &request,
                           int callback_index, int context_index);
     std::uint64_t await(lua_State *L, nlohmann::json &request);
+    std::uint64_t raw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
     std::size_t pendingCount() const;
+    static bool responseRequestId(const nlohmann::json &response,
+                                  std::uint64_t &request_id);
     void on(lua_State *L, const std::string &type, int callback_index);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type) const;

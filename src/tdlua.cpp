@@ -1,6 +1,6 @@
 /**
  * @author Giuseppe Marino
- * ©Giuseppe Marino 2018 - 2018
+ * ©Giuseppe Marino 2018 - 2026
  * This file is under GPLv3 license see LICENCE
  */
 
@@ -8,7 +8,6 @@
 #include <chrono>
 #include <iostream>
 #include <fstream>
-#include <map>
 #include <mutex>
 #include <queue>
 #include <set>
@@ -123,8 +122,8 @@ private:
 
 TDLua::TDLua(lua_State *lua)
     : client_id(JsonRuntime::instance().createClient()),
-      next_request_id(1), updates(), timed_out_execute_extras(), dbpath(),
-      _ready(false), state(ClientState::Running), dispatcher_(lua)
+      updates(), dbpath(), _ready(false), state(ClientState::Running),
+      dispatcher_(lua)
 {
 }
 
@@ -174,75 +173,35 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
         if (!it->dispatched || !it->value.is_object()) {
             continue;
         }
-        const nlohmann::json::const_iterator extra = it->value.find("@extra");
-        if (extra == it->value.end()) {
+        const nlohmann::json::const_iterator request_id_value =
+            it->value.find("_request_id");
+        if (request_id_value == it->value.end() ||
+            !request_id_value->is_number_unsigned()) {
             continue;
         }
-        bool matches = false;
-        if (extra->is_object()) {
-            const auto marker = extra->find("__tdlua_execute");
-            matches = marker != extra->end() && marker->is_number_unsigned() &&
-                      marker->get<std::uint64_t>() == request_id;
-        } else if (extra->is_number_unsigned()) {
-            matches = extra->get<std::uint64_t>() == request_id;
-        } else if (extra->is_number_integer() && extra->get<std::int64_t>() >= 0) {
-            matches = static_cast<std::uint64_t>(extra->get<std::int64_t>()) == request_id;
-        }
-        if (!matches) {
+        if (request_id_value->get<std::uint64_t>() != request_id) {
             continue;
         }
         response = std::move(*it);
         updates.erase(it);
-        restoreTimedOutExecuteExtra(response.value);
         return true;
     }
     return false;
 }
 
-void TDLua::rememberTimedOutExecuteExtra(std::uint64_t request_id,
-                                         nlohmann::json extra)
-{
-    timed_out_execute_extras[request_id] = std::move(extra);
-}
-
-void TDLua::restoreTimedOutExecuteExtra(nlohmann::json &response)
-{
-    if (!response.is_object()) {
-        return;
-    }
-    const auto extra = response.find("@extra");
-    if (extra == response.end() || !extra->is_object()) {
-        return;
-    }
-    const auto marker = extra->find("__tdlua_execute");
-    if (marker == extra->end() || !marker->is_number_unsigned()) {
-        return;
-    }
-    const std::uint64_t request_id = marker->get<std::uint64_t>();
-    const auto found = timed_out_execute_extras.find(request_id);
-    if (found == timed_out_execute_extras.end()) {
-        return;
-    }
-    response["@extra"] = std::move(found->second);
-    timed_out_execute_extras.erase(found);
-}
-
-void TDLua::clearTimedOutExecuteExtras()
-{
-    timed_out_execute_extras.clear();
-}
-
 void TDLua::close()
 {
     if (state == ClientState::Closed) {
-        clearTimedOutExecuteExtras();
+        dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
         state = ClientState::Closed;
         return;
     }
 
     if (state == ClientState::Running) {
-        send({{"@type", "close"}});
+        nlohmann::json close_request = {{"@type", "close"}};
+        dispatcher_.raw(close_request);
+        send(close_request);
         state = ClientState::Closing;
     }
 
@@ -260,18 +219,13 @@ void TDLua::close()
             checkAuthState(update);
         }
     }
-    clearTimedOutExecuteExtras();
+    dispatcher_.clear();
     JsonRuntime::instance().forget(client_id);
 }
 
 bool TDLua::closed() const
 {
     return state == ClientState::Closed;
-}
-
-std::uint64_t TDLua::nextRequestId()
-{
-    return next_request_id++;
 }
 
 LuaDispatcher &TDLua::dispatcher()

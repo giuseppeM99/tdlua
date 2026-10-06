@@ -16,7 +16,6 @@ struct NativeResponse {
     td::ClientManager::ClientId client_id;
     td::ClientManager::RequestId request_id;
     td::td_api::object_ptr<td::td_api::Object> object;
-    int extra_ref;
     bool dispatched;
 
     NativeResponse();

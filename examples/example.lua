@@ -11,12 +11,11 @@ tdlua.setLogLevel(6)
 local client = tdlua()
 
 -- Legacy raw API: send() remains fire-and-forget and receive() pumps events.
-client:send({_ = 'getAuthorizationState', ['@extra'] = 1.01234})
+local authorization_request_id = client:send({_ = 'getAuthorizationState'})
 
 vardump(
     client:execute({
         _ = 'getTextEntities', text = '@telegram /test_command https://telegram.org telegram.me',
-        ['@extra'] = {'5', 7.0},
     })
 )
 
