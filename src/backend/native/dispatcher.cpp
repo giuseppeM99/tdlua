@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 NativeDispatcher::NativeDispatcher(lua_State *owner)
-    : owner_(owner), router_(owner)
+    : owner_(owner), router_(owner), pending_handlers_()
 {
 }
 
@@ -52,16 +52,16 @@ std::shared_ptr<tdlua::ManagedState> NativeDispatcher::awaitState(lua_State *L)
 }
 
 int NativeDispatcher::wait(lua_State *L,
-                           const std::shared_ptr<tdlua::ManagedState> &state,
-                           bool has_timeout, double timeout, tdlua::WaitKind kind,
-                           const std::string &field)
+                            const std::shared_ptr<tdlua::ManagedState> &state,
+                            bool has_timeout, double timeout, tdlua::WaitKind kind,
+                            const char *field)
 {
     return router_.wait(L, state, has_timeout, timeout, kind, field);
 }
 
 int NativeDispatcher::waitById(lua_State *L, std::uint64_t request_id,
-                               bool has_timeout, double timeout,
-                               tdlua::WaitKind kind, const std::string &field)
+                                bool has_timeout, double timeout,
+                                tdlua::WaitKind kind, const char *field)
 {
     return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
 }
@@ -99,32 +99,61 @@ void NativeDispatcher::pushResponse(lua_State *L, const NativeResponse &response
     }
 }
 
-void NativeDispatcher::dispatchHandlers(lua_State *L, const NativeResponse &response)
+void NativeDispatcher::queueHandler(const NativeResponse &response)
 {
     if (!response.object) {
         return;
     }
-    pushResponse(L, response);
-    lua_getfield(L, -1, "_");
-    const char *type_name = lua_tostring(L, -1);
+    pushResponse(owner_, response);
+    lua_getfield(owner_, -1, "_");
+    const char *type_name = lua_tostring(owner_, -1);
     const std::string type = type_name ? type_name : "";
-    lua_pop(L, 2);
+    lua_pop(owner_, 2);
     const auto found = handlers_.find(type);
     if (type.empty() || found == handlers_.end()) {
         return;
     }
-    const int handler_ref = found->second;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, handler_ref);
-    pushResponse(L, response);
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-        const char *text = lua_tostring(L, -1);
-        const std::string message = text ? text : "unknown Lua error";
-        lua_pop(L, 1);
-        throw std::runtime_error("tdlua event handler failed: " + message);
+    PendingHandler pending;
+    lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
+    pending.callback_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
+    pushResponse(owner_, response);
+    pending.event_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
+    pending_handlers_.push_back(pending);
+}
+
+void NativeDispatcher::drainHandlers()
+{
+    while (!pending_handlers_.empty()) {
+        PendingHandler pending = pending_handlers_.front();
+        pending_handlers_.pop_front();
+        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
+        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
+        const int status = lua_pcall(owner_, 1, 0, 0);
+        std::string error;
+        if (status != LUA_OK) {
+            const char *text = lua_tostring(owner_, -1);
+            error = text ? text : "unknown Lua error";
+            lua_pop(owner_, 1);
+        }
+        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
+        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
+        if (!error.empty()) {
+            throw std::runtime_error("tdlua event handler failed: " + error);
+        }
     }
 }
 
-tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
+void NativeDispatcher::clearHandlerQueue()
+{
+    while (!pending_handlers_.empty()) {
+        const PendingHandler pending = pending_handlers_.front();
+        pending_handlers_.pop_front();
+        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
+        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
+    }
+}
+
+tdlua::RouteKind NativeDispatcher::dispatch(lua_State *, NativeResponse &response)
 {
     const tdlua::RouteKind route = router_.dispatchRoute(response.request_id,
                                                          [&](lua_State *target) {
@@ -132,10 +161,22 @@ tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &respon
     });
     if (route == tdlua::RouteKind::Raw ||
         route == tdlua::RouteKind::Task ||
+        route == tdlua::RouteKind::LegacyRequest ||
         route == tdlua::RouteKind::Update) {
-        dispatchHandlers(L, response);
+        queueHandler(response);
     }
     return route;
+}
+
+void NativeDispatcher::drain()
+{
+    try {
+        router_.tick();
+    } catch (...) {
+        clearHandlerQueue();
+        throw;
+    }
+    drainHandlers();
 }
 
 void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index)
@@ -165,6 +206,7 @@ bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type) const
 }
 void NativeDispatcher::clear()
 {
+    clearHandlerQueue();
     router_.closePending();
     router_.clear();
     for (auto &entry : handlers_) {

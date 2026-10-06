@@ -141,23 +141,26 @@ bool NativeTDLua::pump(const double timeout)
     if (closed_) {
         return false;
     }
-    NativeResponse response;
-    if (!updates_.empty() && !updates_.front().dispatched) {
-        response = pop();
-    } else {
-        response = receiveBackend(timeout);
+    {
+        NativeResponse response;
+        if (!updates_.empty() && !updates_.front().dispatched) {
+            response = pop();
+        } else {
+            response = receiveBackend(timeout);
+        }
+        if (!response.object) {
+            return false;
+        }
+        checkAuthState(response);
+        const tdlua::RouteKind route = dispatcher_.dispatch(lua_, response);
+        if (route == tdlua::RouteKind::Raw ||
+            route == tdlua::RouteKind::Unknown ||
+            route == tdlua::RouteKind::Update) {
+            response.dispatched = true;
+            push(std::move(response));
+        }
     }
-    if (!response.object) {
-        return false;
-    }
-    checkAuthState(response);
-    const tdlua::RouteKind route = dispatcher_.dispatch(lua_, response);
-    if (route == tdlua::RouteKind::Raw ||
-        route == tdlua::RouteKind::Unknown ||
-        route == tdlua::RouteKind::Update) {
-        response.dispatched = true;
-        push(std::move(response));
-    }
+    dispatcher_.drain();
     return true;
 }
 

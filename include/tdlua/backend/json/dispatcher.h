@@ -7,6 +7,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <deque>
 
 #include "tdlua/lua_compat.h"
 
@@ -27,12 +28,12 @@ public:
                                               bool supplied_thread);
     std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
     int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
-             bool has_timeout, double timeout,
-             tdlua::WaitKind kind = tdlua::WaitKind::Result,
-             const std::string &field = std::string());
+              bool has_timeout, double timeout,
+              tdlua::WaitKind kind = tdlua::WaitKind::Result,
+              const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
-                 double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
-                 const std::string &field = std::string());
+                  double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
+                  const char *field = nullptr);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
     std::uint64_t raw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
@@ -44,12 +45,21 @@ public:
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type) const;
     tdlua::RouteKind dispatch(nlohmann::json &event);
+    void drain();
     void clear();
 
 private:
-    void dispatchHandlers(nlohmann::json &event);
+    struct PendingHandler {
+        int callback_ref = LUA_NOREF;
+        int event_ref = LUA_NOREF;
+    };
+
+    void queueHandler(nlohmann::json &event);
+    void drainHandlers();
+    void clearHandlerQueue();
 
     lua_State *owner_;
     RequestRouter router_;
     std::map<std::string, int> handlers_;
+    std::deque<PendingHandler> pending_handlers_;
 };

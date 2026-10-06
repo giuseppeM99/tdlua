@@ -121,12 +121,15 @@ static int tdclient_receive(lua_State *L)
             throw std::runtime_error("invalid tdlua client");
         }
         if (!td->empty()) {
-            TDLua::QueuedUpdate queued = td->pop();
-            if (!queued.dispatched) {
-                td->checkAuthState(queued.value);
-                td->dispatcher().dispatch(queued.value);
+            {
+                TDLua::QueuedUpdate queued = td->pop();
+                if (!queued.dispatched) {
+                    td->checkAuthState(queued.value);
+                    td->dispatcher().dispatch(queued.value);
+                }
+                lua_pushjson(L, queued.value);
             }
-            lua_pushjson(L, queued.value);
+            td->dispatcher().drain();
             return 1;
         }
         if (td->closed()) {
@@ -137,14 +140,17 @@ static int tdclient_receive(lua_State *L)
         if (lua_type(L, 2) == LUA_TNUMBER) {
             timeout = lua_tonumber(L, 2);
         }
-        json result = td->receive(timeout);
-        if (result.empty()) {
-            lua_pushnil(L);
-        } else {
-            td->checkAuthState(result);
-            td->dispatcher().dispatch(result);
-            lua_pushjson(L, result);
+        {
+            json result = td->receive(timeout);
+            if (result.empty()) {
+                lua_pushnil(L);
+            } else {
+                td->checkAuthState(result);
+                td->dispatcher().dispatch(result);
+                lua_pushjson(L, result);
+            }
         }
+        td->dispatcher().drain();
         return 1;
     });
 }
@@ -209,6 +215,7 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
     const auto dispatch_response = [td](json &value) {
         td->checkAuthState(value);
         td->dispatcher().dispatch(value);
+        td->dispatcher().drain();
     };
     const auto response_id = [](const json &value) {
         const auto field = value.find("_request_id");
@@ -237,7 +244,10 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
 
 static int tdclient_execute(lua_State *L)
 {
-    return tdlua_binding::protected_call(L, [&]() -> int {
+    std::uint64_t wait_id = 0;
+    bool wait_for_result = false;
+    TDLua *wait_td = nullptr;
+    const int result = tdlua_binding::protected_call(L, [&]() -> int {
         json j;
         const int request_index = 2;
         const int top = lua_gettop(L);
@@ -316,18 +326,27 @@ static int tdclient_execute(lua_State *L)
             throw;
         }
         if (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index)) {
-            const std::uint64_t request_id = state->request_id;
+            wait_td = td;
+            wait_id = state->request_id;
             state.reset();
-            return td->dispatcher().waitById(L, request_id, false, 0.0);
+            wait_for_result = true;
+            return 0;
         }
         tdlua::pushManagedHandle(L, state, "tdlua.future");
         return 1;
     });
+    if (wait_for_result) {
+        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+    }
+    return result;
 }
 
 static int call(lua_State *L)
 {
-    return tdlua_binding::protected_call(L, [&]() -> int {
+    std::uint64_t wait_id = 0;
+    bool wait_for_result = false;
+    TDLua *wait_td = nullptr;
+    const int result = tdlua_binding::protected_call(L, [&]() -> int {
         TDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("invalid tdlua client is closed");
@@ -397,13 +416,19 @@ static int call(lua_State *L)
             throw;
         }
         if (arguments.explicit_wait) {
-            const std::uint64_t request_id = state->request_id;
+            wait_td = td;
+            wait_id = state->request_id;
             state.reset();
-            return td->dispatcher().waitById(L, request_id, false, 0.0);
+            wait_for_result = true;
+            return 0;
         }
         tdlua::pushManagedHandle(L, state, "tdlua.future");
         return 1;
     });
+    if (wait_for_result) {
+        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+    }
+    return result;
 }
 
 static int tdclient_rawexecute(lua_State *L)
@@ -474,7 +499,10 @@ static int tdclient_request(lua_State *L)
 
 static int tdclient_await(lua_State *L)
 {
-    return tdlua_binding::protected_call(L, [&]() -> int {
+    std::uint64_t wait_id = 0;
+    bool wait_for_result = false;
+    TDLua *wait_td = nullptr;
+    const int result = tdlua_binding::protected_call(L, [&]() -> int {
         TDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
@@ -503,8 +531,15 @@ static int tdclient_await(lua_State *L)
             throw;
         }
         state.reset();
-        return td->dispatcher().waitById(L, request_id, false, 0.0);
+        wait_td = td;
+        wait_id = request_id;
+        wait_for_result = true;
+        return 0;
     });
+    if (wait_for_result) {
+        return wait_td->dispatcher().waitById(L, wait_id, false, 0.0);
+    }
+    return result;
 }
 
 #ifdef TDLUA_TESTING

@@ -31,12 +31,12 @@ public:
                                               bool supplied_thread);
     std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
     int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
-             bool has_timeout, double timeout,
-             tdlua::WaitKind kind = tdlua::WaitKind::Result,
-             const std::string &field = std::string());
+              bool has_timeout, double timeout,
+              tdlua::WaitKind kind = tdlua::WaitKind::Result,
+              const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
-                 double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
-                 const std::string &field = std::string());
+                  double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
+                  const char *field = nullptr);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
@@ -52,6 +52,7 @@ public:
     tdlua::RouteKind dispatchRoute(nlohmann::json &response);
     bool dispatch(nlohmann::json &response);
     void closePending() { router_.closePending(); }
+    void tick() { router_.tick(); }
     void clear();
 
 private:

@@ -38,16 +38,16 @@ std::shared_ptr<tdlua::ManagedState> RequestRouter::awaitState(lua_State *L)
 }
 
 int RequestRouter::wait(lua_State *L,
-                        const std::shared_ptr<tdlua::ManagedState> &state,
-                        bool has_timeout, double timeout, tdlua::WaitKind kind,
-                        const std::string &field)
+                         const std::shared_ptr<tdlua::ManagedState> &state,
+                         bool has_timeout, double timeout, tdlua::WaitKind kind,
+                         const char *field)
 {
     return router_.wait(L, state, has_timeout, timeout, kind, field);
 }
 
 int RequestRouter::waitById(lua_State *L, std::uint64_t request_id,
-                            bool has_timeout, double timeout,
-                            tdlua::WaitKind kind, const std::string &field)
+                             bool has_timeout, double timeout,
+                             tdlua::WaitKind kind, const char *field)
 {
     return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
 }

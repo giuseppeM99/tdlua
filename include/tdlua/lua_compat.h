@@ -23,14 +23,16 @@ inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments
 #endif
 }
 
-/* Lua 5.3 made yieldability observable.  Older versions supported by the
- * compatibility layer do not expose the query, so conservatively use the
- * non-yieldable path there.  Future/Task code must never infer this from who
- * created the coroutine. */
+/* Lua 5.3 made yieldability observable.  Lua 5.2 lacks the query, but a
+ * C-bound function can still yield when it runs on a coroutine. */
 inline bool tdlua_lua_is_yieldable(lua_State *L)
 {
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
     return lua_isyieldable(L) != 0;
+#elif defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
+    const int is_main = lua_pushthread(L);
+    lua_pop(L, 1);
+    return is_main == 0;
 #else
     (void)L;
     return false;

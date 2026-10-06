@@ -238,25 +238,28 @@ bool TDLua::pump(const double timeout)
     if (closed()) {
         return false;
     }
-    nlohmann::json value;
-    if (!updates.empty() && !updates.front().dispatched) {
-        QueuedUpdate queued = pop();
-        value = std::move(queued.value);
-    } else {
-        // Use the configured non-owning transport, including deterministic
-        // test transports injected below the common router.
-        value = transport().receive(timeout);
+    {
+        nlohmann::json value;
+        if (!updates.empty() && !updates.front().dispatched) {
+            QueuedUpdate queued = pop();
+            value = std::move(queued.value);
+        } else {
+            // Use the configured non-owning transport, including deterministic
+            // test transports injected below the common router.
+            value = transport().receive(timeout);
+        }
+        if (!value.is_object() || value.empty()) {
+            return false;
+        }
+        checkAuthState(value);
+        const tdlua::RouteKind route = dispatcher_.dispatch(value);
+        if (route == tdlua::RouteKind::Raw ||
+            route == tdlua::RouteKind::Unknown ||
+            route == tdlua::RouteKind::Update) {
+            push(value, true);
+        }
     }
-    if (!value.is_object() || value.empty()) {
-        return false;
-    }
-    checkAuthState(value);
-    const tdlua::RouteKind route = dispatcher_.dispatch(value);
-    if (route == tdlua::RouteKind::Raw ||
-        route == tdlua::RouteKind::Unknown ||
-        route == tdlua::RouteKind::Update) {
-        push(value, true);
-    }
+    dispatcher_.drain();
     return true;
 }
 

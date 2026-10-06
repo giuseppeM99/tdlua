@@ -250,6 +250,51 @@ void testManagedFutureAndTasks(lua_State *L, Fake &fake)
     runLua(L, "closing = c:getMe()");
 }
 
+void testReviewRegressions(lua_State *L, Fake &fake)
+{
+    runLua(L,
+           "timeout_future = c:getMe(); "
+           "timeout_co = coroutine.create(function() "
+           "  timeout_value, timeout_error = timeout_future:wait(0) "
+           "end); "
+           "assert(coroutine.resume(timeout_co)); "
+           "assert(coroutine.status(timeout_co) == 'suspended')");
+    runLua(L,
+           "c:receive(0); assert(coroutine.status(timeout_co) == 'dead' and "
+           "timeout_value == nil and timeout_error == 'timeout')");
+
+    runLua(L,
+           "multi_task = c:getMe(function(result) "
+           "  return false, result.value, nil "
+           "end); "
+           "multi_co = coroutine.create(function() "
+           "  multi_a, multi_b, multi_c = multi_task:wait() "
+           "end); assert(coroutine.resume(multi_co))");
+    const auto multi_id = fake.sent.back().first;
+    fake.response(multi_id, 101);
+    runLua(L,
+           "c:receive(0); assert(coroutine.status(multi_co) == 'dead' and "
+           "multi_a == false and multi_b == 101 and multi_c == nil)");
+
+    runLua(L,
+           "two_wait_task = c:getMe(function() "
+           "  local first = c:getMe():wait(); "
+           "  local second = c:getMe():wait(); "
+           "  return first.value, second.value "
+           "end)");
+    const auto outer_id = fake.sent.back().first;
+    fake.response(outer_id, 102);
+    runLua(L, "c:receive(0)");
+    const auto first_nested_id = fake.sent.back().first;
+    fake.response(first_nested_id, 103);
+    runLua(L, "c:receive(0)");
+    const auto second_nested_id = fake.sent.back().first;
+    fake.response(second_nested_id, 104);
+    runLua(L,
+           "c:receive(0); local first, second = two_wait_task:wait(); "
+           "assert(first == 103 and second == 104 and two_wait_task:ready())");
+}
+
 void testRollbackAndCallbackErrors(lua_State *L, TDLua *client, Fake &fake)
 {
     const auto pending_before_failure = client->dispatcher().pendingCount();
@@ -300,7 +345,25 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
            "other = d:send{_='getMe'}; "
            "assert(other == ids[1]); "
            "do local value = {}; weak[2] = value; "
-           "c:request({_='getMe'}, function() return value end) end; "
+           "c:request({_='getMe'}, function() return value end) end");
+
+    runLua(L,
+           "shared = c:getMe(); "
+           "close_co = coroutine.create(function() "
+           "  close_value = shared:wait(); c:close() end); "
+           "other_co = coroutine.create(function() "
+           "  other_ok, other_error = pcall(function() "
+           "    other_value = shared:wait() end) end); "
+           "assert(coroutine.resume(close_co)); "
+           "assert(coroutine.resume(other_co))");
+    const auto shared_id = fake.sent.back().first;
+    fake.response(shared_id, 105);
+    runLua(L,
+           "c:receive(0); assert(coroutine.status(close_co) == 'dead' and "
+           "coroutine.status(other_co) == 'dead' and close_value.value == 105 and "
+           "not other_ok and other_value == nil and other_error:find('client closed'))");
+
+    runLua(L,
            "c:close(); c:close(); "
            "local ok, message = pcall(function() closing:wait() end); "
            "assert(not ok and message:find('client closed')); "
@@ -325,6 +388,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testResponses(L, fake);
     testAwaitAndSynchronousCalls(L, fake);
     testManagedFutureAndTasks(L, fake);
+    testReviewRegressions(L, fake);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
     testCloseAndClientIsolation(L, fake, second);

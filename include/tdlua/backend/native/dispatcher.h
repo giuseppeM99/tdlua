@@ -12,6 +12,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <deque>
 
 class NativeDispatcher final {
 public:
@@ -27,12 +28,12 @@ public:
                                               bool supplied_thread);
     std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
     int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
-             bool has_timeout, double timeout,
-             tdlua::WaitKind kind = tdlua::WaitKind::Result,
-             const std::string &field = std::string());
+              bool has_timeout, double timeout,
+              tdlua::WaitKind kind = tdlua::WaitKind::Result,
+              const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
-                 double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
-                 const std::string &field = std::string());
+                  double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
+                  const char *field = nullptr);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
     std::uint64_t raw(lua_State *L, int request_index);
     void cancel(std::uint64_t request_id);
@@ -40,6 +41,7 @@ public:
     std::size_t pendingCount() const;
 
     tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response);
+    void drain();
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();
 
@@ -49,9 +51,17 @@ public:
     void clear();
 
 private:
-    void dispatchHandlers(lua_State *L, const NativeResponse &response);
+    struct PendingHandler {
+        int callback_ref = LUA_NOREF;
+        int event_ref = LUA_NOREF;
+    };
+
+    void queueHandler(const NativeResponse &response);
+    void drainHandlers();
+    void clearHandlerQueue();
 
     lua_State *owner_;
     tdlua::RequestRouter router_;
     std::map<std::string, int> handlers_;
+    std::deque<PendingHandler> pending_handlers_;
 };
