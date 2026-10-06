@@ -1,8 +1,6 @@
-/**
- * @author Giuseppe Marino
- * ©Giuseppe Marino 2018 - 2018
- * This file is under GPLv3 license see LICENCE
- */
+// Copyright (c) 2018-2026 Giuseppe Marino
+// SPDX-License-Identifier: BSD-3-Clause
+
 
 #pragma once
 #include <cstdint>

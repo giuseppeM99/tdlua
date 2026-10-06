@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 local tdlua = require "tdlua"
 
 local function optional_value(value)

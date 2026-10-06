@@ -1,8 +1,5 @@
-/**
- * @author Giuseppe Marino
- * ©Giuseppe Marino 2018 - 2026
- * This file is under GPLv3 license see LICENCE
- */
+// Copyright (c) 2018-2026 Giuseppe Marino
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "tdlua/backend/json/client.h"
 #include <chrono>

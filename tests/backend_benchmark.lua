@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 package.cpath = assert(tdlua_benchmark_module_dir) .. "/?.so;" .. package.cpath
 local tdlua = require "tdlua"
 tdlua.setLogLevel(0)

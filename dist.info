@@ -1,7 +1,10 @@
+# Copyright (c) 2018-2026 Giuseppe Marino
+# SPDX-License-Identifier: BSD-3-Clause
+
 name = "tdlua"
 version = "0.3"
 desc = "A basic interface between tdlib and lua"
 author = "Giuseppe Marino"
 maintainer = "Giuseppe Marino"
-license = "GPLv3"
+license = "BSD-3-Clause"
 url = "https://github.com/giuseppeM99/tdlua"

@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 local serpent = require 'serpent'
 local tdbot = require 'tdbot'
 local function vardump(w)

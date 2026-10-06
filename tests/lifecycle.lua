@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 local module_dir = assert(arg[1], "the module directory is required")
 package.cpath = module_dir .. "/?.so;" .. package.cpath
 

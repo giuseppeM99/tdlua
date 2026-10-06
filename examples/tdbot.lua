@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 --[[
     tdbot / tdcli retrocompatibility script
     put this file into your bot folder and append in the end of the main bot file

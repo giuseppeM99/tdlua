@@ -1,7 +1,6 @@
---[[
-© Giuseppe Marino 2018
-This file is under GPLv3 license see LICENCE
---]]
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 local tdlua = require 'tdlua'
 local serpent = require 'serpent'
 local function vardump(wut)

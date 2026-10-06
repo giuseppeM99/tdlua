@@ -1,3 +1,6 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
 local module_dir = assert(tdlua_benchmark_module_dir)
 package.cpath = module_dir .. "/?.so;" .. package.cpath
 

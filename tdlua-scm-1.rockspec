@@ -1,3 +1,6 @@
+# Copyright (c) 2018-2026 Giuseppe Marino
+# SPDX-License-Identifier: BSD-3-Clause
+
 rockspec_format = "3.0"
 
 package = "tdlua"
@@ -16,7 +19,7 @@ description = {
       and cooperative coroutines.
    ]],
    homepage = "https://github.com/giuseppeM99/tdlua",
-   license = "GPL-3.0"
+   license = "BSD-3-Clause"
 }
 
 dependencies = {
