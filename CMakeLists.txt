@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/dist.info" _tdlua_dist_version_line
      REGEX "^version[ \t]*=")
-string(REGEX MATCH "\"([0-9]+\\.[0-9]+)\""
+string(REGEX MATCH "\"([0-9]+\\.[0-9]+)(\\.[0-9]+)?\""
        _tdlua_dist_version_match "${_tdlua_dist_version_line}")
 if(NOT _tdlua_dist_version_match)
   message(FATAL_ERROR "Unable to read TDLua version from dist.info")
