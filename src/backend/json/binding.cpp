@@ -165,12 +165,7 @@ static int tdclient_send(lua_State *L)
             td->setDB(j["database_directory"]);
         }
         const std::uint64_t id = td->dispatcher().raw(j);
-        try {
-            td->send(j);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(j));
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
     });
@@ -215,43 +210,53 @@ static int tdclient_execute(lua_State *L)
         if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
         }
-        try {
-            td->send(j);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(j));
         if (fire_and_forget) {
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
         const auto started = std::chrono::steady_clock::now();
-        while (!td->closed()) {
-            TDLua::QueuedUpdate queued_response(j, true);
-            if (td->takeQueuedResponse(id, queued_response)) {
-                lua_pushjson(L, queued_response.value);
-                return 1;
+        json response;
+        const auto take_queued_response = [td, id](json &value) {
+            TDLua::QueuedUpdate queued(nullptr, true);
+            if (!td->takeQueuedResponse(id, queued)) {
+                return false;
             }
-            const std::chrono::duration<double> elapsed =
-                std::chrono::steady_clock::now() - started;
-            const double remaining = timeout - elapsed.count();
-            if (remaining <= 0.0) {
-                break;
+            value = std::move(queued.value);
+            return true;
+        };
+        const auto is_valid_response = [](const json &value) {
+            return value.is_object();
+        };
+        const auto dispatch_response = [td](json &value) {
+            td->checkAuthState(value);
+            td->dispatcher().dispatch(value);
+        };
+        const auto response_id = [](const json &value) {
+            const auto field = value.find("_request_id");
+            if (field == value.end() || !field->is_number_unsigned()) {
+                return std::uint64_t(0);
             }
-            json res = td->receive(remaining);
-            if (!res.is_object()) {
-                continue;
-            }
-            td->checkAuthState(res);
-            std::uint64_t response_id = 0;
-            if (LuaDispatcher::responseRequestId(res, response_id) &&
-                response_id == id) {
-                td->dispatcher().dispatch(res);
-                lua_pushjson(L, res);
-                return 1;
-            }
-            td->dispatcher().dispatch(res);
-            td->push(res, true);
+            return field->get<std::uint64_t>();
+        };
+        const auto buffer_response = [td](json value) {
+            td->push(value, true);
+        };
+        const auto remaining_timeout = [timeout, started]() {
+            return timeout - std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        };
+        const auto wait_policy = tdlua::makeResponseWaitPolicy(
+            take_queued_response,
+            is_valid_response,
+            dispatch_response,
+            response_id,
+            buffer_response,
+            remaining_timeout,
+            tdlua::QueueCheckOrder::BeforeTimeout);
+        if (tdlua::waitResponse(td->transport(), id, response, wait_policy)) {
+            lua_pushjson(L, response);
+            return 1;
         }
         return 0;
     });
@@ -294,12 +299,7 @@ static int call(lua_State *L)
                 td->setDB(request["database_directory"]);
             }
             const std::uint64_t id = td->dispatcher().raw(request);
-            try {
-                td->send(request);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
@@ -311,12 +311,7 @@ static int call(lua_State *L)
                 request["database_directory"].is_string()) {
                 td->setDB(request["database_directory"]);
             }
-            try {
-                td->send(request);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
@@ -329,12 +324,7 @@ static int call(lua_State *L)
                 request["database_directory"].is_string()) {
                 td->setDB(request["database_directory"]);
             }
-            try {
-                td->send(request);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             yield_after_submit = true;
             return 0;
         }
@@ -361,7 +351,7 @@ static int tdclient_rawexecute(lua_State *L)
         TDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
-        auto result = td->execute(j);
+        auto result = td->transport().executeSync(std::move(j));
         if (result.empty()) {
             lua_pushnil(L);
         } else {
@@ -405,12 +395,7 @@ static int tdclient_request(lua_State *L)
             request["database_directory"].is_string()) {
             td->setDB(request["database_directory"]);
         }
-        try {
-            td->send(request);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
     });
@@ -439,12 +424,7 @@ static int tdclient_await(lua_State *L)
             request["database_directory"].is_string()) {
             td->setDB(request["database_directory"]);
         }
-        try {
-            td->send(request);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         yield_after_submit = true;
         return 0;
     });

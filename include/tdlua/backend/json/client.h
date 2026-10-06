@@ -8,6 +8,7 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
+#include "tdlua/common/transport.h"
 
 
 class TDLua {
@@ -35,6 +36,7 @@ private:
     bool _ready;
     ClientState state;
     LuaDispatcher dispatcher_;
+    tdlua::Transport<nlohmann::json, nlohmann::json> injected_transport_ = {nullptr, nullptr};
 public:
 
     explicit TDLua(lua_State *lua);
@@ -45,7 +47,14 @@ public:
 
     void setDB(const std::string &path);
 
-    void send(const nlohmann::json &json);
+    void send(std::uint64_t request_id, nlohmann::json json);
+    using Transport = tdlua::Transport<nlohmann::json, nlohmann::json>;
+    Transport transport();
+    // Test injection is below the normal Lua binding and shared router.
+#ifdef TDLUA_TESTING
+    void injectTransport(Transport transport) { injected_transport_ = transport; }
+#endif
+    nlohmann::json receiveBackend(double timeout);
 
     nlohmann::json execute(const nlohmann::json &json);
 

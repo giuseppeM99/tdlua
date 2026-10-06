@@ -5,10 +5,9 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <map>
-#include <string>
 
 #include "tdlua/lua_compat.h"
+#include "tdlua/common/request_router.h"
 
 #include <nlohmann/json.hpp>
 
@@ -35,21 +34,5 @@ public:
     void clear();
 
 private:
-    struct PendingRequest {
-        int callback_ref;
-        int context_ref;
-        int coroutine_ref;
-        lua_State *coroutine;
-
-        PendingRequest();
-    };
-
-    std::uint64_t addPending(nlohmann::json &request,
-                             int callback_ref, int context_ref,
-                             int coroutine_ref, lua_State *coroutine);
-    void release(PendingRequest &pending);
-
-    lua_State *owner_;
-    std::uint64_t next_id_;
-    std::map<std::uint64_t, PendingRequest> pending_;
+    tdlua::RequestRouter router_;
 };

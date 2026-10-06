@@ -154,6 +154,12 @@ void lua_pushjson (lua_State *L, const json j) {
             lua_pushlstring(L, s.c_str(), s.length());
             lua_pushjson(L, it.value());
             lua_settable(L, -3);
+
+            if (s == "@type" && j.find("_") == j.end()) {
+                lua_pushliteral(L, "_");
+                lua_pushjson(L, it.value());
+                lua_rawset(L, -3);
+            }
         }
     } else {
         lua_pushnil(L);

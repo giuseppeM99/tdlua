@@ -238,7 +238,7 @@ static int tdclient_send(lua_State *L)
                 std::uint64_t id = 0;
                 try {
                     id = td->dispatcher().raw(L, table_index);
-                    td->send(codec_error_request(error), id);
+                    tdlua::submit(td->dispatcher(), td->transport(), id, codec_error_request(error));
                     pop_owned(L, owned);
                     tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
                     return 1;
@@ -255,12 +255,7 @@ static int tdclient_send(lua_State *L)
         }
         try {
             const std::uint64_t id = td->dispatcher().raw(L, table_index);
-            try {
-                td->send(std::move(request), id);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
@@ -293,12 +288,7 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
         // progress on unrelated asynchronous responses in the same receive
         // loop. This is the async-first behavior shared with the JSON path.
         const std::uint64_t id = td->dispatcher().raw(L, table_index);
-        try {
-            td->send(std::move(request), id);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         pop_owned(L, owned);
 
         if (fire_and_forget) {
@@ -307,26 +297,38 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
         }
 
         const auto started = std::chrono::steady_clock::now();
-        while (!td->closed()) {
-            const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started).count();
-            const double remaining = static_cast<double>(timeout) - elapsed;
-            if (remaining <= 0.0) {
-                return 0;
-            }
-            NativeResponse response;
-            if (!td->takeQueuedResponse(id, response)) {
-                response = td->receiveBackend(remaining);
-            }
-            if (!response.object) {
-                continue;
-            }
-            td->dispatch(response);
-            if (response.request_id == id) {
-                return return_response(L, td, response);
-            }
-            td->push(std::move(response));
-        }
+        NativeResponse response;
+        const auto take_queued_response = [td, id](NativeResponse &value) {
+            return td->takeQueuedResponse(id, value);
+        };
+        const auto is_valid_response = [](const NativeResponse &value) {
+            return bool(value.object);
+        };
+        const auto dispatch_response = [td](NativeResponse &value) {
+            td->dispatch(value);
+        };
+        const auto response_id = [](const NativeResponse &value) {
+            return value.request_id;
+        };
+        const auto buffer_response = [td](NativeResponse value) {
+            td->push(std::move(value));
+        };
+        const auto remaining_timeout = [timeout, started]() {
+            return static_cast<double>(timeout) -
+                   std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - started)
+                       .count();
+        };
+        const auto wait_policy = tdlua::makeResponseWaitPolicy(
+            take_queued_response,
+            is_valid_response,
+            dispatch_response,
+            response_id,
+            buffer_response,
+            remaining_timeout,
+            tdlua::QueueCheckOrder::AfterTimeout);
+        if (tdlua::waitResponse(td->transport(), id, response, wait_policy))
+            return return_response(L, td, response);
         return 0;
     } catch (...) {
         pop_owned(L, owned);
@@ -428,12 +430,7 @@ static int call(lua_State *L)
         }
         if (fire_and_forget) {
             const std::uint64_t id = td->dispatcher().raw(L, encoded_table_index);
-            try {
-                td->send(std::move(request), id);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
@@ -441,24 +438,14 @@ static int call(lua_State *L)
         if (callback_index != 0) {
             const std::uint64_t id = td->dispatcher().request(
                 L, encoded_table_index, callback_index, context_index);
-            try {
-                td->send(std::move(request), id);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
         }
         if (!is_main) {
             const std::uint64_t id = td->dispatcher().await(L, encoded_table_index);
-            try {
-                td->send(std::move(request), id);
-            } catch (...) {
-                td->dispatcher().cancel(id);
-                throw;
-            }
+            tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             yield_after_submit = true;
             return 0;
@@ -487,9 +474,7 @@ static int tdclient_rawexecute(lua_State *L)
                 }
                 request = codec_error_request(error);
             }
-            td::td_api::object_ptr<td::td_api::Object> result = td->executeSync(std::move(request));
-            NativeResponse response;
-            response.object = std::move(result);
+            NativeResponse response = td->transport().executeSync(std::move(request));
             td->pushResponse(L, response);
             pop_owned(L, owned);
             return 1;
@@ -527,12 +512,7 @@ static int tdclient_request(lua_State *L)
         }
         const std::uint64_t id = td->dispatcher().request(
             L, table_index, callback_index, context_index);
-        try {
-            td->send(std::move(request), id);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         pop_owned(L, owned);
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
@@ -560,12 +540,7 @@ static int tdclient_await(lua_State *L)
             request = codec_error_request(error);
         }
         const std::uint64_t id = td->dispatcher().await(L, table_index);
-        try {
-            td->send(std::move(request), id);
-        } catch (...) {
-            td->dispatcher().cancel(id);
-            throw;
-        }
+        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         pop_owned(L, owned);
         yield_after_submit = true;
         return 0;

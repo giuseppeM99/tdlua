@@ -4,6 +4,7 @@
 #pragma once
 
 #include "tdlua/backend/native/dispatcher.h"
+#include "tdlua/common/transport.h"
 
 #include <td/telegram/td_api.h>
 
@@ -22,6 +23,8 @@ public:
               std::uint64_t request_id);
     NativeResponse receive(double timeout);
     NativeResponse receiveBackend(double timeout);
+    using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
+    Transport transport();
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
 

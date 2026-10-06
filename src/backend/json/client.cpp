@@ -39,6 +39,40 @@ bool persistedRequestId(const json &value, std::uint64_t &request_id)
     return true;
 }
 
+void json_transport_send(void *context, std::uint64_t request_id,
+                         json request)
+{
+    static_cast<TDLua *>(context)->send(request_id, std::move(request));
+}
+
+json json_transport_receive(void *context, double timeout)
+{
+    return static_cast<TDLua *>(context)->receiveBackend(timeout);
+}
+
+json json_transport_execute_sync(void *context, json request)
+{
+    return static_cast<TDLua *>(context)->execute(std::move(request));
+}
+
+void json_transport_close(void *context)
+{
+    static_cast<TDLua *>(context)->close();
+}
+
+bool json_transport_closed(void *context)
+{
+    return static_cast<TDLua *>(context)->closed();
+}
+
+const TDLua::Transport::Operations json_transport_operations = {
+    json_transport_send,
+    json_transport_receive,
+    json_transport_execute_sync,
+    json_transport_close,
+    json_transport_closed
+};
+
 class JsonRuntime {
 public:
     static JsonRuntime &instance()
@@ -171,9 +205,16 @@ void TDLua::setDB(const std::string &path)
     dbpath += "tdlua.json";
 }
 
-void TDLua::send(const nlohmann::json &json)
+void TDLua::send(std::uint64_t request_id, nlohmann::json json)
 {
+    json["@extra"] = {{"__tdlua_request_id", request_id}};
     JsonRuntime::instance().send(client_id, json);
+}
+
+TDLua::Transport TDLua::transport()
+{
+    if (injected_transport_.operations) return injected_transport_;
+    return {this, &json_transport_operations};
 }
 
 nlohmann::json TDLua::execute(const nlohmann::json &json)
@@ -182,6 +223,11 @@ nlohmann::json TDLua::execute(const nlohmann::json &json)
 }
 
 nlohmann::json TDLua::receive(const double timeout)
+{
+    return transport().receive(timeout);
+}
+
+nlohmann::json TDLua::receiveBackend(const double timeout)
 {
     return JsonRuntime::instance().receive(client_id, timeout);
 }
@@ -212,6 +258,13 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
 
 void TDLua::close()
 {
+    if (injected_transport_.operations) {
+        injected_transport_.close();
+        dispatcher_.clear();
+        JsonRuntime::instance().forget(client_id);
+        state = ClientState::Closed;
+        return;
+    }
     if (state == ClientState::Closed) {
         dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
@@ -221,8 +274,8 @@ void TDLua::close()
 
     if (state == ClientState::Running) {
         nlohmann::json close_request = {{"@type", "close"}};
-        dispatcher_.raw(close_request);
-        send(close_request);
+        const auto id = dispatcher_.raw(close_request);
+        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
         state = ClientState::Closing;
     }
 

@@ -39,6 +39,45 @@ bool persistedRequestId(const nlohmann::json &value, std::uint64_t &request_id)
     return true;
 }
 
+void native_transport_send(
+    void *context, std::uint64_t request_id,
+    td::td_api::object_ptr<td::td_api::Function> request)
+{
+    static_cast<NativeTDLua *>(context)->send(std::move(request), request_id);
+}
+
+NativeResponse native_transport_receive(void *context, double timeout)
+{
+    return static_cast<NativeTDLua *>(context)->receiveBackend(timeout);
+}
+
+NativeResponse native_transport_execute_sync(
+    void *context, td::td_api::object_ptr<td::td_api::Function> request)
+{
+    NativeResponse response;
+    response.object = static_cast<NativeTDLua *>(context)->executeSync(
+        std::move(request));
+    return response;
+}
+
+void native_transport_close(void *context)
+{
+    static_cast<NativeTDLua *>(context)->close();
+}
+
+bool native_transport_closed(void *context)
+{
+    return static_cast<NativeTDLua *>(context)->closed();
+}
+
+const NativeTDLua::Transport::Operations native_transport_operations = {
+    native_transport_send,
+    native_transport_receive,
+    native_transport_execute_sync,
+    native_transport_close,
+    native_transport_closed
+};
+
 }
 
 NativeTDLua::NativeTDLua(lua_State *lua)
@@ -78,7 +117,7 @@ NativeResponse NativeTDLua::receive(double timeout)
         updates_.pop_front();
         return response;
     }
-    NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
+    NativeResponse response = transport().receive(timeout);
     return response;
 }
 
@@ -89,6 +128,11 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
     }
     NativeResponse response = NativeRuntime::instance().receive(client_id_, timeout);
     return response;
+}
+
+NativeTDLua::Transport NativeTDLua::transport()
+{
+    return {this, &native_transport_operations};
 }
 
 td::td_api::object_ptr<td::td_api::Object> NativeTDLua::executeSync(
@@ -221,7 +265,7 @@ void NativeTDLua::close()
     const std::uint64_t close_request_id = nextRequestId();
     if (!closing_) {
         closing_ = true;
-        send(td::td_api::make_object<td::td_api::close>(), close_request_id);
+        transport().send(close_request_id, td::td_api::make_object<td::td_api::close>());
     }
     while (!closed_) {
         const double elapsed = std::chrono::duration<double>(

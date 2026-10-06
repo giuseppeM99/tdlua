@@ -401,6 +401,26 @@ if(TDLUA_BUILD_TESTS)
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
 
+    add_executable(tdlua_common_router_test "tests/common_router_test.cpp")
+    target_include_directories(tdlua_common_router_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_common_router_test PRIVATE ${LUA_LIBRARIES})
+    target_compile_features(tdlua_common_router_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_common_router_test)
+    add_test(NAME tdlua_common_router COMMAND tdlua_common_router_test)
+
+    if(_tdlua_backend STREQUAL "json")
+        add_executable(tdlua_fake_client_test "tests/fake_client_test.cpp")
+        target_include_directories(tdlua_fake_client_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_fake_client_test PRIVATE TDLUA_TESTING)
+        target_compile_features(tdlua_fake_client_test PRIVATE cxx_std_11)
+        target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_fake_client_test)
+        add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+    endif()
+
     add_executable(tdlua_persistence_test
         "tests/persistence_test.cpp"
     )

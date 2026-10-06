@@ -5,6 +5,7 @@
 
 #include "tdlua/lua_compat.h"
 #include "tdlua/backend/native/runtime.h"
+#include "tdlua/common/request_router.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -34,23 +35,9 @@ public:
     void clear();
 
 private:
-    struct PendingRequest {
-        int callback_ref;
-        int context_ref;
-        int coroutine_ref;
-        lua_State *coroutine;
-
-        PendingRequest();
-    };
-
-    std::uint64_t addPending(lua_State *L, int request_index,
-                             int callback_index, int context_index,
-                             int coroutine_ref, lua_State *coroutine);
-    void release(PendingRequest &pending);
     void dispatchHandlers(lua_State *L, const NativeResponse &response);
 
     lua_State *owner_;
-    std::uint64_t next_id_;
-    std::map<std::uint64_t, PendingRequest> pending_;
+    tdlua::RequestRouter router_;
     std::map<std::string, int> handlers_;
 };
