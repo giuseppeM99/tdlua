@@ -202,6 +202,75 @@ client.onUpdateNewMessage = handle_message
 client.onUpdateNewMessage = nil
 ```
 
+## From receive loops to managed async
+
+The low-level form gives the application each object and runs its callback
+inline:
+
+```lua
+while running do
+    local update = client:receive(1)
+    if update then
+        process(update)
+    end
+end
+```
+
+The smallest managed migration is:
+
+```lua
+while running do
+    client:poll(process)
+end
+```
+
+`poll(process)` waits for an unsolicited update, starts `process(update)` in a
+managed coroutine Task, and returns its Task handle. It does not join that
+Task. A yielding callback may still be running when the call returns, so this
+is not the same as `process(client:poll())`. The callback may yield on a
+pending Future while later calls continue to drive the client.
+
+For a continuous runner, use:
+
+```lua
+client:loop(process)
+```
+
+`receive()` is low-level and manual, `poll(process)` handles one update with a
+managed Task, and `loop(process)` owns continuous driving and graceful stop.
+Only `loop(process)` gives an exact `false` return from `process` its graceful
+stop meaning. A `poll(process)` callback returning `false` only produces Task
+data.
+
+TDLua uses cooperative asynchronous Tasks, not parallel Lua execution. A
+callback passed to `poll()` or `loop()` runs as a managed coroutine. When it
+touches an unresolved Future, TDLua yields that coroutine. The managed driver
+keeps receiving objects, routes responses, may start later update Tasks, and
+resumes the suspended coroutine when its response arrives.
+
+Futures submit requests eagerly and synchronize lazily. In this example, both
+requests are in flight before either result is read:
+
+```lua
+local user = client:getUser {user_id = user_id}
+local chat = client:getChat {chat_id = chat_id}
+
+print(user.first_name, chat.title)
+```
+
+This explicitly sequential form waits before submitting the second request:
+
+```lua
+local user = client:getUser {user_id = user_id}:wait()
+local chat = client:getChat {chat_id = chat_id}:wait()
+```
+
+The first form overlaps independent TDLib requests. It does not make either
+individual request faster. Managed Tasks can also overlap across updates, so a
+second handler can start while the first one is yielded. The runnable
+`examples/async_demo.lua` listens for `/async` and prints the request IDs and
+the resulting interleaving.
+
 Run the regression tests with:
 
 ```bash

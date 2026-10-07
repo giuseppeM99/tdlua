@@ -454,6 +454,23 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_simple_bot_example
             COMMAND tdlua_simple_bot_example_test
         )
+
+        add_executable(tdlua_async_demo_test
+            "tests/async_demo_test.cpp"
+        )
+        target_include_directories(tdlua_async_demo_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_async_demo_test PRIVATE
+            TDLUA_TESTING
+            TDLUA_ASYNC_DEMO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_features(tdlua_async_demo_test PRIVATE cxx_std_11)
+        target_link_libraries(tdlua_async_demo_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_async_demo_test)
+        add_test(NAME tdlua_async_demo
+            COMMAND tdlua_async_demo_test
+        )
     endif()
 
     add_executable(tdlua_persistence_test
