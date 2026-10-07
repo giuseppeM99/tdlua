@@ -33,7 +33,15 @@ local function submit_once(name, request)
         return
     end
     submitted[name] = true
-    client[name](client, request)
+    local result = client[name](client, request)
+    local kind = result._ or result["@type"]
+    if kind == "error" then
+        error(string.format(
+            "%s failed: %s",
+            name,
+            result.message or "TDLib error"
+        ))
+    end
 end
 
 local function authorization_state(state)
