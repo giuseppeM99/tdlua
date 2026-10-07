@@ -434,6 +434,9 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_managed_driver
             COMMAND tdlua_fake_client_test --m4-only
         )
+        add_test(NAME tdlua_m5_conformance
+            COMMAND tdlua_fake_client_test --m5-only
+        )
     endif()
 
     add_executable(tdlua_persistence_test

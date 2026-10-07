@@ -1800,6 +1800,9 @@ inline int managedGc(lua_State *L)
 }
 inline int futureReady(lua_State *L)
 {
+    if (lua_gettop(L) != 1) {
+        return luaL_error(L, "tdlua: Future:ready() accepts no arguments");
+    }
     const ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
     lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
@@ -1807,6 +1810,9 @@ inline int futureReady(lua_State *L)
 
 inline int taskReady(lua_State *L)
 {
+    if (lua_gettop(L) != 1) {
+        return luaL_error(L, "tdlua: Task:ready() accepts no arguments");
+    }
     const ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.task");
     lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
@@ -1814,10 +1820,13 @@ inline int taskReady(lua_State *L)
 inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char *field)
 {
     ManagedHandle *handle = checkManagedHandle(L, 1, type);
+    if (kind == WaitKind::Result && lua_gettop(L) > 2) {
+        return luaL_error(L, "tdlua: wait accepts at most one timeout");
+    }
     int results = 0, context = 0;
     const bool timed = kind == WaitKind::Result && !lua_isnoneornil(L, 2);
     double timeout = 0;
-    if (timed && !lua_isnumber(L, 2)) {
+    if (timed && lua_type(L, 2) != LUA_TNUMBER) {
         return luaL_error(L, "tdlua: wait timeout must be a number");
     }
     if (timed) {

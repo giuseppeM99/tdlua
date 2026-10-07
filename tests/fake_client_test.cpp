@@ -69,6 +69,18 @@ struct Fake {
         });
     }
 
+    void responseWithCollidingFutureFields(std::uint64_t id)
+    {
+        incoming.push_back({
+            {"@type", "testInt"},
+            {"wait", "tdlib-field"},
+            {"ready", "tdlib-field"},
+            {"_request_id", 999},
+            {"value", 42},
+            {"@extra", {{"__tdlua_request_id", id}}}
+        });
+    }
+
     void errorResponse(std::uint64_t id)
     {
         incoming.push_back({
@@ -261,6 +273,58 @@ void testManagedFutureAndTasks(lua_State *L, Fake &fake)
     runLua(L, "c:receive(0)");
 
     runLua(L, "closing = c:getMe()");
+}
+
+void testM5Conformance(lua_State *L, Fake &fake)
+{
+    runLua(L, R"lua(
+        m5_future = c:getMe()
+        m5_future_id = m5_future._request_id
+        assert(not m5_future:ready())
+        assert(not pcall(function() m5_future:ready(true) end))
+        assert(not pcall(function() m5_future:wait("0") end))
+        assert(not pcall(function() m5_future:wait(0, "extra") end))
+    )lua");
+    fake.responseWithCollidingFutureFields(fake.sent.back().first);
+    runLua(L, R"lua(
+        assert(not m5_future:ready())
+        assert(type(m5_future.wait) == "function")
+        assert(type(m5_future.ready) == "function")
+        assert(m5_future._request_id == m5_future_id)
+        local response = m5_future:wait()
+        assert(m5_future:ready())
+        assert(response.wait == "tdlib-field")
+        assert(response.ready == "tdlib-field")
+        assert(response._request_id == m5_future_id)
+        assert(response.value == 42)
+        assert(m5_future:wait() == response)
+    )lua");
+
+    fake.update("m5", 0);
+    runLua(L, R"lua(
+        m5_poll_task = c:poll(function() return false end)
+        assert(m5_poll_task._request_id == nil)
+        assert(type(m5_poll_task.wait) == "function")
+        assert(type(m5_poll_task.ready) == "function")
+        assert(m5_poll_task:wait() == false)
+        assert(not pcall(function() m5_poll_task:ready(false) end))
+    )lua");
+
+    runLua(L, R"lua(
+        local pending = c:getMe()
+        local before = c:pendingCount()
+        for _, call in ipairs({
+            function() return c:getMe(1.0) end,
+            function() return c:getChat({}, 1.0) end,
+            function() return c:execute({_ = "getMe"}, "1") end,
+            function() return c:execute({_ = "getMe"}, {}) end,
+            function() return c:execute({_ = "getMe"}, false, {}) end,
+            function() return c:on("m5", function() end, {unknown = true}) end
+        }) do
+            assert(not pcall(call))
+        end
+        assert(c:pendingCount() == before)
+    )lua");
 }
 
 void testReviewRegressions(lua_State *L, Fake &fake, Fake &second)
@@ -719,6 +783,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testResponses(L, fake);
     testAwaitAndSynchronousCalls(L, fake);
     testManagedFutureAndTasks(L, fake);
+    testM5Conformance(L, fake);
     testReviewRegressions(L, fake, second);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
@@ -1278,7 +1343,12 @@ int main(int argc, char **argv)
     luaL_openlibs(L);
     int result = 0;
     try {
-        if (argc > 1 && std::string(argv[1]) == "--m4-only") {
+        if (argc > 1 && std::string(argv[1]) == "--m5-only") {
+            createClients(L);
+            attachTransport(L, "c", fake);
+            attachTransport(L, "d", second);
+            testM5Conformance(L, fake);
+        } else if (argc > 1 && std::string(argv[1]) == "--m4-only") {
             testManagedDrivers(L);
         } else if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
             runScenarios(L, fake, second);

@@ -235,6 +235,9 @@ static int tdclient_send(lua_State *L)
         if (!td) {
             throw std::runtime_error("invalid tdlua client");
         }
+        if (td->closed()) {
+            throw std::runtime_error("tdlua client is closed");
+        }
         std::string error;
         td::td_api::object_ptr<td::td_api::Function> request;
         int table_index = 0;

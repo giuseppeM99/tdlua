@@ -248,17 +248,23 @@ inline bool parse_event_concurrency(lua_State *L, int index)
     if (!lua_istable(L, index)) {
         throw std::runtime_error("tdlua: event options must be a table");
     }
-    lua_getfield(L, index, "concurrent");
-    if (lua_isnil(L, -1)) {
+    bool concurrent = true;
+    lua_pushnil(L);
+    while (lua_next(L, index) != 0) {
+        const bool is_concurrent = lua_type(L, -2) == LUA_TSTRING &&
+            std::string(lua_tostring(L, -2)) == "concurrent";
+        if (!is_concurrent) {
+            lua_pop(L, 2);
+            throw std::runtime_error(
+                "tdlua: event supports only the boolean option 'concurrent'");
+        }
+        if (!lua_isboolean(L, -1)) {
+            lua_pop(L, 2);
+            throw std::runtime_error("tdlua: event option 'concurrent' must be boolean");
+        }
+        concurrent = lua_toboolean(L, -1) != 0;
         lua_pop(L, 1);
-        return true;
     }
-    if (!lua_isboolean(L, -1)) {
-        lua_pop(L, 1);
-        throw std::runtime_error("tdlua: event option 'concurrent' must be boolean");
-    }
-    const bool concurrent = lua_toboolean(L, -1) != 0;
-    lua_pop(L, 1);
     return concurrent;
 }
 

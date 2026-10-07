@@ -72,6 +72,36 @@ Both backends treat an `execute(request, timeout)` timeout as a timeout of the
 caller, not cancellation of the TDLib request. A response that arrives later
 can still be returned by `receive()` with its TDLua `_request_id`.
 
+## v0.4 managed API
+
+The v0.4 dynamic method and `execute(request)` forms submit eagerly and
+return a Future. Accessing a response field resolves that Future automatically;
+use `future:wait()` when a plain response table is preferred. Wrapper members
+(`wait`, `ready`, and `_request_id`) take precedence over response fields with
+the same names. Full `rawget`, `rawset`, `next`, and `pairs` transparency is not
+part of the API contract.
+
+Use explicit controls when the flow should be visible:
+
+```lua
+local id = 123
+local user = client:getUser { user_id = id }
+local chat = client:getChat { chat_id = id }
+print(user.first_name, chat.title)
+
+local me = client:getMe(false) -- managed wait, returns the response
+local request_id = client:getMe(true) -- raw send, observe with receive()
+```
+
+`receive(timeout)` is low-level raw transport observation. Managed `poll()`
+waits for an unsolicited update while routing managed work; `poll(callback)`
+returns a one-shot Task, and `loop(callback)` is the continuous managed driver.
+Managed driving may consume unobserved unsolicited updates, while raw responses
+remain available to `receive()` in FIFO order. Native versus JSON selects the
+backend; callbacks versus Futures selects the control-flow style. Async calls
+do not make an individual TDLib request faster, but allow independent requests
+to overlap while Futures preserve sequential-looking Lua.
+
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
 Build with Lua 5.2 and the latest version of tdlib.
 
@@ -106,8 +136,8 @@ end, {origin = "startup"})
 client:receive(1.0)
 ```
 
-`await` is cooperative and must run inside a coroutine. A normal `receive()`
-call, or its `poll()` alias, resumes it when the response arrives:
+`await` is cooperative and must run inside a coroutine. The coroutine resumes
+when managed driving receives its response:
 
 ```lua
 local co = coroutine.create(function()
@@ -115,7 +145,7 @@ local co = coroutine.create(function()
     print(me.first_name)
 end)
 coroutine.resume(co)
-client:receive(1.0)
+client:loop()
 ```
 
 The callback context is kept locally by TDLua and is never sent to TDLib.
@@ -138,14 +168,16 @@ client:getChat({chat_id = chat_id}, function(result, context)
 end, {origin = "startup"})
 ```
 
-Without a callback, the legacy blocking behavior remains available:
+Without a callback, the eager Future form is the default:
 
 ```lua
 local me = client:getMe()
+print(me.first_name)
 ```
 
-Inside a coroutine, a helper without a callback waits cooperatively and is
-resumed by `receive()` or `poll()`:
+Inside a yieldable coroutine, waiting on or accessing a pending Future suspends
+cooperatively and resumes when managed driving receives its response. A helper
+without a callback still returns its Future immediately:
 
 ```lua
 local co = coroutine.create(function()
@@ -154,7 +186,7 @@ local co = coroutine.create(function()
 end)
 coroutine.resume(co)
 while coroutine.status(co) ~= "dead" do
-    client:poll(1.0)
+    client:poll()
 end
 ```
 
