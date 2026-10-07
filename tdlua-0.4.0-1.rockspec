@@ -20,7 +20,7 @@ description = {
 }
 
 dependencies = {
-   "lua >= 5.1, < 5.6"
+   "lua >= 5.2, < 5.6"
 }
 
 build = {
@@ -41,9 +41,11 @@ build = {
    ]],
    install_command = [[
       cmake --install build.luarocks \
-      && if [ -L "$(PREFIX)/lib/libtdjson.so" ]; then \
-           tdjson_target="$(readlink -f "$(PREFIX)/lib/libtdjson.so")"; \
-           cp --remove-destination "$tdjson_target" "$(PREFIX)/lib/libtdjson.so"; \
-         fi
+      && for tdjson_library in "$(PREFIX)/lib/libtdjson.so" "$(PREFIX)/lib/libtdjson.dylib"; do \
+           if [ -L "$tdjson_library" ]; then \
+             cp -L "$tdjson_library" "$tdjson_library.tdlua-copy" \
+             && mv -f "$tdjson_library.tdlua-copy" "$tdjson_library" || exit 1; \
+           fi; \
+         done
    ]]
 }
