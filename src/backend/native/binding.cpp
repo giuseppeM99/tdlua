@@ -59,7 +59,8 @@ static void native_clear_updates(tdlua_binding::ClientHandle client)
 static void native_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<NativeTDLua> owned_client(static_cast<NativeTDLua *>(client));
-    owned_client->close();
+    owned_client->close(false);
+    owned_client->dispatcher().drainForFinalizer();
 }
 
 static void native_close(tdlua_binding::ClientHandle client)

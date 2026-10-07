@@ -57,7 +57,8 @@ static void json_clear_updates(tdlua_binding::ClientHandle client)
 static void json_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<TDLua> owned_client(static_cast<TDLua *>(client));
-    owned_client->close();
+    owned_client->close(false);
+    owned_client->dispatcher().drainForFinalizer();
 }
 
 static void json_close(tdlua_binding::ClientHandle client)
@@ -127,8 +128,7 @@ static int tdclient_receive(lua_State *L)
             {
                 TDLua::QueuedUpdate queued = td->pop();
                 if (!queued.dispatched) {
-                    td->checkAuthState(queued.value);
-                    td->dispatcher().dispatch(queued.value);
+                    td->dispatch(queued.value);
                 }
                 lua_pushjson(L, queued.value);
             }
@@ -148,8 +148,7 @@ static int tdclient_receive(lua_State *L)
             if (result.empty()) {
                 lua_pushnil(L);
             } else {
-                td->checkAuthState(result);
-                td->dispatcher().dispatch(result);
+                td->dispatch(result);
                 lua_pushjson(L, result);
             }
         }
@@ -216,8 +215,7 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
         return value.is_object();
     };
     const auto dispatch_response = [td](json &value) {
-        td->checkAuthState(value);
-        td->dispatcher().dispatch(value);
+        td->dispatch(value);
         td->dispatcher().drain();
     };
     const auto response_id = [](const json &value) {

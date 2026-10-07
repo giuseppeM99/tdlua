@@ -258,10 +258,9 @@ bool TDLua::pump(const double timeout)
             dispatcher_.drain();
             return false;
         }
-        checkAuthState(value);
         // The common router owns update observation; this flag distinguishes
         // managed pumping from the public raw receive path.
-        const tdlua::RouteKind route = dispatcher_.dispatch(value, true);
+        const tdlua::RouteKind route = dispatch(value, true);
         if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
             push(value, true);
         }
@@ -438,8 +437,20 @@ void TDLua::checkAuthState(const nlohmann::json &update)
             emptyUpdatesBuffer();
             _ready = false;
             state = ClientState::Closed;
-            dispatcher_.detachTransport();
         }
+    }
+}
+
+tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive)
+{
+    checkAuthState(update);
+    try {
+        const auto route = dispatcher_.dispatch(update, managed_receive);
+        if (state == ClientState::Closed) dispatcher_.detachAfterDrain();
+        return route;
+    } catch (...) {
+        if (state == ClientState::Closed) dispatcher_.detachTransport();
+        throw;
     }
 }
 

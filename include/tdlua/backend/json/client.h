@@ -83,6 +83,7 @@ public:
     void emptyUpdatesBuffer();
 
     void checkAuthState(const nlohmann::json &update);
+    tdlua::RouteKind dispatch(nlohmann::json &update, bool managed_receive = false);
 
     bool ready() const;
 

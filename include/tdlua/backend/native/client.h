@@ -36,7 +36,7 @@ public:
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
 
-    void dispatch(NativeResponse &response);
+    tdlua::RouteKind dispatch(NativeResponse &response, bool managed_receive = false);
     NativeDispatcher &dispatcher();
     void push(NativeResponse response);
     NativeResponse pop();

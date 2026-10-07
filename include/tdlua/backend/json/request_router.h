@@ -60,6 +60,7 @@ public:
         router_.attachStorage(L, client);
     }
 
+    void detachAfterDrain() { router_.detachAfterDrain(); }
     void detachTransport()
     {
         router_.detachTransport();
@@ -81,6 +82,7 @@ public:
     bool dispatch(nlohmann::json &response);
     void closePending() { router_.closePending(); }
     void tick() { router_.tick(); }
+    void drainForFinalizer() { router_.drainForFinalizer(); }
     void clear();
 
 private:

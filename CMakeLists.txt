@@ -409,6 +409,14 @@ if(TDLUA_BUILD_TESTS)
     tdlua_enable_sanitizers(tdlua_common_router_test)
     add_test(NAME tdlua_common_router COMMAND tdlua_common_router_test)
 
+    add_executable(tdlua_hardening_common_test "tests/hardening_common_test.cpp")
+    target_include_directories(tdlua_hardening_common_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_hardening_common_test PRIVATE ${LUA_LIBRARIES})
+    target_compile_features(tdlua_hardening_common_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_hardening_common_test)
+    add_test(NAME tdlua_hardening_common COMMAND tdlua_hardening_common_test)
+
     add_executable(tdlua_managed_driver_test
         "tests/managed_driver_test.cpp"
     )
@@ -431,6 +439,8 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
         tdlua_enable_sanitizers(tdlua_fake_client_test)
         add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+        add_test(NAME tdlua_hardening_fake
+            COMMAND tdlua_fake_client_test --hardening-only)
         add_test(NAME tdlua_managed_driver
             COMMAND tdlua_fake_client_test --m4-only
         )
@@ -552,6 +562,12 @@ if(TDLUA_BUILD_TESTS)
             NAMES "lua${TDLUA_LUA_VERSION}" lua5.5 lua5.4 lua5.3 lua5.2 lua5.1 luajit lua)
     endif()
     if(TDLUA_LUA_EXECUTABLE)
+        add_test(NAME tdlua_hardening_backend
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardening.lua"
+                    "$<TARGET_FILE_DIR:tdlua>")
+        set_tests_properties(tdlua_hardening_backend PROPERTIES TIMEOUT 30)
+        tdlua_enable_sanitizer_test_runtime(tdlua_hardening_backend)
         add_test(NAME tdlua_lifecycle
             COMMAND ${TDLUA_LUA_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle.lua"

@@ -1333,6 +1333,71 @@ void testManagedDrivers(lua_State *L)
     fake.before_receive = {};
 }
 
+
+void testHardening()
+{
+    for (int mode = 0; mode < 4; ++mode) {
+        Fake fake, other;
+        lua_State *L = luaL_newstate();
+        luaL_openlibs(L);
+        try {
+            createClients(L);
+            attachTransport(L, "c", fake);
+            attachTransport(L, "d", other);
+            runLua(L, R"lua(
+                pending=c:getMe()
+                co=coroutine.create(function() return pending.value end)
+                assert(coroutine.resume(co))
+                await_co=coroutine.create(function() return c:await{_='getMe'} end)
+                assert(coroutine.resume(await_co))
+                states={}
+                c:on('updateAuthorizationState', function(u)
+                    local state=u.authorization_state._
+                    states[#states+1]=state
+                    if state=='authorizationStateClosed' and closed_error then
+                        error('fake Closed handler failure')
+                    end
+                end)
+            )lua");
+            const auto auth = [](const char *state) {
+                return json{{"@type", "updateAuthorizationState"},
+                            {"authorization_state", {{"@type", state}}}};
+            };
+            fake.incoming.push_back(auth("authorizationStateClosing"));
+            fake.incoming.push_back(auth("authorizationStateClosed"));
+            if (mode == 1) runLua(L, "closed_error=true");
+            if (mode == 2) {
+                // Receive Closed inside an already-running event task.
+                fake.incoming.push_front({{"@type", "trigger"}});
+                runLua(L, "c:on('trigger',function() c:receive(0); c:receive(0) end)");
+            }
+            if (mode == 3) {
+                runLua(L, "c:close(); assert(c:isClosed())");
+            } else {
+                runLua(L, mode == 1
+                    ? "local ok,e=pcall(c.loop,c); assert(not ok and e:find('fake Closed handler failure'))"
+                    : "c:loop()");
+                runLua(L, R"lua(
+                    assert(#states==2 and states[1]=='authorizationStateClosing'
+                           and states[2]=='authorizationStateClosed')
+                )lua");
+            }
+            runLua(L, R"lua(
+                assert(c:isClosed() and c:poll()==nil)
+                assert(coroutine.status(co)=='dead')
+                assert(coroutine.status(await_co)=='dead')
+                local ok,e=pcall(function() pending:wait() end)
+                assert(not ok and e:find('client closed'))
+                c:close(); d:close()
+            )lua");
+        } catch (...) {
+            lua_close(L);
+            throw;
+        }
+        lua_close(L);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -1343,7 +1408,9 @@ int main(int argc, char **argv)
     luaL_openlibs(L);
     int result = 0;
     try {
-        if (argc > 1 && std::string(argv[1]) == "--m5-only") {
+        if (argc > 1 && std::string(argv[1]) == "--hardening-only") {
+            testHardening();
+        } else if (argc > 1 && std::string(argv[1]) == "--m5-only") {
             createClients(L);
             attachTransport(L, "c", fake);
             attachTransport(L, "d", second);

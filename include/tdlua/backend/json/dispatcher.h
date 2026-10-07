@@ -48,6 +48,7 @@ public:
     tdlua::RouteKind dispatch(nlohmann::json &event,
                               bool managed_receive = false);
     void drain();
+    void drainForFinalizer() { router_.drainForFinalizer(); }
     void clear();
     // Storage belongs to the Lua client uservalue. The dispatcher only passes
     // the attachment and transport-detach operations to the common router.
@@ -55,6 +56,8 @@ public:
     {
         router_.attachStorage(L, client);
     }
+
+    void detachAfterDrain() { router_.detachAfterDrain(); }
 
     void detachTransport()
     {

@@ -43,6 +43,7 @@ public:
     tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response,
                               bool managed_receive = false);
     void drain();
+    void drainForFinalizer() { router_.drainForFinalizer(); }
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();
 
@@ -57,6 +58,8 @@ public:
     {
         router_.attachStorage(L, client);
     }
+
+    void detachAfterDrain() { router_.detachAfterDrain(); }
 
     void detachTransport()
     {

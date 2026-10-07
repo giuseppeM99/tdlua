@@ -108,6 +108,8 @@ static int tdclient_send(lua_State *L) { return operations().send(L); }
 static int tdclient_execute(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
+        if (lua_type(L, 2) != LUA_TTABLE && lua_type(L, 2) != LUA_TSTRING)
+            throw std::runtime_error("tdlua: invalid request argument: expected table or JSON string");
         tdlua_binding::validate_execute_control(L);
         return operations().execute(L);
     });

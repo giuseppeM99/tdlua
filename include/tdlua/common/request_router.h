@@ -54,6 +54,7 @@ enum class ManagedStatus {
 };
 
 enum class WaitKind { Result, Field };
+enum class ErrorDelivery { PublicCall, Finalizer };
 
 enum class WaitOutcome {
     Pending,
@@ -84,6 +85,9 @@ struct ManagedState {
     int result_ref = LUA_NOREF;
     std::string error;
     bool callback_is_thread = false;
+    bool failure_observed = false;
+    bool failure_reported = false;
+    bool teardown_failure = false;
     std::size_t handle_count = 0;
     std::size_t waiter_count = 0;
     std::shared_ptr<EventRegistration> event_registration;
@@ -325,6 +329,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     void *pump_context_ = nullptr;
     bool (*pump_)(void *, double) = nullptr;
     bool draining_ = false;
+    bool detach_after_drain_ = false;
     ManagedDriverState managed_driver_;
 
     // ----- CoreAnchor reference-table helpers -----
@@ -450,6 +455,15 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     void retireState(const State &state)
     {
         if (isTerminalState(state) && !state->handle_count && !state->waiter_count) {
+            // Retained handles own failures until wait() observes them or GC
+            // releases the last handle. Transfer abandoned failures once, on
+            // the task's owner core, including cross-client continuations.
+            if (state->kind == RequestKind::Task &&
+                state->status == ManagedStatus::Failed &&
+                !state->failure_observed && !state->failure_reported) {
+                scheduler_errors_.push_back(state->error);
+                state->failure_reported = true;
+            }
             releaseLuaReferences(state);
             if (isUpdateCallbackTask(state->kind)) {
                 event_states_.erase(
@@ -822,6 +836,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         pushLuaReference(lua_owner_, registration->thread_ref);
         int arguments = 0;
         if (continuation) continuation->outcome = outcome;
+        if (outcome == WaitOutcome::Failed) dependency->failure_observed = true;
         if (outcome == WaitOutcome::Success) {
             arguments = pushResult(thread, dependency);
             if (continuation) continuation->result_count = arguments;
@@ -832,6 +847,11 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             task_core->finishTask(task, thread, status);
         } else if (status != LUA_OK && status != LUA_YIELD && (direct || !task)) {
             const char *message = lua_tostring(thread, -1);
+            // lua_error delivers the exact dependency error to the waiter.
+            // Only that expected teardown failure belongs to the coroutine.
+            // A waiter that catches it and raises another error still reports.
+            if (outcome == WaitOutcome::Failed && dependency->teardown_failure &&
+                message && dependency->error == message) return;
             throw std::runtime_error(std::string("tdlua await failed: ") +
                                      (message ? message : "unknown Lua error"));
         }
@@ -1298,7 +1318,10 @@ public:
     }
     int pushResult(lua_State *L, const State &state)
     {
-        if (state->status == ManagedStatus::Failed) throw std::runtime_error(state->error);
+        if (state->status == ManagedStatus::Failed) {
+            state->failure_observed = true;
+            throw std::runtime_error(state->error);
+        }
         if (!isTaskState(state)) { pushLuaReference(L, state->response_ref); return 1; }
         if (state->result_ref == LUA_NOREF) return 0;
         pushLuaReference(L, state->result_ref);
@@ -1465,6 +1488,7 @@ public:
     // unreachable before pending failures can be observed from a later drain.
     void detachTransport(const std::string &message = "tdlua: client closed")
     {
+        detach_after_drain_ = false;
         pump_ = nullptr;
         pump_context_ = nullptr;
         events_enabled_ = false;
@@ -1479,6 +1503,7 @@ public:
         pending.swap(pending_);
         resetPendingRequests();
         for (const auto &entry : pending) {
+            entry.second->teardown_failure = true;
             failState(entry.second, message);
             ready_.push_back(entry.second);
         }
@@ -1489,6 +1514,10 @@ public:
             it = waiters_.erase(it);
         }
     }
+
+    // A live Closed update has already been routed. Finish its protected
+    // delivery before phase one, even if received from a reentrant callback.
+    void detachAfterDrain() { detach_after_drain_ = true; }
 
     void clearEvents()
     {
@@ -1547,7 +1576,7 @@ public:
 
     // Phase 2: each item is removed before entering Lua. Reentrant detach/drain
     // cannot invalidate an iterator or the shared core pinned by its caller.
-    void tick()
+    void tick(ErrorDelivery delivery = ErrorDelivery::PublicCall)
     {
         // Keep the core alive while a reentrant pump drains Lua work.
         const auto scheduler_lease = shared_from_this();
@@ -1557,16 +1586,21 @@ public:
         if (draining_) return;
         draining_ = true;
         try {
-            while (!ready_.empty() || !deferred_events_.empty()) {
+            while (!ready_.empty() || !deferred_events_.empty() || detach_after_drain_) {
                 drainReadyStates();
                 drainDeferredEvents();
+                if (ready_.empty() && deferred_events_.empty() && detach_after_drain_) {
+                    detachTransport();
+                    drainDetachedNotifications();
+                }
             }
         } catch (...) {
+            if (detach_after_drain_) detachTransport();
             draining_ = false;
             throw;
         }
         draining_ = false;
-        if (!scheduler_errors_.empty()) {
+        if (delivery == ErrorDelivery::PublicCall && !scheduler_errors_.empty()) {
             const std::string error = scheduler_errors_.front();
             scheduler_errors_.pop_front();
             throw std::runtime_error(error);
@@ -1707,6 +1741,7 @@ public:
     {
         core_->detachTransport();
     }
+    void detachAfterDrain() { core_->detachAfterDrain(); }
 
     void tick()
     {
@@ -1714,6 +1749,9 @@ public:
         core->tick();
     }
 
+    // Finalization drains lifecycle notifications but leaves unobserved Task
+    // errors for a later public pump if Lua still retains this core.
+    void drainForFinalizer() { core_->tick(ErrorDelivery::Finalizer); }
     void drain()
     {
         tick();
