@@ -458,8 +458,10 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             // Retained handles own failures until wait() observes them or GC
             // releases the last handle. Transfer abandoned failures once, on
             // the task's owner core, including cross-client continuations.
+            // Expected transport teardown failures stay local to the Task.
             if (state->kind == RequestKind::Task &&
                 state->status == ManagedStatus::Failed &&
+                !state->teardown_failure &&
                 !state->failure_observed && !state->failure_reported) {
                 scheduler_errors_.push_back(state->error);
                 state->failure_reported = true;
@@ -843,15 +845,18 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         removeRegistration(thread);
         const int status = tdlua_lua_resume(thread, lua_owner_, arguments);
+        const char *message = status != LUA_OK && status != LUA_YIELD
+            ? lua_tostring(thread, -1) : nullptr;
+        // lua_error delivers the exact dependency error to the waiter.
+        // A waiter that catches it and raises another error still reports.
+        const bool teardown_failure = outcome == WaitOutcome::Failed &&
+            dependency->teardown_failure && message && dependency->error == message;
         if (task && task_core) {
+            // Classify before finishTask can retire an abandoned request Task.
+            if (teardown_failure) task->teardown_failure = true;
             task_core->finishTask(task, thread, status);
         } else if (status != LUA_OK && status != LUA_YIELD && (direct || !task)) {
-            const char *message = lua_tostring(thread, -1);
-            // lua_error delivers the exact dependency error to the waiter.
-            // Only that expected teardown failure belongs to the coroutine.
-            // A waiter that catches it and raises another error still reports.
-            if (outcome == WaitOutcome::Failed && dependency->teardown_failure &&
-                message && dependency->error == message) return;
+            if (teardown_failure) return;
             throw std::runtime_error(std::string("tdlua await failed: ") +
                                      (message ? message : "unknown Lua error"));
         }

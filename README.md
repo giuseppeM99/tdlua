@@ -72,12 +72,11 @@ A timeout does not cancel the underlying TDLib request. With the legacy
 `execute(request, timeout)` form, a late response remains available through
 `receive()` with its `_request_id`. A timed-out Future can be waited on again.
 
-Lua 5.2, 5.3, and 5.5 are tested on Linux with both backends. The declared
-range is Lua >= 5.2 and < 5.6. Lua 5.4 is within that range but was not tested
-in this release pass. Stock Lua 5.1 and LuaJIT 2.1 are unsupported because the
-managed waits require Lua's continuation API. Linux is tested; macOS is
-supported by the build design but was not runtime-tested. Windows was not
-validated.
+Lua 5.2, 5.3, 5.4, and 5.5 are tested on Linux with both backends. The declared
+range is Lua >= 5.2 and < 5.6. Stock Lua 5.1 and LuaJIT 2.1 are unsupported
+because the managed waits require Lua's continuation API. Linux is tested. The build is
+intended to support macOS, but macOS was not runtime-tested for this release.
+Windows was not validated.
 
 ## v0.4 managed API
 
@@ -128,7 +127,9 @@ and send SIGINT while the client is idle.
 Request callback Tasks retain their failures for `task:wait()`. If the last
 Task handle is collected without observing its failure, the owning client's
 next scheduler-pumping operation raises the error exactly once. Observing it
-through `wait()` prevents a later scheduler report.
+through `wait()` prevents a later scheduler report. Failures caused solely by
+client teardown remain observable through a retained Task handle and do not
+become scheduler errors when the Task is discarded.
 
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
 Build with Lua 5.2 and the latest version of tdlib.

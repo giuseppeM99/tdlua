@@ -49,6 +49,40 @@ for _,mode in ipairs{'await', 'field', 'future'} do
     c:close()
 end
 
+-- Discarded callback Tasks must not turn expected close failures into
+-- scheduler errors, whether still pending or yielded on a same-client Future.
+for _,mode in ipairs{'pending', 'running', 'unrelated'} do
+    c = td()
+    local started = false
+    local task = c:getMe(function()
+        started = true
+        if mode == 'unrelated' then
+            pcall(function() c:getMe():wait() end)
+            error('offline unrelated task close boom')
+        end
+        return c:getMe():wait()
+    end)
+    if mode ~= 'pending' then
+        for _ = 1, 40 do
+            c:receive(0.05)
+            if started then break end
+        end
+        assert(started and not task:ready())
+    end
+    task = nil
+    collectgarbage('collect')
+    local ok, message = pcall(c.close, c)
+    if mode == 'unrelated' then
+        assert(not ok and message:find('offline unrelated task close boom'))
+    else
+        assert(ok, message)
+    end
+    if mode == 'pending' then assert(not started) end
+    assert(c:isClosed() and c:poll() == nil)
+    c:loop()
+    c:close()
+end
+
 -- Raw receive and managed loop must both deliver Closed before detach.
 for _,managed in ipairs{false, true} do
     for _,fail_handler in ipairs{false, true} do

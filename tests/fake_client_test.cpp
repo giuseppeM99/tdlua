@@ -1334,6 +1334,63 @@ void testManagedDrivers(lua_State *L)
 }
 
 
+enum class TaskCloseCase {
+    PendingDiscarded, RunningDiscarded, PendingRetained, RunningRetained,
+    UnrelatedFailure
+};
+
+void testTaskCloseOwnership()
+{
+    for (const auto scenario : {TaskCloseCase::PendingDiscarded,
+                               TaskCloseCase::RunningDiscarded,
+                               TaskCloseCase::PendingRetained,
+                               TaskCloseCase::RunningRetained,
+                               TaskCloseCase::UnrelatedFailure}) {
+        Fake fake, other;
+        lua_State *L = luaL_newstate();
+        luaL_openlibs(L);
+        try {
+            createClients(L);
+            attachTransport(L, "c", fake);
+            attachTransport(L, "d", other);
+            const bool running = scenario != TaskCloseCase::PendingDiscarded &&
+                                 scenario != TaskCloseCase::PendingRetained;
+            const bool retained = scenario == TaskCloseCase::PendingRetained ||
+                                  scenario == TaskCloseCase::RunningRetained;
+            const bool unrelated = scenario == TaskCloseCase::UnrelatedFailure;
+            runLua(L, unrelated
+                ? "task=c:getMe(function() callback_started=true; pcall(function() c:getMe():wait() end); error('unrelated task close boom') end)"
+                : "task=c:getMe(function() callback_started=true; return c:getMe():wait() end)");
+            if (running) {
+                fake.response(fake.sent.back().first, 1);
+                runLua(L, "c:receive(0); assert(callback_started and not task:ready())");
+            }
+            if (!retained) runLua(L, "task=nil; collectgarbage('collect')");
+            runLua(L, unrelated
+                ? "local ok,e=pcall(c.close,c); assert(not ok and e:find('unrelated task close boom'))"
+                : "local ok,e=pcall(c.close,c); assert(ok,e)");
+            if (!running) runLua(L, "assert(not callback_started)");
+            if (retained) {
+                runLua(L, R"lua(
+                    assert(task:ready())
+                    local ok,e=pcall(function() task:wait() end)
+                    assert(not ok and e:find('client closed'))
+                    task=nil; collectgarbage('collect')
+                )lua");
+            }
+            runLua(L, R"lua(
+                assert(c:isClosed() and c:pendingCount()==0)
+                assert(c:poll()==nil); c:loop(); assert(c:receive(0)==nil)
+                c:close(); assert(c:poll()==nil); d:close()
+            )lua");
+        } catch (...) {
+            lua_close(L);
+            throw;
+        }
+        lua_close(L);
+    }
+}
+
 void testHardening()
 {
     for (int mode = 0; mode < 4; ++mode) {
@@ -1409,6 +1466,7 @@ int main(int argc, char **argv)
     int result = 0;
     try {
         if (argc > 1 && std::string(argv[1]) == "--hardening-only") {
+            testTaskCloseOwnership();
             testHardening();
         } else if (argc > 1 && std::string(argv[1]) == "--m5-only") {
             createClients(L);

@@ -39,6 +39,44 @@ void respond(tdlua::RequestRouter &router, const tdlua::ManagedStatePtr &state)
     router.dispatchRoute(state->request_id, [](lua_State *L) { lua_pushnil(L); });
     router.tick();
 }
+void testTaskTeardown(lua_State *L)
+{
+    for (bool cross_client : {false, true}) {
+        for (bool unrelated : {false, true}) {
+            tdlua::RequestRouter owner(L), other(L);
+            auto &closing = cross_client ? other : owner;
+            const auto future = closing.future();
+            tdlua::pushManagedHandle(L, future, "tdlua.future");
+            lua_setglobal(L, "closing_future");
+            const auto state = task(L, owner, unrelated
+                ? "return function() pcall(function() closing_future:wait() end); error('unrelated task teardown boom') end"
+                : "return function() return closing_future:wait() end");
+            respond(owner, state);
+            run(L, "task=nil; collectgarbage('collect')");
+            bool threw = false;
+            try { closing.clear(); }
+            catch (const std::exception &error) {
+                require(unrelated && !cross_client &&
+                        std::string(error.what()).find("unrelated task teardown boom") != std::string::npos,
+                        "close reported an expected abandoned Task failure");
+                threw = true;
+            }
+            require(threw == (unrelated && !cross_client),
+                    "unrelated Task failure lost its owner");
+            require(state->status == tdlua::ManagedStatus::Failed &&
+                    state->teardown_failure == !unrelated,
+                    "Task teardown cause was classified incorrectly");
+            if (unrelated && cross_client) {
+                require(tickFails(owner, "unrelated task teardown boom"),
+                        "cross-client unrelated failure disappeared");
+            }
+            require(!tickFails(owner, "repeated error"), "Task failure was reported again");
+            require(!tickFails(other, "wrong owner"), "dependency reported a Task failure");
+            run(L, "closing_future=nil; collectgarbage('collect')");
+        }
+    }
+}
+
 void scenarios(lua_State *L)
 {
     tdlua::RequestRouter owner(L), dependency(L);
@@ -113,7 +151,7 @@ int main()
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
     int result = 0;
-    try { scenarios(L); }
+    try { scenarios(L); testTaskTeardown(L); }
     catch (const std::exception &error) { std::cerr << error.what() << '\n'; result = 1; }
     lua_close(L);
     if (tdlua::liveSchedulerCores() || tdlua::liveContinuations() ||
