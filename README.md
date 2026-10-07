@@ -110,6 +110,10 @@ VoIP bindings are currently not part of the native or JSON backend.
 ## Usage
 __See the examples directory for usage examples.__
 
+`examples/simple_bot.lua` is a small managed bot using `client:on`, eager
+Futures, and `client:loop()`. It reads `TDLUA_API_ID`, `TDLUA_API_HASH`, and
+`TDLUA_BOT_TOKEN` from the environment.
+
 The Lua type alias `_` is accepted alongside `@type` and is emitted together with
 `@type` in decoded objects. Clients accept fractional receive and execute timeouts:
 

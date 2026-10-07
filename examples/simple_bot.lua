@@ -1,0 +1,86 @@
+-- Copyright (c) 2018-2026 Giuseppe Marino
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- From a build tree, run for example:
+-- LUA_CPATH=build/?.so lua examples/simple_bot.lua
+
+local tdlua = require "tdlua"
+local logic = assert(dofile("examples/simple_bot_logic.lua"))
+
+local function required(name)
+    local value = os.getenv(name)
+    if not value or value == "" then
+        error("missing required environment variable " .. name)
+    end
+    return value
+end
+
+local api_id = tonumber(required("TDLUA_API_ID"))
+if not api_id then
+    error("TDLUA_API_ID must be a number")
+end
+
+local api_hash = required("TDLUA_API_HASH")
+local bot_token = required("TDLUA_BOT_TOKEN")
+local database_directory = os.getenv("TDLUA_DATABASE_DIR") or "./tdlua-simple-bot"
+local database_key = os.getenv("TDLUA_DATABASE_KEY") or ""
+
+local client = tdlua()
+local submitted = {}
+
+local function submit_once(name, request)
+    if submitted[name] then
+        return
+    end
+    submitted[name] = true
+    client[name](client, request)
+end
+
+local function authorization_state(state)
+    if type(state) ~= "table" then
+        return
+    end
+
+    local kind = state._ or state["@type"]
+    if kind == "authorizationStateWaitTdlibParameters" then
+        submit_once("setTdlibParameters", {
+            use_test_dc = false,
+            database_directory = database_directory,
+            files_directory = database_directory,
+            database_encryption_key = database_key,
+            use_file_database = true,
+            use_chat_info_database = true,
+            use_message_database = true,
+            use_secret_chats = false,
+            api_id = api_id,
+            api_hash = api_hash,
+            system_language_code = "en",
+            device_model = "tdlua-simple-bot",
+            system_version = "unknown",
+            application_version = "0.4"
+        })
+    elseif kind == "authorizationStateWaitEncryptionKey" then
+        submit_once("checkDatabaseEncryptionKey", {
+            encryption_key = database_key
+        })
+    elseif kind == "authorizationStateWaitPhoneNumber" then
+        submit_once("checkAuthenticationBotToken", {token = bot_token})
+    elseif kind == "authorizationStateReady" then
+        print("bot ready")
+    elseif kind == "authorizationStateClosed" then
+        print("bot closed")
+    end
+end
+
+client:on("updateAuthorizationState", function(update)
+    authorization_state(update.authorization_state)
+end)
+
+logic.install(client)
+print("authorizing...")
+
+client:getAuthorizationState(function(state)
+    authorization_state(state)
+end)
+
+client:loop()

@@ -437,6 +437,23 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_m5_conformance
             COMMAND tdlua_fake_client_test --m5-only
         )
+
+        add_executable(tdlua_simple_bot_example_test
+            "tests/simple_bot_example_test.cpp"
+        )
+        target_include_directories(tdlua_simple_bot_example_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_simple_bot_example_test PRIVATE
+            TDLUA_TESTING
+            TDLUA_SIMPLE_BOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_features(tdlua_simple_bot_example_test PRIVATE cxx_std_11)
+        target_link_libraries(tdlua_simple_bot_example_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_simple_bot_example_test)
+        add_test(NAME tdlua_simple_bot_example
+            COMMAND tdlua_simple_bot_example_test
+        )
     endif()
 
     add_executable(tdlua_persistence_test

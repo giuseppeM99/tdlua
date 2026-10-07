@@ -249,7 +249,8 @@ extern "C" {
 LUALIB_API int luaopen_tdlua(lua_State *L)
 {
     const auto &ops = operations();
-    luaL_newmetatable(L, "tdlua");
+    const int base = lua_gettop(L);
+    const int created_metatable = luaL_newmetatable(L, "tdlua");
     lua_pushstring(L, "__call");
     lua_pushcfunction(L, tdclient_new);
     lua_settable(L, -3);
@@ -261,6 +262,7 @@ LUALIB_API int luaopen_tdlua(lua_State *L)
     lua_pushstring(L, TDLUA_TDLIB_VERSION);
     lua_setfield(L, -2, "tdlib_version");
     luaL_setmetatable(L, "tdlua");
+    if (created_metatable) lua_remove(L, base + 1);
     ops.initialize_logging();
     return 1;
 }
