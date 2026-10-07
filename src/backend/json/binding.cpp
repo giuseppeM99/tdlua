@@ -10,6 +10,7 @@
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -20,7 +21,9 @@ static TDLua * getTD(lua_State *L)
 
 static void *createTD(lua_State *L)
 {
-    return new TDLua(L);
+    auto *client = new TDLua(L);
+    client->dispatcher().attachStorage(L, -1);
+    return client;
 }
 
 static bool json_push_handler(tdlua_binding::ClientHandle client,
@@ -52,9 +55,8 @@ static void json_clear_updates(tdlua_binding::ClientHandle client)
 
 static void json_unload(tdlua_binding::ClientHandle client)
 {
-    TDLua *td = static_cast<TDLua *>(client);
-    td->close();
-    delete td;
+    std::unique_ptr<TDLua> owned_client(static_cast<TDLua *>(client));
+    owned_client->close();
 }
 
 static void json_close(tdlua_binding::ClientHandle client)

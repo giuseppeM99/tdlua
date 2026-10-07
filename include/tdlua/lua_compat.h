@@ -23,8 +23,23 @@ inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments
 #endif
 }
 
-/* Lua 5.3 made yieldability observable.  Lua 5.2 lacks the query, but a
- * C-bound function can still yield when it runs on a coroutine. */
+/* Long-lived scheduler/backend storage uses the VM's main thread rather than a
+ * collectible coroutine that happened to create the client. */
+inline lua_State *tdlua_lua_main_thread(lua_State *L)
+{
+#if LUA_VERSION_NUM >= 502
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    lua_State *main = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return main;
+#else
+    return L;
+#endif
+}
+
+/* Lua 5.3 and later expose exact yieldability. Lua 5.2 uses the
+ * coroutine/non-main approximation below and cannot detect a non-yieldable C
+ * frame between the caller and this check. */
 inline bool tdlua_lua_is_yieldable(lua_State *L)
 {
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503

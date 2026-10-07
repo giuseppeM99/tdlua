@@ -327,6 +327,121 @@ void runScenarios(lua_State *L)
     testIsolationAndCleanup(scenario);
 }
 
+void testSharedCoreLifetime(lua_State *L)
+{
+    runLua(L, "collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')");
+    const auto baseline = tdlua::liveSchedulerCores();
+    const auto continuations = tdlua::liveContinuations();
+    {
+        tdlua::RequestRouter owner(L);
+        const auto future = owner.future();
+        tdlua::pushManagedHandle(L, future, "tdlua.future");
+        lua_setglobal(L, "closing_deadline");
+        runLua(L,
+               "deadline_co = coroutine.create(function() "
+               "  deadline_ok, deadline_message = pcall(function() "
+               "    return closing_deadline:wait(0.001) end) end); "
+               "assert(coroutine.resume(deadline_co))");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        owner.detachTransport();
+        lua_getglobal(L, "deadline_co");
+        lua_State *thread = lua_tothread(L, -1);
+        lua_pop(L, 1);
+        require(!tdlua::waitBindings().count(thread),
+                "failed registration remained in the active timer index");
+        runLua(L, "assert(coroutine.status(deadline_co) == 'suspended')");
+        owner.tick();
+        runLua(L,
+               "assert(not deadline_ok and deadline_message:find('client closed')); "
+               "closing_deadline = nil; deadline_co = nil; "
+               "collectgarbage('collect'); collectgarbage('collect')");
+    }
+    runLua(L, "collectgarbage('collect'); collectgarbage('collect')");
+    std::weak_ptr<tdlua::SchedulerCore> owner_core, dependency_core;
+    std::weak_ptr<tdlua::SchedulerCore> cyclic_core;
+    {
+        tdlua::RequestRouter owner(L);
+        const auto nil_future = owner.future();
+        cyclic_core = nil_future->core;
+        tdlua::pushManagedHandle(L, nil_future, "tdlua.future");
+        lua_setglobal(L, "nil_future");
+        owner.dispatch(nil_future->request_id, [](lua_State *target) { lua_pushnil(target); });
+        runLua(L, "assert(not pcall(function() return nil_future.value end))");
+        runLua(L, "return function() return cyclic_task end");
+        const auto task = owner.task(L, -1, 0, false);
+        lua_pop(L, 1);
+        tdlua::pushManagedHandle(L, task, "tdlua.task");
+        lua_setglobal(L, "cyclic_task");
+        owner.dispatch(task->request_id, [](lua_State *target) { lua_pushnil(target); });
+        runLua(L, "assert(cyclic_task:wait() == cyclic_task)");
+    }
+    runLua(L,
+           "nil_future = nil; cyclic_task = nil; "
+           "collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')");
+    require(cyclic_core.expired(), "field error or self-referential result retained core");
+    {
+        std::unique_ptr<tdlua::RequestRouter> owner(new tdlua::RequestRouter(L));
+        std::unique_ptr<tdlua::RequestRouter> dependency(new tdlua::RequestRouter(L));
+        const auto completed = owner->future();
+        owner_core = completed->core;
+        tdlua::pushManagedHandle(L, completed, "tdlua.future");
+        lua_setglobal(L, "completed_lifetime");
+        owner->dispatch(completed->request_id, [](lua_State *target) {
+            lua_pushinteger(target, 301);
+        });
+        const auto future = dependency->future();
+        dependency_core = future->core;
+        tdlua::pushManagedHandle(L, future, "tdlua.future");
+        lua_setglobal(L, "dependency_lifetime");
+        runLua(L,
+               "return function() retained_lifetime_co = coroutine.running(); "
+               "return dependency_lifetime:wait(), 302 end");
+        const auto task = owner->task(L, -1, 0, false);
+        lua_pop(L, 1);
+        tdlua::pushManagedHandle(L, task, "tdlua.task");
+        lua_setglobal(L, "task_lifetime");
+        owner->dispatch(task->request_id, [](lua_State *target) { lua_pushnil(target); });
+        owner.reset();
+        runLua(L,
+               "collectgarbage('collect'); "
+               "assert(completed_lifetime:wait() == 301 and not task_lifetime:ready())");
+        dependency->dispatch(future->request_id, [](lua_State *target) {
+            lua_pushinteger(target, 303);
+        });
+        runLua(L,
+               "local a, b = task_lifetime:wait(); assert(a == 303 and b == 302); "
+               "assert(task_lifetime:ready()); "
+               "assert(not coroutine.resume(retained_lifetime_co))");
+        dependency.reset();
+    }
+    runLua(L,
+           "completed_lifetime = nil; dependency_lifetime = nil; "
+           "task_lifetime = nil; retained_lifetime_co = nil; "
+           "collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')");
+    require(owner_core.expired() && dependency_core.expired(), "terminal core cycle survived GC");
+
+    for (int iteration = 0; iteration < 20; ++iteration) {
+        {
+            tdlua::RequestRouter owner(L), dependency(L);
+            const auto future = dependency.future();
+            tdlua::pushManagedHandle(L, future, "tdlua.future");
+            lua_setglobal(L, "abandoned_dependency");
+            runLua(L, "return function() return abandoned_dependency:wait() end");
+            const auto task = owner.task(L, -1, 0, false);
+            lua_pop(L, 1);
+            tdlua::pushManagedHandle(L, task, "tdlua.task");
+            lua_setglobal(L, "abandoned_task");
+            owner.dispatch(task->request_id, [](lua_State *target) { lua_pushnil(target); });
+        }
+        runLua(L,
+               "abandoned_dependency = nil; abandoned_task = nil; "
+               "collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')");
+        require(tdlua::liveSchedulerCores() == baseline &&
+                tdlua::liveContinuations() == continuations,
+                "abandoned core/continuation survived collection");
+    }
+}
+
 }  // namespace
 
 int main()
@@ -336,6 +451,7 @@ int main()
     int result = 0;
     try {
         runScenarios(L);
+        testSharedCoreLifetime(L);
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;

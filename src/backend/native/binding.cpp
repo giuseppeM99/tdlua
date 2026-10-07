@@ -12,6 +12,7 @@
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -22,7 +23,9 @@ static NativeTDLua *getTD(lua_State *L)
 
 static void *createNativeTDLua(lua_State *L)
 {
-    return new NativeTDLua(L);
+    auto *client = new NativeTDLua(L);
+    client->dispatcher().attachStorage(L, -1);
+    return client;
 }
 
 static bool native_push_handler(tdlua_binding::ClientHandle client,
@@ -54,9 +57,8 @@ static void native_clear_updates(tdlua_binding::ClientHandle client)
 
 static void native_unload(tdlua_binding::ClientHandle client)
 {
-    NativeTDLua *td = static_cast<NativeTDLua *>(client);
-    td->close();
-    delete td;
+    std::unique_ptr<NativeTDLua> owned_client(static_cast<NativeTDLua *>(client));
+    owned_client->close();
 }
 
 static void native_close(tdlua_binding::ClientHandle client)

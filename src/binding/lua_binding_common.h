@@ -349,13 +349,17 @@ inline int clear(lua_State *, ClientHandle client,
     return 0;
 }
 
-inline int unload(lua_State *, ClientHandle client,
-                  const ClientOperations &operations)
+inline int unload(lua_State *L, ClientHandle client,
+                   const ClientOperations &operations)
 {
-    if (client) {
-        operations.unload(client);
+    // Invalidate the userdata before lifecycle code can resume arbitrary Lua.
+    if (lua_type(L, 1) == LUA_TUSERDATA) {
+        *static_cast<ClientHandle *>(lua_touserdata(L, 1)) = nullptr;
     }
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (client) operations.unload(client);
+        return 0;
+    });
 }
 
 inline int close(lua_State *L, ClientHandle client,

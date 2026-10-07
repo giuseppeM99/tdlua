@@ -444,8 +444,12 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
            "owner = tdlua()");
     Fake owner_fake;
     attachTransport(L, "owner", owner_fake);
+    runLua(L, "completed_owner = owner:getMe()");
+    owner_fake.response(owner_fake.sent.back().first, 110);
+    runLua(L, "owner:receive(0)");
     runLua(L,
            "owner_task = owner:getMe(function() "
+           "  leaked_owner_co = coroutine.running(); "
            "  return d:getMe():wait().value end)");
     const auto owner_request_id = owner_fake.sent.back().first;
     owner_fake.response(owner_request_id, 111);
@@ -453,9 +457,11 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
     const auto owner_dependency_id = second.sent.back().first;
     second.response(owner_dependency_id, 112);
     runLua(L,
-           "owner = nil; collectgarbage('collect'); d:receive(0); "
-           "local ok, message = pcall(function() owner_task:wait() end); "
-           "assert(not ok, message); assert(message:find('task owner closed'), message)");
+           "owner = nil; collectgarbage('collect'); "
+           "assert(completed_owner:wait().value == 110 and not owner_task:ready()); "
+           "d:receive(0); assert(owner_task:wait() == 112 and owner_task:ready()); "
+           "local ok, message = coroutine.resume(leaked_owner_co); "
+           "assert(not ok and message:find('dead coroutine'))");
 
     runLua(L,
            "running_task = d:getMe(function(result) "
@@ -486,9 +492,125 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testCloseAndClientIsolation(L, fake, second);
 }
 
+void testLifetimeAndAbandonment()
+{
+    const auto cores_before = tdlua::liveSchedulerCores();
+    const auto continuations_before = tdlua::liveContinuations();
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    Fake owner, dependency, external, abandoned_owner, abandoned_dependency, reentrant, creator;
+    try {
+        createClients(L);
+        attachTransport(L, "c", owner);
+        attachTransport(L, "d", dependency);
+        runLua(L,
+               "completed = c:getMe(); pending = c:getMe(); "
+               "pending_task = c:getMe(function() error('must not start') end)");
+        owner.response(owner.sent.front().first, 201);
+        runLua(L,
+               "c:receive(0); "
+               "survivor = c:getMe(function() "
+               "  retained_co = coroutine.running(); "
+               "  local first = d:getMe():wait(); "
+               "  local second = d:getMe():wait(); "
+               "  return first.value, second.value, nil end); "
+               "survivor_waiter = coroutine.create(function() "
+               "  survivor_a, survivor_b = survivor:wait() end); "
+               "assert(coroutine.resume(survivor_waiter))");
+        owner.response(owner.sent.back().first, 202);
+        runLua(L,
+               "c:receive(0); c = nil; collectgarbage('collect'); "
+               "assert(completed:wait().value == 201 and not survivor:ready()); "
+               "local ok, message = pcall(function() pending:wait() end); "
+               "assert(not ok and message:find('client closed')); "
+               "ok, message = pcall(function() pending_task:wait() end); "
+               "assert(not ok and message:find('client closed'))");
+        dependency.response(dependency.sent.back().first, 203);
+        runLua(L, "d:receive(0); assert(not survivor:ready())");
+        dependency.response(dependency.sent.back().first, 204);
+        runLua(L,
+               "d:receive(0); assert(survivor:ready()); "
+               "local a, b = survivor:wait(); assert(a == 203 and b == 204); "
+               "assert(survivor_a == 203 and survivor_b == 204); "
+               "assert(coroutine.status(retained_co) == 'dead'); "
+               "local ok = coroutine.resume(retained_co); assert(not ok)");
+
+        // A still-suspended continuation must also survive facade GC before
+        // the dependency response arrives, including an external resume.
+        runLua(L, "e = tdlua()");
+        attachTransport(L, "e", external);
+        runLua(L,
+               "external = e:getMe(function() "
+               "  external_co = coroutine.running(); return d:getMe():wait() end)");
+        external.response(external.sent.back().first, 205);
+        runLua(L,
+               "e:receive(0); e = nil; collectgarbage('collect'); "
+               "local ok, message = coroutine.resume(external_co); "
+               "assert(not ok and message:find('resumed externally')); "
+               "assert(external:ready()); "
+               "ok, message = pcall(function() external:wait() end); "
+               "assert(not ok and message:find('resumed externally'))");
+        dependency.response(dependency.sent.back().first, 206);
+        runLua(L, "d:receive(0)");
+
+        // Pending callback/context references deliberately capture their own
+        // facade. The cycle must be visible to Lua, not rooted in the registry.
+        runLua(L, "collectgarbage('collect'); collectgarbage('collect')");
+        const auto abandonment_cores = tdlua::liveSchedulerCores();
+        const auto abandonment_continuations = tdlua::liveContinuations();
+        runLua(L, "a = tdlua(); b = tdlua()");
+        attachTransport(L, "a", abandoned_owner);
+        attachTransport(L, "b", abandoned_dependency);
+        runLua(L,
+               "weak_lifetime = setmetatable({}, {__mode='v'}); "
+               "do local client = a; local marker = {}; weak_lifetime[1] = marker; "
+               "  abandoned = a:getMe(function() "
+               "    return client, marker, b:getMe():wait() end, marker) end");
+        abandoned_owner.response(abandoned_owner.sent.back().first, 207);
+        runLua(L,
+               "a:receive(0); a = nil; b = nil; abandoned = nil; "
+               "collectgarbage('collect'); collectgarbage('collect'); "
+               "collectgarbage('collect'); assert(weak_lifetime[1] == nil)");
+        if (tdlua::liveSchedulerCores() != abandonment_cores ||
+            tdlua::liveContinuations() != abandonment_continuations)
+            throw std::runtime_error("abandoned scheduler cycle survived garbage collection");
+
+        runLua(L, "r = tdlua()");
+        attachTransport(L, "r", reentrant);
+        runLua(L,
+               "reentrant_future = r:getMe(); "
+               "close_waiter = coroutine.create(function() "
+               "  local ok, message = pcall(function() return reentrant_future:wait() end); "
+               "  assert(not ok and message:find('client closed')); "
+               "  ok, message = pcall(function() return r:getMe() end); "
+               "  assert(not ok and message:find('closed')); "
+               "  r:close(); r = nil; collectgarbage('collect') end); "
+               "assert(coroutine.resume(close_waiter)); r:close(); "
+               "assert(coroutine.status(close_waiter) == 'dead')");
+
+        runLua(L,
+               "do local co = coroutine.create(function() created = tdlua() end); "
+               "  assert(coroutine.resume(co)) end; collectgarbage('collect')");
+        attachTransport(L, "created", creator);
+        runLua(L, "created_task = created:getMe(function(result) return result.value end)");
+        creator.response(creator.sent.back().first, 208);
+        runLua(L,
+               "created:receive(0); assert(created_task:wait() == 208); "
+               "created:close(); created = nil; created_task = nil; "
+               "collectgarbage('collect'); collectgarbage('collect')");
+    } catch (...) {
+        lua_close(L);
+        throw;
+    }
+    lua_close(L);
+    if (tdlua::liveSchedulerCores() != cores_before ||
+        tdlua::liveContinuations() != continuations_before)
+        throw std::runtime_error("lifetime/abandonment test retained scheduler storage");
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     Fake fake;
     Fake second;
@@ -496,11 +618,18 @@ int main()
     luaL_openlibs(L);
     int result = 0;
     try {
-        runScenarios(L, fake, second);
+        if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
+            runScenarios(L, fake, second);
+        testLifetimeAndAbandonment();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
     }
     lua_close(L);
+    if (tdlua::liveSchedulerCores() || tdlua::liveContinuations() ||
+        !tdlua::taskBindings().empty() || !tdlua::waitBindings().empty()) {
+        std::cerr << "scheduler objects survived lua_close\n";
+        result = 1;
+    }
     return result;
 }

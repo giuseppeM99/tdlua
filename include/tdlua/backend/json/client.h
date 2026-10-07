@@ -63,7 +63,9 @@ public:
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 
-    void close();
+    // Detach/fail work first. A true drain then performs phase two while the
+    // caller still has a protected Lua boundary.
+    void close(bool drain = true);
 
     bool closed() const;
 

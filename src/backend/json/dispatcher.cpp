@@ -21,13 +21,18 @@ std::string eventType(const nlohmann::json &event)
 }
 
 LuaDispatcher::LuaDispatcher(lua_State *owner)
-    : owner_(owner), router_(owner), handlers_(), pending_handlers_()
+    : owner_(tdlua_lua_main_thread(owner)), router_(owner), handlers_(), pending_handlers_()
 {
 }
 
 LuaDispatcher::~LuaDispatcher()
 {
-    clear();
+    // The router destructor never resumes Lua. Handler references are released
+    // here while the owning Lua state is still valid.
+    router_.detachTransport();
+    clearHandlerQueue();
+    for (const auto &entry : handlers_)
+        luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);
 }
 
 std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &request,

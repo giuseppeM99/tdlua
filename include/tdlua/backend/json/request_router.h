@@ -16,6 +16,7 @@
 #define LUA_OK 0
 #endif
 
+// JSON-specific adapter. Scheduling and ownership live in the common router.
 class RequestRouter {
 public:
     explicit RequestRouter(lua_State *owner);
@@ -38,6 +39,15 @@ public:
                   double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
                   const char *field = nullptr);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
+    void attachStorage(lua_State *L, int client)
+    {
+        router_.attachStorage(L, client);
+    }
+
+    void detachTransport()
+    {
+        router_.detachTransport();
+    }
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;

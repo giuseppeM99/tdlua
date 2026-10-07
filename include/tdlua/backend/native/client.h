@@ -29,7 +29,9 @@ public:
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
 
-    void close();
+    // Detach/fail work first. A true drain then performs phase two while the
+    // caller still has a protected Lua boundary.
+    void close(bool drain = true);
     bool closed() const;
     bool ready() const;
     void checkAuthState(const NativeResponse &response);

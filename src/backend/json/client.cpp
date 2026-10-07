@@ -190,7 +190,13 @@ TDLua::TDLua(lua_State *lua)
 
 TDLua::~TDLua()
 {
-    close();
+    // Destruction cannot safely enter Lua. The binding performs the protected
+    // drain before this destructor runs; this path only detaches transport.
+    try {
+        close(false);
+    } catch (...) {
+        dispatcher_.detachTransport();
+    }
 }
 
 TDLua::QueuedUpdate TDLua::pop()
@@ -293,17 +299,23 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
     return false;
 }
 
-void TDLua::close()
+void TDLua::close(bool drain)
 {
+    // Phase one detaches the scheduler before backend shutdown can reenter the
+    // client. The optional drain is phase two and is safe only at the binding
+    // boundary that called close().
     if (injected_transport_.operations) {
+        state = ClientState::Closed;
+        dispatcher_.detachTransport();
         injected_transport_.close();
-        dispatcher_.clear();
+        if (drain) dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
         state = ClientState::Closed;
         return;
     }
     if (state == ClientState::Closed) {
-        dispatcher_.clear();
+        dispatcher_.detachTransport();
+        if (drain) dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
         state = ClientState::Closed;
         return;
@@ -312,8 +324,9 @@ void TDLua::close()
     if (state == ClientState::Running) {
         nlohmann::json close_request = {{"@type", "close"}};
         const auto id = dispatcher_.raw(close_request);
-        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
         state = ClientState::Closing;
+        dispatcher_.detachTransport();
+        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -330,13 +343,15 @@ void TDLua::close()
             checkAuthState(update);
         }
     }
-    dispatcher_.clear();
+    state = ClientState::Closed;
+    dispatcher_.detachTransport();
+    if (drain) dispatcher_.clear();
     JsonRuntime::instance().forget(client_id);
 }
 
 bool TDLua::closed() const
 {
-    return state == ClientState::Closed;
+    return state != ClientState::Running;
 }
 
 LuaDispatcher &TDLua::dispatcher()

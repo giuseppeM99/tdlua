@@ -86,7 +86,7 @@ const NativeTDLua::Transport::Operations native_transport_operations = {
 }
 
 NativeTDLua::NativeTDLua(lua_State *lua)
-    : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
+    : lua_(tdlua_lua_main_thread(lua)), client_id_(NativeRuntime::instance().create_client()),
       updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
       dispatcher_(lua)
 {
@@ -95,7 +95,13 @@ NativeTDLua::NativeTDLua(lua_State *lua)
 
 NativeTDLua::~NativeTDLua()
 {
-    close();
+    // Destruction cannot safely enter Lua. The binding performs the protected
+    // drain before this destructor runs; this path only detaches transport.
+    try {
+        close(false);
+    } catch (...) {
+        dispatcher_.detachTransport();
+    }
 }
 
 td::td_api::object_ptr<td::td_api::Function> NativeTDLua::makeRequest(
@@ -289,10 +295,14 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
     }
 }
 
-void NativeTDLua::close()
+void NativeTDLua::close(bool drain)
 {
+    // Phase one detaches the scheduler before backend shutdown can reenter the
+    // client. The optional drain is phase two and is safe only at the binding
+    // boundary that called close().
     if (closed_) {
-        dispatcher_.clear();
+        dispatcher_.detachTransport();
+        if (drain) dispatcher_.clear();
         NativeRuntime::instance().forget(client_id_);
         return;
     }
@@ -300,6 +310,7 @@ void NativeTDLua::close()
     const std::uint64_t close_request_id = nextRequestId();
     if (!closing_) {
         closing_ = true;
+        dispatcher_.detachTransport();
         transport().send(close_request_id, td::td_api::make_object<td::td_api::close>());
     }
     while (!closed_) {
@@ -325,13 +336,16 @@ void NativeTDLua::close()
     }
     saveUpdatesBuffer();
     emptyUpdatesBuffer();
-    dispatcher_.clear();
+    closed_ = true;
+    closing_ = false;
+    dispatcher_.detachTransport();
+    if (drain) dispatcher_.clear();
     NativeRuntime::instance().forget(client_id_);
 }
 
 bool NativeTDLua::closed() const
 {
-    return closed_;
+    return closed_ || closing_;
 }
 
 bool NativeTDLua::ready() const

@@ -4,13 +4,10 @@
 
 #include "tdlua/lua_compat.h"
 
-#include <algorithm>
-#include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <deque>
-#include <cmath>
-#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -21,11 +18,8 @@
 
 namespace tdlua {
 
+class SchedulerCore;
 class RequestRouter;
-
-struct ManagedTaskOwner {
-    RequestRouter *router = nullptr;
-};
 
 enum class RequestKind {
     Raw,
@@ -53,16 +47,30 @@ enum class ManagedStatus {
     Failed
 };
 
+enum class WaitKind { Result, Field };
+
+enum class WaitOutcome {
+    Pending,
+    Success,
+    Failed,
+    Timeout,
+    ExternalResume
+};
+
+// These indexes are part of the Lua uservalue owned by a continuation.
+// Keeping their meaning here avoids coupling the reader to raw table indexes.
+enum CoreAnchorSlot {
+    DependencyCoreSlot = 1,
+    TaskOwnerCoreSlot = 2
+};
+
+// A ManagedState is retained by the scheduler while it is active and by Lua
+// handles while it is observable. It never keeps the scheduler alive.
 struct ManagedState {
-    RequestRouter *router = nullptr;
-    lua_State *owner = nullptr;
+    std::weak_ptr<SchedulerCore> core;
     std::uint64_t request_id = 0;
     RequestKind kind = RequestKind::Future;
     ManagedStatus status = ManagedStatus::Pending;
-
-    // All references are owned by RequestRouter.  The state can outlive the
-    // router through a Lua Future/Task handle, therefore refs are explicitly
-    // released by the router and are never released in this destructor.
     int callback_ref = LUA_NOREF;
     int context_ref = LUA_NOREF;
     int thread_ref = LUA_NOREF;
@@ -74,729 +82,892 @@ struct ManagedState {
     std::size_t waiter_count = 0;
 };
 
-struct ManagedTaskBinding {
-    std::shared_ptr<ManagedTaskOwner> owner;
-    std::shared_ptr<ManagedState> task;
+using ManagedStatePtr = std::shared_ptr<ManagedState>;
+
+struct ManagedHandle {
+    ManagedStatePtr state;
 };
 
-inline std::map<lua_State *, ManagedTaskBinding> &managedTaskBindings()
+struct CoreAnchor {
+    std::shared_ptr<SchedulerCore> core;
+};
+
+// These indexes are weak bookkeeping only. They never root a coroutine or
+// keep a SchedulerCore alive.
+struct TaskBinding {
+    std::weak_ptr<SchedulerCore> core;
+    std::weak_ptr<ManagedState> state;
+};
+inline std::map<lua_State *, TaskBinding> &taskBindings()
 {
-    static std::map<lua_State *, ManagedTaskBinding> bindings;
+    static std::map<lua_State *, TaskBinding> bindings;
+    return bindings;
+}
+inline std::map<lua_State *, std::weak_ptr<SchedulerCore>> &waitBindings()
+{
+    static std::map<lua_State *, std::weak_ptr<SchedulerCore>> bindings;
     return bindings;
 }
 
-struct ManagedHandle {
-    std::shared_ptr<ManagedState> state;
-};
-
-inline void releaseManagedReference(lua_State *L, int &reference)
+inline std::size_t &liveSchedulerCores()
 {
-    if (reference != LUA_NOREF && reference != LUA_REFNIL) {
-        luaL_unref(L, LUA_REGISTRYINDEX, reference);
-    }
-    reference = LUA_NOREF;
+    static std::size_t count = 0;
+    return count;
 }
 
-inline void releaseManagedStateReferences(ManagedState *state)
+inline std::size_t &liveContinuations()
 {
-    if (!state || !state->owner) {
-        return;
-    }
-    releaseManagedReference(state->owner, state->callback_ref);
-    releaseManagedReference(state->owner, state->context_ref);
-    releaseManagedReference(state->owner, state->thread_ref);
-    releaseManagedReference(state->owner, state->response_ref);
-    releaseManagedReference(state->owner, state->result_ref);
+    static std::size_t count = 0;
+    return count;
 }
 
-enum class WaitKind {
-    Result,
-    Field
-};
-
-enum class WaitOutcome {
-    Pending,
-    Success,
-    Failed,
-    Timeout,
-    ExternalResume
-};
-
-struct WaitToken {
-    RequestRouter *router = nullptr;
-    std::shared_ptr<ManagedState> dependency;
-    std::shared_ptr<ManagedState> task;
-    std::shared_ptr<ManagedTaskOwner> task_owner;
+// The userdata lives on the suspended coroutine's stack, independently of
+// WaitRegistration. Its uservalue holds both Lua core anchors.
+struct ContinuationState {
+    std::weak_ptr<SchedulerCore> dependency_core;
+    std::weak_ptr<SchedulerCore> task_core;
+    ManagedStatePtr dependency;
+    ManagedStatePtr task;
     lua_State *coroutine = nullptr;
-    int thread_ref = LUA_NOREF;
     WaitKind kind = WaitKind::Result;
-    std::string field;
     WaitOutcome outcome = WaitOutcome::Pending;
-    int result_count = 1;
+    std::string field;
+    int result_count = 0;
+    bool consumed = false;
+    ContinuationState()
+    {
+        ++liveContinuations();
+    }
+
+    ~ContinuationState()
+    {
+        --liveContinuations();
+    }
+};
+
+struct WaitNotification {
+    ContinuationState *continuation = nullptr;
+    ManagedStatePtr dependency;
+    int thread_ref = LUA_NOREF;
     bool direct_resume = false;
-    bool wait_lease = false;
-    bool detached = false;
+};
+
+struct WaitRegistration : WaitNotification {
     bool has_deadline = false;
     std::chrono::steady_clock::time_point deadline;
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
-    int continuation_key = 0;
-#endif
 };
 
-inline std::map<lua_State *, WaitToken *> &managedWaiters()
+inline bool isTerminalState(const ManagedStatePtr &state)
 {
-    static std::map<lua_State *, WaitToken *> waiters;
-    return waiters;
+    return state && (state->status == ManagedStatus::Resolved ||
+                     state->status == ManagedStatus::Done ||
+                     state->status == ManagedStatus::Failed);
+}
+inline bool isTaskState(const ManagedStatePtr &state)
+{
+    return state && (state->kind == RequestKind::Task ||
+                     state->kind == RequestKind::LegacyRequest);
 }
 
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
-inline std::map<int, WaitToken *> &lua52WaitTokens()
+// Weak registry lookup. Reference tables are uservalues of Lua-owned anchors,
+// so coroutine -> continuation -> anchor -> coroutine cycles are visible to GC.
+inline void pushCoreAnchors(lua_State *L)
 {
-    static std::map<int, WaitToken *> tokens;
-    return tokens;
+    static const char key = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &key);
+    if (!lua_isnil(L, -1)) return;
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushliteral(L, "v");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+    lua_pushvalue(L, -1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &key);
+}
+inline bool pushCoreAnchor(lua_State *L, const SchedulerCore *core)
+{
+    pushCoreAnchors(L);
+    lua_rawgetp(L, -1, core);
+    lua_remove(L, -2);
+    return !lua_isnil(L, -1);
+}
+inline bool pushCoreReferences(lua_State *L, const SchedulerCore *core)
+{
+    if (!pushCoreAnchor(L, core)) { lua_pop(L, 1); return false; }
+    lua_getuservalue(L, -1);
+    lua_remove(L, -2);
+    if (lua_istable(L, -1)) return true;
+    lua_pop(L, 1);
+    return false;
 }
 
-inline int registerLua52WaitToken(WaitToken *token)
+inline int managedFieldLookup(lua_State *L)
 {
-    static int next_key = 1;
-    std::map<int, WaitToken *> &tokens = lua52WaitTokens();
-    for (;;) {
-        const int key = next_key;
-        next_key = next_key == (std::numeric_limits<int>::max)()
-                       ? 1
-                       : next_key + 1;
-        if (tokens.emplace(key, token).second) {
-            return key;
-        }
+    lua_pushvalue(L, 2);
+    lua_gettable(L, 1);
+    return 1;
+}
+
+// A response table can have a user-installed __index metamethod. Convert its
+// Lua error to C++ before it can longjmp across a core/registration lease.
+inline void pushManagedField(lua_State *L, const char *field)
+{
+    const int object = lua_gettop(L);
+    lua_pushcfunction(L, managedFieldLookup);
+    lua_pushvalue(L, object);
+    lua_pushstring(L, field);
+    if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
+        const char *message = lua_tostring(L, -1);
+        const std::string error = message ? message : "tdlua: field lookup failed";
+        lua_pop(L, 1);
+        throw std::runtime_error(error);
     }
 }
 
-inline WaitToken *findLua52WaitToken(int key)
-{
-    const std::map<int, WaitToken *> &tokens = lua52WaitTokens();
-    const auto found = tokens.find(key);
-    return found == tokens.end() ? nullptr : found->second;
-}
-
-inline void unregisterLua52WaitToken(WaitToken *token)
-{
-    if (!token || token->continuation_key == 0) {
-        return;
-    }
-    lua52WaitTokens().erase(token->continuation_key);
-    token->continuation_key = 0;
-}
-#endif
-
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
+inline int continuationGc(lua_State *L);
+inline int coreAnchorGc(lua_State *L);
+#if LUA_VERSION_NUM == 502
 static int managedWaitContinuation(lua_State *L, int status, lua_KContext ctx);
 static int managedWaitContinuation_52(lua_State *L);
 #else
 inline int managedWaitContinuation(lua_State *L, int status, lua_KContext ctx);
 #endif
 
-/*
- * The router owns the common managed state machine.  Backends only provide a
- * response push operation and a one-step pump through setPump().  This keeps
- * Future/Task policy, registry lifetime and coroutine scheduling identical for
- * JSON and native transports without allocating a per-request std::function.
- */
-class RequestRouter {
-    struct PendingRequest {
-        RequestKind kind = RequestKind::Raw;
-        std::shared_ptr<ManagedState> state;
-    };
+class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
+    using State = ManagedStatePtr;
 
-    using State = std::shared_ptr<ManagedState>;
-
-    lua_State *owner_;
-    std::shared_ptr<ManagedTaskOwner> task_owner_;
+    // All Lua references below are stored in the CoreAnchor uservalue table.
+    // The anchor is Lua-owned, so these references do not create a hidden
+    // registry root for the scheduler.
+    lua_State *lua_owner_;
     std::uint64_t next_ = 1;
-    std::map<std::uint64_t, PendingRequest> pending_;
+
+    // State and routing ownership.
+    std::map<std::uint64_t, State> pending_;
     std::map<std::uint64_t, State> live_states_;
-    std::map<lua_State *, WaitToken *> waiters_;
+
+    // Waiters are active registrations. Notifications have been detached
+    // from dependency/timer lookup and are safe to drain in phase two.
+    std::map<lua_State *, WaitRegistration> waiters_;
+    std::map<lua_State *, WaitNotification> notifications_;
+
+    // A running task is indexed weakly by coroutine. The State itself remains
+    // strongly owned by live_states_ while it has active scheduler work.
     std::map<lua_State *, State> running_tasks_;
     std::deque<State> ready_;
+
+    // The pump belongs to the backend facade and can be detached independently
+    // of the SchedulerCore lifetime.
     void *pump_context_ = nullptr;
     bool (*pump_)(void *, double) = nullptr;
     bool draining_ = false;
-    bool clearing_ = false;
-    bool cleanup_deferred_ = false;
 
-    static constexpr double default_wait_timeout_ = 10.0;
+    // ----- CoreAnchor reference-table helpers -----
 
-    void releaseReference(int &reference)
+    int createLuaReference(lua_State *L, int index)
     {
-        if (reference != LUA_NOREF && reference != LUA_REFNIL) {
-            luaL_unref(owner_, LUA_REGISTRYINDEX, reference);
-        }
-        reference = LUA_NOREF;
-    }
-
-    void releaseStateReferences(ManagedState *state)
-    {
-        if (!state) {
-            return;
-        }
-        releaseReference(state->callback_ref);
-        releaseReference(state->context_ref);
-        releaseReference(state->thread_ref);
-        releaseReference(state->response_ref);
-        releaseReference(state->result_ref);
-    }
-
-    void releaseStateReferences(const State &state)
-    {
-        releaseStateReferences(state.get());
-    }
-
-    static bool terminal(const State &state)
-    {
-        return state && (state->status == ManagedStatus::Resolved ||
-                         state->status == ManagedStatus::Done ||
-                         state->status == ManagedStatus::Failed);
-    }
-
-    static bool terminal(const ManagedState *state)
-    {
-        return state && (state->status == ManagedStatus::Resolved ||
-                         state->status == ManagedStatus::Done ||
-                         state->status == ManagedStatus::Failed);
-    }
-
-    static bool successful(const State &state)
-    {
-        return state && (state->status == ManagedStatus::Resolved ||
-                         state->status == ManagedStatus::Done);
-    }
-
-    static bool successful(const ManagedState *state)
-    {
-        return state && (state->status == ManagedStatus::Resolved ||
-                         state->status == ManagedStatus::Done);
-    }
-
-    static bool taskLike(const ManagedState *state)
-    {
-        return state && (state->kind == RequestKind::Task ||
-                         state->kind == RequestKind::LegacyRequest);
-    }
-
-    static std::chrono::steady_clock::time_point deadlineAfter(double timeout)
-    {
-        const std::chrono::steady_clock::time_point now =
-            std::chrono::steady_clock::now();
-        const std::chrono::duration<double> maximum(
-            std::chrono::steady_clock::time_point::max() - now);
-        if (timeout >= maximum.count()) {
-            return std::chrono::steady_clock::time_point::max();
-        }
-        return now + std::chrono::duration_cast<
-                          std::chrono::steady_clock::duration>(
-                          std::chrono::duration<double>(timeout));
-    }
-
-    static std::string coroutineResumeError(lua_State *coroutine)
-    {
-        const char *message = coroutine ? lua_tostring(coroutine, -1) : nullptr;
-        return std::string("tdlua await failed: ") +
-               (message ? message : "unknown Lua error");
-    }
-
-    void registerRunningTask(lua_State *thread, const State &task)
-    {
-        running_tasks_[thread] = task;
-        ManagedTaskBinding binding;
-        binding.owner = task_owner_;
-        binding.task = task;
-        managedTaskBindings()[thread] = binding;
-    }
-
-    void unregisterRunningTask(lua_State *thread, const State &task)
-    {
-        const auto local = running_tasks_.find(thread);
-        if (local != running_tasks_.end() && local->second == task) {
-            running_tasks_.erase(local);
-        }
-        const auto global = managedTaskBindings().find(thread);
-        if (global != managedTaskBindings().end() &&
-            global->second.owner == task_owner_ && global->second.task == task) {
-            managedTaskBindings().erase(global);
-        }
-    }
-
-    void markTaskFailed(const State &state, const std::string &message)
-    {
-        if (!state || terminal(state)) {
-            return;
-        }
-        state->status = ManagedStatus::Failed;
-        state->error = message;
-        releaseReference(state->callback_ref);
-        releaseReference(state->context_ref);
-        releaseReference(state->thread_ref);
-    }
-
-    void failTaskFromExternalResume(const State &state, lua_State *thread,
-                                    const std::string &message)
-    {
-        if (!state) {
-            return;
-        }
-        unregisterRunningTask(thread, state);
-        markTaskFailed(state, message);
-        try {
-            wake(state);
-        } catch (...) {
-            // The external coroutine resume must report the managed failure,
-            // not let a second waiter resume error escape through Lua's C API.
-        }
-        retire(state);
-    }
-
-    void captureValue(lua_State *L, int index, int &reference)
-    {
+        index = lua_absindex(L, index);
+        if (!pushCoreReferences(L, this))
+            throw std::runtime_error("tdlua: scheduler storage unavailable");
         lua_pushvalue(L, index);
-        reference = luaL_ref(L, LUA_REGISTRYINDEX);
+        const int ref = luaL_ref(L, -2);
+        lua_pop(L, 1);
+        return ref;
     }
 
-    State registerState(RequestKind kind)
+    void releaseLuaReference(int &ref)
+    {
+        if (ref != LUA_NOREF && ref != LUA_REFNIL &&
+            pushCoreReferences(lua_owner_, this)) {
+            luaL_unref(lua_owner_, -1, ref);
+            lua_pop(lua_owner_, 1);
+        }
+        ref = LUA_NOREF;
+    }
+
+    // Push a referenced value or nil when its anchor has already been
+    // collected. The caller owns the resulting stack value.
+    void pushLuaReference(lua_State *L, int ref)
+    {
+        if (ref == LUA_NOREF || !pushCoreReferences(L, this)) {
+            lua_pushnil(L);
+            return;
+        }
+        lua_rawgeti(L, -1, ref);
+        lua_remove(L, -2);
+    }
+    void releaseLuaReferences(const State &state)
+    {
+        releaseLuaReference(state->callback_ref);
+        releaseLuaReference(state->context_ref);
+        releaseLuaReference(state->thread_ref);
+        releaseLuaReference(state->response_ref);
+        releaseLuaReference(state->result_ref);
+    }
+
+    // ----- State allocation and retirement -----
+
+    void retireState(const State &state)
+    {
+        if (isTerminalState(state) && !state->handle_count && !state->waiter_count) {
+            releaseLuaReferences(state);
+            live_states_.erase(state->request_id);
+        }
+    }
+
+    State createState(RequestKind kind)
     {
         State state(new ManagedState());
-        state->router = this;
-        state->owner = owner_;
-        state->request_id = nextRequestId();
+        state->core = shared_from_this();
+        state->request_id = next_++;
         state->kind = kind;
-        PendingRequest pending;
-        pending.kind = kind;
-        pending.state = state;
-        const auto inserted = pending_.emplace(state->request_id, pending);
-        if (!inserted.second) {
-            throw std::runtime_error("tdlua: duplicate request ID");
-        }
-        live_states_.emplace(state->request_id, state);
+        pending_[state->request_id] = state;
+        live_states_[state->request_id] = state;
         return state;
     }
-
-    void retire(ManagedState *state)
+    void failState(const State &state, const std::string &error)
     {
-        if (!state || !terminal(state) || state->waiter_count != 0 ||
-            state->handle_count != 0) {
-            return;
-        }
-        const auto found = pending_.find(state->request_id);
-        if (found != pending_.end() && found->second.state.get() == state) {
-            pending_.erase(found);
-        }
-        state->router = nullptr;
-        releaseStateReferences(state);
-        live_states_.erase(state->request_id);
-    }
-
-    void retire(const State &state)
-    {
-        retire(state.get());
-    }
-
-    State findState(std::uint64_t id) const
-    {
-        const auto found = pending_.find(id);
-        return found == pending_.end() ? State() : found->second.state;
-    }
-
-    void setFailure(const State &state, const std::string &message)
-    {
-        if (!state || terminal(state)) {
+        if (isTerminalState(state)) {
             return;
         }
         state->status = ManagedStatus::Failed;
-        state->error = message;
-        if (taskLike(state.get()) && state->status != ManagedStatus::Running) {
-            releaseReference(state->callback_ref);
-            releaseReference(state->context_ref);
-            releaseReference(state->thread_ref);
-        }
+        state->error = error;
+        releaseLuaReference(state->callback_ref);
+        releaseLuaReference(state->context_ref);
+        releaseLuaReference(state->thread_ref);
     }
 
-    int pushResult(const ManagedState *state, lua_State *L)
+    void removeRunningTask(lua_State *thread)
     {
-        if (!state) {
-            throw std::runtime_error("tdlua: missing managed state");
+        running_tasks_.erase(thread);
+        const auto found = taskBindings().find(thread);
+        if (found != taskBindings().end() &&
+            found->second.core.lock().get() == this) {
+            taskBindings().erase(found);
         }
-        if (state->status == ManagedStatus::Failed) {
-            throw std::runtime_error(state->error.empty()
-                                         ? "tdlua: managed operation failed"
-                                         : state->error);
-        }
-        if (state->kind == RequestKind::Future ||
-            state->kind == RequestKind::LegacyAwait) {
-            if (state->response_ref == LUA_NOREF) {
-                throw std::runtime_error("tdlua: missing managed response");
-            }
-            lua_rawgeti(L, LUA_REGISTRYINDEX, state->response_ref);
-            return 1;
-        }
-
-        if (state->result_ref == LUA_NOREF) {
-            return 0;
-        }
-        lua_rawgeti(L, LUA_REGISTRYINDEX, state->result_ref);
-        const int table = lua_gettop(L);
-        lua_getfield(L, -1, "n");
-        const int count = static_cast<int>(lua_tointeger(L, -1));
-        lua_pop(L, 1);
-        for (int index = 1; index <= count; ++index) {
-            lua_rawgeti(L, table, index);
-        }
-        lua_remove(L, table);
-        return count;
     }
+    // ----- Task execution -----
 
-    int pushResult(const State &state, lua_State *L)
+    void storeTaskResults(const State &state, lua_State *thread)
     {
-        return pushResult(state.get(), L);
-    }
-
-    void storeResults(const State &state, lua_State *thread)
-    {
-        const int count = lua_gettop(thread);
-        lua_newtable(owner_);
-        const int table = lua_gettop(owner_);
-        lua_pushinteger(owner_, count);
-        lua_setfield(owner_, table, "n");
-        for (int index = count; index >= 1; --index) {
-            lua_xmove(thread, owner_, 1);
-            lua_rawseti(owner_, table, index);
+        const int result_count = lua_gettop(thread);
+        lua_newtable(thread);
+        const int result_table = lua_gettop(thread);
+        lua_pushinteger(thread, result_count);
+        lua_setfield(thread, result_table, "n");
+        for (int index = 1; index <= result_count; ++index) {
+            lua_pushvalue(thread, index);
+            lua_rawseti(thread, result_table, index);
         }
-        state->result_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-    }
-
-    void failTask(const State &state, const char *prefix, lua_State *thread)
-    {
-        const char *text = lua_tostring(thread, -1);
-        state->status = ManagedStatus::Failed;
-        state->error = std::string(prefix) +
-                       (text ? text : "unknown Lua error");
+        state->result_ref = createLuaReference(thread, result_table);
         lua_settop(thread, 0);
-        releaseReference(state->callback_ref);
-        releaseReference(state->context_ref);
-        releaseReference(state->thread_ref);
+        state->status = ManagedStatus::Done;
+        releaseLuaReference(state->thread_ref);
     }
 
-    void finishTaskResume(const State &state, lua_State *thread, int status)
+    void failTaskExecution(const State &state, lua_State *thread, int status)
     {
-        if (!state || !thread) {
+        const char *message = lua_tostring(thread, -1);
+        const char *prefix = status == LUA_YIELD
+            ? "tdlua task yielded without a managed dependency: "
+            : "tdlua task failed: ";
+        failState(state, std::string(prefix) + (message ? message : "unknown Lua error"));
+        lua_settop(thread, 0);
+    }
+
+    void finishTask(const State &state, lua_State *thread, int status)
+    {
+        if (isTerminalState(state)) {
             return;
         }
-        if (status == LUA_OK) {
-            storeResults(state, thread);
-            state->status = ManagedStatus::Done;
-            unregisterRunningTask(thread, state);
-            releaseReference(state->thread_ref);
-            wake(state);
-        } else if (status == LUA_YIELD) {
-            // A managed Future wait installs a waiter before yielding. Keep
-            // the task association alive so a subsequent wait in the same
-            // callback remains owned by this Task.
-            if (managedWaiters().find(thread) == managedWaiters().end()) {
-                unregisterRunningTask(thread, state);
-                failTask(state, "tdlua task yielded without a managed dependency: ",
-                         thread);
-                wake(state);
-            }
-        } else {
-            unregisterRunningTask(thread, state);
-            failTask(state, "tdlua task failed: ", thread);
-            wake(state);
-            if (state->kind == RequestKind::LegacyRequest) {
-                const std::string message = state->error.empty()
-                                                ? "tdlua: legacy request failed"
-                                                : state->error;
-                retire(state);
-                throw std::runtime_error(message);
-            }
+        if (status == LUA_YIELD && waitBindings().count(thread)) {
+            return;
         }
-        retire(state);
-        if (!clearing_ && cleanup_deferred_ && running_tasks_.empty() &&
-            waiters_.empty()) {
-            bool ready_task = false;
-            for (const State &ready : ready_) {
-                if (taskLike(ready.get()) && ready->status == ManagedStatus::Pending) {
-                    ready_task = true;
-                    break;
-                }
-            }
-            if (!ready_task) {
-                finalizeClear();
-            }
+        removeRunningTask(thread);
+        if (status == LUA_OK) {
+            storeTaskResults(state, thread);
+        } else {
+            failTaskExecution(state, thread, status);
+        }
+        releaseLuaReference(state->callback_ref);
+        releaseLuaReference(state->context_ref);
+        wake(state);
+        retireState(state);
+        if (state->kind == RequestKind::LegacyRequest &&
+            state->status == ManagedStatus::Failed) {
+            throw std::runtime_error(state->error);
         }
     }
 
     void runTask(const State &state)
     {
-        if (!state || state->status != ManagedStatus::Pending ||
-            state->response_ref == LUA_NOREF) {
+        if (state->status != ManagedStatus::Pending) {
             return;
         }
-
-        lua_State *thread = nullptr;
+        lua_State *thread;
         if (state->callback_is_thread) {
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, state->thread_ref);
-            thread = lua_tothread(owner_, -1);
-            lua_pop(owner_, 1);
+            pushLuaReference(lua_owner_, state->thread_ref);
+            thread = lua_tothread(lua_owner_, -1);
+            lua_pop(lua_owner_, 1);
         } else {
-            lua_newthread(owner_);
-            thread = lua_tothread(owner_, -1);
-            state->thread_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, state->callback_ref);
-            lua_xmove(owner_, thread, 1);
+            thread = lua_newthread(lua_owner_);
+            state->thread_ref = createLuaReference(lua_owner_, -1);
+            lua_pop(lua_owner_, 1);
+            pushLuaReference(thread, state->callback_ref);
         }
         if (!thread) {
-            setFailure(state, "tdlua: task coroutine is unavailable");
-            retire(state);
+            failState(state, "tdlua: task coroutine unavailable");
+            wake(state);
             return;
         }
-
-        lua_rawgeti(owner_, LUA_REGISTRYINDEX, state->response_ref);
-        lua_xmove(owner_, thread, 1);
-        if (state->context_ref == LUA_NOREF || state->context_ref == LUA_REFNIL) {
-            lua_pushnil(thread);
-        } else {
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, state->context_ref);
-            lua_xmove(owner_, thread, 1);
-        }
-        releaseReference(state->response_ref);
-        releaseReference(state->callback_ref);
-        releaseReference(state->context_ref);
-
+        pushLuaReference(thread, state->response_ref);
+        pushLuaReference(thread, state->context_ref);
+        releaseLuaReference(state->response_ref);
+        releaseLuaReference(state->callback_ref);
+        releaseLuaReference(state->context_ref);
         state->status = ManagedStatus::Running;
-        registerRunningTask(thread, state);
-        const int status = tdlua_lua_resume(thread, owner_, 2);
-        finishTaskResume(state, thread, status);
+        running_tasks_[thread] = state;
+        TaskBinding binding;
+        binding.core = shared_from_this();
+        binding.state = state;
+        taskBindings()[thread] = binding;
+        // Pin the owner core before the initial callback can enter Lua and
+        // yield into a dependency owned by another core.
+        const int status = tdlua_lua_resume(thread, lua_owner_, 2);
+        finishTask(state, thread, status);
+    }
+    // ----- Wait registration and resumption -----
+
+    const WaitNotification *findWaitNotification(lua_State *thread,
+                                                 const State &dependency) const
+    {
+        const auto active = waiters_.find(thread);
+        if (active != waiters_.end() && active->second.dependency == dependency) {
+            return &active->second;
+        }
+
+        const auto detached = notifications_.find(thread);
+        if (detached != notifications_.end() &&
+            detached->second.dependency == dependency) {
+            return &detached->second;
+        }
+        return nullptr;
     }
 
-    void detachWaitToken(WaitToken *token)
+    void removeRegistration(lua_State *thread)
     {
-        if (!token || token->detached) {
+        const auto found = waiters_.find(thread);
+        const auto notification = notifications_.find(thread);
+        if (found == waiters_.end() && notification == notifications_.end()) {
             return;
         }
-        token->detached = true;
-        const State dependency = token->dependency;
-        const auto found = waiters_.find(token->coroutine);
-        if (found != waiters_.end() && found->second == token) {
+
+        State dependency;
+        if (found != waiters_.end()) {
+            dependency = found->second.dependency;
+            releaseLuaReference(found->second.thread_ref);
             waiters_.erase(found);
+        } else {
+            dependency = notification->second.dependency;
+            releaseLuaReference(notification->second.thread_ref);
+            notifications_.erase(notification);
         }
-        const auto managed = managedWaiters().find(token->coroutine);
-        if (managed != managedWaiters().end() && managed->second == token) {
-            managedWaiters().erase(managed);
+
+        const auto global = waitBindings().find(thread);
+        if (global != waitBindings().end() &&
+            global->second.lock().get() == this) {
+            waitBindings().erase(global);
         }
-        if (dependency && dependency->waiter_count != 0) {
-            --dependency->waiter_count;
-        }
-        if (token->wait_lease && dependency && dependency->handle_count != 0) {
-            --dependency->handle_count;
-            token->wait_lease = false;
-        }
-        releaseReference(token->thread_ref);
+        if (dependency->waiter_count) --dependency->waiter_count;
+        retireState(dependency);
     }
 
-    void cleanupWaitToken(WaitToken *token)
+    void resume(lua_State *thread, const State &dependency, WaitOutcome outcome)
     {
-        if (!token) {
+        const WaitNotification *registration = findWaitNotification(thread, dependency);
+        if (!registration) {
             return;
         }
-        const State dependency = token->dependency;
-        detachWaitToken(token);
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
-        unregisterLua52WaitToken(token);
-#endif
-        retire(dependency);
-    }
+        const bool direct = registration->direct_resume;
+        ContinuationState *continuation = registration->continuation;
 
-    // Return -1 after placing an error message on the Lua stack. The caller
-    // turns that marker into lua_error only after all C++ locals here have
-    // unwound.
-    int continuation(lua_State *L, WaitToken *token)
-    {
-        if (token->outcome == WaitOutcome::Pending) {
-            token->outcome = WaitOutcome::ExternalResume;
-        }
-        const WaitOutcome outcome = token->outcome;
-        const WaitKind kind = token->kind;
-        if (outcome == WaitOutcome::ExternalResume) {
-            const State task = token->task;
-            const std::shared_ptr<ManagedTaskOwner> task_owner =
-                token->task_owner;
-            const std::string error =
-                "tdlua await failed: coroutine resumed externally while waiting";
-            lua_pushliteral(L,
-                            "tdlua: coroutine resumed externally while waiting");
-            cleanupWaitToken(token);
-            delete token;
-            if (task && task_owner && task_owner->router) {
-                task_owner->router->failTaskFromExternalResume(task, L, error);
-            }
-            return -1;
-        }
-        if (outcome == WaitOutcome::Timeout) {
-            cleanupWaitToken(token);
-            delete token;
-            if (kind == WaitKind::Field) {
-                lua_pushliteral(L, "tdlua: Future wait timeout");
-                return -1;
-            }
-            lua_pushnil(L);
-            lua_pushliteral(L, "timeout");
-            return 2;
-        }
-        if (outcome == WaitOutcome::Failed) {
-            const char *error = token->dependency &&
-                                        !token->dependency->error.empty()
-                                    ? token->dependency->error.c_str()
-                                    : "tdlua: client closed";
-            lua_pushstring(L, error);
-            cleanupWaitToken(token);
-            delete token;
-            return -1;
-        }
-        if (kind == WaitKind::Field) {
-            if (!lua_istable(L, -1)) {
-                lua_pushliteral(L, "tdlua: Future response is not a table");
-                cleanupWaitToken(token);
-                delete token;
-                return -1;
-            }
-            lua_getfield(L, -1, token->field.c_str());
-            cleanupWaitToken(token);
-            delete token;
-            return 1;
-        }
-        const int result_count = token->result_count;
-        cleanupWaitToken(token);
-        delete token;
-        return result_count;
-    }
-
-    void resumeWaiter(WaitToken *token, const State &state,
-                      WaitOutcome outcome)
-    {
-        if (!token || !state) {
-            return;
-        }
-        const bool direct_resume = token->direct_resume;
-        lua_State *coroutine = token->coroutine;
-        const State task = token->task;
-        const std::shared_ptr<ManagedTaskOwner> task_owner = token->task_owner;
-        RequestRouter *task_router = task_owner ? task_owner->router : nullptr;
-        token->outcome = outcome;
-
-        if (task && !task_router) {
-            cleanupWaitToken(token);
-            delete token;
-            return;
-        }
-
+        // Pin both cores and the coroutine before removing their active leases.
+        // Keep the dependency core alive while removing the registration and
+        // resuming arbitrary Lua code.
+        const auto dependency_core_lease = shared_from_this();
+        (void)dependency_core_lease;
+        const auto task_core = continuation ? continuation->task_core.lock() : nullptr;
+        const State task = continuation ? continuation->task : State();
+        const int base = lua_gettop(lua_owner_);
+        struct ResumeStack {
+            lua_State *L;
+            int base;
+            ~ResumeStack() { lua_settop(L, base); }
+        } stack{lua_owner_, base};
+        pushCoreAnchor(lua_owner_, this);
+        if (task_core) pushCoreAnchor(lua_owner_, task_core.get());
+        pushLuaReference(lua_owner_, registration->thread_ref);
         int arguments = 0;
+        if (continuation) continuation->outcome = outcome;
         if (outcome == WaitOutcome::Success) {
-            if (state->kind == RequestKind::Future ||
-                state->kind == RequestKind::LegacyAwait) {
-                lua_rawgeti(owner_, LUA_REGISTRYINDEX, state->response_ref);
-                lua_xmove(owner_, coroutine, 1);
-                arguments = 1;
-            } else {
-                arguments = pushResult(state, coroutine);
-                token->result_count = arguments;
-            }
+            arguments = pushResult(thread, dependency);
+            if (continuation) continuation->result_count = arguments;
         }
-
-        if (direct_resume) {
-            detachWaitToken(token);
-            cleanupWaitToken(token);
-            delete token;
-            const int status = tdlua_lua_resume(coroutine, owner_, arguments);
-            if (status != LUA_OK && status != LUA_YIELD) {
-                throw std::runtime_error(coroutineResumeError(coroutine));
-            }
-            return;
-        }
-
-        if (task) {
-            task_router->registerRunningTask(coroutine, task);
-        }
-        // Remove the old lease before entering Lua. A resumed Task may issue
-        // another managed wait; that new waiter must be allowed to claim the
-        // coroutine while this token remains alive as the continuation ctx.
-        detachWaitToken(token);
-        const int status = tdlua_lua_resume(coroutine, owner_, arguments);
-        if (task) {
-            RequestRouter *resumed_task_router =
-                task_owner ? task_owner->router : nullptr;
-            if (resumed_task_router) {
-                resumed_task_router->finishTaskResume(task, coroutine, status);
-            }
-        } else if (status != LUA_OK && status != LUA_YIELD) {
-            throw std::runtime_error(coroutineResumeError(coroutine));
+        removeRegistration(thread);
+        const int status = tdlua_lua_resume(thread, lua_owner_, arguments);
+        if (task && task_core) {
+            task_core->finishTask(task, thread, status);
+        } else if (status != LUA_OK && status != LUA_YIELD && (direct || !task)) {
+            const char *message = lua_tostring(thread, -1);
+            throw std::runtime_error(std::string("tdlua await failed: ") +
+                                     (message ? message : "unknown Lua error"));
         }
     }
 
     void wake(const State &state)
     {
-        std::vector<lua_State *> pending_waiters;
-        for (const auto &entry : waiters_) {
-            if (entry.second->dependency == state) {
-                pending_waiters.push_back(entry.first);
-            }
-        }
-        for (lua_State *coroutine : pending_waiters) {
-            const auto found = waiters_.find(coroutine);
-            if (found == waiters_.end() || found->second->dependency != state) {
-                continue;
-            }
-            resumeWaiter(found->second, state,
-                         state->status == ManagedStatus::Failed
-                             ? WaitOutcome::Failed
-                             : WaitOutcome::Success);
+        std::vector<lua_State *> threads;
+        for (const auto &entry : waiters_)
+            if (entry.second.dependency == state) threads.push_back(entry.first);
+        for (const auto &entry : notifications_)
+            if (entry.second.dependency == state) threads.push_back(entry.first);
+        const WaitOutcome outcome = state->status == ManagedStatus::Failed
+            ? WaitOutcome::Failed
+            : WaitOutcome::Success;
+        for (lua_State *thread : threads) {
+            resume(thread, state, outcome);
         }
     }
 
-    void expireWaiters()
+    void anchorContinuation(lua_State *L, int continuation_index)
+    {
+        lua_newtable(L);
+        pushCoreAnchor(L, this);
+        lua_rawseti(L, -2, DependencyCoreSlot);
+
+        const auto binding = taskBindings().find(L);
+        if (binding != taskBindings().end()) {
+            const auto task_core = binding->second.core.lock();
+            if (task_core) {
+                pushCoreAnchor(L, task_core.get());
+                lua_rawseti(L, -2, TaskOwnerCoreSlot);
+            }
+        }
+        lua_setuservalue(L, continuation_index);
+    }
+
+    std::chrono::steady_clock::time_point deadlineFor(double timeout) const
     {
         const auto now = std::chrono::steady_clock::now();
+        const double maximum = std::chrono::duration<double>(
+            std::chrono::steady_clock::time_point::max() - now).count();
+        if (timeout >= maximum) {
+            return std::chrono::steady_clock::time_point::max();
+        }
+        return now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                         std::chrono::duration<double>(timeout));
+    }
+
+    int beginYield(lua_State *L, const State &state, WaitKind kind,
+                   const char *field, bool timed, double timeout)
+    {
+        if (waitBindings().count(L)) {
+            lua_pushliteral(L, "tdlua: coroutine is already waiting on TDLua");
+            return -1;
+        }
+        if (luaL_newmetatable(L, "tdlua.continuation")) {
+            lua_pushcfunction(L, continuationGc);
+            lua_setfield(L, -2, "__gc");
+        }
+        lua_pop(L, 1);
+        auto *continuation = new (lua_newuserdata(L, sizeof(ContinuationState)))
+            ContinuationState();
+        const int context = lua_gettop(L);
+        luaL_setmetatable(L, "tdlua.continuation");
+        continuation->dependency_core = shared_from_this();
+        continuation->dependency = state;
+        continuation->coroutine = L;
+        continuation->kind = kind;
+        if (field) continuation->field = field;
+        const auto binding = taskBindings().find(L);
+        if (binding != taskBindings().end()) {
+            continuation->task_core = binding->second.core;
+            continuation->task = binding->second.state.lock();
+        }
+        anchorContinuation(L, context);
+
+        WaitRegistration registration;
+        registration.continuation = continuation;
+        registration.dependency = state;
+        registration.has_deadline = timed;
+        if (timed) {
+            registration.deadline = deadlineFor(timeout);
+        }
+        lua_pushthread(L);
+        registration.thread_ref = createLuaReference(L, -1);
+        lua_pop(L, 1);
+        // Lua allocation may have run the client finalizer while preparing
+        // storage. Do not install a new wait on an already terminal state.
+        if (isTerminalState(state)) {
+            releaseLuaReference(registration.thread_ref);
+            continuation->consumed = true;
+            continuation->dependency.reset();
+            continuation->task.reset();
+            lua_pop(L, 1);
+            return 0;
+        }
+        waiters_[L] = registration;
+        waitBindings()[L] = shared_from_this();
+        ++state->waiter_count;
+        return context;
+    }
+
+public:
+    using Pump = bool (*)(void *, double);
+    explicit SchedulerCore(lua_State *L) : lua_owner_(tdlua_lua_main_thread(L))
+    {
+        ++liveSchedulerCores();
+    }
+    ~SchedulerCore()
+    {
+        // No Lua calls, no registry unrefs and no callbacks during destruction.
+        for (const auto &entry : running_tasks_) taskBindings().erase(entry.first);
+        for (const auto &entry : waiters_) waitBindings().erase(entry.first);
+        for (const auto &entry : notifications_) waitBindings().erase(entry.first);
+        --liveSchedulerCores();
+    }
+    void setPump(void *context, Pump pump) { pump_context_ = context; pump_ = pump; }
+    std::uint64_t nextRequestId() { return next_++; }
+    void observeRequestId(std::uint64_t id)
+    {
+        if (id >= next_) next_ = id == UINT64_MAX ? id : id + 1;
+    }
+    std::size_t pendingCount() const { return pending_.size(); }
+    std::uint64_t raw() { return createState(RequestKind::Raw)->request_id; }
+    State future() { return createState(RequestKind::Future); }
+    State task(lua_State *L, int callback, int context, bool supplied_thread)
+    {
+        if (supplied_thread ? !lua_isthread(L, callback) : !lua_isfunction(L, callback))
+            throw std::runtime_error("tdlua: invalid task callback");
+        const State state = createState(RequestKind::Task);
+        state->callback_is_thread = supplied_thread;
+        if (supplied_thread) state->thread_ref = createLuaReference(L, callback);
+        else state->callback_ref = createLuaReference(L, callback);
+        if (context) state->context_ref = createLuaReference(L, context);
+        return state;
+    }
+    std::uint64_t request(lua_State *L, int callback, int context)
+    {
+        const State state = task(L, callback, context, false);
+        state->kind = RequestKind::LegacyRequest;
+        return state->request_id;
+    }
+    State awaitState(lua_State *L)
+    {
+        const bool main = lua_pushthread(L) != 0;
+        lua_pop(L, 1);
+        if (main) throw std::runtime_error("tdlua: await() must run inside a coroutine");
+        return createState(RequestKind::LegacyAwait);
+    }
+    std::uint64_t await(lua_State *L)
+    {
+        const State state = awaitState(L);
+        if (lua_status(L) == LUA_YIELD) {
+            WaitRegistration registration;
+            registration.dependency = state;
+            registration.direct_resume = true;
+            lua_pushthread(L);
+            registration.thread_ref = createLuaReference(L, -1);
+            lua_pop(L, 1);
+            waiters_[L] = registration;
+            waitBindings()[L] = shared_from_this();
+            ++state->waiter_count;
+        }
+        return state->request_id;
+    }
+    void cancel(std::uint64_t id)
+    {
+        const auto found = pending_.find(id);
+        if (found == pending_.end()) return;
+        releaseLuaReferences(found->second);
+        pending_.erase(found);
+        live_states_.erase(id);
+    }
+    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push)
+    {
+        if (!id) return RouteKind::Update;
+        const auto found = pending_.find(id);
+        if (found == pending_.end()) return RouteKind::Unknown;
+        const State state = found->second;
+        pending_.erase(found);
+        if (state->kind == RequestKind::Raw) {
+            state->status = ManagedStatus::Done;
+            retireState(state);
+            return RouteKind::Raw;
+        }
+        try {
+            push(lua_owner_);
+            state->response_ref = createLuaReference(lua_owner_, -1);
+            lua_pop(lua_owner_, 1);
+        } catch (...) {
+            failState(state, "tdlua: local response routing failure");
+            ready_.push_back(state);
+            throw;
+        }
+        if (!isTaskState(state)) state->status = ManagedStatus::Resolved;
+        ready_.push_back(state);
+        switch (state->kind) {
+            case RequestKind::Future: return RouteKind::Future;
+            case RequestKind::Task: return RouteKind::Task;
+            case RequestKind::LegacyRequest: return RouteKind::LegacyRequest;
+            default: return RouteKind::LegacyAwait;
+        }
+    }
+    int pushResult(lua_State *L, const State &state)
+    {
+        if (state->status == ManagedStatus::Failed) throw std::runtime_error(state->error);
+        if (!isTaskState(state)) { pushLuaReference(L, state->response_ref); return 1; }
+        if (state->result_ref == LUA_NOREF) return 0;
+        pushLuaReference(L, state->result_ref);
+        const int table = lua_gettop(L);
+        lua_getfield(L, table, "n");
+        const int count = static_cast<int>(lua_tointeger(L, -1));
+        lua_pop(L, 1);
+        for (int i = 1; i <= count; ++i) lua_rawgeti(L, table, i);
+        lua_remove(L, table);
+        return count;
+    }
+
+    void pushTimeout(lua_State *L, WaitKind kind, int &results) const
+    {
+        if (kind == WaitKind::Field) {
+            throw std::runtime_error("tdlua: Future wait timeout");
+        }
+        lua_pushnil(L);
+        lua_pushliteral(L, "timeout");
+        results = 2;
+    }
+
+    bool waitSynchronously(lua_State *L, const State &state, bool timed,
+                           double timeout, WaitKind kind, int &results)
+    {
+        if (isTerminalState(state)) {
+            return true;
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        const double budget = timed ? timeout : 10.0;
+        while (!isTerminalState(state)) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            const double remaining = budget - elapsed;
+            if (remaining <= 0) {
+                pushTimeout(L, kind, results);
+                return false;
+            }
+            if (!pump_) {
+                throw std::runtime_error("tdlua: managed scheduler has no pump");
+            }
+            if (!pump_(pump_context_, remaining)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        return true;
+    }
+
+    // Returns a positive stack index for a newly installed continuation, or
+    // zero for a completed/non-yielding wait. No C++ owner lives across yield.
+    int prepareWait(lua_State *L, State state, bool timed, double timeout,
+                    WaitKind kind, const char *field, int &results)
+    {
+        // Lua allocation in beginYield may run a client finalizer. Keep this
+        // core alive until the continuation has installed its Lua anchors.
+        const auto wait_core_lease = shared_from_this();
+        (void)wait_core_lease;
+        if (timed && (!std::isfinite(timeout) || timeout < 0)) {
+            throw std::runtime_error("tdlua: timeout must be finite and non-negative");
+        }
+        if (!isTerminalState(state) && timed && timeout == 0) {
+            pushTimeout(L, kind, results);
+            return 0;
+        }
+        if (!isTerminalState(state) && tdlua_lua_is_yieldable(L)) {
+            const int context = beginYield(L, state, kind, field, timed, timeout);
+            if (context < 0) results = -1;
+            if (context != 0) return context < 0 ? 0 : context;
+        }
+
+        struct BlockingLease {
+            SchedulerCore *core;
+            State state;
+            ~BlockingLease()
+            {
+                core->releaseHandle(state);
+            }
+        } lease = {this, state};
+        ++state->handle_count;
+        if (!waitSynchronously(L, state, timed, timeout, kind, results)) {
+            return 0;
+        }
+
+        results = pushResult(L, state);
+        if (kind == WaitKind::Field) {
+            pushManagedField(L, field ? field : "");
+            results = 1;
+        }
+        retireState(state);
+        return 0;
+    }
+
+    int completeContinuation(lua_State *L, ContinuationState *continuation)
+    {
+        if (continuation->consumed) {
+            lua_pushliteral(L, "tdlua: managed continuation already consumed");
+            return -1;
+        }
+        continuation->consumed = true;
+        const auto task_core = continuation->task_core.lock();
+        const State task = continuation->task;
+        const State dependency = continuation->dependency;
+        const WaitOutcome outcome = continuation->outcome == WaitOutcome::Pending
+            ? WaitOutcome::ExternalResume
+            : continuation->outcome;
+        removeRegistration(continuation->coroutine);
+        int results = continuation->result_count;
+        if (outcome == WaitOutcome::ExternalResume) {
+            if (task_core && task) {
+                task_core->removeRunningTask(L);
+                task_core->failState(
+                    task, "tdlua: coroutine resumed externally while waiting");
+                task_core->wake(task);
+                task_core->retireState(task);
+            }
+            lua_pushliteral(L, "tdlua: coroutine resumed externally while waiting");
+            results = -1;
+        } else if (outcome == WaitOutcome::Failed) {
+            lua_pushstring(L, dependency->error.c_str());
+            results = -1;
+        } else if (outcome == WaitOutcome::Timeout) {
+            if (continuation->kind == WaitKind::Field) {
+                lua_pushliteral(L, "tdlua: Future wait timeout");
+                results = -1;
+            } else {
+                lua_pushnil(L);
+                lua_pushliteral(L, "timeout");
+                results = 2;
+            }
+        } else if (continuation->kind == WaitKind::Field) {
+            pushManagedField(L, continuation->field.c_str());
+            results = 1;
+        }
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+        retireState(dependency);
+        return results;
+    }
+
+    void abandon(ContinuationState *continuation)
+    {
+        if (continuation->consumed) {
+            return;
+        }
+        continuation->consumed = true;
+        removeRegistration(continuation->coroutine);
+        const auto task_core = continuation->task_core.lock();
+        if (task_core && continuation->task) {
+            task_core->removeRunningTask(continuation->coroutine);
+            task_core->failState(continuation->task, "tdlua: managed coroutine abandoned");
+            task_core->retireState(continuation->task);
+        }
+    }
+
+    void releaseHandle(const State &state)
+    {
+        if (state->handle_count) --state->handle_count;
+        retireState(state);
+    }
+    // Phase 1: no Lua resumes, snapshots or user callbacks. The pump/facade is
+    // unreachable before pending failures can be observed from a later drain.
+    void detachTransport(const std::string &message = "tdlua: client closed")
+    {
+        pump_ = nullptr;
+        pump_context_ = nullptr;
+        std::map<std::uint64_t, State> pending;
+        pending.swap(pending_);
+        for (const auto &entry : pending) {
+            failState(entry.second, message);
+            ready_.push_back(entry.second);
+        }
+        for (auto it = waiters_.begin(); it != waiters_.end();) {
+            if (!isTerminalState(it->second.dependency)) { ++it; continue; }
+            notifications_[it->first] = static_cast<const WaitNotification &>(it->second);
+            waitBindings().erase(it->first);
+            it = waiters_.erase(it);
+        }
+    }
+
+    void drainDetachedNotifications()
+    {
+        while (!notifications_.empty()) {
+            lua_State *thread = notifications_.begin()->first;
+            const State dependency = notifications_.begin()->second.dependency;
+            const WaitOutcome outcome = dependency->status == ManagedStatus::Failed
+                ? WaitOutcome::Failed
+                : WaitOutcome::Success;
+            resume(thread, dependency, outcome);
+        }
+    }
+
+    void drainExpiredWaiters()
+    {
         std::vector<lua_State *> expired;
         for (const auto &entry : waiters_) {
-            if (entry.second->has_deadline && entry.second->deadline <= now) {
+            if (entry.second.has_deadline &&
+                entry.second.deadline <= std::chrono::steady_clock::now()) {
                 expired.push_back(entry.first);
             }
         }
-        for (lua_State *coroutine : expired) {
-            const auto found = waiters_.find(coroutine);
-            if (found == waiters_.end() || !found->second->has_deadline ||
-                found->second->deadline > std::chrono::steady_clock::now()) {
+        for (lua_State *thread : expired) {
+            const auto found = waiters_.find(thread);
+            if (found == waiters_.end() || !found->second.has_deadline ||
+                found->second.deadline > std::chrono::steady_clock::now()) {
                 continue;
             }
-            const State dependency = found->second->dependency;
-            resumeWaiter(found->second, dependency, WaitOutcome::Timeout);
+            const State dependency = found->second.dependency;
+            resume(thread, dependency, WaitOutcome::Timeout);
         }
     }
 
-    void drainReady()
+    void drainReadyStates()
     {
-        if (draining_) {
-            return;
+        while (!ready_.empty()) {
+            const State state = ready_.front();
+            ready_.pop_front();
+            if (isTerminalState(state)) {
+                wake(state);
+                retireState(state);
+            } else {
+                runTask(state);
+            }
         }
+    }
+
+    // Phase 2: each item is removed before entering Lua. Reentrant detach/drain
+    // cannot invalidate an iterator or the shared core pinned by its caller.
+    void tick()
+    {
+        // Keep the core alive while a reentrant pump drains Lua work.
+        const auto scheduler_lease = shared_from_this();
+        (void)scheduler_lease;
+        drainDetachedNotifications();
+        drainExpiredWaiters();
+        if (draining_) return;
         draining_ = true;
         try {
-            while (!ready_.empty()) {
-                State state = ready_.front();
-                ready_.pop_front();
-                if (state->kind == RequestKind::Future ||
-                    state->kind == RequestKind::LegacyAwait) {
-                    wake(state);
-                    retire(state);
-                } else {
-                    runTask(state);
-                }
-            }
+            drainReadyStates();
         } catch (...) {
             draining_ = false;
             throw;
@@ -804,908 +975,352 @@ class RequestRouter {
         draining_ = false;
     }
 
-    bool hasReadyTask() const
+    State stateById(std::uint64_t id)
     {
-        for (const State &state : ready_) {
-            if (taskLike(state.get()) && state->status == ManagedStatus::Pending) {
-                return true;
-            }
+        const auto found = live_states_.find(id);
+        if (found == live_states_.end()) {
+            throw std::runtime_error("tdlua: unknown managed request ID");
         }
-        return false;
+        return found->second;
     }
+};
 
-    void wakeTerminalWaiters()
+inline int coreAnchorGc(lua_State *L)
+{
+    static_cast<CoreAnchor *>(lua_touserdata(L, 1))->~CoreAnchor();
+    return 0;
+}
+inline int continuationGc(lua_State *L)
+{
+    auto *continuation = static_cast<ContinuationState *>(lua_touserdata(L, 1));
     {
-        std::vector<lua_State *> terminal_waiters;
-        for (const auto &entry : waiters_) {
-            if (entry.second->dependency && terminal(entry.second->dependency)) {
-                terminal_waiters.push_back(entry.first);
-            }
-        }
-        for (lua_State *coroutine : terminal_waiters) {
-            const auto found = waiters_.find(coroutine);
-            if (found == waiters_.end() || !found->second->dependency ||
-                !terminal(found->second->dependency)) {
-                continue;
-            }
-            const State dependency = found->second->dependency;
-            resumeWaiter(found->second, dependency,
-                         dependency->status == ManagedStatus::Failed
-                             ? WaitOutcome::Failed
-                             : WaitOutcome::Success);
-        }
+        const auto core = continuation->dependency_core.lock();
+        if (core) core->abandon(continuation);
     }
+    continuation->~ContinuationState();
+    return 0;
+}
 
-    bool finalizeClear()
-    {
-        assert(waiters_.empty());
-        if (!waiters_.empty()) {
-            return false;
-        }
-        for (const auto &entry : managedWaiters()) {
-            if (entry.second && entry.second->router == this) {
-                assert(false);
-                return false;
-            }
-        }
-        waiters_.clear();
-        for (auto &entry : pending_) {
-            releaseStateReferences(entry.second.state);
-            entry.second.state->router = nullptr;
-        }
-        for (auto &entry : live_states_) {
-            if (entry.second->handle_count == 0 &&
-                entry.second->waiter_count == 0) {
-                releaseStateReferences(entry.second);
-            }
-            entry.second->router = nullptr;
-        }
-        pending_.clear();
-        live_states_.clear();
-        ready_.clear();
-        running_tasks_.clear();
-        pump_ = nullptr;
-        pump_context_ = nullptr;
-        cleanup_deferred_ = false;
-        return true;
-    }
-
-    State stateReference(ManagedState *state) const
-    {
-        for (const auto &entry : pending_) {
-            if (entry.second.state.get() == state) {
-                return entry.second.state;
-            }
-        }
-        for (const auto &entry : live_states_) {
-            if (entry.second.get() == state) {
-                return entry.second;
-            }
-        }
-        return State();
-    }
-
-    int beginYield(lua_State *L, ManagedState *state, WaitKind kind,
-                   const char *field, bool has_timeout, double timeout)
-    {
-        if (waiters_.find(L) != waiters_.end()) {
-            return luaL_error(L, "tdlua: coroutine is already waiting on TDLua");
-        }
-        WaitToken *token = new WaitToken();
-        token->router = this;
-        token->dependency = stateReference(state);
-        if (!token->dependency) {
-            delete token;
-            return luaL_error(L, "tdlua: managed state is no longer live");
-        }
-        token->coroutine = L;
-        token->kind = kind;
-        if (field) {
-            token->field = field;
-        }
-        if (has_timeout) {
-            token->has_deadline = true;
-            token->deadline = deadlineAfter(timeout);
-        }
-        ++state->handle_count;
-        token->wait_lease = true;
-        const auto running = managedTaskBindings().find(L);
-        if (running != managedTaskBindings().end()) {
-            token->task = running->second.task;
-            token->task_owner = running->second.owner;
-        }
-        lua_pushthread(L);
-        lua_xmove(L, owner_, 1);
-        token->thread_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-        waiters_[L] = token;
-        managedWaiters()[L] = token;
-        ++state->waiter_count;
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
-        token->continuation_key = registerLua52WaitToken(token);
-        const lua_KContext context =
-            static_cast<lua_KContext>(token->continuation_key);
-#else
-        const lua_KContext context = static_cast<lua_KContext>(
-            reinterpret_cast<std::uintptr_t>(token));
-#endif
-        return lua_yieldk(L, 0, context, managedWaitContinuation);
-    }
-
-    enum class BlockingResult {
-        Ready,
-        Timeout
-    };
-
-    BlockingResult pumpUntil(ManagedState *state, double timeout)
-    {
-        const auto started = std::chrono::steady_clock::now();
-        while (!terminal(state)) {
-            const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started).count();
-            const double remaining = timeout - elapsed;
-            if (remaining <= 0.0) {
-                return BlockingResult::Timeout;
-            }
-            if (!pump_) {
-                throw std::runtime_error("tdlua: managed scheduler has no pump");
-            }
-            const bool progressed = pump_(pump_context_, remaining);
-            if (!progressed) {
-                // Fake transports are intentionally non-blocking.  A tiny
-                // cooperative sleep prevents the fallback path from becoming
-                // a busy loop while real transports still block in receive.
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        return BlockingResult::Ready;
-    }
-
-    int waitState(lua_State *L, ManagedState *state, bool has_timeout,
-                  double timeout, WaitKind kind, const char *field)
-    {
-        if (!state) {
-            return luaL_error(L, "tdlua: invalid Future/Task");
-        }
-        if (has_timeout && (!std::isfinite(timeout) || timeout < 0.0)) {
-            return luaL_error(L,
-                              "tdlua: timeout must be finite and non-negative");
-        }
-        bool wait_lease = false;
-        if (!terminal(state)) {
-            if (has_timeout && timeout == 0.0) {
-                if (kind == WaitKind::Field) {
-                    lua_pushliteral(L, "tdlua: Future wait timeout");
-                    return -1;
-                }
-                lua_pushnil(L);
-                lua_pushliteral(L, "timeout");
-                return 2;
-            }
-            if (tdlua_lua_is_yieldable(L)) {
-                return beginYield(L, state, kind, field, has_timeout, timeout);
-            }
-            const double budget = has_timeout ? timeout : default_wait_timeout_;
-            ++state->handle_count;
-            wait_lease = true;
-            BlockingResult pump_result = BlockingResult::Ready;
-            try {
-                pump_result = pumpUntil(state, budget);
-            } catch (...) {
-                if (wait_lease) {
-                    releaseWaitLease(state);
-                    wait_lease = false;
-                }
-                retire(state);
-                throw;
-            }
-            if (pump_result == BlockingResult::Timeout) {
-                releaseWaitLease(state);
-                wait_lease = false;
-                retire(state);
-                if (kind == WaitKind::Field) {
-                    lua_pushliteral(L, "tdlua: Future wait timeout");
-                    return -1;
-                }
-                lua_pushnil(L);
-                lua_pushliteral(L, "timeout");
-                return 2;
-            }
-        }
-        if (kind == WaitKind::Field) {
-            if (!successful(state)) {
-                if (wait_lease) {
-                    releaseWaitLease(state);
-                }
-                retire(state);
-                lua_pushstring(L, state->error.c_str());
-                return -1;
-            }
-            lua_rawgeti(L, LUA_REGISTRYINDEX, state->response_ref);
-            lua_getfield(L, -1, field ? field : "");
-            if (wait_lease) {
-                releaseWaitLease(state);
-            }
-            retire(state);
-            return 1;
-        }
-        try {
-            const int result = pushResult(state, L);
-            if (wait_lease) {
-                releaseWaitLease(state);
-            }
-            retire(state);
-            return result;
-        } catch (const std::exception &error) {
-            if (wait_lease) {
-                releaseWaitLease(state);
-            }
-            retire(state);
-            lua_pushstring(L, error.what());
-            return -1;
-        }
-    }
-
-    void handleReleased(const State &state)
-    {
-        if (!state) {
-            return;
-        }
-        if (state->handle_count != 0) {
-            --state->handle_count;
-        }
-        retire(state);
-    }
-
-    void releaseHandle(ManagedHandle *handle)
-    {
-        if (!handle || !handle->state) {
-            return;
-        }
-        const State state = handle->state;
-        if (state->router == this) {
-            handleReleased(state);
-        }
-    }
-
-    void releaseWaitLease(const State &state)
-    {
-        releaseWaitLease(state.get());
-    }
-
-    void releaseWaitLease(ManagedState *state)
-    {
-        if (state && state->handle_count != 0) {
-            --state->handle_count;
-        }
-    }
-
-    void invalidateTaskOwner()
-    {
-        if (!task_owner_) {
-            return;
-        }
-        std::map<lua_State *, ManagedTaskBinding> &bindings =
-            managedTaskBindings();
-        for (auto it = bindings.begin(); it != bindings.end();) {
-            if (it->second.owner != task_owner_) {
-                ++it;
-                continue;
-            }
-            const State state = it->second.task;
-            if (state && !terminal(state)) {
-                markTaskFailed(state, "tdlua: task owner closed");
-                try {
-                    wake(state);
-                } catch (...) {
-                    // Destruction must not let a waiter resume exception escape.
-                }
-                state->router = nullptr;
-            }
-            it = bindings.erase(it);
-        }
-        running_tasks_.clear();
-        task_owner_->router = nullptr;
-    }
-
-    friend int managedWaitContinuation(lua_State *, int, lua_KContext);
-    friend int futureReady(lua_State *);
-    friend int futureWait(lua_State *);
-    friend int futureIndex(lua_State *);
-    friend int futureGc(lua_State *);
-    friend int taskReady(lua_State *);
-    friend int taskWait(lua_State *);
-    friend int taskIndex(lua_State *);
-    friend int taskGc(lua_State *);
+// Backend adapter. Only the Lua anchor, not this facade, is retained by work.
+class RequestRouter {
+    std::shared_ptr<SchedulerCore> core_;
+    lua_State *lua_owner_;
+    int anchor_reference_ = LUA_NOREF;
 
 public:
-    using Pump = bool (*)(void *, double);
+    using Pump = SchedulerCore::Pump;
 
-    explicit RequestRouter(lua_State *owner)
-        : owner_(owner), task_owner_(new ManagedTaskOwner())
+    // ----- CoreAnchor lifetime -----
+
+    explicit RequestRouter(lua_State *L)
+        : core_(new SchedulerCore(L)), lua_owner_(tdlua_lua_main_thread(L))
     {
-        task_owner_->router = this;
+        if (luaL_newmetatable(L, "tdlua.core")) {
+            lua_pushcfunction(L, coreAnchorGc); lua_setfield(L, -2, "__gc");
+        }
+        lua_pop(L, 1);
+        new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{core_};
+        luaL_setmetatable(L, "tdlua.core");
+        lua_newtable(L); lua_setuservalue(L, -2);
+        pushCoreAnchors(L);
+        lua_pushvalue(L, -2); lua_rawsetp(L, -2, core_.get()); lua_pop(L, 1);
+        anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
     }
 
     ~RequestRouter()
     {
-        clear();
-        invalidateTaskOwner();
+        core_->detachTransport();
+        if (anchor_reference_ != LUA_NOREF) {
+            luaL_unref(lua_owner_, LUA_REGISTRYINDEX, anchor_reference_);
+        }
     }
 
     RequestRouter(const RequestRouter &) = delete;
     RequestRouter &operator=(const RequestRouter &) = delete;
 
-    void setPump(void *context, Pump pump)
+    void attachStorage(lua_State *L, int client)
     {
-        pump_context_ = context;
-        pump_ = pump;
+        client = lua_absindex(L, client);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, anchor_reference_);
+        lua_setuservalue(L, client);
+        luaL_unref(L, LUA_REGISTRYINDEX, anchor_reference_);
+        anchor_reference_ = LUA_NOREF;
     }
 
-    std::uint64_t nextRequestId()
+    // ----- Backend pump and state creation -----
+
+    void setPump(void *context, Pump pump) { core_->setPump(context, pump); }
+    std::uint64_t nextRequestId() { return core_->nextRequestId(); }
+    void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }
+    std::size_t pendingCount() const { return core_->pendingCount(); }
+    std::uint64_t raw() { return core_->raw(); }
+    ManagedStatePtr future() { return core_->future(); }
+    ManagedStatePtr task(lua_State *L, int callback, int context, bool thread)
     {
-        return next_++;
+        return core_->task(L, callback, context, thread);
+    }
+    ManagedStatePtr awaitState(lua_State *L) { return core_->awaitState(L); }
+    std::uint64_t request(lua_State *L, int callback, int context)
+    {
+        return core_->request(L, callback, context);
+    }
+    std::uint64_t await(lua_State *L) { return core_->await(L); }
+    void cancel(std::uint64_t id) { core_->cancel(id); }
+
+    // ----- Response routing and scheduler progress -----
+
+    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push)
+    {
+        return core_->dispatchRoute(id, std::move(push));
     }
 
-    void observeRequestId(std::uint64_t id)
+    template<class Push> bool dispatch(std::uint64_t id, Push push)
     {
-        if (!id || id < next_) {
-            return;
-        }
-        next_ = id == std::numeric_limits<std::uint64_t>::max()
-                    ? id
-                    : id + 1;
-    }
-
-    std::size_t pendingCount() const { return pending_.size(); }
-
-    std::uint64_t raw()
-    {
-        return registerState(RequestKind::Raw)->request_id;
-    }
-
-    State future()
-    {
-        return registerState(RequestKind::Future);
-    }
-
-    State task(lua_State *L, int callback_index, int context_index,
-               bool supplied_thread)
-    {
-        State state = registerState(RequestKind::Task);
-        state->callback_is_thread = supplied_thread;
-        try {
-            if (supplied_thread) {
-                if (!lua_isthread(L, callback_index)) {
-                    throw std::runtime_error("tdlua: task must be a coroutine thread");
-                }
-                captureValue(L, callback_index, state->thread_ref);
-            } else {
-                if (!lua_isfunction(L, callback_index)) {
-                    throw std::runtime_error("tdlua: request callback must be a function");
-                }
-                captureValue(L, callback_index, state->callback_ref);
-            }
-            if (context_index) {
-                captureValue(L, context_index, state->context_ref);
-            }
-            return state;
-        } catch (...) {
-            releaseStateReferences(state);
-            pending_.erase(state->request_id);
-            live_states_.erase(state->request_id);
-            throw;
-        }
-    }
-
-    State awaitState(lua_State *L)
-    {
-        if (lua_pushthread(L)) {
-            lua_pop(L, 1);
-            throw std::runtime_error("tdlua: await() must run inside a coroutine");
-        }
-        lua_pop(L, 1);
-        State state = registerState(RequestKind::LegacyAwait);
-        return state;
-    }
-
-    std::uint64_t request(lua_State *L, int callback_index, int context_index)
-    {
-        State state = registerState(RequestKind::LegacyRequest);
-        state->callback_is_thread = false;
-        try {
-            if (!lua_isfunction(L, callback_index)) {
-                throw std::runtime_error("tdlua: request callback must be a function");
-            }
-            captureValue(L, callback_index, state->callback_ref);
-            if (context_index) {
-                captureValue(L, context_index, state->context_ref);
-            }
-            return state->request_id;
-        } catch (...) {
-            releaseStateReferences(state);
-            pending_.erase(state->request_id);
-            live_states_.erase(state->request_id);
-            throw;
-        }
-    }
-
-    std::uint64_t await(lua_State *L)
-    {
-        const State state = awaitState(L);
-        // This overload is retained for the low-level/common-router API used
-        // by the legacy tests.  The public binding uses awaitState()+wait(),
-        // which has the full failure continuation.  A coroutine already
-        // suspended at coroutine.yield receives the response directly.
-        if (lua_status(L) == LUA_YIELD) {
-            WaitToken *token = new WaitToken();
-            token->router = this;
-            token->dependency = state;
-            token->coroutine = L;
-            token->direct_resume = true;
-            lua_pushthread(L);
-            lua_xmove(L, owner_, 1);
-            token->thread_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-            waiters_[L] = token;
-            managedWaiters()[L] = token;
-            ++state->waiter_count;
-        }
-        return state->request_id;
-    }
-
-    void cancel(std::uint64_t id)
-    {
-        const auto found = pending_.find(id);
-        if (found == pending_.end()) {
-            return;
-        }
-        const State state = found->second.state;
-        pending_.erase(found);
-        live_states_.erase(id);
-        releaseStateReferences(state);
-        state->router = nullptr;
-    }
-
-    template <class Push>
-    RouteKind dispatchRoute(std::uint64_t id, Push push)
-    {
-        if (!id) {
-            return RouteKind::Update;
-        }
-        const auto found = pending_.find(id);
-        if (found == pending_.end()) {
-            return RouteKind::Unknown;
-        }
-        const PendingRequest pending = found->second;
-        pending_.erase(found);
-        const State state = pending.state;
-        if (pending.kind == RequestKind::Raw) {
-            state->status = ManagedStatus::Done;
-            releaseStateReferences(state);
-            live_states_.erase(state->request_id);
-            state->router = nullptr;
-            return RouteKind::Raw;
-        }
-
-        try {
-            push(owner_);
-            state->response_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-            if (pending.kind == RequestKind::Future ||
-                pending.kind == RequestKind::LegacyAwait) {
-                state->status = ManagedStatus::Resolved;
-                ready_.push_back(state);
-                return pending.kind == RequestKind::Future
-                           ? RouteKind::Future
-                           : RouteKind::LegacyAwait;
-            }
-            ready_.push_back(state);
-            // The compatibility request() API historically reports callback
-            // failures from the driving receive call.  A user-visible Task,
-            // however, records the failure for Task:wait() instead of making
-            // the transport driver fail synchronously.
-            if (state->status == ManagedStatus::Failed &&
-                state->handle_count == 0) {
-                throw std::runtime_error(state->error.empty()
-                                             ? "tdlua: task failed"
-                                             : state->error);
-            }
-            return pending.kind == RequestKind::LegacyRequest
-                       ? RouteKind::LegacyRequest
-                       : RouteKind::Task;
-        } catch (...) {
-            setFailure(state, "tdlua: local response routing failure");
-            wake(state);
-            retire(state);
-            throw;
-        }
-    }
-
-    template <class Push>
-    bool dispatch(std::uint64_t id, Push push)
-    {
-        const RouteKind route = dispatchRoute(id, std::move(push));
-        tick();
+        const auto core = core_;
+        const RouteKind route = core->dispatchRoute(id, std::move(push));
+        core->tick();
         return route != RouteKind::Unknown && route != RouteKind::Update;
     }
 
-    int wait(lua_State *L, const State &state, bool has_timeout,
-             double timeout, WaitKind kind = WaitKind::Result,
-             const char *field = nullptr)
+    // closePending and detachTransport are compatibility names for phase one.
+    // clear performs phase one followed by the protected scheduler drain.
+    void closePending()
     {
-        return waitState(L, state.get(), has_timeout, timeout, kind, field);
+        core_->detachTransport();
     }
 
-    // Resolve the state by ID without copying a shared_ptr into the caller's
-    // C++ frame.  This matters when the wait yields: Lua resumes through a C
-    // continuation and cannot run destructors for locals that were skipped by
-    // the yield longjmp.
-    int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
-                 double timeout, WaitKind kind = WaitKind::Result,
-                 const char *field = nullptr)
+    void detachTransport()
     {
-        const auto pending = pending_.find(request_id);
-        if (pending != pending_.end()) {
-            return waitState(L, pending->second.state.get(), has_timeout,
-                             timeout, kind, field);
-        }
-        const auto live = live_states_.find(request_id);
-        if (live != live_states_.end()) {
-            return waitState(L, live->second.get(), has_timeout, timeout, kind,
-                             field);
-        }
-        return luaL_error(L, "tdlua: unknown managed request ID");
-    }
-
-    void closePending(const std::string &message = "tdlua: client closed")
-    {
-        std::vector<State> states;
-        for (auto &entry : pending_) {
-            if (entry.second.kind != RequestKind::Raw) {
-                states.push_back(entry.second.state);
-            }
-        }
-        for (const State &state : states) {
-            const auto found = pending_.find(state->request_id);
-            if (found == pending_.end()) {
-                continue;
-            }
-            pending_.erase(found);
-            setFailure(state, message);
-            wake(state);
-            retire(state);
-        }
-    }
-
-    void drain()
-    {
-        drainReady();
+        core_->detachTransport();
     }
 
     void tick()
     {
-        expireWaiters();
-        drainReady();
+        const auto core = core_;
+        core->tick();
     }
 
-    void handleGC(ManagedHandle *handle)
+    void drain()
     {
-        if (!handle) {
-            return;
-        }
-        releaseHandle(handle);
-        handle->state.reset();
-        handle->~ManagedHandle();
+        tick();
     }
 
     void clear()
     {
-        if (clearing_) {
-            return;
-        }
-        clearing_ = true;
-        try {
-            cleanup_deferred_ = true;
-            closePending();
-            wakeTerminalWaiters();
-            if (!running_tasks_.empty() || !waiters_.empty() || hasReadyTask()) {
-                if (!draining_) {
-                    clearing_ = false;
-                    drainReady();
-                    if (running_tasks_.empty() && !hasReadyTask()) {
-                        finalizeClear();
-                    }
-                    return;
-                }
-                clearing_ = false;
-                return;
-            }
-            finalizeClear();
-            clearing_ = false;
-        } catch (...) {
-            clearing_ = false;
-            throw;
-        }
+        const auto core = core_;
+        core->detachTransport();
+        core->tick();
     }
+    int wait(lua_State *L, const ManagedStatePtr &state, bool timed, double timeout,
+             WaitKind kind = WaitKind::Result, const char *field = nullptr);
+    int waitById(lua_State *L, std::uint64_t id, bool timed, double timeout,
+                 WaitKind kind = WaitKind::Result, const char *field = nullptr);
 };
 
-/* Lua proxy functions are common policy, not backend bindings. */
-inline ManagedHandle *checkManagedHandle(lua_State *L, int index,
-                                         const char *metatable)
+// The C++ scheduler methods above finish before this boundary enters Lua's
+// longjmp-based error or yield path.
+inline int finishManagedWait(lua_State *L, int result)
 {
-    ManagedHandle *handle = static_cast<ManagedHandle *>(
-        luaL_checkudata(L, index, metatable));
-    if (!handle || !handle->state) {
-        luaL_error(L, "tdlua: invalid managed handle");
+    if (result < 0) {
+        return lua_error(L);
     }
-    return handle;
+    return result;
 }
 
-inline int futureGc(lua_State *L)
+inline int yieldManagedWait(lua_State *L, int context, int results)
 {
-    ManagedHandle *handle = static_cast<ManagedHandle *>(
-        luaL_checkudata(L, 1, "tdlua.future"));
-    if (handle && handle->state && handle->state->router) {
-        handle->state->router->handleGC(handle);
-    } else if (handle) {
-        releaseManagedStateReferences(handle->state.get());
-        handle->state.reset();
-        handle->~ManagedHandle();
+    if (context) {
+        return lua_yieldk(L, 0, static_cast<lua_KContext>(context),
+                          managedWaitContinuation);
     }
+    return finishManagedWait(L, results);
+}
+
+inline int RequestRouter::wait(lua_State *L, const ManagedStatePtr &state, bool timed,
+                               double timeout, WaitKind kind, const char *field)
+{
+    int results = 0, context = 0;
+    try {
+        context = core_->prepareWait(L, state, timed, timeout, kind, field, results);
+    } catch (const std::exception &error) {
+        lua_pushstring(L, error.what());
+        results = -1;
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        results = -1;
+    }
+    return yieldManagedWait(L, context, results);
+}
+
+inline int RequestRouter::waitById(lua_State *L, std::uint64_t id, bool timed,
+                                    double timeout, WaitKind kind, const char *field)
+{
+    int results = 0, context = 0;
+    try {
+        const auto state = core_->stateById(id);
+        context = core_->prepareWait(L, state, timed, timeout, kind, field, results);
+    } catch (const std::exception &error) {
+        lua_pushstring(L, error.what());
+        results = -1;
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        results = -1;
+    }
+    return yieldManagedWait(L, context, results);
+}
+
+inline ManagedHandle *checkManagedHandle(lua_State *L, int index, const char *type)
+{
+    return static_cast<ManagedHandle *>(luaL_checkudata(L, index, type));
+}
+
+inline int managedGc(lua_State *L)
+{
+    auto *handle = static_cast<ManagedHandle *>(lua_touserdata(L, 1));
+    {
+        const auto core = handle->state->core.lock();
+        if (core) core->releaseHandle(handle->state);
+    }
+    handle->~ManagedHandle();
     return 0;
 }
-
-inline int taskGc(lua_State *L)
-{
-    ManagedHandle *handle = static_cast<ManagedHandle *>(
-        luaL_checkudata(L, 1, "tdlua.task"));
-    if (handle && handle->state && handle->state->router) {
-        handle->state->router->handleGC(handle);
-    } else if (handle) {
-        releaseManagedStateReferences(handle->state.get());
-        handle->state.reset();
-        handle->~ManagedHandle();
-    }
-    return 0;
-}
-
 inline int futureReady(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
-    lua_pushboolean(L, handle->state->status == ManagedStatus::Resolved ||
-                           handle->state->status == ManagedStatus::Failed);
+    const ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
+    lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
 }
 
 inline int taskReady(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.task");
-    lua_pushboolean(L, handle->state->status == ManagedStatus::Done ||
-                           handle->state->status == ManagedStatus::Failed);
+    const ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.task");
+    lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
 }
-
-inline int pushDetachedManagedResult(lua_State *L,
-                                      const std::shared_ptr<ManagedState> &state)
+inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char *field)
 {
-    if (!state) {
-        lua_pushliteral(L, "tdlua: invalid managed handle");
-        return -1;
+    ManagedHandle *handle = checkManagedHandle(L, 1, type);
+    int results = 0, context = 0;
+    const bool timed = kind == WaitKind::Result && !lua_isnoneornil(L, 2);
+    double timeout = 0;
+    if (timed && !lua_isnumber(L, 2)) {
+        return luaL_error(L, "tdlua: wait timeout must be a number");
     }
-    if (state->status == ManagedStatus::Failed) {
-        lua_pushstring(L, state->error.empty()
-                                  ? "tdlua: managed operation failed"
-                                  : state->error.c_str());
-        return -1;
+    if (timed) {
+        timeout = lua_tonumber(L, 2);
     }
-    if (state->kind == RequestKind::Future ||
-        state->kind == RequestKind::LegacyAwait) {
-        if (state->response_ref == LUA_NOREF) {
-            lua_pushliteral(L, "tdlua: missing managed response");
-            return -1;
+    try {
+        const auto core = handle->state->core.lock();
+        if (!core) {
+            throw std::runtime_error("tdlua: scheduler storage unavailable");
         }
-        lua_rawgeti(L, LUA_REGISTRYINDEX, state->response_ref);
-        return 1;
+        context = core->prepareWait(L, handle->state, timed, timeout, kind, field, results);
+    } catch (const std::exception &error) {
+        lua_pushstring(L, error.what());
+        results = -1;
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        results = -1;
     }
-    if (state->result_ref == LUA_NOREF) {
-        return 0;
-    }
-    lua_rawgeti(L, LUA_REGISTRYINDEX, state->result_ref);
-    const int table = lua_gettop(L);
-    lua_getfield(L, table, "n");
-    const int count = static_cast<int>(lua_tointeger(L, -1));
-    lua_pop(L, 1);
-    for (int index = 1; index <= count; ++index) {
-        lua_rawgeti(L, table, index);
-    }
-    lua_remove(L, table);
-    return count;
-}
-
-inline bool optionalTimeout(lua_State *L, int index, bool &present,
-                            double &timeout)
-{
-    present = false;
-    timeout = 0.0;
-    if (lua_gettop(L) < index || lua_isnil(L, index)) {
-        return true;
-    }
-    if (!lua_isnumber(L, index)) {
-        return false;
-    }
-    present = true;
-    timeout = lua_tonumber(L, index);
-    return true;
-}
-
-inline int finishManagedWait(lua_State *L, int result)
-{
-    return result < 0 ? lua_error(L) : result;
+    return yieldManagedWait(L, context, results);
 }
 
 inline int futureWait(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
-    bool present = false;
-    double timeout = 0.0;
-    if (!optionalTimeout(L, 2, present, timeout)) {
-        return luaL_error(L, "tdlua: Future:wait timeout must be a number");
-    }
-    int result = 0;
-    bool failed = false;
-    try {
-        if (!handle->state->router) {
-            result = pushDetachedManagedResult(L, handle->state);
-        } else {
-            result = handle->state->router->wait(L, handle->state, present, timeout);
-        }
-    } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
-        failed = true;
-    }
-    return failed ? lua_error(L) : finishManagedWait(L, result);
+    return managedWait(L, "tdlua.future", WaitKind::Result, nullptr);
 }
 
 inline int taskWait(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.task");
-    bool present = false;
-    double timeout = 0.0;
-    if (!optionalTimeout(L, 2, present, timeout)) {
-        return luaL_error(L, "tdlua: Task:wait timeout must be a number");
+    return managedWait(L, "tdlua.task", WaitKind::Result, nullptr);
+}
+
+inline int managedIndex(lua_State *L, const char *type, bool task)
+{
+    ManagedHandle *handle = checkManagedHandle(L, 1, type);
+    const char *key = luaL_checkstring(L, 2);
+    if (std::string(key) == "wait") {
+        lua_pushcfunction(L, task ? taskWait : futureWait);
+        return 1;
     }
-    int result = 0;
-    bool failed = false;
-    try {
-        if (!handle->state->router) {
-            result = pushDetachedManagedResult(L, handle->state);
-        } else {
-            result = handle->state->router->wait(L, handle->state, present, timeout);
-        }
-    } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
-        failed = true;
+    if (std::string(key) == "ready") {
+        lua_pushcfunction(L, task ? taskReady : futureReady);
+        return 1;
     }
-    return failed ? lua_error(L) : finishManagedWait(L, result);
+    if (std::string(key) == "_request_id") {
+        tdlua_lua_push_integer(
+            L, static_cast<std::int64_t>(handle->state->request_id));
+        return 1;
+    }
+    if (task) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return managedWait(L, type, WaitKind::Field, key);
 }
 
 inline int futureIndex(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.future");
-    if (!lua_isstring(L, 2)) {
-        return luaL_error(L, "tdlua: Future field name must be a string");
-    }
-    const char *key = lua_tostring(L, 2);
-    if (std::string(key) == "wait") {
-        lua_pushcfunction(L, futureWait);
-        return 1;
-    }
-    if (std::string(key) == "ready") {
-        lua_pushcfunction(L, futureReady);
-        return 1;
-    }
-    if (std::string(key) == "_request_id") {
-        tdlua_lua_push_integer(L,
-                               static_cast<std::int64_t>(handle->state->request_id));
-        return 1;
-    }
-    int result = 0;
-    bool failed = false;
-    try {
-        if (!handle->state->router) {
-            if (handle->state->status == ManagedStatus::Failed) {
-                lua_pushstring(L, handle->state->error.empty()
-                                      ? "tdlua: managed operation failed"
-                                      : handle->state->error.c_str());
-                failed = true;
-            } else {
-                lua_rawgeti(L, LUA_REGISTRYINDEX, handle->state->response_ref);
-                lua_getfield(L, -1, key);
-                result = 1;
-            }
-        } else {
-            result = handle->state->router->wait(L, handle->state, false, 0.0,
-                                                 WaitKind::Field, key);
-        }
-    } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
-        failed = true;
-    }
-    return failed ? lua_error(L) : finishManagedWait(L, result);
+    return managedIndex(L, "tdlua.future", false);
 }
 
 inline int taskIndex(lua_State *L)
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, "tdlua.task");
-    if (!lua_isstring(L, 2)) {
-        return luaL_error(L, "tdlua: Task member name must be a string");
-    }
-    const char *key = lua_tostring(L, 2);
-    if (std::string(key) == "wait") {
-        lua_pushcfunction(L, taskWait);
-        return 1;
-    }
-    if (std::string(key) == "ready") {
-        lua_pushcfunction(L, taskReady);
-        return 1;
-    }
-    if (std::string(key) == "_request_id") {
-        tdlua_lua_push_integer(L,
-                               static_cast<std::int64_t>(handle->state->request_id));
-        return 1;
-    }
-    lua_pushnil(L);
-    return 1;
+    return managedIndex(L, "tdlua.task", true);
 }
 
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
+#if LUA_VERSION_NUM == 502
 LUA_KFUNCTION(managedWaitContinuation)
-{
-    WaitToken *token = findLua52WaitToken(static_cast<int>(ctx));
-    if (!token || !token->router) {
-        return luaL_error(L, "tdlua: invalid managed waiter");
-    }
-    const int result = token->router->continuation(L, token);
-    return result < 0 ? lua_error(L) : result;
-}
 #else
 inline int managedWaitContinuation(lua_State *L, int, lua_KContext ctx)
-{
-    WaitToken *token = reinterpret_cast<WaitToken *>(
-        static_cast<std::uintptr_t>(ctx));
-    if (!token || !token->router) {
-        return luaL_error(L, "tdlua: invalid managed waiter");
-    }
-    const int result = token->router->continuation(L, token);
-    return result < 0 ? lua_error(L) : result;
-}
 #endif
+{
+    auto *continuation = static_cast<ContinuationState *>(
+        luaL_testudata(L, static_cast<int>(ctx), "tdlua.continuation"));
+    int results = -1;
+    if (!continuation) {
+        return luaL_error(L, "tdlua: invalid managed continuation");
+    }
+    try {
+        const auto core = continuation->dependency_core.lock();
+        if (!core) {
+            throw std::runtime_error("tdlua: scheduler storage unavailable");
+        }
+        results = core->completeContinuation(L, continuation);
+        lua_pushnil(L);
+        lua_setuservalue(L, static_cast<int>(ctx));
+    } catch (const std::exception &error) {
+        lua_pushstring(L, error.what());
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+    }
+    return finishManagedWait(L, results);
+}
 
+// Future and Task handles share the same lifetime bookkeeping. Their uservalue
+// keeps the CoreAnchor reachable while the handle remains visible to Lua.
 inline void ensureManagedMetatables(lua_State *L)
 {
     if (luaL_newmetatable(L, "tdlua.future")) {
-        lua_pushcfunction(L, futureIndex);
-        lua_setfield(L, -2, "__index");
-        lua_pushcfunction(L, futureGc);
-        lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, futureIndex); lua_setfield(L, -2, "__index");
+        lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
     }
     lua_pop(L, 1);
     if (luaL_newmetatable(L, "tdlua.task")) {
-        lua_pushcfunction(L, taskIndex);
-        lua_setfield(L, -2, "__index");
-        lua_pushcfunction(L, taskGc);
-        lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, taskIndex); lua_setfield(L, -2, "__index");
+        lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
     }
     lua_pop(L, 1);
 }
-
-inline void pushManagedHandle(lua_State *L, const std::shared_ptr<ManagedState> &state,
-                              const char *metatable)
+inline void pushManagedHandle(lua_State *L, const ManagedStatePtr &state, const char *type)
 {
     ensureManagedMetatables(L);
-    void *memory = lua_newuserdata(L, sizeof(ManagedHandle));
-    ManagedHandle *handle = new (memory) ManagedHandle();
-    handle->state = state;
+    new (lua_newuserdata(L, sizeof(ManagedHandle))) ManagedHandle{state};
     ++state->handle_count;
-    luaL_setmetatable(L, metatable);
+    luaL_setmetatable(L, type);
+    const auto core = state->core.lock();
+    pushCoreAnchor(L, core.get());
+    lua_setuservalue(L, -2);
 }
 
-}  // namespace tdlua
+} // namespace tdlua
