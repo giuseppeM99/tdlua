@@ -5,6 +5,7 @@
 #include "tdlua/backend/json/client.h"
 
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -22,6 +23,8 @@ struct Fake {
     json sync = {{"@type", "ok"}};
     bool closed = false;
     bool fail = false;
+    std::function<void(double)> before_receive;
+    std::vector<double> waits;
 
     TDLua::Transport transport()
     {
@@ -33,8 +36,10 @@ struct Fake {
                 }
                 fake.sent.emplace_back(id, std::move(request));
             },
-            [](void *context, double) {
+            [](void *context, double timeout) {
                 auto &fake = *static_cast<Fake *>(context);
+                fake.waits.push_back(timeout);
+                if (fake.before_receive) fake.before_receive(timeout);
                 if (fake.incoming.empty()) {
                     return json(nullptr);
                 }
@@ -862,6 +867,407 @@ void testDispatcherDestructorDoesNotRunLua(lua_State *L)
     runLua(L, "assert(destructor_callback_calls == 0)");
 }
 
+void testManagedDrivers(lua_State *L)
+{
+    Fake fake, other;
+    createClients(L);
+    TDLua *client = attachTransport(L, "c", fake);
+    attachTransport(L, "d", other);
+    runLua(L, R"lua(
+        c:loop()
+        for _, args in ipairs({{1}, {0.5}, {false}, {{}}, {function() end, 1}}) do
+            local ok, message = pcall(c.poll, c, table.unpack(args))
+            assert(not ok and message:find('poll'))
+        end
+        assert(not pcall(c.loop, c, 1))
+        assert(not pcall(c.loop, c, function() end, {concurrent=1}))
+        assert(not pcall(c.loop, c, function() end, {unknown=true}))
+        raw_a = c:send{_='getMe'}
+        raw_b = c:getMe(true)
+        future = c:getMe()
+        task = c:getMe(function(r) return r.value end)
+        discarded = c:getMe(); discarded_id = discarded._request_id
+        discarded = nil; collectgarbage('collect')
+        seen = 0
+        c:on('m4', function(u) seen = seen + u.value end)
+    )lua");
+    fake.response(fake.sent[0].first, 1);
+    fake.response(fake.sent[2].first, 3);
+    fake.response(fake.sent[1].first, 2);
+    fake.response(fake.sent[3].first, 4);
+    fake.response(fake.sent[4].first, 5);
+    fake.update("m4", 6);
+    runLua(L, R"lua(
+        local u = c:poll()
+        assert(u.value == 6 and u._request_id == nil and seen == 6)
+        assert(future:ready() and future.value == 3 and task:wait() == 4)
+        c:off('m4')
+        assert(c:receive(0)._request_id == raw_a)
+        assert(c:receive(0)._request_id == raw_b)
+        assert(c:receive(0) == nil)
+        c:loop()
+    )lua");
+
+    // The migration loop starts all three callbacks before any one completes.
+    fake.update("m4", 1);
+    fake.update("m4", 2);
+    fake.update("m4", 3);
+    const auto sentBeforeMigration = fake.sent.size();
+    runLua(L, R"lua(
+        tasks = {}; starts = {}; finishes = {}
+        for i=1,3 do
+            tasks[i] = c:poll(function(u)
+                starts[#starts+1] = u.value
+                local a = c:testMethod{value=u.value*10+1}
+                local b = c:testMethod{value=u.value*10+2}
+                local av, bv = a.value, b.value
+                finishes[#finishes+1] = u.value
+                return av, bv, nil
+            end)
+            assert(tasks[i]._request_id == nil and not tasks[i]:ready())
+        end
+        assert(#starts == 3 and #finishes == 0)
+    )lua");
+    for (int i = 2; i >= 0; --i) {
+        fake.response(fake.sent[sentBeforeMigration + 2*i + 1].first, 10*i + 12);
+        fake.response(fake.sent[sentBeforeMigration + 2*i].first, 10*i + 11);
+    }
+    runLua(L, R"lua(
+        c:loop()
+        assert(finishes[1] == 3 and finishes[2] == 2 and finishes[3] == 1)
+        for i=1,3 do
+            local a,b,n = tasks[i]:wait()
+            assert(a == i*10+1 and b == i*10+2 and n == nil)
+        end
+    )lua");
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        dropped_done = false
+        c:poll(function() local f=c:getMe(); dropped_done=f.value==19 end)
+        collectgarbage('collect')
+    )lua");
+    fake.response(fake.sent.back().first, 19);
+    runLua(L, "c:loop(); assert(dropped_done)");
+    fake.update("m4", 1);
+    runLua(L, "false_task = c:poll(function() return false end); assert(false_task:wait() == false)");
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        bad_poll = c:poll(function() error('poll callback error') end)
+        assert(bad_poll:ready())
+        local ok,msg=pcall(function() bad_poll:wait() end)
+        assert(not ok and msg:find('poll callback error'))
+        c:loop()
+    )lua");
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        prior_poll=c:poll(function() c:getMe():wait(); return false end)
+        ordinary=c:getMe(function() return false end)
+        legacy_false=c:request({_='getMe'}, function() return false end)
+    )lua");
+    fake.response(fake.sent[fake.sent.size()-3].first, 1);
+    fake.response(fake.sent[fake.sent.size()-2].first, 2);
+    fake.response(fake.sent.back().first, 3);
+    fake.update("m4", 1);
+    fake.update("m4", 2);
+    runLua(L, R"lua(
+        false_origins_seen=0
+        c:loop(function(u)
+            false_origins_seen=false_origins_seen+1
+            if u.value==2 then return false end
+        end)
+        assert(false_origins_seen==2 and prior_poll:wait()==false and ordinary:wait()==false)
+    )lua");
+
+    // A Future-only runner discards updates but must preserve raw responses.
+    runLua(L, "wait_raw=c:send{_='getMe'}; wait_future=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 91);
+    fake.update("unobserved", 92);
+    fake.response(fake.sent.back().first, 93);
+    runLua(L, R"lua(
+        assert(wait_future:wait().value==93)
+        assert(c:receive(0)._request_id==wait_raw and c:receive(0)==nil)
+    )lua");
+
+    runLua(L, "raw = c:send{_='getMe'}; pending = c:getMe()");
+    const auto raw_id = fake.sent[fake.sent.size()-2].first;
+    fake.update("unobserved", 10);
+    fake.response(raw_id, 11);
+    fake.response(fake.sent.back().first, 12);
+    runLua(L, R"lua(
+        c:loop(); assert(pending.value == 12)
+        local before = c:pendingCount(); c:send{_='getMe'}; c:loop()
+        assert(c:pendingCount() == before+1)
+        assert(c:receive(0)._request_id == raw)
+        assert(c:receive(0) == nil)
+    )lua");
+
+    // Concurrent A/B run, A stops, C has only its ordinary M3 observer.
+    runLua(L, "loop_raw_a=c:send{_='getMe'}; loop_raw_b=c:send{_='getMe'}");
+    const auto loop_raw_a = fake.sent[fake.sent.size()-2].first;
+    const auto loop_raw_b = fake.sent.back().first;
+    fake.response(loop_raw_a, 81);
+    fake.update("m4", 1);
+    fake.update("m4", 2);
+    int phase = 0;
+    fake.before_receive = [&](double) {
+        if (phase == 0 && fake.incoming.empty()) {
+            phase = 1;
+            fake.response(fake.sent[fake.sent.size()-2].first, 21);
+            fake.response(loop_raw_b, 82);
+            fake.update("m4", 3);
+            fake.response(fake.sent.back().first, 22);
+        }
+    };
+    runLua(L, R"lua(
+        loop_started = {}; loop_done = {}; event_seen = {}
+        c:on('m4', function(u) event_seen[#event_seen+1]=u.value; return false end)
+        c:loop(function(u)
+            loop_started[#loop_started+1]=u.value
+            local f=c:getMe(); local v=f.value
+            loop_done[#loop_done+1]=u.value
+            if u.value==1 then return false end
+        end)
+        assert(#loop_started==2 and #loop_done==2 and #event_seen==3)
+        assert(loop_started[1]==1 and loop_started[2]==2)
+        c:off('m4')
+        assert(c:receive(0)._request_id==loop_raw_a)
+        assert(c:receive(0)._request_id==loop_raw_b)
+    )lua");
+    fake.before_receive = {};
+
+    // Serialized catch-all does not serialize matching M3 event Tasks.
+    for (int i = 1; i <= 3; ++i) fake.update("m4", i);
+    int serial_responses = 0;
+    fake.before_receive = [&](double) {
+        if (fake.incoming.empty() && serial_responses < 3) {
+            ++serial_responses;
+            fake.response(fake.sent.back().first, 30+serial_responses);
+        }
+    };
+    runLua(L, R"lua(
+        serial = {}; independent=0
+        c:on('m4', function() independent=independent+1 end)
+        c:loop(function(u)
+            serial[#serial+1]='start'..u.value
+            local r=c:getMe():wait()
+            serial[#serial+1]='done'..u.value
+            if u.value==3 then return false end
+        end, {concurrent=false})
+        assert(table.concat(serial, ',')=='start1,done1,start2,done2,start3,done3')
+        assert(independent==3); c:off('m4')
+    )lua");
+    fake.before_receive = {};
+
+    for (int i = 1; i <= 3; ++i) fake.update("m4", i);
+    fake.before_receive = [&](double) {
+        if (fake.incoming.empty()) fake.response(fake.sent.back().first, 40);
+    };
+    runLua(L, R"lua(
+        serial_stop=0
+        c:loop(function()
+            serial_stop=serial_stop+1; c:getMe():wait(); return false
+        end, {concurrent=false})
+        assert(serial_stop==1)
+    )lua");
+    fake.before_receive = {};
+
+    fake.update("m4", 1);
+    fake.update("m4", 2);
+    runLua(L, R"lua(
+        raw_competition_calls=0
+        c:loop(function(u)
+            raw_competition_calls=raw_competition_calls+1
+            assert(u.value==1 and c:receive(0).value==2)
+            return false
+        end)
+        assert(raw_competition_calls==1)
+    )lua");
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        unrelated_future=c:getMe()
+        c:loop(function() return false end)
+        assert(not unrelated_future:ready())
+    )lua");
+    fake.response(fake.sent.back().first, 41);
+    runLua(L, "c:loop(); assert(unrelated_future.value==41)");
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        consumer_errors=0
+        c:on('m4', function()
+            for _,f in ipairs({c.poll,c.loop}) do
+                local ok,msg=pcall(f,c)
+                assert(not ok and msg:find('already active'))
+                consumer_errors=consumer_errors+1
+            end
+            c:off('m4')
+        end)
+        c:loop(function()
+            local ok,msg=pcall(c.poll,c)
+            assert(not ok and msg:find('already active'))
+            consumer_errors=consumer_errors+1
+            return false
+        end)
+        assert(consumer_errors==3)
+    )lua");
+
+    runLua(L, R"lua(
+        nested_consumer=c:getMe(function()
+            local ok,msg=pcall(c.poll,c)
+            assert(not ok and msg:find('already active'))
+            return 1
+        end)
+    )lua");
+    fake.response(fake.sent.back().first, 1);
+    runLua(L, "c:receive(0); assert(nested_consumer:wait()==1)");
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        c:on('m4', function()
+            local ok,msg=pcall(c.poll,c)
+            assert(not ok and msg:find('already active')); c:off('m4')
+        end)
+        assert(c:poll().value==1)
+        c:loop()
+    )lua");
+
+    fake.update("m4", 1);
+    other.before_receive = [&](double) {
+        if (other.incoming.empty()) other.response(other.sent.back().first, 51);
+    };
+    runLua(L, R"lua(
+        cross_done=false
+        c:loop(function()
+            local v=d:getMe().value; cross_done=v==51; return false
+        end)
+        assert(cross_done)
+    )lua");
+    other.before_receive = {};
+
+    // A poll callback's owner can be collected while its dependency survives.
+    Fake owner;
+    runLua(L, "e=tdlua()");
+    attachTransport(L, "e", owner);
+    owner.update("m4", 1);
+    runLua(L, R"lua(
+        survivor=e:poll(function() return d:getMe().value end)
+        e=nil; collectgarbage('collect'); assert(not survivor:ready())
+    )lua");
+    other.response(other.sent.back().first, 52);
+    runLua(L, "d:loop(); assert(survivor:wait()==52)");
+
+    // An abandoned poll callback cycle is Lua-owned, not a registry root.
+    Fake abandoned_owner, abandoned_dependency;
+    runLua(L, "collectgarbage('collect'); collectgarbage('collect')");
+    const auto cores_before = tdlua::liveSchedulerCores();
+    const auto continuations_before = tdlua::liveContinuations();
+    runLua(L, "e=tdlua(); f=tdlua()");
+    attachTransport(L, "e", abandoned_owner);
+    attachTransport(L, "f", abandoned_dependency);
+    abandoned_owner.update("m4", 1);
+    runLua(L, R"lua(
+        abandoned_weak=setmetatable({}, {__mode='v'})
+        do
+            local owner,dependency=e,f
+            local marker={}; abandoned_weak[1]=marker
+            abandoned_task=e:poll(function()
+                dependency:getMe():wait(); return owner,marker
+            end)
+        end
+        e=nil; f=nil; abandoned_task=nil
+        collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')
+        assert(abandoned_weak[1]==nil)
+    )lua");
+    if (tdlua::liveSchedulerCores() != cores_before ||
+        tdlua::liveContinuations() != continuations_before)
+        throw std::runtime_error("abandoned M4 callback retained scheduler storage");
+
+    for (int origin = 0; origin < 2; ++origin) {
+        Fake closing;
+        runLua(L, "e=tdlua(); close_origin_called=false");
+        attachTransport(L, "e", closing);
+        closing.update("m4", 1);
+        if (origin == 0) {
+            runLua(L, R"lua(
+                e:on('m4', function() e:close(); close_origin_called=true end)
+                e:loop()
+            )lua");
+        } else {
+            runLua(L, R"lua(
+                e:loop(function() e:close(); close_origin_called=true end)
+            )lua");
+        }
+        runLua(L, "assert(close_origin_called and e:isClosed()); e=nil; collectgarbage('collect')");
+    }
+
+    // Listener liveness and ready work that adds a new Future.
+    fake.update("m4", 1);
+    fake.before_receive = [&](double) {
+        if (fake.incoming.empty()) fake.response(fake.sent.back().first, 61);
+    };
+    runLua(L, R"lua(
+        c:on('m4', function() created_future=c:getMe(); c:off('m4') end)
+        c:loop(); assert(created_future.value==61)
+    )lua");
+    fake.before_receive = {};
+
+    fake.update("m4", 1);
+    runLua(L, R"lua(
+        local ok,msg=pcall(c.loop,c,function() error('loop callback error') end)
+        assert(not ok and msg:find('loop callback error'))
+        c:loop()
+    )lua");
+
+    // A scheduler deadline bounds the transport's requested idle wait.
+    runLua(L, R"lua(
+        timer_future=c:getMe()
+        timer_co=coroutine.create(function()
+            local r,e=timer_future:wait(0.02)
+            assert(r==nil and e=='timeout'); timer_expired=true
+        end)
+        assert(coroutine.resume(timer_co))
+    )lua");
+    int timer_phase = 0;
+    fake.before_receive = [&](double timeout) {
+        const int phase = timer_phase++;
+        if (phase == 0) {
+            if (!(timeout > 0 && timeout <= 0.02))
+                throw std::runtime_error("poll slept past scheduler deadline");
+            std::this_thread::sleep_for(std::chrono::duration<double>(timeout));
+        } else if (phase == 1) {
+            fake.update("m4", 1);
+            fake.response(fake.sent.back().first, 70);
+        }
+    };
+    runLua(L, "assert(c:poll().value==1 and timer_expired); c:loop(); assert(timer_future.value==70)");
+    fake.before_receive = {};
+
+    // Controlled empty receive blocks for a positive wait, then closes.
+    const auto wait_count = fake.waits.size();
+    fake.before_receive = [&](double timeout) {
+        if (!(timeout > 0)) throw std::runtime_error("managed driver requested a zero wait");
+        client->close(false);
+    };
+    runLua(L, R"lua(
+        close_pending=c:getMe()
+        close_waiter=coroutine.create(function()
+            local ok,msg=pcall(function() close_pending:wait() end)
+            assert(not ok and msg:find('closed')); close_woken=true
+        end)
+        assert(coroutine.resume(close_waiter))
+        assert(c:poll(function() error('must not start') end)==nil)
+        assert(close_woken and c:poll()==nil)
+        c:loop(); d:close(); c=nil; d=nil
+        collectgarbage('collect')
+    )lua");
+    if (fake.waits.size() != wait_count+1)
+        throw std::runtime_error("idle poll spun instead of using one controlled wait");
+    fake.before_receive = {};
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -872,7 +1278,9 @@ int main(int argc, char **argv)
     luaL_openlibs(L);
     int result = 0;
     try {
-        if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
+        if (argc > 1 && std::string(argv[1]) == "--m4-only") {
+            testManagedDrivers(L);
+        } else if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
             runScenarios(L, fake, second);
         testDispatcherDestructorDoesNotRunLua(L);
         testLifetimeAndAbandonment();

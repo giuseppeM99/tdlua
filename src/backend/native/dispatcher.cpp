@@ -119,16 +119,18 @@ std::string nativeEventType(lua_State *L, const NativeDispatcher &dispatcher,
 
 }
 
-tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
+tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response,
+                                           bool managed_receive)
 {
     const tdlua::RouteKind route = router_.dispatchRoute(response.request_id,
                                                          [&](lua_State *target) {
         pushResponse(target, response);
-    });
-    if (route == tdlua::RouteKind::Raw ||
-        route == tdlua::RouteKind::Task ||
-        route == tdlua::RouteKind::LegacyRequest ||
-        route == tdlua::RouteKind::Update) {
+    }, managed_receive);
+    const bool shouldDefer = route == tdlua::RouteKind::Raw ||
+                             route == tdlua::RouteKind::Task ||
+                             route == tdlua::RouteKind::LegacyRequest ||
+                             route == tdlua::RouteKind::Update;
+    if (shouldDefer) {
         router_.deferEvent(nativeEventType(L, *this, response),
                               [&](lua_State *target) {
                                   pushResponse(target, response);

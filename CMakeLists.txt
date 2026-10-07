@@ -409,6 +409,18 @@ if(TDLUA_BUILD_TESTS)
     tdlua_enable_sanitizers(tdlua_common_router_test)
     add_test(NAME tdlua_common_router COMMAND tdlua_common_router_test)
 
+    add_executable(tdlua_managed_driver_test
+        "tests/managed_driver_test.cpp"
+    )
+    target_include_directories(tdlua_managed_driver_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_managed_driver_test PRIVATE ${LUA_LIBRARIES})
+    target_compile_features(tdlua_managed_driver_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_managed_driver_test)
+    add_test(NAME tdlua_managed_driver_common
+        COMMAND tdlua_managed_driver_test
+    )
+
     if(_tdlua_backend STREQUAL "json")
         add_executable(tdlua_fake_client_test "tests/fake_client_test.cpp")
         target_include_directories(tdlua_fake_client_test PRIVATE
@@ -419,6 +431,9 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
         tdlua_enable_sanitizers(tdlua_fake_client_test)
         add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+        add_test(NAME tdlua_managed_driver
+            COMMAND tdlua_fake_client_test --m4-only
+        )
     endif()
 
     add_executable(tdlua_persistence_test
@@ -520,11 +535,18 @@ if(TDLUA_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_smoke.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
+        add_test(NAME tdlua_managed_driver_backend
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/managed_driver.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+        set_tests_properties(tdlua_managed_driver_backend PROPERTIES TIMEOUT 30)
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle
             tdlua_async
             tdlua_backend_parity
             tdlua_e2e_smoke
+            tdlua_managed_driver_backend
         )
     endif()
 endif()

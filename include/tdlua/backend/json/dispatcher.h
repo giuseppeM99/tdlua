@@ -43,7 +43,10 @@ public:
             bool concurrent);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type);
-    tdlua::RouteKind dispatch(nlohmann::json &event);
+    // Managed pumps need to expose unsolicited updates to SchedulerCore;
+    // ordinary receive() keeps the legacy dispatch behavior.
+    tdlua::RouteKind dispatch(nlohmann::json &event,
+                              bool managed_receive = false);
     void drain();
     void clear();
     // Storage belongs to the Lua client uservalue. The dispatcher only passes

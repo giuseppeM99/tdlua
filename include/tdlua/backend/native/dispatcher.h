@@ -38,7 +38,10 @@ public:
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
 
-    tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response);
+    // Managed pumps need to expose unsolicited updates to SchedulerCore;
+    // ordinary receive() keeps the legacy dispatch behavior.
+    tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response,
+                              bool managed_receive = false);
     void drain();
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();

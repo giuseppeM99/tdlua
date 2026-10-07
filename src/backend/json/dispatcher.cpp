@@ -121,7 +121,7 @@ bool LuaDispatcher::pushHandler(lua_State *L, const std::string &type)
     return router_.pushEventHandler(L, type);
 }
 
-tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event)
+tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event, bool managed_receive)
 {
     std::uint64_t id = 0;
     const bool correlated = RequestRouter::responseRequestId(event, id);
@@ -131,11 +131,12 @@ tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event)
     }
     const tdlua::RouteKind route = router_.dispatchRoute(id, [&](lua_State *L) {
         lua_pushjson(L, event);
-    });
-    if (route == tdlua::RouteKind::Raw ||
-        route == tdlua::RouteKind::Task ||
-        route == tdlua::RouteKind::LegacyRequest ||
-        route == tdlua::RouteKind::Update) {
+    }, managed_receive);
+    const bool shouldDefer = route == tdlua::RouteKind::Raw ||
+                             route == tdlua::RouteKind::Task ||
+                             route == tdlua::RouteKind::LegacyRequest ||
+                             route == tdlua::RouteKind::Update;
+    if (shouldDefer) {
         router_.deferEvent(eventType(event), [&](lua_State *L) {
             lua_pushjson(L, event);
         });

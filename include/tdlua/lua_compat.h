@@ -10,6 +10,32 @@
 #include <limits>
 #include <string>
 
+/* Value uservalues are direct values on Lua 5.3+ but must be tables on Lua
+ * 5.2. Keep this adapter separate from the existing reference-table uservalues
+ * used by continuations and scheduler storage. */
+inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
+{
+    index = lua_absindex(L, index);
+#if LUA_VERSION_NUM == 502
+    lua_newtable(L);
+    lua_pushvalue(L, -2);
+    lua_rawseti(L, -2, 1);
+    lua_remove(L, -2);
+#endif
+    lua_setuservalue(L, index);
+}
+
+inline void tdlua_lua_get_value_uservalue(lua_State *L, int index)
+{
+    lua_getuservalue(L, index);
+#if LUA_VERSION_NUM == 502
+    if (lua_istable(L, -1)) {
+        lua_rawgeti(L, -1, 1);
+        lua_remove(L, -2);
+    }
+#endif
+}
+
 /* Resume on the calling thread. Return the Lua status and leave yielded
  * values, return values, or the error on the coroutine's stack. */
 inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments)

@@ -259,10 +259,10 @@ bool TDLua::pump(const double timeout)
             return false;
         }
         checkAuthState(value);
-        const tdlua::RouteKind route = dispatcher_.dispatch(value);
-        if (route == tdlua::RouteKind::Raw ||
-            route == tdlua::RouteKind::Unknown ||
-            route == tdlua::RouteKind::Update) {
+        // The common router owns update observation; this flag distinguishes
+        // managed pumping from the public raw receive path.
+        const tdlua::RouteKind route = dispatcher_.dispatch(value, true);
+        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
             push(value, true);
         }
     }
@@ -438,6 +438,7 @@ void TDLua::checkAuthState(const nlohmann::json &update)
             emptyUpdatesBuffer();
             _ready = false;
             state = ClientState::Closed;
+            dispatcher_.detachTransport();
         }
     }
 }

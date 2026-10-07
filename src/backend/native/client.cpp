@@ -159,10 +159,10 @@ bool NativeTDLua::pump(const double timeout)
             return false;
         }
         checkAuthState(response);
-        const tdlua::RouteKind route = dispatcher_.dispatch(lua_, response);
-        if (route == tdlua::RouteKind::Raw ||
-            route == tdlua::RouteKind::Unknown ||
-            route == tdlua::RouteKind::Update) {
+        // The common router owns update observation; this flag distinguishes
+        // managed pumping from the public raw receive path.
+        const tdlua::RouteKind route = dispatcher_.dispatch(lua_, response, true);
+        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
             response.dispatched = true;
             push(std::move(response));
         }
@@ -292,6 +292,7 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
         ready_ = false;
         closed_ = true;
         closing_ = false;
+        dispatcher_.detachTransport();
     }
 }
 

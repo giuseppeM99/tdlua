@@ -70,10 +70,12 @@ public:
 
     static bool responseRequestId(const nlohmann::json &response,
                                   std::uint64_t &request_id);
+    // Keep the managed/raw distinction at the common-router boundary.
     template <class Push>
-    tdlua::RouteKind dispatchRoute(std::uint64_t id, Push push)
+    tdlua::RouteKind dispatchRoute(std::uint64_t id, Push push,
+                                   bool managed_receive = false)
     {
-        return router_.dispatchRoute(id, std::move(push));
+        return router_.dispatchRoute(id, std::move(push), managed_receive);
     }
     tdlua::RouteKind dispatchRoute(nlohmann::json &response);
     bool dispatch(nlohmann::json &response);

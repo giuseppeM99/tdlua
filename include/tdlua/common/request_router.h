@@ -22,12 +22,15 @@ namespace tdlua {
 class SchedulerCore;
 class RequestRouter;
 struct EventRegistration;
+struct LoopObserver;
 
 enum class RequestKind {
     Raw,
     Future,
     Task,
     EventTask,
+    PollTask,
+    LoopTask,
     LegacyRequest,
     LegacyAwait
 };
@@ -84,6 +87,7 @@ struct ManagedState {
     std::size_t handle_count = 0;
     std::size_t waiter_count = 0;
     std::shared_ptr<EventRegistration> event_registration;
+    std::weak_ptr<LoopObserver> loop_observer;
 };
 
 using ManagedStatePtr = std::shared_ptr<ManagedState>;
@@ -108,6 +112,37 @@ struct EventRegistration {
 };
 
 using EventRegistrationPtr = std::shared_ptr<EventRegistration>;
+
+// This observer belongs to one loop invocation, not to the event registry.
+struct LoopObserver {
+    int callback_ref = LUA_NOREF;
+    bool concurrent = true;
+    bool active = false;
+    bool stopped = false;
+    std::deque<int> queued_updates;
+};
+
+// State owned by one SchedulerCore's managed driver. The flags have separate
+// meanings: consumer_active owns public poll/loop entry, pump_active marks the
+// backend call, draining_ belongs to scheduler tick(), and drive_active
+// prevents recursive driving of the same core.
+struct ManagedDriverState {
+    std::size_t pending_requests = 0;
+    bool consumer_active = false;
+    bool pump_active = false;
+    bool drive_active = false;
+    bool poll_selecting = false;
+    int selected_update = LUA_NOREF;
+    std::shared_ptr<LoopObserver> loop_observer;
+};
+
+// EventTask, PollTask and LoopTask all consume an unsolicited update and do
+// not represent a transport request with a public request ID.
+inline bool isUpdateCallbackTask(RequestKind kind)
+{
+    return kind == RequestKind::EventTask || kind == RequestKind::PollTask ||
+           kind == RequestKind::LoopTask;
+}
 
 struct DeferredEvent {
     std::string type;
@@ -188,7 +223,7 @@ inline bool isTerminalState(const ManagedStatePtr &state)
 inline bool isTaskState(const ManagedStatePtr &state)
 {
     return state && (state->kind == RequestKind::Task ||
-                     state->kind == RequestKind::EventTask ||
+                     isUpdateCallbackTask(state->kind) ||
                      state->kind == RequestKind::LegacyRequest);
 }
 
@@ -290,6 +325,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     void *pump_context_ = nullptr;
     bool (*pump_)(void *, double) = nullptr;
     bool draining_ = false;
+    ManagedDriverState managed_driver_;
 
     // ----- CoreAnchor reference-table helpers -----
 
@@ -375,13 +411,47 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         events_.erase(found);
     }
 
+    static double managedReceiveSlice()
+    {
+        return 1.0;
+    }
+
+    static double crossClientReceiveSlice()
+    {
+        return 0.01;
+    }
+
+    static std::chrono::milliseconds emptyPumpBackoff()
+    {
+        return std::chrono::milliseconds(1);
+    }
+
+    void trackPendingRequest(const State &state)
+    {
+        if (state->kind != RequestKind::Raw) {
+            ++managed_driver_.pending_requests;
+        }
+    }
+
+    void untrackPendingRequest(const State &state)
+    {
+        if (state->kind != RequestKind::Raw) {
+            --managed_driver_.pending_requests;
+        }
+    }
+
+    void resetPendingRequests()
+    {
+        managed_driver_.pending_requests = 0;
+    }
+
     // ----- State allocation and retirement -----
 
     void retireState(const State &state)
     {
         if (isTerminalState(state) && !state->handle_count && !state->waiter_count) {
             releaseLuaReferences(state);
-            if (state->kind == RequestKind::EventTask) {
+            if (isUpdateCallbackTask(state->kind)) {
                 event_states_.erase(
                     std::remove(event_states_.begin(), event_states_.end(), state),
                     event_states_.end());
@@ -396,12 +466,13 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         State state(new ManagedState());
         state->core = shared_from_this();
         state->kind = kind;
-        if (kind == RequestKind::EventTask) {
+        if (isUpdateCallbackTask(kind)) {
             event_states_.push_back(state);
         } else {
             state->request_id = next_++;
             pending_[state->request_id] = state;
             live_states_[state->request_id] = state;
+            trackPendingRequest(state);
         }
         return state;
     }
@@ -468,6 +539,76 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         lua_pop(lua_owner_, 1);
         state->response_ref = update_ref;
         return state;
+    }
+
+    State createUpdateTask(RequestKind kind, int callback_ref, int update_ref)
+    {
+        const State state = createState(kind);
+        pushLuaReference(lua_owner_, callback_ref);
+        state->callback_ref = createLuaReference(lua_owner_, -1);
+        lua_pop(lua_owner_, 1);
+        state->response_ref = update_ref;
+        if (kind == RequestKind::LoopTask)
+            state->loop_observer = managed_driver_.loop_observer;
+        ready_.push_back(state);
+        return state;
+    }
+
+    void discardQueuedLoopUpdates(const std::shared_ptr<LoopObserver> &observer)
+    {
+        while (!observer->queued_updates.empty()) {
+            int ref = observer->queued_updates.front();
+            observer->queued_updates.pop_front();
+            releaseLuaReference(ref);
+        }
+    }
+
+    void requestLoopStop(const std::shared_ptr<LoopObserver> &observer)
+    {
+        observer->stopped = true;
+        discardQueuedLoopUpdates(observer);
+    }
+
+    void scheduleNextLoopTask(const std::shared_ptr<LoopObserver> &observer)
+    {
+        if (observer->queued_updates.empty()) return;
+        const int update_ref = observer->queued_updates.front();
+        observer->queued_updates.pop_front();
+        observer->active = true;
+        createUpdateTask(RequestKind::LoopTask, observer->callback_ref, update_ref);
+    }
+
+    void queueOrScheduleLoopUpdate(
+        const std::shared_ptr<LoopObserver> &observer, int update_ref)
+    {
+        if (!observer->concurrent && observer->active) {
+            observer->queued_updates.push_back(update_ref);
+            return;
+        }
+        observer->active = true;
+        createUpdateTask(RequestKind::LoopTask, observer->callback_ref, update_ref);
+    }
+
+    void finishLoopTask(const State &state)
+    {
+        const auto observer = state->loop_observer.lock();
+        if (!observer) return;
+        if (state->status == ManagedStatus::Done) {
+            pushLuaReference(lua_owner_, state->result_ref);
+            lua_rawgeti(lua_owner_, -1, 1);
+            const bool stop = lua_isboolean(lua_owner_, -1) &&
+                              !lua_toboolean(lua_owner_, -1);
+            lua_pop(lua_owner_, 2);
+            if (stop) requestLoopStop(observer);
+        }
+        if (state->status == ManagedStatus::Failed) requestLoopStop(observer);
+        if (observer->stopped || !events_enabled_) {
+            discardQueuedLoopUpdates(observer);
+            return;
+        }
+        if (observer->concurrent) return;
+        observer->active = false;
+        scheduleNextLoopTask(observer);
     }
 
     void finishSerializedEvent(const State &state)
@@ -548,11 +689,12 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         const bool legacy_request_failed =
             state->kind == RequestKind::LegacyRequest &&
             state->status == ManagedStatus::Failed;
-        if (state->kind == RequestKind::EventTask &&
+        if ((state->kind == RequestKind::EventTask || state->kind == RequestKind::LoopTask) &&
             state->status == ManagedStatus::Failed) {
             scheduler_errors_.push_back(state->error);
         }
         finishSerializedEvent(state);
+        finishLoopTask(state);
         wake(state);
         retireState(state);
         if (legacy_request_failed) {
@@ -579,16 +721,17 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         if (!thread) {
             failState(state, "tdlua: task coroutine unavailable");
-            if (state->kind == RequestKind::EventTask) {
+            if (state->kind == RequestKind::EventTask || state->kind == RequestKind::LoopTask) {
                 scheduler_errors_.push_back(state->error);
                 finishSerializedEvent(state);
+                finishLoopTask(state);
             }
             wake(state);
             retireState(state);
             return;
         }
         pushLuaReference(thread, state->response_ref);
-        const int argument_count = state->kind == RequestKind::EventTask ? 1 : 2;
+        const int argument_count = isUpdateCallbackTask(state->kind) ? 1 : 2;
         if (argument_count == 2) {
             pushLuaReference(thread, state->context_ref);
         }
@@ -813,6 +956,211 @@ public:
         if (id >= next_) next_ = id == UINT64_MAX ? id : id + 1;
     }
     std::size_t pendingCount() const { return pending_.size(); }
+
+    double deadlineBound(double wait) const
+    {
+        for (const auto &entry : waiters_) {
+            if (!entry.second.has_deadline) continue;
+            const double remaining = std::chrono::duration<double>(
+                entry.second.deadline - std::chrono::steady_clock::now()).count();
+            wait = std::min(wait, std::max(0.0, remaining));
+        }
+        return wait;
+    }
+
+    std::vector<std::shared_ptr<SchedulerCore>>
+    crossClientDependencies() const
+    {
+        std::vector<std::shared_ptr<SchedulerCore>> dependencies;
+        for (const auto &entry : running_tasks_) {
+            const auto binding = waitBindings().find(entry.first);
+            if (binding == waitBindings().end()) continue;
+            const auto dependency = binding->second.lock();
+            if (dependency && dependency.get() != this &&
+                std::find(dependencies.begin(), dependencies.end(), dependency) ==
+                    dependencies.end()) {
+                dependencies.push_back(dependency);
+            }
+        }
+        return dependencies;
+    }
+
+    double receiveBudget(double requested,
+                         const std::vector<std::shared_ptr<SchedulerCore>> &dependencies)
+        const
+    {
+        if (!dependencies.empty()) {
+            requested = std::min(requested, crossClientReceiveSlice());
+        }
+        requested = deadlineBound(requested);
+        for (const auto &dependency : dependencies) {
+            requested = dependency->deadlineBound(requested);
+        }
+        return requested;
+    }
+
+    bool pumpCurrentTransport(double wait)
+    {
+        const bool previous = managed_driver_.pump_active;
+        managed_driver_.pump_active = true;
+        try {
+            const bool progressed = pump_(pump_context_, wait);
+            managed_driver_.pump_active = previous;
+            return progressed;
+        } catch (...) {
+            managed_driver_.pump_active = previous;
+            throw;
+        }
+    }
+
+    void pumpCrossClientDependencies(
+        const std::vector<std::shared_ptr<SchedulerCore>> &dependencies)
+    {
+        for (const auto &dependency : dependencies) {
+            // Pin Lua storage as well as C++ ownership across arbitrary resumes.
+            const int base = lua_gettop(lua_owner_);
+            pushCoreAnchor(lua_owner_, dependency.get());
+            try {
+                dependency->driveStep(crossClientReceiveSlice());
+            } catch (...) {
+                lua_settop(lua_owner_, base);
+                throw;
+            }
+            lua_settop(lua_owner_, base);
+        }
+    }
+
+    void backoffAfterEmptyPump(bool progressed)
+    {
+        // A conforming transport blocks. This fallback also bounds a
+        // spuriously empty fake/non-blocking transport without a zero-timeout
+        // busy loop.
+        if (!progressed && pump_) {
+            std::this_thread::sleep_for(emptyPumpBackoff());
+        }
+    }
+
+    // Deadline-aware effect boundary shared by waits, poll and loop. Backend
+    // pumps never consume their already-preserved raw response queue again.
+    bool driveStep(double wait)
+    {
+        if (managed_driver_.drive_active) return false;
+        struct DrivingScope {
+            bool &active;
+            explicit DrivingScope(bool &value) : active(value) { active = true; }
+            ~DrivingScope() { active = false; }
+        } driving(managed_driver_.drive_active);
+        tick();
+        if (!pump_) return false;
+        const auto dependencies = crossClientDependencies();
+        wait = receiveBudget(wait, dependencies);
+        const bool progressed = pumpCurrentTransport(wait);
+        pumpCrossClientDependencies(dependencies);
+        backoffAfterEmptyPump(progressed);
+        tick();
+        return progressed;
+    }
+
+    template<class Push> void observeManagedUpdate(Push push)
+    {
+        if (!managed_driver_.pump_active || !events_enabled_) return;
+        if (managed_driver_.poll_selecting &&
+            managed_driver_.selected_update == LUA_NOREF) {
+            push(lua_owner_);
+            managed_driver_.selected_update = createLuaReference(lua_owner_, -1);
+            lua_pop(lua_owner_, 1);
+        } else if (managed_driver_.loop_observer &&
+                   !managed_driver_.loop_observer->stopped) {
+            const auto observer = managed_driver_.loop_observer;
+            push(lua_owner_);
+            const int ref = createLuaReference(lua_owner_, -1);
+            lua_pop(lua_owner_, 1);
+            queueOrScheduleLoopUpdate(observer, ref);
+        }
+    }
+
+    static bool shouldPreserveManagedPumpObject(RouteKind route)
+    {
+        return route == RouteKind::Raw || route == RouteKind::Unknown;
+    }
+
+    void beginUpdateConsumer()
+    {
+        if (managed_driver_.consumer_active ||
+            managed_driver_.drive_active || draining_) {
+            throw std::runtime_error("tdlua: poll/loop cannot consume updates while another managed call is already active on this client");
+        }
+        managed_driver_.consumer_active = true;
+    }
+
+    void endUpdateConsumer()
+    {
+        managed_driver_.poll_selecting = false;
+        releaseLuaReference(managed_driver_.selected_update);
+        if (managed_driver_.loop_observer) {
+            requestLoopStop(managed_driver_.loop_observer);
+            releaseLuaReference(managed_driver_.loop_observer->callback_ref);
+            managed_driver_.loop_observer.reset();
+        }
+        managed_driver_.consumer_active = false;
+    }
+
+    State selectPollUpdate(lua_State *L, int callback)
+    {
+        managed_driver_.poll_selecting = true;
+        while (managed_driver_.selected_update == LUA_NOREF && pump_)
+            driveStep(managedReceiveSlice());
+        tick();
+        if (managed_driver_.selected_update == LUA_NOREF) {
+            lua_pushnil(L);
+            return State();
+        }
+        if (!callback) {
+            pushLuaReference(L, managed_driver_.selected_update);
+            releaseLuaReference(managed_driver_.selected_update);
+            return State();
+        }
+        int callback_ref = createLuaReference(L, callback);
+        const int update_ref = managed_driver_.selected_update;
+        managed_driver_.selected_update = LUA_NOREF;
+        State state = createUpdateTask(RequestKind::PollTask, callback_ref, update_ref);
+        releaseLuaReference(callback_ref);
+        // The caller first creates the handle, then may perform an ordinary
+        // drain. It never joins this Task, including after a managed yield.
+        return state;
+    }
+
+    bool hasNormalLoopInterest() const
+    {
+        if (managed_driver_.loop_observer &&
+            managed_driver_.loop_observer->stopped) {
+            return false;
+        }
+        return !events_.empty() || managed_driver_.loop_observer ||
+               managed_driver_.pending_requests != 0;
+    }
+
+    bool hasGracefulDrainWork() const
+    {
+        return !ready_.empty() || !running_tasks_.empty();
+    }
+
+    void runLoop(lua_State *L, int callback, bool concurrent)
+    {
+        if (callback) {
+            managed_driver_.loop_observer.reset(new LoopObserver());
+            managed_driver_.loop_observer->concurrent = concurrent;
+            managed_driver_.loop_observer->callback_ref = createLuaReference(L, callback);
+        }
+        while (true) {
+            tick();
+            if (!pump_) return;
+            // After explicit stop, a standalone Future is not required Task
+            // cleanup. It remains pending for the next managed driver.
+            if (!hasNormalLoopInterest() && !hasGracefulDrainWork()) return;
+            driveStep(managedReceiveSlice());
+        }
+    }
     std::uint64_t raw() { return createState(RequestKind::Raw)->request_id; }
     State future() { return createState(RequestKind::Future); }
     State task(lua_State *L, int callback, int context, bool supplied_thread)
@@ -908,17 +1256,23 @@ public:
     {
         const auto found = pending_.find(id);
         if (found == pending_.end()) return;
+        untrackPendingRequest(found->second);
         releaseLuaReferences(found->second);
         pending_.erase(found);
         live_states_.erase(id);
     }
-    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push)
+    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push,
+                                               bool managed_receive = false)
     {
-        if (!id) return RouteKind::Update;
+        if (!id) {
+            if (managed_receive) observeManagedUpdate(push);
+            return RouteKind::Update;
+        }
         const auto found = pending_.find(id);
         if (found == pending_.end()) return RouteKind::Unknown;
         const State state = found->second;
         pending_.erase(found);
+        untrackPendingRequest(state);
         if (state->kind == RequestKind::Raw) {
             state->status = ManagedStatus::Done;
             retireState(state);
@@ -977,6 +1331,8 @@ public:
         const auto started = std::chrono::steady_clock::now();
         const double budget = timed ? timeout : 10.0;
         while (!isTerminalState(state)) {
+            tick();
+            if (isTerminalState(state)) break;
             const double elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             const double remaining = budget - elapsed;
@@ -987,9 +1343,7 @@ public:
             if (!pump_) {
                 throw std::runtime_error("tdlua: managed scheduler has no pump");
             }
-            if (!pump_(pump_context_, remaining)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+            driveStep(remaining);
         }
         return true;
     }
@@ -1114,12 +1468,16 @@ public:
         pump_ = nullptr;
         pump_context_ = nullptr;
         events_enabled_ = false;
+        if (managed_driver_.loop_observer) {
+            requestLoopStop(managed_driver_.loop_observer);
+        }
         for (const auto &entry : events_) {
             entry.second->removed = true;
         }
         clearEvents();
         std::map<std::uint64_t, State> pending;
         pending.swap(pending_);
+        resetPendingRequests();
         for (const auto &entry : pending) {
             failState(entry.second, message);
             ready_.push_back(entry.second);
@@ -1249,6 +1607,7 @@ class RequestRouter {
 
 public:
     using Pump = SchedulerCore::Pump;
+    std::shared_ptr<SchedulerCore> core() const { return core_; }
 
     // ----- CoreAnchor lifetime -----
 
@@ -1282,7 +1641,7 @@ public:
     {
         client = lua_absindex(L, client);
         lua_rawgeti(L, LUA_REGISTRYINDEX, anchor_reference_);
-        lua_setuservalue(L, client);
+        tdlua_lua_set_value_uservalue(L, client);
         luaL_unref(L, LUA_REGISTRYINDEX, anchor_reference_);
         anchor_reference_ = LUA_NOREF;
     }
@@ -1323,9 +1682,10 @@ public:
 
     // ----- Response routing and scheduler progress -----
 
-    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push)
+    template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push,
+                                               bool managed_receive = false)
     {
-        return core_->dispatchRoute(id, std::move(push));
+        return core_->dispatchRoute(id, std::move(push), managed_receive);
     }
 
     template<class Push> bool dispatch(std::uint64_t id, Push push)
@@ -1502,6 +1862,10 @@ inline int managedIndex(lua_State *L, const char *type, bool task)
         return 1;
     }
     if (std::string(key) == "_request_id") {
+        if (!handle->state->request_id) {
+            lua_pushnil(L);
+            return 1;
+        }
         tdlua_lua_push_integer(
             L, static_cast<std::int64_t>(handle->state->request_id));
         return 1;
@@ -1574,7 +1938,7 @@ inline void pushManagedHandle(lua_State *L, const ManagedStatePtr &state, const 
     luaL_setmetatable(L, type);
     const auto core = state->core.lock();
     pushCoreAnchor(L, core.get());
-    lua_setuservalue(L, -2);
+    tdlua_lua_set_value_uservalue(L, -2);
 }
 
 } // namespace tdlua
