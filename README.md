@@ -68,9 +68,16 @@ currently require `TDLUA_BUNDLED_TDLIB=ON`. The JSON backend can instead link
 against an installed TDLib with `TDLUA_BUNDLED_TDLIB=OFF`; its C JSON ABI is
 the replaceable backend boundary.
 
-Both backends treat an `execute(request, timeout)` timeout as a timeout of the
-caller, not cancellation of the TDLib request. A response that arrives later
-can still be returned by `receive()` with its TDLua `_request_id`.
+A timeout does not cancel the underlying TDLib request. With the legacy
+`execute(request, timeout)` form, a late response remains available through
+`receive()` with its `_request_id`. A timed-out Future can be waited on again.
+
+Lua 5.2, 5.3, and 5.5 are tested on Linux with both backends. The declared
+range is Lua >= 5.2 and < 5.6. Lua 5.4 is within that range but was not tested
+in this release pass. Stock Lua 5.1 and LuaJIT 2.1 are unsupported because the
+managed waits require Lua's continuation API. Linux is tested; macOS is
+supported by the build design but was not runtime-tested. Windows was not
+validated.
 
 ## v0.4 managed API
 
@@ -80,6 +87,12 @@ use `future:wait()` when a plain response table is preferred. Wrapper members
 (`wait`, `ready`, and `_request_id`) take precedence over response fields with
 the same names. Full `rawget`, `rawset`, `next`, and `pairs` transparency is not
 part of the API contract.
+
+In a yieldable coroutine, `wait()` without a timeout has no implicit deadline.
+On the main thread or in another non-yieldable context, it uses the historical
+10-second safety timeout. An explicit `wait(timeout)` applies in both contexts.
+Implicit Future field access on the main thread uses the same safety limit and
+raises `tdlua: Future wait timeout` if it expires. Timeouts do not cancel requests.
 
 Use explicit controls when the flow should be visible:
 
@@ -101,6 +114,21 @@ remain available to `receive()` in FIFO order. Native versus JSON selects the
 backend; callbacks versus Futures selects the control-flow style. Async calls
 do not make an individual TDLib request faster, but allow independent requests
 to overlap while Futures preserve sequential-looking Lua.
+
+`client:poll()` and `client:poll(callback)` are the valid poll forms.
+`client:poll(1)` is invalid; use `receive(timeout)` for a timed polling loop.
+`poll()` and `loop()` are blocking managed drivers intended for applications
+where TDLua owns update driving. While idle, they may stay inside C++ and delay
+the standalone Lua interpreter's SIGINT hook. Use `receive(timeout)` when the
+host must periodically regain Lua control for external I/O, custom timers, or
+shutdown. TDLua does not install signal handlers or promise POSIX signal handling.
+For a manual reproduction, run `lua -e 'require("tdlua")():loop(function() end)'`
+and send SIGINT while the client is idle.
+
+Request callback Tasks retain their failures for `task:wait()`. If the last
+Task handle is collected without observing its failure, the owning client's
+next scheduler-pumping operation raises the error exactly once. Observing it
+through `wait()` prevents a later scheduler report.
 
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
 Build with Lua 5.2 and the latest version of tdlib.
