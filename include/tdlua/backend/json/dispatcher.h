@@ -50,7 +50,7 @@ public:
 
 private:
     struct PendingHandler {
-        int callback_ref = LUA_NOREF;
+        std::string type;
         int event_ref = LUA_NOREF;
     };
 

@@ -5,9 +5,11 @@
 #include "tdlua/lua_compat.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
@@ -20,6 +22,10 @@
 namespace tdlua {
 
 class RequestRouter;
+
+struct ManagedTaskOwner {
+    RequestRouter *router = nullptr;
+};
 
 enum class RequestKind {
     Raw,
@@ -68,6 +74,17 @@ struct ManagedState {
     std::size_t waiter_count = 0;
 };
 
+struct ManagedTaskBinding {
+    std::shared_ptr<ManagedTaskOwner> owner;
+    std::shared_ptr<ManagedState> task;
+};
+
+inline std::map<lua_State *, ManagedTaskBinding> &managedTaskBindings()
+{
+    static std::map<lua_State *, ManagedTaskBinding> bindings;
+    return bindings;
+}
+
 struct ManagedHandle {
     std::shared_ptr<ManagedState> state;
 };
@@ -109,6 +126,7 @@ struct WaitToken {
     RequestRouter *router = nullptr;
     std::shared_ptr<ManagedState> dependency;
     std::shared_ptr<ManagedState> task;
+    std::shared_ptr<ManagedTaskOwner> task_owner;
     lua_State *coroutine = nullptr;
     int thread_ref = LUA_NOREF;
     WaitKind kind = WaitKind::Result;
@@ -124,6 +142,12 @@ struct WaitToken {
     int continuation_key = 0;
 #endif
 };
+
+inline std::map<lua_State *, WaitToken *> &managedWaiters()
+{
+    static std::map<lua_State *, WaitToken *> waiters;
+    return waiters;
+}
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
 inline std::map<int, WaitToken *> &lua52WaitTokens()
@@ -186,6 +210,7 @@ class RequestRouter {
     using State = std::shared_ptr<ManagedState>;
 
     lua_State *owner_;
+    std::shared_ptr<ManagedTaskOwner> task_owner_;
     std::uint64_t next_ = 1;
     std::map<std::uint64_t, PendingRequest> pending_;
     std::map<std::uint64_t, State> live_states_;
@@ -257,11 +282,76 @@ class RequestRouter {
                          state->kind == RequestKind::LegacyRequest);
     }
 
+    static std::chrono::steady_clock::time_point deadlineAfter(double timeout)
+    {
+        const std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now();
+        const std::chrono::duration<double> maximum(
+            std::chrono::steady_clock::time_point::max() - now);
+        if (timeout >= maximum.count()) {
+            return std::chrono::steady_clock::time_point::max();
+        }
+        return now + std::chrono::duration_cast<
+                          std::chrono::steady_clock::duration>(
+                          std::chrono::duration<double>(timeout));
+    }
+
     static std::string coroutineResumeError(lua_State *coroutine)
     {
         const char *message = coroutine ? lua_tostring(coroutine, -1) : nullptr;
         return std::string("tdlua await failed: ") +
                (message ? message : "unknown Lua error");
+    }
+
+    void registerRunningTask(lua_State *thread, const State &task)
+    {
+        running_tasks_[thread] = task;
+        ManagedTaskBinding binding;
+        binding.owner = task_owner_;
+        binding.task = task;
+        managedTaskBindings()[thread] = binding;
+    }
+
+    void unregisterRunningTask(lua_State *thread, const State &task)
+    {
+        const auto local = running_tasks_.find(thread);
+        if (local != running_tasks_.end() && local->second == task) {
+            running_tasks_.erase(local);
+        }
+        const auto global = managedTaskBindings().find(thread);
+        if (global != managedTaskBindings().end() &&
+            global->second.owner == task_owner_ && global->second.task == task) {
+            managedTaskBindings().erase(global);
+        }
+    }
+
+    void markTaskFailed(const State &state, const std::string &message)
+    {
+        if (!state || terminal(state)) {
+            return;
+        }
+        state->status = ManagedStatus::Failed;
+        state->error = message;
+        releaseReference(state->callback_ref);
+        releaseReference(state->context_ref);
+        releaseReference(state->thread_ref);
+    }
+
+    void failTaskFromExternalResume(const State &state, lua_State *thread,
+                                    const std::string &message)
+    {
+        if (!state) {
+            return;
+        }
+        unregisterRunningTask(thread, state);
+        markTaskFailed(state, message);
+        try {
+            wake(state);
+        } catch (...) {
+            // The external coroutine resume must report the managed failure,
+            // not let a second waiter resume error escape through Lua's C API.
+        }
+        retire(state);
     }
 
     void captureValue(lua_State *L, int index, int &reference)
@@ -401,21 +491,21 @@ class RequestRouter {
         if (status == LUA_OK) {
             storeResults(state, thread);
             state->status = ManagedStatus::Done;
-            running_tasks_.erase(thread);
+            unregisterRunningTask(thread, state);
             releaseReference(state->thread_ref);
             wake(state);
         } else if (status == LUA_YIELD) {
             // A managed Future wait installs a waiter before yielding. Keep
             // the task association alive so a subsequent wait in the same
             // callback remains owned by this Task.
-            if (waiters_.find(thread) == waiters_.end()) {
-                running_tasks_.erase(thread);
+            if (managedWaiters().find(thread) == managedWaiters().end()) {
+                unregisterRunningTask(thread, state);
                 failTask(state, "tdlua task yielded without a managed dependency: ",
                          thread);
                 wake(state);
             }
         } else {
-            running_tasks_.erase(thread);
+            unregisterRunningTask(thread, state);
             failTask(state, "tdlua task failed: ", thread);
             wake(state);
             if (state->kind == RequestKind::LegacyRequest) {
@@ -480,7 +570,7 @@ class RequestRouter {
         releaseReference(state->context_ref);
 
         state->status = ManagedStatus::Running;
-        running_tasks_[thread] = state;
+        registerRunningTask(thread, state);
         const int status = tdlua_lua_resume(thread, owner_, 2);
         finishTaskResume(state, thread, status);
     }
@@ -495,6 +585,10 @@ class RequestRouter {
         const auto found = waiters_.find(token->coroutine);
         if (found != waiters_.end() && found->second == token) {
             waiters_.erase(found);
+        }
+        const auto managed = managedWaiters().find(token->coroutine);
+        if (managed != managedWaiters().end() && managed->second == token) {
+            managedWaiters().erase(managed);
         }
         if (dependency && dependency->waiter_count != 0) {
             --dependency->waiter_count;
@@ -530,10 +624,18 @@ class RequestRouter {
         const WaitOutcome outcome = token->outcome;
         const WaitKind kind = token->kind;
         if (outcome == WaitOutcome::ExternalResume) {
+            const State task = token->task;
+            const std::shared_ptr<ManagedTaskOwner> task_owner =
+                token->task_owner;
+            const std::string error =
+                "tdlua await failed: coroutine resumed externally while waiting";
             lua_pushliteral(L,
                             "tdlua: coroutine resumed externally while waiting");
             cleanupWaitToken(token);
             delete token;
+            if (task && task_owner && task_owner->router) {
+                task_owner->router->failTaskFromExternalResume(task, L, error);
+            }
             return -1;
         }
         if (outcome == WaitOutcome::Timeout) {
@@ -584,7 +686,15 @@ class RequestRouter {
         const bool direct_resume = token->direct_resume;
         lua_State *coroutine = token->coroutine;
         const State task = token->task;
+        const std::shared_ptr<ManagedTaskOwner> task_owner = token->task_owner;
+        RequestRouter *task_router = task_owner ? task_owner->router : nullptr;
         token->outcome = outcome;
+
+        if (task && !task_router) {
+            cleanupWaitToken(token);
+            delete token;
+            return;
+        }
 
         int arguments = 0;
         if (outcome == WaitOutcome::Success) {
@@ -611,7 +721,7 @@ class RequestRouter {
         }
 
         if (task) {
-            running_tasks_[coroutine] = task;
+            task_router->registerRunningTask(coroutine, task);
         }
         // Remove the old lease before entering Lua. A resumed Task may issue
         // another managed wait; that new waiter must be allowed to claim the
@@ -619,7 +729,11 @@ class RequestRouter {
         detachWaitToken(token);
         const int status = tdlua_lua_resume(coroutine, owner_, arguments);
         if (task) {
-            finishTaskResume(task, coroutine, status);
+            RequestRouter *resumed_task_router =
+                task_owner ? task_owner->router : nullptr;
+            if (resumed_task_router) {
+                resumed_task_router->finishTaskResume(task, coroutine, status);
+            }
         } else if (status != LUA_OK && status != LUA_YIELD) {
             throw std::runtime_error(coroutineResumeError(coroutine));
         }
@@ -722,8 +836,18 @@ class RequestRouter {
         }
     }
 
-    void finalizeClear()
+    bool finalizeClear()
     {
+        assert(waiters_.empty());
+        if (!waiters_.empty()) {
+            return false;
+        }
+        for (const auto &entry : managedWaiters()) {
+            if (entry.second && entry.second->router == this) {
+                assert(false);
+                return false;
+            }
+        }
         waiters_.clear();
         for (auto &entry : pending_) {
             releaseStateReferences(entry.second.state);
@@ -743,6 +867,7 @@ class RequestRouter {
         pump_ = nullptr;
         pump_context_ = nullptr;
         cleanup_deferred_ = false;
+        return true;
     }
 
     State stateReference(ManagedState *state) const
@@ -780,21 +905,20 @@ class RequestRouter {
         }
         if (has_timeout) {
             token->has_deadline = true;
-            token->deadline = std::chrono::steady_clock::now() +
-                              std::chrono::duration_cast<
-                                  std::chrono::steady_clock::duration>(
-                                  std::chrono::duration<double>(timeout));
+            token->deadline = deadlineAfter(timeout);
         }
         ++state->handle_count;
         token->wait_lease = true;
-        const auto running = running_tasks_.find(L);
-        if (running != running_tasks_.end()) {
-            token->task = running->second;
+        const auto running = managedTaskBindings().find(L);
+        if (running != managedTaskBindings().end()) {
+            token->task = running->second.task;
+            token->task_owner = running->second.owner;
         }
         lua_pushthread(L);
         lua_xmove(L, owner_, 1);
         token->thread_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
         waiters_[L] = token;
+        managedWaiters()[L] = token;
         ++state->waiter_count;
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
         token->continuation_key = registerLua52WaitToken(token);
@@ -842,11 +966,21 @@ class RequestRouter {
         if (!state) {
             return luaL_error(L, "tdlua: invalid Future/Task");
         }
-        if (has_timeout && timeout < 0.0) {
-            return luaL_error(L, "tdlua: timeout must not be negative");
+        if (has_timeout && (!std::isfinite(timeout) || timeout < 0.0)) {
+            return luaL_error(L,
+                              "tdlua: timeout must be finite and non-negative");
         }
         bool wait_lease = false;
         if (!terminal(state)) {
+            if (has_timeout && timeout == 0.0) {
+                if (kind == WaitKind::Field) {
+                    lua_pushliteral(L, "tdlua: Future wait timeout");
+                    return -1;
+                }
+                lua_pushnil(L);
+                lua_pushliteral(L, "timeout");
+                return 2;
+            }
             if (tdlua_lua_is_yieldable(L)) {
                 return beginYield(L, state, kind, field, has_timeout, timeout);
             }
@@ -945,6 +1079,34 @@ class RequestRouter {
         }
     }
 
+    void invalidateTaskOwner()
+    {
+        if (!task_owner_) {
+            return;
+        }
+        std::map<lua_State *, ManagedTaskBinding> &bindings =
+            managedTaskBindings();
+        for (auto it = bindings.begin(); it != bindings.end();) {
+            if (it->second.owner != task_owner_) {
+                ++it;
+                continue;
+            }
+            const State state = it->second.task;
+            if (state && !terminal(state)) {
+                markTaskFailed(state, "tdlua: task owner closed");
+                try {
+                    wake(state);
+                } catch (...) {
+                    // Destruction must not let a waiter resume exception escape.
+                }
+                state->router = nullptr;
+            }
+            it = bindings.erase(it);
+        }
+        running_tasks_.clear();
+        task_owner_->router = nullptr;
+    }
+
     friend int managedWaitContinuation(lua_State *, int, lua_KContext);
     friend int futureReady(lua_State *);
     friend int futureWait(lua_State *);
@@ -958,11 +1120,16 @@ class RequestRouter {
 public:
     using Pump = bool (*)(void *, double);
 
-    explicit RequestRouter(lua_State *owner) : owner_(owner) {}
+    explicit RequestRouter(lua_State *owner)
+        : owner_(owner), task_owner_(new ManagedTaskOwner())
+    {
+        task_owner_->router = this;
+    }
 
     ~RequestRouter()
     {
         clear();
+        invalidateTaskOwner();
     }
 
     RequestRouter(const RequestRouter &) = delete;
@@ -1079,6 +1246,7 @@ public:
             lua_xmove(L, owner_, 1);
             token->thread_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
             waiters_[L] = token;
+            managedWaiters()[L] = token;
             ++state->waiter_count;
         }
         return state->request_id;

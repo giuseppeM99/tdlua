@@ -140,16 +140,8 @@ void LuaDispatcher::queueHandler(nlohmann::json &event)
         return;
     }
 
-    const std::map<std::string, int>::const_iterator found = handlers_.find(type);
-    if (found == handlers_.end()) {
-        return;
-    }
-
     PendingHandler pending;
-    // Keep independent registry leases. The callback may call on()/off() or
-    // close() while a different queued response is being drained.
-    lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
-    pending.callback_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
+    pending.type = type;
     lua_pushjson(owner_, event);
     pending.event_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
     pending_handlers_.push_back(pending);
@@ -160,16 +152,19 @@ void LuaDispatcher::drainHandlers()
     while (!pending_handlers_.empty()) {
         PendingHandler pending = pending_handlers_.front();
         pending_handlers_.pop_front();
-        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
-        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-        const int status = lua_pcall(owner_, 1, 0, 0);
         std::string error;
-        if (status != LUA_OK) {
-            const char *message = lua_tostring(owner_, -1);
-            error = message ? message : "unknown Lua error";
-            lua_pop(owner_, 1);
+        const std::map<std::string, int>::const_iterator found =
+            handlers_.find(pending.type);
+        if (found != handlers_.end()) {
+            lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
+            lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
+            const int status = lua_pcall(owner_, 1, 0, 0);
+            if (status != LUA_OK) {
+                const char *message = lua_tostring(owner_, -1);
+                error = message ? message : "unknown Lua error";
+                lua_pop(owner_, 1);
+            }
         }
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
         luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
         if (!error.empty()) {
             throw std::runtime_error("tdlua event handler failed: " + error);
@@ -182,7 +177,6 @@ void LuaDispatcher::clearHandlerQueue()
     while (!pending_handlers_.empty()) {
         const PendingHandler pending = pending_handlers_.front();
         pending_handlers_.pop_front();
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
         luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
     }
 }
@@ -221,7 +215,6 @@ void LuaDispatcher::drain()
 void LuaDispatcher::clear()
 {
     clearHandlerQueue();
-    router_.closePending();
     router_.clear();
     for (std::map<std::string, int>::iterator map_it = handlers_.begin();
          map_it != handlers_.end(); ++map_it) {

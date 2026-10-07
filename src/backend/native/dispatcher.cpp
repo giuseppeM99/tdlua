@@ -109,13 +109,11 @@ void NativeDispatcher::queueHandler(const NativeResponse &response)
     const char *type_name = lua_tostring(owner_, -1);
     const std::string type = type_name ? type_name : "";
     lua_pop(owner_, 2);
-    const auto found = handlers_.find(type);
-    if (type.empty() || found == handlers_.end()) {
+    if (type.empty()) {
         return;
     }
     PendingHandler pending;
-    lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
-    pending.callback_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
+    pending.type = type;
     pushResponse(owner_, response);
     pending.event_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
     pending_handlers_.push_back(pending);
@@ -126,16 +124,18 @@ void NativeDispatcher::drainHandlers()
     while (!pending_handlers_.empty()) {
         PendingHandler pending = pending_handlers_.front();
         pending_handlers_.pop_front();
-        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
-        lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-        const int status = lua_pcall(owner_, 1, 0, 0);
         std::string error;
-        if (status != LUA_OK) {
-            const char *text = lua_tostring(owner_, -1);
-            error = text ? text : "unknown Lua error";
-            lua_pop(owner_, 1);
+        const auto found = handlers_.find(pending.type);
+        if (found != handlers_.end()) {
+            lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
+            lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
+            const int status = lua_pcall(owner_, 1, 0, 0);
+            if (status != LUA_OK) {
+                const char *text = lua_tostring(owner_, -1);
+                error = text ? text : "unknown Lua error";
+                lua_pop(owner_, 1);
+            }
         }
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
         luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
         if (!error.empty()) {
             throw std::runtime_error("tdlua event handler failed: " + error);
@@ -148,7 +148,6 @@ void NativeDispatcher::clearHandlerQueue()
     while (!pending_handlers_.empty()) {
         const PendingHandler pending = pending_handlers_.front();
         pending_handlers_.pop_front();
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.callback_ref);
         luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
     }
 }
@@ -207,7 +206,6 @@ bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type) const
 void NativeDispatcher::clear()
 {
     clearHandlerQueue();
-    router_.closePending();
     router_.clear();
     for (auto &entry : handlers_) {
         luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);

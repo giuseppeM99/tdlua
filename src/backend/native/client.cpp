@@ -149,6 +149,7 @@ bool NativeTDLua::pump(const double timeout)
             response = receiveBackend(timeout);
         }
         if (!response.object) {
+            dispatcher_.drain();
             return false;
         }
         checkAuthState(response);

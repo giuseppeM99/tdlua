@@ -249,6 +249,7 @@ bool TDLua::pump(const double timeout)
             value = transport().receive(timeout);
         }
         if (!value.is_object() || value.empty()) {
+            dispatcher_.drain();
             return false;
         }
         checkAuthState(value);

@@ -250,7 +250,7 @@ void testManagedFutureAndTasks(lua_State *L, Fake &fake)
     runLua(L, "closing = c:getMe()");
 }
 
-void testReviewRegressions(lua_State *L, Fake &fake)
+void testReviewRegressions(lua_State *L, Fake &fake, Fake &second)
 {
     runLua(L,
            "timeout_future = c:getMe(); "
@@ -258,10 +258,52 @@ void testReviewRegressions(lua_State *L, Fake &fake)
            "  timeout_value, timeout_error = timeout_future:wait(0) "
            "end); "
            "assert(coroutine.resume(timeout_co)); "
-           "assert(coroutine.status(timeout_co) == 'suspended')");
-    runLua(L,
-           "c:receive(0); assert(coroutine.status(timeout_co) == 'dead' and "
+           "assert(coroutine.status(timeout_co) == 'dead' and "
            "timeout_value == nil and timeout_error == 'timeout')");
+    const auto timeout_id = fake.sent.back().first;
+    fake.response(timeout_id, 100);
+    runLua(L,
+           "c:receive(0); assert(timeout_future:ready() and "
+           "timeout_future:wait().value == 100); "
+           "local ok, message = pcall(function() timeout_future:wait(math.huge) end); "
+           "assert(not ok and message:find('finite')); "
+           "ok, message = pcall(function() timeout_future:wait(0 / 0) end); "
+           "assert(not ok and message:find('finite'))");
+
+    runLua(L,
+           "timer_future = c:getMe(); "
+           "timer_co = coroutine.create(function() "
+           "  timer_value, timer_error = timer_future:wait(0.01) end); "
+           "assert(coroutine.resume(timer_co)); "
+           "blocking_future = c:getMe(); "
+           "blocking_value, blocking_error = blocking_future:wait(0.03); "
+           "assert(blocking_value == nil and blocking_error == 'timeout' and "
+           "coroutine.status(timer_co) == 'dead' and timer_value == nil and "
+           "timer_error == 'timeout')");
+
+    runLua(L,
+           "cross_task = c:getMe(function() "
+           "  return d:getMe():wait().value end)");
+    const auto cross_outer_id = fake.sent.back().first;
+    fake.response(cross_outer_id, 105);
+    runLua(L, "c:receive(0)");
+    const auto cross_inner_id = second.sent.back().first;
+    second.response(cross_inner_id, 106);
+    runLua(L,
+           "d:receive(0); local cross_value = cross_task:wait(); "
+           "assert(cross_value == 106 and cross_task:ready())");
+
+    runLua(L,
+           "external_task = c:getMe(function() "
+           "  external_task_co = coroutine.running(); "
+           "  return c:getMe():wait() end)");
+    const auto external_outer_id = fake.sent.back().first;
+    fake.response(external_outer_id, 107);
+    runLua(L, "c:receive(0)");
+    runLua(L,
+           "local resumed, error_message = coroutine.resume(external_task_co); "
+           "assert(not resumed and error_message:find('resumed externally') and "
+           "external_task:ready())");
 
     runLua(L,
            "multi_task = c:getMe(function(result) "
@@ -337,15 +379,40 @@ void testHandlers(lua_State *L, Fake &fake)
            "local ok, error_message = pcall(c.receive, c, 0); "
            "assert(not ok and error_message:find('fake handler boom')); "
            "c.onUpdateOption = nil");
+
+    runLua(L,
+           "old_handler_calls = 0; new_handler_calls = 0; "
+           "old_handler = function() old_handler_calls = old_handler_calls + 1 end; "
+           "new_handler = function() new_handler_calls = new_handler_calls + 1 end; "
+           "c:on('testInt', old_handler); "
+           "handler_order_task = c:getMe(function(result) "
+           "  c:off('testInt'); return result.value end)");
+    const auto handler_order_id = fake.sent.back().first;
+    fake.response(handler_order_id, 109);
+    runLua(L,
+           "c:receive(0); assert(handler_order_task:wait() == 109 and "
+           "old_handler_calls == 0)");
+
+    runLua(L,
+           "c:on('testInt', old_handler); "
+           "handler_replace_task = c:getMe(function(result) "
+           "  c:on('testInt', new_handler); return result.value end)");
+    const auto handler_replace_id = fake.sent.back().first;
+    fake.response(handler_replace_id, 110);
+    runLua(L,
+           "c:receive(0); assert(handler_replace_task:wait() == 110 and "
+           "old_handler_calls == 0 and new_handler_calls == 1); "
+           "c:off('testInt')");
 }
 
 void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
 {
     runLua(L,
            "other = d:send{_='getMe'}; "
-           "assert(other == ids[1]); "
+           "assert(other > 0); "
            "do local value = {}; weak[2] = value; "
            "c:request({_='getMe'}, function() return value end) end");
+    const auto other_id = second.sent.back().first;
 
     runLua(L,
            "shared = c:getMe(); "
@@ -371,9 +438,26 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
            "collectgarbage('collect'); assert(weak[2] == nil); "
            "assert(d:pendingCount() == 1)");
 
-    second.response(second.sent.front().first, 5);
+    second.response(other_id, 5);
     runLua(L,
            "assert(d:receive(0).value == 5); "
+           "owner = tdlua()");
+    Fake owner_fake;
+    attachTransport(L, "owner", owner_fake);
+    runLua(L,
+           "owner_task = owner:getMe(function() "
+           "  return d:getMe():wait().value end)");
+    const auto owner_request_id = owner_fake.sent.back().first;
+    owner_fake.response(owner_request_id, 111);
+    runLua(L, "owner:receive(0)");
+    const auto owner_dependency_id = second.sent.back().first;
+    second.response(owner_dependency_id, 112);
+    runLua(L,
+           "owner = nil; collectgarbage('collect'); d:receive(0); "
+           "local ok, message = pcall(function() owner_task:wait() end); "
+           "assert(not ok, message); assert(message:find('task owner closed'), message)");
+
+    runLua(L,
            "running_task = d:getMe(function(result) "
            "  d:close(); return result.value, 123 end)");
     const auto running_id = second.sent.back().first;
@@ -396,7 +480,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testResponses(L, fake);
     testAwaitAndSynchronousCalls(L, fake);
     testManagedFutureAndTasks(L, fake);
-    testReviewRegressions(L, fake);
+    testReviewRegressions(L, fake, second);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
     testCloseAndClientIsolation(L, fake, second);
