@@ -210,7 +210,7 @@ end)
 
 while coroutine.status(auth_thread) ~= "dead" do
     check_auth_error()
-    client:poll(1.0)
+    client:poll()
 end
 check_auth_error()
 client:off("updateAuthorizationState")
@@ -231,7 +231,7 @@ if not resumed then
     error(resume_error)
 end
 while coroutine.status(verification_thread) ~= "dead" do
-    client:poll(1.0)
+    client:poll()
 end
 
 client:close()
