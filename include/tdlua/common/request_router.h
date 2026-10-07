@@ -4,6 +4,7 @@
 
 #include "tdlua/lua_compat.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -20,11 +21,13 @@ namespace tdlua {
 
 class SchedulerCore;
 class RequestRouter;
+struct EventRegistration;
 
 enum class RequestKind {
     Raw,
     Future,
     Task,
+    EventTask,
     LegacyRequest,
     LegacyAwait
 };
@@ -80,6 +83,7 @@ struct ManagedState {
     bool callback_is_thread = false;
     std::size_t handle_count = 0;
     std::size_t waiter_count = 0;
+    std::shared_ptr<EventRegistration> event_registration;
 };
 
 using ManagedStatePtr = std::shared_ptr<ManagedState>;
@@ -90,6 +94,24 @@ struct ManagedHandle {
 
 struct CoreAnchor {
     std::shared_ptr<SchedulerCore> core;
+};
+
+// A registration owns only Lua references stored in the core anchor. Running
+// event tasks keep the registration alive after replacement or removal; the
+// registration's queued updates are never transferred to a new registration.
+struct EventRegistration {
+    int handler_ref = LUA_NOREF;
+    bool concurrent = true;
+    bool active = false;
+    bool removed = false;
+    std::deque<int> queued_updates;
+};
+
+using EventRegistrationPtr = std::shared_ptr<EventRegistration>;
+
+struct DeferredEvent {
+    std::string type;
+    int update_ref = LUA_NOREF;
 };
 
 // These indexes are weak bookkeeping only. They never root a coroutine or
@@ -166,6 +188,7 @@ inline bool isTerminalState(const ManagedStatePtr &state)
 inline bool isTaskState(const ManagedStatePtr &state)
 {
     return state && (state->kind == RequestKind::Task ||
+                     state->kind == RequestKind::EventTask ||
                      state->kind == RequestKind::LegacyRequest);
 }
 
@@ -246,6 +269,11 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     // State and routing ownership.
     std::map<std::uint64_t, State> pending_;
     std::map<std::uint64_t, State> live_states_;
+    std::vector<State> event_states_;
+    std::map<std::string, EventRegistrationPtr> events_;
+    std::deque<DeferredEvent> deferred_events_;
+    bool events_enabled_ = true;
+    std::deque<std::string> scheduler_errors_;
 
     // Waiters are active registrations. Notifications have been detached
     // from dependency/timer lookup and are safe to drain in phase two.
@@ -306,13 +334,60 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         releaseLuaReference(state->result_ref);
     }
 
+    void releaseEventRegistration(const EventRegistrationPtr &registration)
+    {
+        if (!registration) return;
+        releaseLuaReference(registration->handler_ref);
+        while (!registration->queued_updates.empty()) {
+            int reference = registration->queued_updates.front();
+            registration->queued_updates.pop_front();
+            releaseLuaReference(reference);
+        }
+        registration->removed = true;
+    }
+
+    void discardQueuedEvents(const EventRegistrationPtr &registration)
+    {
+        if (!registration) return;
+        while (!registration->queued_updates.empty()) {
+            int reference = registration->queued_updates.front();
+            registration->queued_updates.pop_front();
+            releaseLuaReference(reference);
+        }
+    }
+
+    void clearDeferredEvents()
+    {
+        while (!deferred_events_.empty()) {
+            DeferredEvent event = std::move(deferred_events_.front());
+            deferred_events_.pop_front();
+            releaseLuaReference(event.update_ref);
+        }
+    }
+
+    void removeEventRegistration(const std::string &type)
+    {
+        const auto found = events_.find(type);
+        if (found == events_.end()) {
+            return;
+        }
+        releaseEventRegistration(found->second);
+        events_.erase(found);
+    }
+
     // ----- State allocation and retirement -----
 
     void retireState(const State &state)
     {
         if (isTerminalState(state) && !state->handle_count && !state->waiter_count) {
             releaseLuaReferences(state);
-            live_states_.erase(state->request_id);
+            if (state->kind == RequestKind::EventTask) {
+                event_states_.erase(
+                    std::remove(event_states_.begin(), event_states_.end(), state),
+                    event_states_.end());
+            } else {
+                live_states_.erase(state->request_id);
+            }
         }
     }
 
@@ -320,10 +395,14 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     {
         State state(new ManagedState());
         state->core = shared_from_this();
-        state->request_id = next_++;
         state->kind = kind;
-        pending_[state->request_id] = state;
-        live_states_[state->request_id] = state;
+        if (kind == RequestKind::EventTask) {
+            event_states_.push_back(state);
+        } else {
+            state->request_id = next_++;
+            pending_[state->request_id] = state;
+            live_states_[state->request_id] = state;
+        }
         return state;
     }
     void failState(const State &state, const std::string &error)
@@ -370,10 +449,84 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     {
         const char *message = lua_tostring(thread, -1);
         const char *prefix = status == LUA_YIELD
-            ? "tdlua task yielded without a managed dependency: "
-            : "tdlua task failed: ";
+            ? (state->kind == RequestKind::EventTask
+                   ? "tdlua event handler yielded without a managed dependency: "
+                   : "tdlua task yielded without a managed dependency: ")
+            : (state->kind == RequestKind::EventTask
+                   ? "tdlua event handler failed: "
+                   : "tdlua task failed: ");
         failState(state, std::string(prefix) + (message ? message : "unknown Lua error"));
         lua_settop(thread, 0);
+    }
+
+    State createEventTask(const EventRegistrationPtr &registration, int update_ref)
+    {
+        const State state = createState(RequestKind::EventTask);
+        state->event_registration = registration;
+        pushLuaReference(lua_owner_, registration->handler_ref);
+        state->callback_ref = createLuaReference(lua_owner_, -1);
+        lua_pop(lua_owner_, 1);
+        state->response_ref = update_ref;
+        return state;
+    }
+
+    void finishSerializedEvent(const State &state)
+    {
+        const EventRegistrationPtr registration = state->event_registration;
+        if (!registration || registration->concurrent) {
+            return;
+        }
+        registration->active = false;
+        if (registration->removed || !events_enabled_) {
+            discardQueuedEvents(registration);
+            return;
+        }
+        if (registration->queued_updates.empty()) {
+            return;
+        }
+        const int update_ref = registration->queued_updates.front();
+        registration->queued_updates.pop_front();
+        registration->active = true;
+        ready_.push_back(createEventTask(registration, update_ref));
+    }
+
+    void bindDeferredEvent(DeferredEvent event)
+    {
+        if (!events_enabled_) {
+            releaseLuaReference(event.update_ref);
+            return;
+        }
+        const auto found = events_.find(event.type);
+        if (found == events_.end() || found->second->removed) {
+            releaseLuaReference(event.update_ref);
+            return;
+        }
+        const EventRegistrationPtr registration = found->second;
+        if (!registration->concurrent && registration->active) {
+            registration->queued_updates.push_back(event.update_ref);
+            return;
+        }
+        if (!registration->concurrent) {
+            registration->active = true;
+        }
+        try {
+            ready_.push_back(createEventTask(registration, event.update_ref));
+        } catch (...) {
+            releaseLuaReference(event.update_ref);
+            if (!registration->concurrent) {
+                registration->active = false;
+            }
+            throw;
+        }
+    }
+
+    void drainDeferredEvents()
+    {
+        while (!deferred_events_.empty()) {
+            DeferredEvent event = std::move(deferred_events_.front());
+            deferred_events_.pop_front();
+            bindDeferredEvent(std::move(event));
+        }
     }
 
     void finishTask(const State &state, lua_State *thread, int status)
@@ -392,10 +545,18 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         releaseLuaReference(state->callback_ref);
         releaseLuaReference(state->context_ref);
+        const bool legacy_request_failed =
+            state->kind == RequestKind::LegacyRequest &&
+            state->status == ManagedStatus::Failed;
+        if (state->kind == RequestKind::EventTask &&
+            state->status == ManagedStatus::Failed) {
+            scheduler_errors_.push_back(state->error);
+        }
+        finishSerializedEvent(state);
         wake(state);
         retireState(state);
-        if (state->kind == RequestKind::LegacyRequest &&
-            state->status == ManagedStatus::Failed) {
+        if (legacy_request_failed) {
+            clearDeferredEvents();
             throw std::runtime_error(state->error);
         }
     }
@@ -418,11 +579,19 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         if (!thread) {
             failState(state, "tdlua: task coroutine unavailable");
+            if (state->kind == RequestKind::EventTask) {
+                scheduler_errors_.push_back(state->error);
+                finishSerializedEvent(state);
+            }
             wake(state);
+            retireState(state);
             return;
         }
         pushLuaReference(thread, state->response_ref);
-        pushLuaReference(thread, state->context_ref);
+        const int argument_count = state->kind == RequestKind::EventTask ? 1 : 2;
+        if (argument_count == 2) {
+            pushLuaReference(thread, state->context_ref);
+        }
         releaseLuaReference(state->response_ref);
         releaseLuaReference(state->callback_ref);
         releaseLuaReference(state->context_ref);
@@ -434,7 +603,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         taskBindings()[thread] = binding;
         // Pin the owner core before the initial callback can enter Lua and
         // yield into a dependency owned by another core.
-        const int status = tdlua_lua_resume(thread, lua_owner_, 2);
+        const int status = tdlua_lua_resume(thread, lua_owner_, argument_count);
         finishTask(state, thread, status);
     }
     // ----- Wait registration and resumption -----
@@ -656,6 +825,55 @@ public:
         else state->callback_ref = createLuaReference(L, callback);
         if (context) state->context_ref = createLuaReference(L, context);
         return state;
+    }
+
+    void onEvent(lua_State *L, const std::string &type, int callback, bool concurrent)
+    {
+        if (!lua_isfunction(L, callback)) {
+            throw std::runtime_error("tdlua: event handler must be a function");
+        }
+        removeEventRegistration(type);
+        EventRegistrationPtr registration(new EventRegistration());
+        registration->concurrent = concurrent;
+        registration->handler_ref = createLuaReference(L, callback);
+        events_[type] = registration;
+    }
+
+    void offEvent(const std::string &type)
+    {
+        removeEventRegistration(type);
+    }
+
+    bool pushEventHandler(lua_State *L, const std::string &type)
+    {
+        const auto found = events_.find(type);
+        if (found == events_.end() || found->second->removed) {
+            return false;
+        }
+        pushLuaReference(L, found->second->handler_ref);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        return true;
+    }
+
+    template<class Push>
+    bool deferEvent(const std::string &type, Push push)
+    {
+        if (!events_enabled_) {
+            return false;
+        }
+        const auto scheduler_lease = shared_from_this();
+        (void)scheduler_lease;
+        push(lua_owner_);
+        int update_ref = createLuaReference(lua_owner_, -1);
+        lua_pop(lua_owner_, 1);
+        DeferredEvent event;
+        event.type = type;
+        event.update_ref = update_ref;
+        deferred_events_.push_back(std::move(event));
+        return true;
     }
     std::uint64_t request(lua_State *L, int callback, int context)
     {
@@ -895,6 +1113,11 @@ public:
     {
         pump_ = nullptr;
         pump_context_ = nullptr;
+        events_enabled_ = false;
+        for (const auto &entry : events_) {
+            entry.second->removed = true;
+        }
+        clearEvents();
         std::map<std::uint64_t, State> pending;
         pending.swap(pending_);
         for (const auto &entry : pending) {
@@ -907,6 +1130,15 @@ public:
             waitBindings().erase(it->first);
             it = waiters_.erase(it);
         }
+    }
+
+    void clearEvents()
+    {
+        clearDeferredEvents();
+        for (const auto &entry : events_) {
+            releaseEventRegistration(entry.second);
+        }
+        events_.clear();
     }
 
     void drainDetachedNotifications()
@@ -967,12 +1199,20 @@ public:
         if (draining_) return;
         draining_ = true;
         try {
-            drainReadyStates();
+            while (!ready_.empty() || !deferred_events_.empty()) {
+                drainReadyStates();
+                drainDeferredEvents();
+            }
         } catch (...) {
             draining_ = false;
             throw;
         }
         draining_ = false;
+        if (!scheduler_errors_.empty()) {
+            const std::string error = scheduler_errors_.front();
+            scheduler_errors_.pop_front();
+            throw std::runtime_error(error);
+        }
     }
 
     State stateById(std::uint64_t id)
@@ -1058,6 +1298,20 @@ public:
     ManagedStatePtr task(lua_State *L, int callback, int context, bool thread)
     {
         return core_->task(L, callback, context, thread);
+    }
+    void onEvent(lua_State *L, const std::string &type, int callback, bool concurrent)
+    {
+        core_->onEvent(L, type, callback, concurrent);
+    }
+    void offEvent(const std::string &type) { core_->offEvent(type); }
+    bool pushEventHandler(lua_State *L, const std::string &type)
+    {
+        return core_->pushEventHandler(L, type);
+    }
+    template<class Push>
+    bool deferEvent(const std::string &type, Push push)
+    {
+        return core_->deferEvent(type, std::move(push));
     }
     ManagedStatePtr awaitState(lua_State *L) { return core_->awaitState(L); }
     std::uint64_t request(lua_State *L, int callback, int context)

@@ -4,10 +4,8 @@
 #pragma once
 
 #include <cstddef>
-#include <map>
 #include <string>
 #include <memory>
-#include <deque>
 
 #include "tdlua/lua_compat.h"
 
@@ -41,9 +39,10 @@ public:
     std::size_t pendingCount() const;
     static bool responseRequestId(const nlohmann::json &response,
                                   std::uint64_t &request_id);
-    void on(lua_State *L, const std::string &type, int callback_index);
+    void on(lua_State *L, const std::string &type, int callback_index,
+            bool concurrent);
     void off(const std::string &type);
-    bool pushHandler(lua_State *L, const std::string &type) const;
+    bool pushHandler(lua_State *L, const std::string &type);
     tdlua::RouteKind dispatch(nlohmann::json &event);
     void drain();
     void clear();
@@ -60,17 +59,5 @@ public:
     }
 
 private:
-    struct PendingHandler {
-        std::string type;
-        int event_ref = LUA_NOREF;
-    };
-
-    void queueHandler(nlohmann::json &event);
-    void drainHandlers();
-    void clearHandlerQueue();
-
-    lua_State *owner_;
     RequestRouter router_;
-    std::map<std::string, int> handlers_;
-    std::deque<PendingHandler> pending_handlers_;
 };

@@ -44,7 +44,7 @@ struct ClientOperations final {
     lua_CFunction request;
     lua_CFunction await;
     bool (*push_handler)(ClientHandle, lua_State *, const char *);
-    void (*on)(ClientHandle, lua_State *, const char *, int);
+    void (*on)(ClientHandle, lua_State *, const char *, int, bool);
     void (*off)(ClientHandle, const char *);
     void (*save_updates)(ClientHandle);
     void (*clear_updates)(ClientHandle);
@@ -240,6 +240,28 @@ inline bool handler_property(const char *name, std::string &type)
     return true;
 }
 
+inline bool parse_event_concurrency(lua_State *L, int index)
+{
+    if (index == 0 || lua_isnoneornil(L, index)) {
+        return true;
+    }
+    if (!lua_istable(L, index)) {
+        throw std::runtime_error("tdlua: event options must be a table");
+    }
+    lua_getfield(L, index, "concurrent");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return true;
+    }
+    if (!lua_isboolean(L, -1)) {
+        lua_pop(L, 1);
+        throw std::runtime_error("tdlua: event option 'concurrent' must be boolean");
+    }
+    const bool concurrent = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return concurrent;
+}
+
 inline int index(lua_State *L, ClientHandle client,
                  const ClientOperations &operations, lua_CFunction helper)
 {
@@ -292,7 +314,7 @@ inline int newindex(lua_State *L, ClientHandle client,
             if (!lua_isfunction(L, 3)) {
                 throw std::runtime_error("tdlua: event handler must be a function");
             }
-            operations.on(client, L, type.c_str(), 3);
+            operations.on(client, L, type.c_str(), 3, true);
         }
         return 0;
     });
@@ -311,7 +333,11 @@ inline int on(lua_State *L, ClientHandle client,
         if (!lua_isfunction(L, 3)) {
             throw std::runtime_error("tdlua: event handler must be a function");
         }
-        operations.on(client, L, lua_tostring(L, 2), 3);
+        if (lua_gettop(L) > 4) {
+            throw std::runtime_error("tdlua: invalid event registration arity");
+        }
+        const bool concurrent = parse_event_concurrency(L, 4);
+        operations.on(client, L, lua_tostring(L, 2), 3, concurrent);
         return 0;
     });
 }

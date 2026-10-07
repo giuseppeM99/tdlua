@@ -9,10 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <string>
 #include <memory>
-#include <deque>
 
 class NativeDispatcher final {
 public:
@@ -45,9 +43,10 @@ public:
     void pushResponse(lua_State *L, const NativeResponse &response) const;
     std::uint64_t nextRequestId();
 
-    void on(lua_State *L, const std::string &type, int callback_index);
+    void on(lua_State *L, const std::string &type, int callback_index,
+            bool concurrent);
     void off(const std::string &type);
-    bool pushHandler(lua_State *L, const std::string &type) const;
+    bool pushHandler(lua_State *L, const std::string &type);
     void clear();
     // Storage belongs to the Lua client uservalue. The dispatcher only passes
     // the attachment and transport-detach operations to the common router.
@@ -62,17 +61,5 @@ public:
     }
 
 private:
-    struct PendingHandler {
-        std::string type;
-        int event_ref = LUA_NOREF;
-    };
-
-    void queueHandler(const NativeResponse &response);
-    void drainHandlers();
-    void clearHandlerQueue();
-
-    lua_State *owner_;
     tdlua::RequestRouter router_;
-    std::map<std::string, int> handlers_;
-    std::deque<PendingHandler> pending_handlers_;
 };

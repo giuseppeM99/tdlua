@@ -98,7 +98,7 @@ NativeTDLua::~NativeTDLua()
     // Destruction cannot safely enter Lua. The binding performs the protected
     // drain before this destructor runs; this path only detaches transport.
     try {
-        close(false);
+        closeInternal(false, false);
     } catch (...) {
         dispatcher_.detachTransport();
     }
@@ -297,6 +297,11 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
 
 void NativeTDLua::close(bool drain)
 {
+    closeInternal(drain, true);
+}
+
+void NativeTDLua::closeInternal(bool drain, bool persist_updates)
+{
     // Phase one detaches the scheduler before backend shutdown can reenter the
     // client. The optional drain is phase two and is safe only at the binding
     // boundary that called close().
@@ -334,7 +339,9 @@ void NativeTDLua::close(bool drain)
             updates_.push_back(std::move(response));
         }
     }
-    saveUpdatesBuffer();
+    if (persist_updates) {
+        saveUpdatesBuffer();
+    }
     emptyUpdatesBuffer();
     closed_ = true;
     closing_ = false;

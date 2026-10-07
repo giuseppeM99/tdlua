@@ -35,9 +35,10 @@ static bool native_push_handler(tdlua_binding::ClientHandle client,
 }
 
 static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
-                      const char *type, int callback_index)
+                      const char *type, int callback_index, bool concurrent)
 {
-    static_cast<NativeTDLua *>(client)->dispatcher().on(L, type, callback_index);
+    static_cast<NativeTDLua *>(client)->dispatcher().on(
+        L, type, callback_index, concurrent);
 }
 
 static void native_off(tdlua_binding::ClientHandle client, const char *type)

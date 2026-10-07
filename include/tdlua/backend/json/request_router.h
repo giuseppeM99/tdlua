@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <utility>
 
 #include "tdlua/lua_compat.h"
 #include "tdlua/common/request_router.h"
@@ -30,6 +31,21 @@ public:
     std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
                                               int context_index,
                                               bool supplied_thread);
+    void onEvent(lua_State *L, const std::string &type, int callback_index,
+                 bool concurrent)
+    {
+        router_.onEvent(L, type, callback_index, concurrent);
+    }
+    void offEvent(const std::string &type) { router_.offEvent(type); }
+    bool pushEventHandler(lua_State *L, const std::string &type)
+    {
+        return router_.pushEventHandler(L, type);
+    }
+    template<class Push>
+    bool deferEvent(const std::string &type, Push push)
+    {
+        return router_.deferEvent(type, std::move(push));
+    }
     std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
     int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
               bool has_timeout, double timeout,

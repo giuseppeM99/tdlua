@@ -5,18 +5,15 @@
 #include <stdexcept>
 
 NativeDispatcher::NativeDispatcher(lua_State *owner)
-    : owner_(tdlua_lua_main_thread(owner)), router_(owner), pending_handlers_()
+    : router_(owner)
 {
 }
 
 NativeDispatcher::~NativeDispatcher()
 {
-    // The router destructor never resumes Lua. Handler references are released
-    // here while the owning Lua state is still valid.
+    // Destruction is phase one only. The owning binding performs the protected
+    // drain before this facade is destroyed.
     router_.detachTransport();
-    clearHandlerQueue();
-    for (const auto &entry : handlers_)
-        luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);
 }
 
 std::uint64_t NativeDispatcher::nextRequestId()
@@ -104,60 +101,25 @@ void NativeDispatcher::pushResponse(lua_State *L, const NativeResponse &response
     }
 }
 
-void NativeDispatcher::queueHandler(const NativeResponse &response)
+namespace {
+
+std::string nativeEventType(lua_State *L, const NativeDispatcher &dispatcher,
+                            const NativeResponse &response)
 {
     if (!response.object) {
-        return;
+        return std::string();
     }
-    pushResponse(owner_, response);
-    lua_getfield(owner_, -1, "_");
-    const char *type_name = lua_tostring(owner_, -1);
+    dispatcher.pushResponse(L, response);
+    lua_getfield(L, -1, "_");
+    const char *type_name = lua_tostring(L, -1);
     const std::string type = type_name ? type_name : "";
-    lua_pop(owner_, 2);
-    if (type.empty()) {
-        return;
-    }
-    PendingHandler pending;
-    pending.type = type;
-    pushResponse(owner_, response);
-    pending.event_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-    pending_handlers_.push_back(pending);
+    lua_pop(L, 2);
+    return type;
 }
 
-void NativeDispatcher::drainHandlers()
-{
-    while (!pending_handlers_.empty()) {
-        PendingHandler pending = pending_handlers_.front();
-        pending_handlers_.pop_front();
-        std::string error;
-        const auto found = handlers_.find(pending.type);
-        if (found != handlers_.end()) {
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-            const int status = lua_pcall(owner_, 1, 0, 0);
-            if (status != LUA_OK) {
-                const char *text = lua_tostring(owner_, -1);
-                error = text ? text : "unknown Lua error";
-                lua_pop(owner_, 1);
-            }
-        }
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-        if (!error.empty()) {
-            throw std::runtime_error("tdlua event handler failed: " + error);
-        }
-    }
 }
 
-void NativeDispatcher::clearHandlerQueue()
-{
-    while (!pending_handlers_.empty()) {
-        const PendingHandler pending = pending_handlers_.front();
-        pending_handlers_.pop_front();
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-    }
-}
-
-tdlua::RouteKind NativeDispatcher::dispatch(lua_State *, NativeResponse &response)
+tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response)
 {
     const tdlua::RouteKind route = router_.dispatchRoute(response.request_id,
                                                          [&](lua_State *target) {
@@ -167,53 +129,33 @@ tdlua::RouteKind NativeDispatcher::dispatch(lua_State *, NativeResponse &respons
         route == tdlua::RouteKind::Task ||
         route == tdlua::RouteKind::LegacyRequest ||
         route == tdlua::RouteKind::Update) {
-        queueHandler(response);
+        router_.deferEvent(nativeEventType(L, *this, response),
+                              [&](lua_State *target) {
+                                  pushResponse(target, response);
+                              });
     }
     return route;
 }
 
 void NativeDispatcher::drain()
 {
-    try {
-        router_.tick();
-    } catch (...) {
-        clearHandlerQueue();
-        throw;
-    }
-    drainHandlers();
+    router_.tick();
 }
 
-void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index)
+void NativeDispatcher::on(lua_State *L, const std::string &type, int callback_index,
+                          bool concurrent)
 {
-    if (!lua_isfunction(L, callback_index)) {
-        throw std::runtime_error("tdlua: event handler must be a function");
-    }
-    off(type);
-    lua_pushvalue(L, callback_index);
-    handlers_[type] = luaL_ref(L, LUA_REGISTRYINDEX);
+    router_.onEvent(L, type, callback_index, concurrent);
 }
 void NativeDispatcher::off(const std::string &type)
 {
-    const auto found = handlers_.find(type);
-    if (found == handlers_.end()) {
-        return;
-    }
-    luaL_unref(owner_, LUA_REGISTRYINDEX, found->second);
-    handlers_.erase(found);
+    router_.offEvent(type);
 }
-bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type) const
+bool NativeDispatcher::pushHandler(lua_State *L, const std::string &type)
 {
-    const auto found = handlers_.find(type);
-    if (found == handlers_.end()) return false;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, found->second);
-    return true;
+    return router_.pushEventHandler(L, type);
 }
 void NativeDispatcher::clear()
 {
-    clearHandlerQueue();
     router_.clear();
-    for (auto &entry : handlers_) {
-        luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);
-    }
-    handlers_.clear();
 }

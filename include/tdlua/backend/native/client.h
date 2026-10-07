@@ -52,6 +52,8 @@ public:
     void emptyUpdatesBuffer();
 
 private:
+    void closeInternal(bool drain, bool persist_updates);
+
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;

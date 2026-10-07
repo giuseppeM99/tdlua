@@ -21,18 +21,15 @@ std::string eventType(const nlohmann::json &event)
 }
 
 LuaDispatcher::LuaDispatcher(lua_State *owner)
-    : owner_(tdlua_lua_main_thread(owner)), router_(owner), handlers_(), pending_handlers_()
+    : router_(owner)
 {
 }
 
 LuaDispatcher::~LuaDispatcher()
 {
-    // The router destructor never resumes Lua. Handler references are released
-    // here while the owning Lua state is still valid.
+    // Destruction is phase one only. The owning binding performs the protected
+    // drain before this facade is destroyed.
     router_.detachTransport();
-    clearHandlerQueue();
-    for (const auto &entry : handlers_)
-        luaL_unref(owner_, LUA_REGISTRYINDEX, entry.second);
 }
 
 std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &request,
@@ -108,82 +105,20 @@ std::size_t LuaDispatcher::pendingCount() const
     return router_.pendingCount();
 }
 
-void LuaDispatcher::on(lua_State *L, const std::string &type, int callback_index)
+void LuaDispatcher::on(lua_State *L, const std::string &type, int callback_index,
+                       bool concurrent)
 {
-    if (!lua_isfunction(L, callback_index)) {
-        throw std::runtime_error("tdlua: event handler must be a function");
-    }
-    off(type);
-    lua_pushvalue(L, callback_index);
-    handlers_[type] = luaL_ref(L, LUA_REGISTRYINDEX);
+    router_.onEvent(L, type, callback_index, concurrent);
 }
 
 void LuaDispatcher::off(const std::string &type)
 {
-    std::map<std::string, int>::iterator found = handlers_.find(type);
-    if (found == handlers_.end()) {
-        return;
-    }
-    luaL_unref(owner_, LUA_REGISTRYINDEX, found->second);
-    handlers_.erase(found);
+    router_.offEvent(type);
 }
 
-bool LuaDispatcher::pushHandler(lua_State *L, const std::string &type) const
+bool LuaDispatcher::pushHandler(lua_State *L, const std::string &type)
 {
-    const std::map<std::string, int>::const_iterator found = handlers_.find(type);
-    if (found == handlers_.end()) {
-        return false;
-    }
-    lua_rawgeti(L, LUA_REGISTRYINDEX, found->second);
-    return true;
-}
-
-void LuaDispatcher::queueHandler(nlohmann::json &event)
-{
-    const std::string type = eventType(event);
-    if (type.empty()) {
-        return;
-    }
-
-    PendingHandler pending;
-    pending.type = type;
-    lua_pushjson(owner_, event);
-    pending.event_ref = luaL_ref(owner_, LUA_REGISTRYINDEX);
-    pending_handlers_.push_back(pending);
-}
-
-void LuaDispatcher::drainHandlers()
-{
-    while (!pending_handlers_.empty()) {
-        PendingHandler pending = pending_handlers_.front();
-        pending_handlers_.pop_front();
-        std::string error;
-        const std::map<std::string, int>::const_iterator found =
-            handlers_.find(pending.type);
-        if (found != handlers_.end()) {
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, found->second);
-            lua_rawgeti(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-            const int status = lua_pcall(owner_, 1, 0, 0);
-            if (status != LUA_OK) {
-                const char *message = lua_tostring(owner_, -1);
-                error = message ? message : "unknown Lua error";
-                lua_pop(owner_, 1);
-            }
-        }
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-        if (!error.empty()) {
-            throw std::runtime_error("tdlua event handler failed: " + error);
-        }
-    }
-}
-
-void LuaDispatcher::clearHandlerQueue()
-{
-    while (!pending_handlers_.empty()) {
-        const PendingHandler pending = pending_handlers_.front();
-        pending_handlers_.pop_front();
-        luaL_unref(owner_, LUA_REGISTRYINDEX, pending.event_ref);
-    }
+    return router_.pushEventHandler(L, type);
 }
 
 tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event)
@@ -201,29 +136,19 @@ tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event)
         route == tdlua::RouteKind::Task ||
         route == tdlua::RouteKind::LegacyRequest ||
         route == tdlua::RouteKind::Update) {
-        queueHandler(event);
+        router_.deferEvent(eventType(event), [&](lua_State *L) {
+            lua_pushjson(L, event);
+        });
     }
     return route;
 }
 
 void LuaDispatcher::drain()
 {
-    try {
-        router_.tick();
-    } catch (...) {
-        clearHandlerQueue();
-        throw;
-    }
-    drainHandlers();
+    router_.tick();
 }
 
 void LuaDispatcher::clear()
 {
-    clearHandlerQueue();
     router_.clear();
-    for (std::map<std::string, int>::iterator map_it = handlers_.begin();
-         map_it != handlers_.end(); ++map_it) {
-        luaL_unref(owner_, LUA_REGISTRYINDEX, map_it->second);
-    }
-    handlers_.clear();
 }

@@ -33,9 +33,10 @@ static bool json_push_handler(tdlua_binding::ClientHandle client,
 }
 
 static void json_on(tdlua_binding::ClientHandle client, lua_State *L,
-                    const char *type, int callback_index)
+                    const char *type, int callback_index, bool concurrent)
 {
-    static_cast<TDLua *>(client)->dispatcher().on(L, type, callback_index);
+    static_cast<TDLua *>(client)->dispatcher().on(
+        L, type, callback_index, concurrent);
 }
 
 static void json_off(tdlua_binding::ClientHandle client, const char *type)

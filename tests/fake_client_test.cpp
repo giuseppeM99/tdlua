@@ -73,6 +73,14 @@ struct Fake {
             {"@extra", {{"__tdlua_request_id", id}}}
         });
     }
+
+    void update(const char *type, int value)
+    {
+        incoming.push_back({
+            {"@type", type},
+            {"value", value}
+        });
+    }
 };
 
 void runLua(lua_State *L, const char *source)
@@ -357,6 +365,17 @@ void testRollbackAndCallbackErrors(lua_State *L, TDLua *client, Fake &fake)
     runLua(L,
            "local ok, error_message = pcall(c.receive, c, 0); "
            "assert(not ok and error_message:find('fake callback boom'))");
+
+    runLua(L,
+           "legacy_order_event = false; "
+           "c:on('testInt', function() legacy_order_event = true end); "
+           "c:request({_='getMe'}, function() error('legacy ordering boom') end)");
+    const auto legacy_order_id = fake.sent.back().first;
+    fake.response(legacy_order_id, 10);
+    runLua(L,
+           "local ok, error_message = pcall(c.receive, c, 0); "
+           "assert(not ok and error_message:find('legacy ordering boom')); "
+           "assert(not legacy_order_event); c:off('testInt'); c:receive(0)");
 }
 
 void testHandlers(lua_State *L, Fake &fake)
@@ -403,6 +422,215 @@ void testHandlers(lua_State *L, Fake &fake)
            "c:receive(0); assert(handler_replace_task:wait() == 110 and "
            "old_handler_calls == 0 and new_handler_calls == 1); "
            "c:off('testInt')");
+
+    runLua(L,
+           "deferred_old = 0; deferred_new = 0; "
+           "c:on('testInt', function() deferred_old = deferred_old + 1 end); "
+           "deferred_rebind_task = c:getMe(function() "
+           "  c:off('testInt'); "
+           "  c:on('testInt', function() deferred_new = deferred_new + 1 end) "
+           "end)");
+    const auto deferred_rebind_id = fake.sent.back().first;
+    fake.response(deferred_rebind_id, 111);
+    runLua(L,
+           "c:receive(0); assert(deferred_rebind_task:ready()); "
+           "assert(deferred_old == 0 and deferred_new == 1); c:off('testInt')");
+
+    runLua(L,
+           "deferred_drop = 0; "
+           "c:on('testInt', function() deferred_drop = deferred_drop + 1 end); "
+           "deferred_drop_task = c:getMe(function() c:off('testInt') end)");
+    const auto deferred_drop_id = fake.sent.back().first;
+    fake.response(deferred_drop_id, 112);
+    runLua(L,
+           "c:receive(0); assert(deferred_drop_task:ready()); "
+           "assert(deferred_drop == 0)");
+}
+
+void testEventScheduling(lua_State *L, Fake &fake, Fake &second)
+{
+    runLua(L,
+           "m3_log = {}; "
+           "c:on('m3Concurrent', function(update) "
+           "  m3_log[#m3_log + 1] = 'start:' .. update.value; "
+           "  local result = c:getMe():wait(); "
+           "  m3_log[#m3_log + 1] = 'done:' .. update.value .. ':' .. result.value "
+           "end)");
+    fake.update("m3Concurrent", 1);
+    runLua(L, "c:receive(0); assert(m3_log[1] == 'start:1')");
+    const auto concurrent_first = fake.sent.back().first;
+    fake.update("m3Concurrent", 2);
+    runLua(L, "c:receive(0); assert(m3_log[2] == 'start:2')");
+    const auto concurrent_second = fake.sent.back().first;
+    fake.response(concurrent_second, 22);
+    runLua(L, "c:receive(0); assert(m3_log[3] == 'done:2:22')");
+    fake.response(concurrent_first, 11);
+    runLua(L, "c:receive(0); assert(m3_log[4] == 'done:1:11')");
+
+    runLua(L,
+           "m3_serial = {}; "
+           "c:on('m3Serial', function(update) "
+           "  m3_serial[#m3_serial + 1] = 'start:' .. update.value; "
+           "  local result = c:getMe():wait(); "
+           "  m3_serial[#m3_serial + 1] = 'done:' .. update.value; "
+           "  m3_serial[#m3_serial + 1] = 'result:' .. result.value "
+           "end, {concurrent = false}); "
+           "c:on('m3Other', function(update) "
+           "  m3_serial[#m3_serial + 1] = 'other:' .. update.value "
+           "end)");
+    fake.update("m3Serial", 1);
+    runLua(L, "c:receive(0); assert(m3_serial[1] == 'start:1')");
+    const auto serial_first = fake.sent.back().first;
+    fake.update("m3Serial", 2);
+    fake.update("m3Serial", 3);
+    fake.update("m3Other", 9);
+    runLua(L,
+           "c:receive(0); c:receive(0); c:receive(0); "
+           "assert(m3_serial[2] == 'other:9' and #m3_serial == 2)");
+    fake.response(serial_first, 31);
+    runLua(L,
+           "c:receive(0); assert(m3_serial[3] == 'done:1' and "
+           "m3_serial[4] == 'result:31' and m3_serial[5] == 'start:2')");
+    const auto serial_second = fake.sent.back().first;
+    fake.response(serial_second, 32);
+    runLua(L,
+           "c:receive(0); assert(m3_serial[6] == 'done:2' and "
+           "m3_serial[7] == 'result:32' and m3_serial[8] == 'start:3')");
+    const auto serial_third = fake.sent.back().first;
+    fake.response(serial_third, 33);
+    runLua(L,
+           "c:receive(0); assert(m3_serial[9] == 'done:3' and "
+           "m3_serial[10] == 'result:33')");
+
+    runLua(L,
+           "m3_old = 0; m3_new = 0; "
+           "c:on('m3Replace', function(update) "
+           "  m3_old = m3_old + 1; local result = c:getMe():wait(); "
+           "  m3_old = m3_old + result.value end, {concurrent = false})");
+    fake.update("m3Replace", 1);
+    runLua(L, "c:receive(0); assert(m3_old == 1)");
+    const auto replace_old_request = fake.sent.back().first;
+    fake.update("m3Replace", 2);
+    runLua(L, "c:receive(0)");
+    runLua(L,
+           "c:on('m3Replace', function(update) m3_new = m3_new + update.value end); "
+           "assert(c.onM3Replace ~= nil)");
+    fake.update("m3Replace", 3);
+    runLua(L, "c:receive(0); assert(m3_new == 3 and m3_old == 1)");
+    fake.response(replace_old_request, 41);
+    runLua(L,
+           "c:receive(0); assert(m3_old == 42 and m3_new == 3); "
+           "c:off('m3Replace'); fake_removed = true");
+
+    runLua(L,
+           "m3_removed = 0; "
+           "c:on('m3Removed', function(update) "
+           "  m3_removed = m3_removed + 1; c:getMe():wait() "
+           "end, {concurrent = false})");
+    fake.update("m3Removed", 1);
+    runLua(L, "c:receive(0); assert(m3_removed == 1)");
+    const auto removed_active_request = fake.sent.back().first;
+    fake.update("m3Removed", 2);
+    fake.update("m3Removed", 3);
+    runLua(L, "c:receive(0); c:receive(0); c:off('m3Removed')");
+    fake.response(removed_active_request, 52);
+    runLua(L,
+           "c:receive(0); assert(m3_removed == 1)");
+
+    runLua(L,
+           "m3_error = 0; m3_after_error = 0; "
+           "c:on('m3Error', function(update) "
+           "  if update.value == 1 then "
+           "    local result = c:getMe():wait(); error('m3 handler error ' .. result.value) "
+           "  end; m3_after_error = m3_after_error + update.value "
+           "end, {concurrent = false})");
+    fake.update("m3Error", 1);
+    runLua(L, "c:receive(0)");
+    const auto error_request = fake.sent.back().first;
+    fake.update("m3Error", 2);
+    runLua(L, "c:receive(0)");
+    fake.response(error_request, 51);
+    runLua(L,
+           "local ok, message = pcall(function() c:receive(0) end); "
+           "assert(not ok and message:find('m3 handler error 51')); "
+           "assert(m3_after_error == 2)");
+
+    runLua(L,
+           "false_result_seen = false; "
+           "c:on('m3False', function() false_result_seen = true; return false end)");
+    fake.update("m3False", 1);
+    runLua(L, "c:receive(0); assert(false_result_seen)");
+
+    runLua(L,
+           "m3_self_removed = 0; "
+           "c:on('m3SelfRemoved', function() "
+           "  m3_self_removed = m3_self_removed + 1; c:off('m3SelfRemoved') "
+           "end)");
+    fake.update("m3SelfRemoved", 1);
+    runLua(L, "c:receive(0); assert(m3_self_removed == 1)");
+    fake.update("m3SelfRemoved", 2);
+    runLua(L, "c:receive(0); assert(m3_self_removed == 1)");
+
+    runLua(L,
+           "m3_multi_a = nil; m3_multi_b = nil; "
+           "c:on('m3MultipleWaits', function() "
+           "  m3_multi_a = c:getMe():wait().value; "
+           "  m3_multi_b = c:getMe():wait().value "
+           "end)");
+    fake.update("m3MultipleWaits", 1);
+    runLua(L, "c:receive(0)");
+    const auto multiple_first_request = fake.sent.back().first;
+    fake.response(multiple_first_request, 81);
+    runLua(L, "c:receive(0)");
+    const auto multiple_second_request = fake.sent.back().first;
+    fake.response(multiple_second_request, 82);
+    runLua(L,
+           "c:receive(0); assert(m3_multi_a == 81 and m3_multi_b == 82)");
+
+    runLua(L,
+           "cross_event_value = nil; "
+           "c:on('m3Cross', function() "
+           "  cross_event_value = d:getMe():wait().value end)");
+    fake.update("m3Cross", 1);
+    runLua(L, "c:receive(0)");
+    const auto cross_event_request = second.sent.back().first;
+    second.response(cross_event_request, 61);
+    runLua(L, "d:receive(0); assert(cross_event_value == 61)");
+
+    Fake closing_owner;
+    runLua(L, "e = tdlua()");
+    attachTransport(L, "e", closing_owner);
+    runLua(L,
+           "close_event_value = nil; "
+           "e:on('m3Close', function() "
+           "  close_event_value = d:getMe():wait().value end)");
+    closing_owner.update("m3Close", 1);
+    runLua(L, "e:receive(0)");
+    const auto close_dependency_request = second.sent.back().first;
+    runLua(L,
+           "e:close(); closing_owner_update_ignored = true; "
+           "assert(e:receive(0) == nil); e = nil; collectgarbage('collect')");
+    closing_owner.update("m3Close", 2);
+    second.response(close_dependency_request, 71);
+    runLua(L, "d:receive(0); assert(close_event_value == 71)");
+
+    Fake reentrant_close_transport;
+    runLua(L, "f = tdlua(); reentrant_close_called = false");
+    attachTransport(L, "f", reentrant_close_transport);
+    runLua(L,
+           "f:on('m3ReentrantClose', function() "
+           "  f:close(); reentrant_close_called = true end)");
+    reentrant_close_transport.update("m3ReentrantClose", 1);
+    runLua(L,
+           "f:receive(0); assert(reentrant_close_called and f:isClosed()); "
+           "assert(f:receive(0) == nil); f = nil; collectgarbage('collect')");
+
+    runLua(L,
+           "c.onM3False = function() end; assert(c.onM3False ~= nil); "
+           "c.onM3False = nil; assert(c.onM3False == nil); "
+           "c:off('m3Concurrent'); c:off('m3Serial'); c:off('m3Other'); "
+           "c:off('m3Error'); c:off('m3Cross'); "
+           "c:off('m3SelfRemoved'); c:off('m3MultipleWaits')");
 }
 
 void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
@@ -489,6 +717,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testReviewRegressions(L, fake, second);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
+    testEventScheduling(L, fake, second);
     testCloseAndClientIsolation(L, fake, second);
 }
 
@@ -608,6 +837,31 @@ void testLifetimeAndAbandonment()
         throw std::runtime_error("lifetime/abandonment test retained scheduler storage");
 }
 
+void testDispatcherDestructorDoesNotRunLua(lua_State *L)
+{
+    runLua(L,
+           "destructor_callback_calls = 0; "
+           "destructor_callback = function() "
+           "  destructor_callback_calls = destructor_callback_calls + 1 "
+           "end");
+    Fake fake;
+    {
+        TDLua client(L);
+        client.injectTransport(fake.transport());
+        lua_getglobal(L, "destructor_callback");
+        const auto task = client.dispatcher().task(L, -1, 0, false);
+        lua_pop(L, 1);
+
+        nlohmann::json response = {
+            {"@type", "testInt"},
+            {"value", 1},
+            {"@extra", {{"__tdlua_request_id", task->request_id}}}
+        };
+        client.dispatcher().dispatch(response);
+    }
+    runLua(L, "assert(destructor_callback_calls == 0)");
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -620,6 +874,7 @@ int main(int argc, char **argv)
     try {
         if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
             runScenarios(L, fake, second);
+        testDispatcherDestructorDoesNotRunLua(L);
         testLifetimeAndAbandonment();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
