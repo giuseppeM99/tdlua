@@ -454,13 +454,36 @@ scenarios.V = function()
 end
 
 scenarios.W = function()
-    local c=client(); local f=c:getMe()
+    local c=client()
+    local function rejected(co)
+        local ok,e=coroutine.resume(co)
+        assert(not ok and tostring(e):find('dead'))
+    end
+
+    local empty=c:getMe()
+    local empty_co=coroutine.create(function() empty:wait() end)
+    assert(coroutine.resume(empty_co)); suspended(empty_co)
+    respond(c,empty._request_id); dead(empty_co); rejected(empty_co)
+
+    local f=c:getMe()
     local co=coroutine.create(function()
-        local result=f:wait(); return 'fine', 42
+        local result=f:wait(); return 'fine', nil, 42
     end)
     assert(coroutine.resume(co)); suspended(co)
-    respond(c,f._request_id); dead(co)
-    local ok,e=coroutine.resume(co)
-    assert(not ok and tostring(e):find('dead'))
+    respond(c,f._request_id); dead(co); rejected(co)
+
+    local yielding=c:getMe()
+    local yielding_co=coroutine.create(function()
+        yielding:wait(); coroutine.yield('again'); return 'after', 43
+    end)
+    assert(coroutine.resume(yielding_co)); suspended(yielding_co)
+    respond(c,yielding._request_id); suspended(yielding_co)
+    local ok,a,b=coroutine.resume(yielding_co)
+    assert(ok and a=='after' and b==43); dead(yielding_co)
+
+    local task=c:getMe(function() return 'task-result', nil, 44 end)
+    respond(c,task._request_id)
+    local a,b,d=task:wait()
+    assert(a=='task-result' and b==nil and d==44 and task:ready())
     clean_waits()
 end

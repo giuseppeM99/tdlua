@@ -69,18 +69,51 @@ void scenarios(lua_State *L, bool jit_off)
                "assert(pending._request_id~=999 and pending:ready())");
     }
 
-    // A coroutine resumed by the scheduler has no Lua caller to receive its
-    // final values. Its thread must nevertheless be retired as dead.
+    // An externally resumed coroutine has no Lua caller to receive its final
+    // values. It must still be retired as dead, regardless of its result count.
+    const auto empty = dependency.future();
+    publish(L, empty, "pending");
+    run(L, "empty_co=coroutine.create(function() pending:wait() end); "
+           "assert(coroutine.resume(empty_co)); "
+           "assert(coroutine.status(empty_co)=='suspended')");
+    response(dependency, empty);
+    run(L, "assert(coroutine.status(empty_co)=='dead'); "
+           "local resumed,message=coroutine.resume(empty_co); "
+           "assert(not resumed and tostring(message):find('dead'))");
+
     const auto external = dependency.future();
     publish(L, external, "pending");
     run(L, "external_co=coroutine.create(function() "
-           "local result=pending:wait(); return 'fine', 42 end); "
+           "local result=pending:wait(); return 'fine', nil, 42 end); "
            "assert(coroutine.resume(external_co)); "
            "assert(coroutine.status(external_co)=='suspended')");
     response(dependency, external);
     run(L, "assert(coroutine.status(external_co)=='dead'); "
            "local resumed,message=coroutine.resume(external_co); "
            "assert(not resumed and tostring(message):find('dead'))");
+
+    // A second suspension is still owned by the coroutine and must not be
+    // cleared by the scheduler.
+    const auto yielding = dependency.future();
+    publish(L, yielding, "pending");
+    run(L, "yielding_co=coroutine.create(function() "
+           "pending:wait(); coroutine.yield('again'); return 'after', 43 end); "
+           "assert(coroutine.resume(yielding_co)); "
+           "assert(coroutine.status(yielding_co)=='suspended')");
+    response(dependency, yielding);
+    run(L, "assert(coroutine.status(yielding_co)=='suspended'); "
+           "local ok,a,b=coroutine.resume(yielding_co); "
+           "assert(ok and a=='after' and b==43 and "
+                  "coroutine.status(yielding_co)=='dead')");
+
+    // Task results must continue to be collected by finishTask().
+    run(L, "return function() return 'task-result', nil, 44 end");
+    const auto result_task = owner.task(L, -1, 0, false);
+    lua_pop(L, 1);
+    publish(L, result_task, "result_task");
+    response(owner, result_task);
+    run(L, "local a,b,c=result_task:wait(); "
+           "assert(a=='task-result' and b==nil and c==44 and result_task:ready())");
 
     const auto future = dependency.future();
     publish(L, future, "pending");
@@ -103,7 +136,8 @@ void scenarios(lua_State *L, bool jit_off)
     run(L, "local f= pending.wait; for i=1,500 do assert(pending.wait==f) end");
     require(tdlua::managedFactoryCompilationCount(L) == 1, "factory was compiled more than once");
 #endif
-    run(L, "pending=nil; co=nil; collectgarbage('collect'); collectgarbage('collect')");
+    run(L, "pending=nil; co=nil; empty_co=nil; external_co=nil; yielding_co=nil; "
+           "result_task=nil; collectgarbage('collect'); collectgarbage('collect')");
 }
 }
 int main(int argc, char **argv)
