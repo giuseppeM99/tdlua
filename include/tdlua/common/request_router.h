@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -196,6 +197,12 @@ struct ContinuationState {
     std::string field;
     int result_count = 0;
     bool consumed = false;
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+    // A false reference reserves storage without rooting this coroutine.
+    int prepared_thread_ref = LUA_NOREF;
+    bool prepared_timed = false;
+    std::chrono::steady_clock::time_point prepared_deadline;
+#endif
     ContinuationState()
     {
         ++liveContinuations();
@@ -206,6 +213,29 @@ struct ContinuationState {
         --liveContinuations();
     }
 };
+
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+// The C preparation callback must never throw C++ through Lua's C frames.
+static_assert(std::is_nothrow_default_constructible<std::string>::value,
+              "Lua 5.1 continuation preparation needs a nonthrowing empty string");
+struct Lua51WaitPreparation {
+    const std::shared_ptr<SchedulerCore> *core;
+    const std::shared_ptr<SchedulerCore> *task_core;
+    const ManagedStatePtr *dependency;
+    const ManagedStatePtr *task;
+    bool timed;
+    std::chrono::steady_clock::time_point deadline;
+};
+#ifdef TDLUA_TESTING
+enum class Lua51WaitStage { Prepared, YieldAccepted, WaiterInserted, BindingInserted };
+using Lua51WaitHook = void (*)(lua_State *, ContinuationState *, Lua51WaitStage);
+inline Lua51WaitHook &lua51WaitHook() { static Lua51WaitHook hook = nullptr; return hook; }
+inline void testLua51WaitStage(lua_State *L, ContinuationState *c, Lua51WaitStage stage)
+{
+    if (lua51WaitHook()) lua51WaitHook()(L, c, stage);
+}
+#endif
+#endif
 
 struct WaitNotification {
     ContinuationState *continuation = nullptr;
@@ -914,6 +944,36 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             lua_pushliteral(L, "tdlua: coroutine is already waiting on TDLua");
             return -1;
         }
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        State task;
+        std::shared_ptr<SchedulerCore> task_core;
+        const auto binding = taskBindings().find(L);
+        if (binding != taskBindings().end()) {
+            task = binding->second.state.lock();
+            task_core = binding->second.core.lock();
+        }
+        const auto dependency_core = shared_from_this();
+        Lua51WaitPreparation preparation = {&dependency_core, &task_core, &state, &task,
+            timed, timed ? deadlineFor(timeout) : std::chrono::steady_clock::time_point()};
+        // The cached C function uses only trivial locals. Lua OOM/GC errors
+        // return from pcall before any caller-owned C++ object must unwind.
+        lua_rawgetp(L, LUA_REGISTRYINDEX, lua51PrepareWaitKey());
+        lua_pushlightuserdata(L, &preparation);
+        // Keep the original Lua error rooted. Return through the C++ frames
+        // before raising it, without allocating a replacement error under OOM.
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) return -1;
+        auto *continuation = static_cast<ContinuationState *>(lua_touserdata(L, -1));
+        const int context = lua_gettop(L);
+#ifdef TDLUA_TESTING
+        testLua51WaitStage(L, continuation, Lua51WaitStage::Prepared);
+#endif
+        if (isTerminalState(state)) {
+            releaseLuaReference(continuation->prepared_thread_ref);
+            lua_pop(L, 1);
+            return 0;
+        }
+        return context;
+#else
         if (luaL_newmetatable(L, "tdlua.continuation")) {
             lua_pushcfunction(L, continuationGc);
             lua_setfield(L, -2, "__gc");
@@ -959,9 +1019,66 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         waitBindings()[L] = shared_from_this();
         ++state->waiter_count;
         return context;
+#endif
     }
 
 public:
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+    // No Lua allocation or user callbacks are permitted after yield acceptance.
+    // The reference table already contains both this slot and its free-list key.
+    void registerAcceptedLua51Wait(lua_State *L, ContinuationState *continuation)
+    {
+        if (waitBindings().count(L) || waiters_.count(L))
+            throw std::runtime_error("tdlua: duplicate managed wait");
+#ifdef TDLUA_TESTING
+        testLua51WaitStage(L, continuation, Lua51WaitStage::YieldAccepted);
+#endif
+        WaitRegistration registration;
+        registration.continuation = continuation;
+        registration.dependency = continuation->dependency;
+        registration.has_deadline = continuation->prepared_timed;
+        registration.deadline = continuation->prepared_deadline;
+        registration.thread_ref = continuation->prepared_thread_ref;
+        bool waiter_inserted = false, binding_inserted = false;
+        try {
+            waiters_.emplace(L, registration);
+            waiter_inserted = true;
+#ifdef TDLUA_TESTING
+            testLua51WaitStage(L, continuation, Lua51WaitStage::WaiterInserted);
+#endif
+            waitBindings().emplace(L, shared_from_this());
+            binding_inserted = true;
+#ifdef TDLUA_TESTING
+            testLua51WaitStage(L, continuation, Lua51WaitStage::BindingInserted);
+#endif
+            // Termination observed here must resume only on a later tick,
+            // after this C function has returned -1 to the VM.
+            if (isTerminalState(registration.dependency))
+                ready_.push_back(registration.dependency);
+            if (!pushCoreReferences(L, this))
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            lua_pushthread(L);
+            lua_rawseti(L, -2, registration.thread_ref); // overwrite false
+            lua_pop(L, 1);
+        } catch (...) {
+            if (binding_inserted) waitBindings().erase(L);
+            if (waiter_inserted) waiters_.erase(L);
+            throw;
+        }
+        continuation->prepared_thread_ref = LUA_NOREF; // transfer reference
+        ++registration.dependency->waiter_count;
+        continuation->consumed = false;
+    }
+#endif
+#ifdef TDLUA_TESTING
+    std::size_t liveTaskCount() const
+    {
+        std::size_t count = event_states_.size();
+        for (const auto &entry : live_states_)
+            if (isTaskState(entry.second)) ++count;
+        return count;
+    }
+#endif
     using Pump = bool (*)(void *, double);
     explicit SchedulerCore(lua_State *L) : lua_owner_(tdlua_lua_main_thread(L))
     {
@@ -1382,6 +1499,13 @@ public:
     int prepareWait(lua_State *L, State state, bool timed, double timeout,
                     WaitKind kind, const char *field, int &results)
     {
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        if (kind == WaitKind::Field) {
+            lua_rawgetp(L, LUA_REGISTRYINDEX, lua51FieldErrorKey());
+            results = -1;
+            return 0;
+        }
+#endif
         // Lua allocation in beginYield may run a client finalizer. Keep this
         // core alive until the continuation has installed its Lua anchors.
         const auto wait_core_lease = shared_from_this();
@@ -1393,6 +1517,13 @@ public:
             pushTimeout(L, kind, results);
             return 0;
         }
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        if (!isTerminalState(state) && !tdlua_lua_is_yieldable(L)) {
+            lua_rawgetp(L, LUA_REGISTRYINDEX, lua51MainWaitErrorKey());
+            results = -1;
+            return 0;
+        }
+#endif
         if (!isTerminalState(state) && tdlua_lua_is_yieldable(L)) {
             const int context = beginYield(L, state, kind, field, timed, timeout);
             if (context < 0) results = -1;
@@ -1472,6 +1603,9 @@ public:
 
     void abandon(ContinuationState *continuation)
     {
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        releaseLuaReference(continuation->prepared_thread_ref);
+#endif
         if (continuation->consumed) {
             return;
         }
@@ -1789,7 +1923,7 @@ inline int completeManagedTrampoline(lua_State *L);
 
 inline int yieldManagedWait(lua_State *L, int context, int results)
 {
-#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#ifdef TDLUA_USE_LUA_CONTINUATION
     if (context) return suspendedManagedBinding(L, context);
     if (results < 0) return lua_error(L);
     return finishManagedBinding(L, results);
@@ -1935,7 +2069,11 @@ inline int managedIndex(lua_State *L, const char *type, bool task)
         lua_pushnil(L);
         return 1;
     }
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+    return luaL_error(L, "tdlua: Lua 5.1 Future response fields require explicit :wait()");
+#else
     return managedWait(L, type, WaitKind::Field, key);
+#endif
 }
 
 inline int futureIndex(lua_State *L)
@@ -1974,6 +2112,78 @@ inline int managedWaitContinuation(lua_State *L, int, lua_KContext ctx)
     }
     return finishManagedWait(L, results);
 }
+
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+// Runs inside the preparation pcall. No C++ automatic owner crosses a Lua call.
+inline int prepareLua51Wait(lua_State *L)
+{
+    auto *args = static_cast<Lua51WaitPreparation *>(lua_touserdata(L, 1));
+    luaL_newmetatable(L, "tdlua.continuation");
+    // A prior OOM may have left the registered metatable only half initialized.
+    // Establish its finalizer before allocating any C++ owning userdata.
+    lua_pushcfunction(L, continuationGc);
+    lua_setfield(L, -2, "__gc");
+    auto *continuation = new (lua_newuserdata(L, sizeof(ContinuationState))) ContinuationState();
+    // Metatable already exists: these stack operations cannot allocate.
+    lua_pushvalue(L, -2);
+    lua_setmetatable(L, -2);
+    lua_remove(L, -2);
+    const int context = lua_gettop(L);
+    continuation->consumed = true;
+    continuation->dependency_core = *args->core;
+    continuation->dependency = *args->dependency;
+    continuation->task = *args->task;
+    continuation->task_core = *args->task_core;
+    continuation->coroutine = L;
+    continuation->prepared_timed = args->timed;
+    continuation->prepared_deadline = args->deadline;
+    lua_createtable(L, 2, 0);
+    pushCoreAnchor(L, args->core->get());
+    lua_rawseti(L, -2, DependencyCoreSlot);
+    if (*args->task_core) {
+        pushCoreAnchor(L, args->task_core->get());
+        lua_rawseti(L, -2, TaskOwnerCoreSlot);
+    }
+    lua_setuservalue(L, context);
+    if (!pushCoreReferences(L, args->core->get()))
+        return luaL_error(L, "tdlua: scheduler storage unavailable");
+    // Preallocate key zero too: cancellation/unref must not allocate.
+    lua_rawgeti(L, -1, 0);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_pushinteger(L, 0);
+        lua_rawseti(L, -2, 0);
+    } else lua_pop(L, 1);
+    lua_pushboolean(L, false);
+    continuation->prepared_thread_ref = luaL_ref(L, -2);
+    lua_pop(L, 1);
+    return 1;
+}
+
+inline int managedTrampolineYield(lua_State *L)
+{
+    auto *continuation = static_cast<ContinuationState *>(
+        luaL_checkudata(L, 1, "tdlua.continuation"));
+    // lua_yield can longjmp only across these trivial locals. Stock Lua 5.1
+    // returns -1 after accepting yield; the C function returns that same value.
+    const int yielded = lua_yield(L, 0);
+    bool failed = false;
+    try {
+        const auto core = continuation->dependency_core.lock();
+        if (!core) throw std::runtime_error("tdlua: scheduler storage unavailable");
+        core->registerAcceptedLua51Wait(L, continuation);
+    } catch (...) {
+        failed = true;
+    }
+    if (failed) {
+        // The original false reference remains owned by inert userdata GC.
+        // Fetch an already-rooted error string without allocating in a catch.
+        lua_rawgetp(L, LUA_REGISTRYINDEX, lua51RegistrationErrorKey());
+        return lua_error(L);
+    }
+    return yielded;
+}
+#endif
 
 inline int completeManagedTrampoline(lua_State *L)
 {

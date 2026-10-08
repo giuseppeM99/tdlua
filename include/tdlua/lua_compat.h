@@ -7,8 +7,12 @@
 
 #ifdef TDLUA_USE_LUAJIT_CONTINUATION
 #include <luajit.h>
-#elif LUA_VERSION_NUM < 502
-#error "TDLua Full Managed API requires Lua 5.2+ or configured LuaJIT 2.1"
+#elif LUA_VERSION_NUM < 502 && !defined(TDLUA_USE_LUA51_CONTINUATION)
+#error "TDLua requires configured stock Lua 5.1, Lua 5.2+, or LuaJIT 2.1"
+#endif
+
+#if defined(TDLUA_USE_LUAJIT_CONTINUATION) || defined(TDLUA_USE_LUA51_CONTINUATION)
+#define TDLUA_USE_LUA_CONTINUATION
 #endif
 
 #include <cmath>
@@ -18,12 +22,12 @@
 #include <stdexcept>
 
 /* Value uservalues are direct values on Lua 5.3+ but must be tables on Lua
- * 5.2. Keep this adapter separate from the existing reference-table uservalues
+ * 5.1 and 5.2. Keep this adapter separate from the reference-table uservalues
  * used by continuations and scheduler storage. */
 inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
 {
     index = lua_absindex(L, index);
-#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
+#if LUA_VERSION_NUM <= 502
     lua_newtable(L);
     lua_pushvalue(L, -2);
     lua_rawseti(L, -2, 1);
@@ -35,7 +39,7 @@ inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
 inline void tdlua_lua_get_value_uservalue(lua_State *L, int index)
 {
     lua_getuservalue(L, index);
-#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
+#if LUA_VERSION_NUM <= 502
     if (lua_istable(L, -1)) {
         lua_rawgeti(L, -1, 1);
         lua_remove(L, -2);
@@ -65,7 +69,7 @@ inline lua_State *tdlua_lua_main_thread(lua_State *L)
     lua_State *main = lua_tothread(L, -1);
     lua_pop(L, 1);
     return main;
-#elif defined(TDLUA_USE_LUAJIT_CONTINUATION)
+#elif defined(TDLUA_USE_LUA_CONTINUATION)
     static const char main_thread_key = 0;
     lua_rawgetp(L, LUA_REGISTRYINDEX, &main_thread_key);
     lua_State *main = lua_tothread(L, -1);
@@ -75,7 +79,11 @@ inline lua_State *tdlua_lua_main_thread(lua_State *L)
     if (!is_main) {
         lua_pop(L, 1);
         throw std::runtime_error(
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+            "tdlua: initialize the module on the Lua 5.1 main thread first");
+#else
             "tdlua: initialize the module on the LuaJIT main thread first");
+#endif
     }
     lua_rawsetp(L, LUA_REGISTRYINDEX, &main_thread_key);
     return L;
@@ -85,7 +93,7 @@ inline lua_State *tdlua_lua_main_thread(lua_State *L)
 inline void tdlua_lua_clear_uservalue(lua_State *L, int index)
 {
     index = lua_absindex(L, index);
-#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
+#if LUA_VERSION_NUM <= 502
     lua_newtable(L);
 #else
     lua_pushnil(L);
@@ -100,13 +108,26 @@ inline bool tdlua_lua_is_yieldable(lua_State *L)
 {
 #if LUA_VERSION_NUM >= 503 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
     return lua_isyieldable(L) != 0;
-#elif defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
+#elif LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUA51_CONTINUATION)
     const int is_main = lua_pushthread(L);
     lua_pop(L, 1);
     return is_main == 0;
 #else
     (void)L;
     return false;
+#endif
+}
+
+// Call inside the binding's protected_call, before creating/submitting a
+// request whose result is returned through an explicit wait without a handle.
+inline void tdlua_lua_require_explicit_submission_context(lua_State *L)
+{
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+    if (!tdlua_lua_is_yieldable(L)) {
+        throw std::runtime_error("tdlua: Lua 5.1 explicit request wait requires a coroutine");
+    }
+#else
+    (void)L;
 #endif
 }
 

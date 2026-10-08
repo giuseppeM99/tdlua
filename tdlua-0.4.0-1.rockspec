@@ -13,14 +13,17 @@ description = {
    detailed = [[
       TDLua exposes TDLib to Lua through the raw send/receive API and the v0.4
       managed Future/Task API, including callbacks, event handlers, and
-      cooperative poll/loop drivers.
+      cooperative poll/loop drivers. Stock Lua 5.1.5 uses Managed Explicit;
+      Lua 5.2-5.5 use Full Managed. Stock support was verified with the
+      unmodified Lua 5.1.5 reference VM on Linux x64. The dependency range
+      permits the 5.1 ABI; older patch releases and modified VMs are unverified.
    ]],
    homepage = "https://github.com/giuseppeM99/tdlua",
    license = "BSD-3-Clause"
 }
 
 dependencies = {
-   "lua >= 5.2, < 5.6"
+   "lua >= 5.1, < 5.6"
 }
 
 build = {

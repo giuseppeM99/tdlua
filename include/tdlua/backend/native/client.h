@@ -26,6 +26,9 @@ public:
     bool pump(double timeout);
     using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
     Transport transport();
+#ifdef TDLUA_TESTING
+    void injectTransport(Transport transport) { injected_transport_ = transport; }
+#endif
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
 
@@ -62,4 +65,5 @@ private:
     bool closing_;
     bool closed_;
     NativeDispatcher dispatcher_;
+    Transport injected_transport_ = {nullptr, nullptr};
 };

@@ -152,7 +152,7 @@ bool NativeTDLua::pump(const double timeout)
         if (!updates_.empty() && !updates_.front().dispatched) {
             response = pop();
         } else {
-            response = receiveBackend(timeout);
+            response = transport().receive(timeout);
         }
         if (!response.object) {
             dispatcher_.drain();
@@ -172,6 +172,7 @@ bool NativeTDLua::pump(const double timeout)
 
 NativeTDLua::Transport NativeTDLua::transport()
 {
+    if (injected_transport_.operations) return injected_transport_;
     return {this, &native_transport_operations};
 }
 
@@ -311,6 +312,15 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
     // Phase one detaches the scheduler before backend shutdown can reenter the
     // client. The optional drain is phase two and is safe only at the binding
     // boundary that called close().
+    if (injected_transport_.operations) {
+        dispatcher_.detachTransport();
+        injected_transport_.close();
+        closed_ = true;
+        closing_ = false;
+        if (drain) dispatcher_.clear();
+        NativeRuntime::instance().forget(client_id_);
+        return;
+    }
     if (closed_) {
         dispatcher_.detachTransport();
         if (drain) dispatcher_.clear();

@@ -298,6 +298,10 @@ static int tdclient_execute(lua_State *L)
                 lua_typename(L, control_type) + "' is not supported");
         }
 
+        if (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index)) {
+            tdlua_lua_require_explicit_submission_context(L);
+        }
+
         if (!td->ready() && j["@type"] == "setTdlibParameters" &&
             j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
@@ -357,6 +361,9 @@ static int call(lua_State *L)
         std::string argument_error;
         if (!tdlua_binding::parse_helper_arguments(L, arguments, argument_error)) {
             throw std::runtime_error(argument_error);
+        }
+        if (arguments.explicit_wait) {
+            tdlua_lua_require_explicit_submission_context(L);
         }
         const int params_index = arguments.params_index;
         const int callback_index = arguments.callback_index;

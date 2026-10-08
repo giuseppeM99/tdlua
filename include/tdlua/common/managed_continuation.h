@@ -7,10 +7,10 @@
 namespace tdlua {
 
 // Normalize every immediate branch of a managed binding at the same boundary.
-// Only the private LuaJIT trampoline consumes the leading boolean.
+// Only the private Lua trampoline consumes the leading boolean.
 inline int finishManagedBinding(lua_State *L, int results)
 {
-#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#ifdef TDLUA_USE_LUA_CONTINUATION
     lua_pushboolean(L, false);
     lua_insert(L, lua_gettop(L) - results);
     return results + 1;
@@ -20,7 +20,7 @@ inline int finishManagedBinding(lua_State *L, int results)
 #endif
 }
 
-#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#ifdef TDLUA_USE_LUA_CONTINUATION
 inline int suspendedManagedBinding(lua_State *L, int context)
 {
     lua_pushboolean(L, true);
@@ -28,7 +28,32 @@ inline int suspendedManagedBinding(lua_State *L, int context)
     return 2;
 }
 
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+inline int managedTrampolineYield(lua_State *L);
+inline int prepareLua51Wait(lua_State *L);
+inline const void *lua51PrepareWaitKey()
+{
+    static const char key = 0;
+    return &key;
+}
+inline const void *lua51MainWaitErrorKey()
+{
+    static const char key = 0;
+    return &key;
+}
+inline const void *lua51FieldErrorKey()
+{
+    static const char key = 0;
+    return &key;
+}
+inline const void *lua51RegistrationErrorKey()
+{
+    static const char key = 0;
+    return &key;
+}
+#else
 inline int managedTrampolineYield(lua_State *L) { return lua_yield(L, 0); }
+#endif
 
 // Convert Lua failures to C++ exceptions while caller-owned objects can unwind.
 // The public binding catches the exception before raising the final Lua error.
@@ -77,7 +102,13 @@ inline void pushManagedContinuationCache(lua_State *L)
             local function dispatch(pending, ...)
                 if not pending then return ... end
                 local context = ...
-                return complete(context, yield())
+    )lua"
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        "                return complete(context, yield(context))\n"
+#else
+        "                return complete(context, yield())\n"
+#endif
+    R"lua(
             end
             if field_index then
                 return function(self, key)
@@ -108,6 +139,7 @@ inline void pushManagedContinuationCache(lua_State *L)
 
 inline void initializeManagedContinuations(lua_State *L)
 {
+#ifdef TDLUA_USE_LUAJIT_CONTINUATION
     // Use the registry's loaded module, not mutable globals such as _G.jit.
     lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
     if (lua_istable(L, -1)) lua_getfield(L, -1, "jit");
@@ -118,6 +150,24 @@ inline void initializeManagedContinuations(lua_State *L)
     lua_pop(L, 3);
     if (version < 20100 || version >= 20200)
         throw std::runtime_error("tdlua: this module requires a LuaJIT 2.1 VM with its jit library loaded");
+#else
+    lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    if (lua_istable(L, -1)) lua_getfield(L, -1, "jit");
+    else lua_pushnil(L);
+    const bool jit_loaded = lua_istable(L, -1);
+    lua_pop(L, 2);
+    if (jit_loaded)
+        throw std::runtime_error("tdlua: a stock Lua 5.1 module cannot run on LuaJIT");
+    lua_pushliteral(L, "tdlua: Lua 5.1 pending explicit wait requires a coroutine");
+    lua_rawsetp(L, LUA_REGISTRYINDEX, lua51MainWaitErrorKey());
+    lua_pushliteral(L, "tdlua: Lua 5.1 Future response fields require explicit :wait()");
+    lua_rawsetp(L, LUA_REGISTRYINDEX, lua51FieldErrorKey());
+    // Cache allocation-capable preparation before any wait owns C++ resources.
+    lua_pushcfunction(L, prepareLua51Wait);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, lua51PrepareWaitKey());
+    lua_pushliteral(L, "tdlua: unable to register Lua 5.1 wait");
+    lua_rawsetp(L, LUA_REGISTRYINDEX, lua51RegistrationErrorKey());
+#endif
     tdlua_lua_main_thread(L);
     pushManagedContinuationCache(L);
     lua_pop(L, 1);
@@ -245,7 +295,7 @@ inline void pushManagedHelper(lua_State *L, const char *name,
 inline void pushManagedFunction(lua_State *L, lua_CFunction prepare,
                                 lua_CFunction complete, bool field_index = false)
 {
-#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#ifdef TDLUA_USE_LUA_CONTINUATION
     pushCachedManagedFunction(L, prepare, complete, field_index);
 #else
     (void)complete;

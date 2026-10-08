@@ -74,9 +74,18 @@ A timeout does not cancel the underlying TDLib request. With the legacy
 
 ## Supported runtimes
 
-The Full Managed API supports Lua 5.2, 5.3, 5.4, 5.5, and LuaJIT 2.1 with both
-JSON and native backends. Stock Lua 5.1 is unsupported and fails during CMake
-configuration. The standard Lua rockspecs retain `lua >= 5.2, < 5.6`.
+Both backends support these profiles:
+
+| Runtime | API profile |
+| --- | --- |
+| Stock Lua 5.1.5 reference VM | Managed Explicit |
+| Lua 5.2, 5.3, 5.4, 5.5 | Full Managed |
+| LuaJIT 2.1 | Full Managed |
+
+Stock Lua 5.1 and LuaJIT are selected independently. Managed Explicit reuses
+the same scheduler, Futures, Tasks, request IDs, and teardown behavior.
+The stock Lua 5.1 validation covers the unmodified 5.1.5 reference VM on Linux
+x64. Older patch releases and modified VMs remain unverified.
 
 LuaJIT uses the same Futures, Tasks, callbacks, and suspending field access.
 Its continuation adapter uses a cached Lua frame around the common scheduler;
@@ -102,7 +111,7 @@ runtime-provided `luajit` dependency as well as the Lua 5.1 ABI; they do not
 claim stock Lua 5.1 support. They install the same `tdlua` module, so choose one
 package for each LuaRocks tree.
 
-LuaJIT and Lua 5.2 use floating-point Lua numbers. Not every integer beyond
+Stock Lua 5.1, LuaJIT, and Lua 5.2 use floating-point Lua numbers. Not every integer beyond
 `2^53` can be represented exactly. Supply TDLib int64 fields as decimal strings
 to preserve the full signed 64-bit range on both backends. A numeric value may
 already have rounded before TDLua sees it. TDLib's JSON interface returns int64
@@ -112,27 +121,101 @@ while `2^53 + 1` and `INT64_MAX` are native strings. No FFI/cdata representation
 is required. On Lua 5.3+, use Lua integers or decimal strings for int64 inputs;
 explicit floats become JSON floats, which TDLib rejects for these fields.
 
-The complete JSON and native suites pass on Linux for all five runtimes.
+The complete profile-specific JSON and native suites pass on Linux for all six runtimes.
 LuaJIT was tested as `LuaJIT 2.1.1788856981` on Linux x64 with JIT enabled and
 disabled. The build is intended to support macOS, but macOS was not
 runtime-tested for this release. Windows was not validated.
 
+## Stock Lua 5.1 Managed Explicit
+
+Load `tdlua` on the main thread before creating clients in coroutines. Build
+against matching stock Lua headers and library, for example:
+
+```bash
+cmake -S . -B build-lua51 -DTDLUA_LUA_IMPLEMENTATION=lua \
+  -DTDLUA_LUA_VERSION=5.1 \
+  -DLUA_INCLUDE_DIR=/usr/include/lua5.1 \
+  -DLUA_LIBRARY=/usr/lib/liblua5.1.so
+cmake --build build-lua51 --target tdlua
+```
+
+The module remains a single `tdlua.so`; no runtime Lua files are needed.
+
+Requests still submit eagerly and return Futures. Resolve a Future explicitly,
+then read the response table:
+
+```lua
+local future = client:getUser { user_id = 123 }
+local reader = coroutine.create(function()
+    local user = future:wait()
+    print(user.first_name)
+end)
+assert(coroutine.resume(reader))
+while coroutine.status(reader) ~= "dead" do
+    client:receive(0.1)
+end
+```
+
+`future.first_name` raises an error requiring explicit `:wait()`, whether the
+Future is pending or already resolved. Rejected field access neither pumps the
+client nor creates a waiter. Wrapper members `wait`, `ready`, and `_request_id`
+remain available. The response table returned by `:wait()` has normal field
+access.
+
+Pending explicit waits require a coroutine. On the main thread they fail
+immediately; completed waits return normally, and `wait(0)` remains a
+nonblocking timeout probe. This is a Lua 5.1 profile-specific exception to the
+shared specification's non-yieldable synchronous fallback. It applies to
+`Future:wait()`, `Task:wait()`, `await()`, and explicit `false` request controls.
+`execute(request, false)`, dynamic methods with `false`, and `await(request)`
+reject main-thread calls before allocating a request ID or submitting to TDLib.
+Use a coroutine for these forms, or submit a Future and retain its handle.
+`executeSync`, `_execute`, and historical numeric timed `execute` retain their
+synchronous contracts. The Full Managed fallback on other runtimes is unchanged.
+
+Request and event callbacks execute as canonical scheduler Tasks and can wait
+explicitly. Concurrent/serial events, `poll(callback)`, `loop(callback)`,
+cross-client waits, timeout/retry, and Task return values are supported.
+Stock Lua 5.1 cannot suspend through standard `pcall`, `xpcall`, metamethods,
+or non-yieldable C callbacks. A genuinely pending wait there raises the native
+VM error without registering a waiter. A still-valid Future can be retried
+from a permitted coroutine. Standard protected calls can consume completed
+results and terminal errors. No replacement protected-call implementation is
+installed.
+The main-thread check cannot detect arbitrary non-yieldable C frames inside a
+coroutine. An explicit `false` call can still submit before yield rejection in
+such a context. Retain a Future and call `:wait()` when a failed wait must leave
+the request handle available.
+
+The suspension boundary is specific to the audited stock Lua 5.1.5 reference
+implementation. It uses the implementation's accepted `lua_yield()` return to
+register the waiter, with no further Lua allocation or user callbacks before
+returning to the VM. This detail is not a portable public Lua C API guarantee;
+modified Lua 5.1 VMs and older patch releases have not been validated. LuaJIT
+uses its separate Full Managed adapter.
+
+CMake's Lua 5.1 probes identify the headers/library ABI, not the internal yield
+behavior or an unmodified reference VM. The main rockspecs' `lua >= 5.1, < 5.6`
+constraint permits installation for the 5.1 ABI; it does not certify every 5.1
+patch release or modified VM. An accepted build with either remains unverified
+until its yield implementation and runtime behavior have been checked.
+
 ## v0.4 managed API
 
 The v0.4 dynamic method and `execute(request)` forms submit eagerly and
-return a Future. Accessing a response field resolves that Future automatically;
+return a Future. In Full Managed, response field access resolves that Future automatically;
 use `future:wait()` when a plain response table is preferred. Wrapper members
 (`wait`, `ready`, and `_request_id`) take precedence over response fields with
 the same names. Full `rawget`, `rawset`, `next`, and `pairs` transparency is not
 part of the API contract.
 
 In a yieldable coroutine, `wait()` without a timeout has no implicit deadline.
-On the main thread or in another non-yieldable context, it uses the historical
+In Full Managed, on the main thread or in another non-yieldable context, it uses the historical
 10-second safety timeout. An explicit `wait(timeout)` applies in both contexts.
 Implicit Future field access on the main thread uses the same safety limit and
 raises `tdlua: Future wait timeout` if it expires. Timeouts do not cancel requests.
 
-Use explicit controls when the flow should be visible:
+The following example uses Full Managed:
 
 ```lua
 local id = 123
@@ -171,7 +254,7 @@ client teardown remain observable through a retained Task handle and do not
 become scheduler errors when the Task is discarded.
 
 You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
-Build with Lua 5.2 and the latest version of tdlib.
+Use binaries built for your Lua runtime and API profile.
 
 VoIP bindings are currently not part of the native or JSON backend.
 
