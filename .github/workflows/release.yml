@@ -11,68 +11,63 @@ on:
 permissions:
   contents: write
 
-env:
-  CMAKE_BUILD_PARALLEL_LEVEL: 2
-
 jobs:
+  validate:
+    name: Validate all supported runtimes
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
   release:
-    name: Build release artifacts
+    name: Package and publish release artifacts
+    needs: validate
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            gperf \
-            liblua5.3-dev \
-            lua5.3 \
-            ninja-build \
-            openssl \
-            libssl-dev \
-            zlib1g-dev \
-            luarocks
+      - name: Download validated runtime artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tdlua-*-static
+          path: ${{ runner.temp }}/tdlua-artifacts
+          merge-multiple: true
 
-      - name: Build and test release
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
-            -DTDLUA_TD_STATIC=ON \
-            -DLUA_EXECUTABLE="$(command -v lua5.3)" \
-            -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
-            -DLUA_LIBRARY=/usr/lib/x86_64-linux-gnu/liblua5.3.so
-          cmake --build build --target tdlua tdlua_codec_test \
-            tdlua_common_router_test tdlua_fake_client_test tdlua_persistence_test
-          ctest --test-dir build --output-on-failure -R '^tdlua_'
-          if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
-            echo "tdlua.so unexpectedly depends on shared libtdjson"
-            exit 1
-          fi
-
-      - name: Read TDLua version
-        id: tdlua-version
+      - name: Verify release version and runtime matrix
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          version="$(cat build/tdlua-version.txt)"
-          test "${RELEASE_TAG#v}" = "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          base_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' dist.info)"
+          test "${RELEASE_TAG#v}" = "$base_version"
+          count="$(find "$RUNNER_TEMP/tdlua-artifacts" -type f -name '*.so' | wc -l)"
+          test "$count" -eq 10
+          for pattern in \
+            'tdlua-5.2-*.so' \
+            'tdlua-5.3-*.so' \
+            'tdlua-5.4-*.so' \
+            'tdlua-5.5-*.so' \
+            'tdlua-luajit-*.so' \
+            'tdlua-5.2-native-*.so' \
+            'tdlua-5.3-native-*.so' \
+            'tdlua-5.4-native-*.so' \
+            'tdlua-5.5-native-*.so' \
+            'tdlua-luajit-native-*.so'; do
+            find "$RUNNER_TEMP/tdlua-artifacts" -type f -name "$pattern" -print -quit | grep -q .
+          done
 
-      - name: Create source bundle with submodules
+      - name: Create source bundle and release metadata
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_VERSION: ${{ steps.tdlua-version.outputs.version }}
         run: |
+          set -euo pipefail
+          base_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' dist.info)"
           root="tdlua-${RELEASE_TAG}"
-          mkdir -p "release/${root}"
+          source_url="https://github.com/giuseppeM99/tdlua/releases/download/${RELEASE_TAG}/tdlua-${RELEASE_TAG}-source.tar.gz"
+
+          mkdir -p "release/${root}" release-artifacts
           git archive HEAD | tar -x -C "release/${root}"
           for module in td base64; do
             mkdir -p "release/${root}/${module}"
@@ -80,19 +75,24 @@ jobs:
           done
           tar -C release -czf "tdlua-${RELEASE_TAG}-source.tar.gz" "${root}"
 
-          cp tdlua-scm-1.rockspec "tdlua-${RELEASE_TAG}.rockspec"
-          cp build/tdlua.so "tdlua-${RELEASE_TAG}-lua5.3-linux-x86_64.so"
-          rock_version="${RELEASE_VERSION%%-*}-1"
-          sed -i \
-            -e "s/version = \"scm-1\"/version = \"${rock_version}\"/" \
-            -e "s|url = \"git+https://github.com/giuseppeM99/tdlua.git\"|url = \"https://github.com/giuseppeM99/tdlua/releases/download/${RELEASE_TAG}/tdlua-${RELEASE_TAG}-source.tar.gz\"|" \
-            "tdlua-${RELEASE_TAG}.rockspec"
+          for package in tdlua tdlua-luajit; do
+            rockspec="${package}-${RELEASE_TAG}.rockspec"
+            cp "${package}-scm-1.rockspec" "$rockspec"
+            sed -i \
+              -e "s/version = \"scm-1\"/version = \"${base_version}-1\"/" \
+              -e "s|url = \"git+https://github.com/giuseppeM99/tdlua.git\"|url = \"${source_url}\"|" \
+              -e '/branch = "master"/d' \
+              "$rockspec"
+          done
+
+          cp "$RUNNER_TEMP/tdlua-artifacts"/*.so release-artifacts/
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
             tdlua-${{ github.ref_name }}-source.tar.gz
             tdlua-${{ github.ref_name }}.rockspec
-            tdlua-${{ github.ref_name }}-lua5.3-linux-x86_64.so
+            tdlua-luajit-${{ github.ref_name }}.rockspec
+            release-artifacts/*.so
