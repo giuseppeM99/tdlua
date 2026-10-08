@@ -127,6 +127,11 @@ int new_client(lua_State *L, ClientFactory factory, lua_CFunction index,
     luaL_newmetatable(L, "tdclient");
     lua_createtable(L, 0, static_cast<int>(MethodCount - 1));
     luaL_setfuncs(L, methods, 0);
+    for (const char *name : {"await", "execute"}) {
+        lua_getfield(L, -1, name);
+        tdlua::wrapManagedFunction(L, tdlua::completeManagedTrampoline);
+        lua_setfield(L, -2, name);
+    }
     lua_setfield(L, -2, "__methods");
     lua_pushcfunction(L, index);
     lua_setfield(L, -2, "__index");
@@ -295,8 +300,7 @@ inline int index(lua_State *L, ClientHandle client,
         }
         lua_pop(L, 3);
 
-        lua_pushstring(L, name);
-        lua_pushcclosure(L, helper, 1);
+        tdlua::pushManagedHelper(L, name, helper, tdlua::completeManagedTrampoline);
         return 1;
     });
 }

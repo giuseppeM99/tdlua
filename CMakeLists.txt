@@ -140,6 +140,28 @@ include(GNUInstallDirs)
 # below, so keep the vendored dependency from adding its full test tree.
 set(BUILD_TESTING OFF CACHE BOOL "Disable TDLib tests when building TDLua" FORCE)
 
+set(TDLUA_LUA_IMPLEMENTATION "auto" CACHE STRING "Lua implementation: auto, lua or luajit")
+set_property(CACHE TDLUA_LUA_IMPLEMENTATION PROPERTY STRINGS auto lua luajit)
+if(NOT TDLUA_LUA_IMPLEMENTATION MATCHES "^(auto|lua|luajit)$")
+    message(FATAL_ERROR "TDLUA_LUA_IMPLEMENTATION must be auto, lua or luajit")
+endif()
+if(TDLUA_LUA_IMPLEMENTATION STREQUAL "luajit")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LUAJIT QUIET luajit)
+    endif()
+    find_path(LUA_INCLUDE_DIR NAMES luajit.h HINTS ${LUAJIT_INCLUDE_DIRS}
+        PATH_SUFFIXES luajit-2.1)
+    find_library(LUA_LIBRARY NAMES luajit-5.1 luajit HINTS ${LUAJIT_LIBRARY_DIRS})
+    if(NOT LUA_INCLUDE_DIR OR NOT LUA_LIBRARY)
+        message(FATAL_ERROR "LuaJIT 2.1 development headers and library were not found")
+    endif()
+    set(TDLUA_LUA_VERSION "5.1" CACHE STRING "LuaJIT installation ABI" FORCE)
+    if(NOT LUA_EXECUTABLE)
+        find_program(LUA_EXECUTABLE NAMES luajit)
+    endif()
+endif()
+
 if(TDLUA_LUA_VERSION AND LUA_INCLUDE_DIR AND LUA_LIBRARY)
   # Older CMake FindLua modules do not recognize Lua 5.5 headers. When the
   # caller supplies an explicit Lua version and paths, use those paths
@@ -164,6 +186,8 @@ endif()
 if(NOT LUA_INCLUDE_DIRS)
   set(LUA_INCLUDE_DIRS "${LUA_INCLUDE_DIR}")
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LuaRuntime.cmake")
 
 if(_tdlua_native_backend AND NOT TDLUA_BUNDLED_TDLIB)
   message(FATAL_ERROR
@@ -401,6 +425,30 @@ if(TDLUA_BUILD_TESTS)
     set_property(TARGET tdlua_codec_test PROPERTY CXX_STANDARD 11)
     add_test(NAME tdlua_codec COMMAND tdlua_codec_test)
 
+    add_executable(tdlua_managed_adapter_test "tests/managed_adapter_test.cpp")
+    target_include_directories(tdlua_managed_adapter_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_managed_adapter_test PRIVATE ${LUA_LIBRARIES})
+    target_compile_features(tdlua_managed_adapter_test PRIVATE cxx_std_11)
+    target_compile_definitions(tdlua_managed_adapter_test PRIVATE TDLUA_TESTING)
+    tdlua_enable_sanitizers(tdlua_managed_adapter_test)
+    add_test(NAME tdlua_managed_adapter COMMAND tdlua_managed_adapter_test)
+    if(TDLUA_USE_LUAJIT_CONTINUATION)
+        add_test(NAME tdlua_managed_adapter_jit_off COMMAND tdlua_managed_adapter_test --jit-off)
+
+        add_executable(tdlua_managed_cache_test "tests/managed_cache_test.cpp")
+        target_include_directories(tdlua_managed_cache_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(tdlua_managed_cache_test PRIVATE tdlua ${LUA_LIBRARIES})
+        target_compile_features(tdlua_managed_cache_test PRIVATE cxx_std_11)
+        target_compile_definitions(tdlua_managed_cache_test PRIVATE TDLUA_TESTING)
+        tdlua_enable_sanitizers(tdlua_managed_cache_test)
+        add_test(NAME tdlua_managed_cache COMMAND tdlua_managed_cache_test)
+        add_test(NAME tdlua_managed_cache_jit_off
+            COMMAND tdlua_managed_cache_test --jit-off)
+    endif()
+
     add_executable(tdlua_common_router_test "tests/common_router_test.cpp")
     target_include_directories(tdlua_common_router_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -439,6 +487,7 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
         tdlua_enable_sanitizers(tdlua_fake_client_test)
         add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+        add_test(NAME tdlua_harness_cleanup COMMAND tdlua_fake_client_test --harness-failure-only)
         add_test(NAME tdlua_hardening_fake
             COMMAND tdlua_fake_client_test --hardening-only)
         add_test(NAME tdlua_managed_driver
@@ -521,6 +570,7 @@ if(TDLUA_BUILD_TESTS)
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         target_link_libraries(tdlua_native_codec_test PRIVATE tdlua ${LUA_LIBRARIES})
+        target_link_libraries(tdlua_native_codec_test PRIVATE tdjson_private)
         target_compile_features(tdlua_native_codec_test PRIVATE cxx_std_23)
         tdlua_enable_sanitizers(tdlua_native_codec_test)
         if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -562,6 +612,15 @@ if(TDLUA_BUILD_TESTS)
             NAMES "lua${TDLUA_LUA_VERSION}" lua5.5 lua5.4 lua5.3 lua5.2 lua5.1 luajit lua)
     endif()
     if(TDLUA_LUA_EXECUTABLE)
+        if(TDLUA_USE_LUAJIT_CONTINUATION)
+            foreach(mode on off)
+                add_test(NAME tdlua_luajit_${mode}
+                    COMMAND ${TDLUA_LUA_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/luajit.lua"
+                        "$<TARGET_FILE_DIR:tdlua>" ${mode})
+                set_tests_properties(tdlua_luajit_${mode} PROPERTIES TIMEOUT 30)
+                tdlua_enable_sanitizer_test_runtime(tdlua_luajit_${mode})
+            endforeach()
+        endif()
         add_test(NAME tdlua_hardening_backend
             COMMAND ${TDLUA_LUA_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardening.lua"
@@ -603,3 +662,14 @@ if(TDLUA_BUILD_TESTS)
         )
     endif()
 endif()
+
+# Apply the VM capability only to TDLua code. TDLib remains untouched.
+foreach(target tdlua tdlua_codec_test tdlua_managed_adapter_test tdlua_managed_cache_test
+        tdlua_common_router_test
+        tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
+        tdlua_simple_bot_example_test tdlua_async_demo_test tdlua_persistence_test
+        tdlua_native_codec_test tdlua_model_benchmark)
+    if(TARGET ${target})
+        target_link_libraries(${target} PRIVATE tdlua_lua_runtime)
+    endif()
+endforeach()

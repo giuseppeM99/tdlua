@@ -72,11 +72,50 @@ A timeout does not cancel the underlying TDLib request. With the legacy
 `execute(request, timeout)` form, a late response remains available through
 `receive()` with its `_request_id`. A timed-out Future can be waited on again.
 
-Lua 5.2, 5.3, 5.4, and 5.5 are tested on Linux with both backends. The declared
-range is Lua >= 5.2 and < 5.6. Stock Lua 5.1 and LuaJIT 2.1 are unsupported
-because the managed waits require Lua's continuation API. Linux is tested. The build is
-intended to support macOS, but macOS was not runtime-tested for this release.
-Windows was not validated.
+## Supported runtimes
+
+The Full Managed API supports Lua 5.2, 5.3, 5.4, 5.5, and LuaJIT 2.1 with both
+JSON and native backends. Stock Lua 5.1 is unsupported and fails during CMake
+configuration. The standard Lua rockspecs retain `lua >= 5.2, < 5.6`.
+
+LuaJIT uses the same Futures, Tasks, callbacks, and suspending field access.
+Its continuation adapter uses a cached Lua frame around the common scheduler;
+standard Lua uses C continuations. Load `tdlua` once on the LuaJIT main thread
+before creating clients from coroutines. First initialization from a coroutine
+raises an error. Embedders must open LuaJIT's `jit` library before loading the
+module, for example with `luaL_openlibs`. Subsequent coroutine use needs no
+additional initialization API.
+
+To select LuaJIT explicitly:
+
+```bash
+cmake -S . -B build-luajit -DTDLUA_LUA_IMPLEMENTATION=luajit
+cmake --build build-luajit --target tdlua
+```
+
+Add `-DTDLUA_BACKEND=native` for the native backend. Non-default installations
+can supply matching `LUA_INCLUDE_DIR` and `LUA_LIBRARY` paths. LuaJIT modules
+install under the Lua 5.1 ABI directory. For LuaRocks, use
+`tdlua-luajit-0.4.0-1.rockspec` or `tdlua-luajit-scm-1.rockspec` with a LuaRocks
+installation configured for LuaJIT. These separate packages require the
+runtime-provided `luajit` dependency as well as the Lua 5.1 ABI; they do not
+claim stock Lua 5.1 support. They install the same `tdlua` module, so choose one
+package for each LuaRocks tree.
+
+LuaJIT and Lua 5.2 use floating-point Lua numbers. Not every integer beyond
+`2^53` can be represented exactly. Supply TDLib int64 fields as decimal strings
+to preserve the full signed 64-bit range on both backends. A numeric value may
+already have rounded before TDLua sees it. TDLib's JSON interface returns int64
+fields as decimal strings. The native backend returns an exact Lua number when
+possible and a decimal string otherwise. For example, `2^53` is a native number,
+while `2^53 + 1` and `INT64_MAX` are native strings. No FFI/cdata representation
+is required. On Lua 5.3+, use Lua integers or decimal strings for int64 inputs;
+explicit floats become JSON floats, which TDLib rejects for these fields.
+
+The complete JSON and native suites pass on Linux for all five runtimes.
+LuaJIT was tested as `LuaJIT 2.1.1788856981` on Linux x64 with JIT enabled and
+disabled. The build is intended to support macOS, but macOS was not
+runtime-tested for this release. Windows was not validated.
 
 ## v0.4 managed API
 

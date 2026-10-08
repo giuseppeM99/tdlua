@@ -3,6 +3,7 @@
 #pragma once
 
 #include "tdlua/lua_compat.h"
+#include "tdlua/common/managed_continuation.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1784,13 +1785,21 @@ inline int finishManagedWait(lua_State *L, int result)
     return result;
 }
 
+inline int completeManagedTrampoline(lua_State *L);
+
 inline int yieldManagedWait(lua_State *L, int context, int results)
 {
+#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+    if (context) return suspendedManagedBinding(L, context);
+    if (results < 0) return lua_error(L);
+    return finishManagedBinding(L, results);
+#else
     if (context) {
         return lua_yieldk(L, 0, static_cast<lua_KContext>(context),
                           managedWaitContinuation);
     }
     return finishManagedWait(L, results);
+#endif
 }
 
 inline int RequestRouter::wait(lua_State *L, const ManagedStatePtr &state, bool timed,
@@ -1906,7 +1915,7 @@ inline int managedIndex(lua_State *L, const char *type, bool task)
     ManagedHandle *handle = checkManagedHandle(L, 1, type);
     const char *key = luaL_checkstring(L, 2);
     if (std::string(key) == "wait") {
-        lua_pushcfunction(L, task ? taskWait : futureWait);
+        pushManagedFunction(L, task ? taskWait : futureWait, completeManagedTrampoline);
         return 1;
     }
     if (std::string(key) == "ready") {
@@ -1957,8 +1966,7 @@ inline int managedWaitContinuation(lua_State *L, int, lua_KContext ctx)
             throw std::runtime_error("tdlua: scheduler storage unavailable");
         }
         results = core->completeContinuation(L, continuation);
-        lua_pushnil(L);
-        lua_setuservalue(L, static_cast<int>(ctx));
+        tdlua_lua_clear_uservalue(L, static_cast<int>(ctx));
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
     } catch (...) {
@@ -1967,12 +1975,18 @@ inline int managedWaitContinuation(lua_State *L, int, lua_KContext ctx)
     return finishManagedWait(L, results);
 }
 
+inline int completeManagedTrampoline(lua_State *L)
+{
+    return managedWaitContinuation(L, LUA_OK, 1);
+}
+
 // Future and Task handles share the same lifetime bookkeeping. Their uservalue
 // keeps the CoreAnchor reachable while the handle remains visible to Lua.
 inline void ensureManagedMetatables(lua_State *L)
 {
     if (luaL_newmetatable(L, "tdlua.future")) {
-        lua_pushcfunction(L, futureIndex); lua_setfield(L, -2, "__index");
+        pushManagedFunction(L, futureIndex, completeManagedTrampoline, true);
+        lua_setfield(L, -2, "__index");
         lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
     }
     lua_pop(L, 1);

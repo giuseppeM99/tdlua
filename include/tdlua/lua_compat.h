@@ -5,10 +5,17 @@
 
 #include <compat-5.3/compat-5.3.h>
 
+#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#include <luajit.h>
+#elif LUA_VERSION_NUM < 502
+#error "TDLua Full Managed API requires Lua 5.2+ or configured LuaJIT 2.1"
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <stdexcept>
 
 /* Value uservalues are direct values on Lua 5.3+ but must be tables on Lua
  * 5.2. Keep this adapter separate from the existing reference-table uservalues
@@ -16,7 +23,7 @@
 inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
 {
     index = lua_absindex(L, index);
-#if LUA_VERSION_NUM == 502
+#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
     lua_newtable(L);
     lua_pushvalue(L, -2);
     lua_rawseti(L, -2, 1);
@@ -28,7 +35,7 @@ inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
 inline void tdlua_lua_get_value_uservalue(lua_State *L, int index)
 {
     lua_getuservalue(L, index);
-#if LUA_VERSION_NUM == 502
+#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
     if (lua_istable(L, -1)) {
         lua_rawgeti(L, -1, 1);
         lua_remove(L, -2);
@@ -58,9 +65,32 @@ inline lua_State *tdlua_lua_main_thread(lua_State *L)
     lua_State *main = lua_tothread(L, -1);
     lua_pop(L, 1);
     return main;
-#else
+#elif defined(TDLUA_USE_LUAJIT_CONTINUATION)
+    static const char main_thread_key = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &main_thread_key);
+    lua_State *main = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    if (main) return main;
+    const bool is_main = lua_pushthread(L) != 0;
+    if (!is_main) {
+        lua_pop(L, 1);
+        throw std::runtime_error(
+            "tdlua: initialize the module on the LuaJIT main thread first");
+    }
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &main_thread_key);
     return L;
 #endif
+}
+
+inline void tdlua_lua_clear_uservalue(lua_State *L, int index)
+{
+    index = lua_absindex(L, index);
+#if LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
+    lua_newtable(L);
+#else
+    lua_pushnil(L);
+#endif
+    lua_setuservalue(L, index);
 }
 
 /* Lua 5.3 and later expose exact yieldability. Lua 5.2 uses the
@@ -68,7 +98,7 @@ inline lua_State *tdlua_lua_main_thread(lua_State *L)
  * frame between the caller and this check. */
 inline bool tdlua_lua_is_yieldable(lua_State *L)
 {
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+#if LUA_VERSION_NUM >= 503 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
     return lua_isyieldable(L) != 0;
 #elif defined(LUA_VERSION_NUM) && LUA_VERSION_NUM == 502
     const int is_main = lua_pushthread(L);

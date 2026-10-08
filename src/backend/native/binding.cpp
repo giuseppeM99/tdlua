@@ -454,7 +454,7 @@ static int tdclient_execute(lua_State *L)
         return tdlua::finishManagedWait(
             L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
-    return result;
+    return tdlua::finishManagedBinding(L, result);
 }
 
 static int call(lua_State *L)
@@ -549,7 +549,7 @@ static int call(lua_State *L)
         return tdlua::finishManagedWait(
             L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
-    return result;
+    return tdlua::finishManagedBinding(L, result);
 }
 
 static int tdclient_rawexecute(lua_State *L)
@@ -659,7 +659,7 @@ static int tdclient_await(lua_State *L)
         return tdlua::finishManagedWait(
             L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
     }
-    return result;
+    return tdlua::finishManagedBinding(L, result);
 }
 
 #ifdef TDLUA_TESTING

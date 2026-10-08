@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -97,6 +98,17 @@ struct Fake {
             {"@type", type},
             {"value", value}
         });
+    }
+};
+
+// The fixture outlives lua_close, including when a scenario throws. Clients
+// retain non-owning transport pointers, so function-local fakes are unsafe.
+struct TestTransports {
+    std::vector<std::unique_ptr<Fake>> values;
+    Fake &create()
+    {
+        values.emplace_back(new Fake());
+        return *values.back();
     }
 };
 
@@ -516,7 +528,7 @@ void testHandlers(lua_State *L, Fake &fake)
            "assert(deferred_drop == 0)");
 }
 
-void testEventScheduling(lua_State *L, Fake &fake, Fake &second)
+void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports &transports)
 {
     runLua(L,
            "m3_log = {}; "
@@ -666,7 +678,7 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second)
     second.response(cross_event_request, 61);
     runLua(L, "d:receive(0); assert(cross_event_value == 61)");
 
-    Fake closing_owner;
+    Fake &closing_owner = transports.create();
     runLua(L, "e = tdlua()");
     attachTransport(L, "e", closing_owner);
     runLua(L,
@@ -683,7 +695,7 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second)
     second.response(close_dependency_request, 71);
     runLua(L, "d:receive(0); assert(close_event_value == 71)");
 
-    Fake reentrant_close_transport;
+    Fake &reentrant_close_transport = transports.create();
     runLua(L, "f = tdlua(); reentrant_close_called = false");
     attachTransport(L, "f", reentrant_close_transport);
     runLua(L,
@@ -702,7 +714,7 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second)
            "c:off('m3SelfRemoved'); c:off('m3MultipleWaits')");
 }
 
-void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
+void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second, TestTransports &transports)
 {
     runLua(L,
            "other = d:send{_='getMe'}; "
@@ -739,7 +751,7 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
     runLua(L,
            "assert(d:receive(0).value == 5); "
            "owner = tdlua()");
-    Fake owner_fake;
+    Fake &owner_fake = transports.create();
     attachTransport(L, "owner", owner_fake);
     runLua(L, "completed_owner = owner:getMe()");
     owner_fake.response(owner_fake.sent.back().first, 110);
@@ -773,7 +785,7 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second)
            "collectgarbage('collect')");
 }
 
-void runScenarios(lua_State *L, Fake &fake, Fake &second)
+void runScenarios(lua_State *L, Fake &fake, Fake &second, TestTransports &transports)
 {
     createClients(L);
     TDLua *client = attachTransport(L, "c", fake);
@@ -787,8 +799,8 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second)
     testReviewRegressions(L, fake, second);
     testRollbackAndCallbackErrors(L, client, fake);
     testHandlers(L, fake);
-    testEventScheduling(L, fake, second);
-    testCloseAndClientIsolation(L, fake, second);
+    testEventScheduling(L, fake, second, transports);
+    testCloseAndClientIsolation(L, fake, second, transports);
 }
 
 void testLifetimeAndAbandonment()
@@ -932,16 +944,18 @@ void testDispatcherDestructorDoesNotRunLua(lua_State *L)
     runLua(L, "assert(destructor_callback_calls == 0)");
 }
 
-void testManagedDrivers(lua_State *L)
+void testManagedDrivers(lua_State *L, TestTransports &transports, bool fail_after_attach = false)
 {
-    Fake fake, other;
+    Fake &fake = transports.create();
+    Fake &other = transports.create();
     createClients(L);
     TDLua *client = attachTransport(L, "c", fake);
     attachTransport(L, "d", other);
+    if (fail_after_attach) throw std::runtime_error("intentional harness failure");
     runLua(L, R"lua(
         c:loop()
         for _, args in ipairs({{1}, {0.5}, {false}, {{}}, {function() end, 1}}) do
-            local ok, message = pcall(c.poll, c, table.unpack(args))
+            local ok, message = pcall(c.poll, c, (table.unpack or unpack)(args))
             assert(not ok and message:find('poll'))
         end
         assert(not pcall(c.loop, c, 1))
@@ -1213,7 +1227,7 @@ void testManagedDrivers(lua_State *L)
     other.before_receive = {};
 
     // A poll callback's owner can be collected while its dependency survives.
-    Fake owner;
+    Fake &owner = transports.create();
     runLua(L, "e=tdlua()");
     attachTransport(L, "e", owner);
     owner.update("m4", 1);
@@ -1225,7 +1239,8 @@ void testManagedDrivers(lua_State *L)
     runLua(L, "d:loop(); assert(survivor:wait()==52)");
 
     // An abandoned poll callback cycle is Lua-owned, not a registry root.
-    Fake abandoned_owner, abandoned_dependency;
+    Fake &abandoned_owner = transports.create();
+    Fake &abandoned_dependency = transports.create();
     runLua(L, "collectgarbage('collect'); collectgarbage('collect')");
     const auto cores_before = tdlua::liveSchedulerCores();
     const auto continuations_before = tdlua::liveContinuations();
@@ -1251,7 +1266,7 @@ void testManagedDrivers(lua_State *L)
         throw std::runtime_error("abandoned M4 callback retained scheduler storage");
 
     for (int origin = 0; origin < 2; ++origin) {
-        Fake closing;
+        Fake &closing = transports.create();
         runLua(L, "e=tdlua(); close_origin_called=false");
         attachTransport(L, "e", closing);
         closing.update("m4", 1);
@@ -1461,6 +1476,7 @@ int main(int argc, char **argv)
 {
     Fake fake;
     Fake second;
+    TestTransports transports;
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
     int result = 0;
@@ -1473,10 +1489,17 @@ int main(int argc, char **argv)
             attachTransport(L, "c", fake);
             attachTransport(L, "d", second);
             testM5Conformance(L, fake);
+        } else if (argc > 1 && std::string(argv[1]) == "--harness-failure-only") {
+            bool caught = false;
+            try { testManagedDrivers(L, transports, true); }
+            catch (const std::runtime_error &error) {
+                caught = std::string(error.what()) == "intentional harness failure";
+            }
+            if (!caught) throw std::runtime_error("harness failure probe did not throw");
         } else if (argc > 1 && std::string(argv[1]) == "--m4-only") {
-            testManagedDrivers(L);
+            testManagedDrivers(L, transports);
         } else if (argc == 1 || std::string(argv[1]) != "--lifetime-only")
-            runScenarios(L, fake, second);
+            runScenarios(L, fake, second, transports);
         testDispatcherDestructorDoesNotRunLua(L);
         testLifetimeAndAbandonment();
     } catch (const std::exception &error) {

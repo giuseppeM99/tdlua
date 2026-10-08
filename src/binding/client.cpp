@@ -220,10 +220,12 @@ static luaL_Reg methods[] = {
 
 static int tdclient_new(lua_State *L)
 {
-    const auto &ops = operations();
-    return tdlua_binding::new_client(
-        L, ops.factory, tdclient_index, tdclient_newindex, tdclient_unload,
-        methods);
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        const auto &ops = operations();
+        return tdlua_binding::new_client(
+            L, ops.factory, tdclient_index, tdclient_newindex, tdclient_unload,
+            methods);
+    });
 }
 
 static luaL_Reg module_functions[] = {
@@ -250,6 +252,11 @@ extern "C" {
 
 LUALIB_API int luaopen_tdlua(lua_State *L)
 {
+    const int initialized = tdlua_binding::protected_call(L, [&]() -> int {
+        tdlua::initializeManagedContinuations(L);
+        return 0;
+    });
+    (void)initialized;
     const auto &ops = operations();
     const int base = lua_gettop(L);
     const int created_metatable = luaL_newmetatable(L, "tdlua");
