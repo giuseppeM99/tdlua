@@ -73,6 +73,10 @@ without requiring parallel Lua execution.
 
 - Hardened Future/Task lifetime, client close, cross-client scheduling, and
   coroutine resumption paths.
+- External coroutines resumed by TDLua now discard final return values after
+  completion, so `coroutine.status()` correctly reports `dead` and a later
+  resume is rejected as expected. Use a managed Task when return values must be
+  observed through `Task:wait()`.
 - Unobserved callback failures are reported once by the owning client, while
   teardown-only failures remain available on retained Task handles.
 - Added coverage for managed continuations, cache collection, allocator/error
