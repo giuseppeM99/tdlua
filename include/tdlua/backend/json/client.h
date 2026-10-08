@@ -16,9 +16,11 @@ public:
     struct QueuedUpdate {
         nlohmann::json value;
         bool dispatched;
+        bool delivery_pending;
 
-        QueuedUpdate(const nlohmann::json &value, const bool dispatched)
-            : value(value), dispatched(dispatched)
+        QueuedUpdate(const nlohmann::json &value, const bool dispatched,
+                     bool delivery_pending = false)
+            : value(value), dispatched(dispatched), delivery_pending(delivery_pending)
         {
         }
     };
@@ -73,6 +75,8 @@ public:
 
     void push(const nlohmann::json &update, bool dispatched = false);
 
+    void restoreReceived(const nlohmann::json &value) { updates.emplace_front(value, true, true); }
+
     bool empty() const;
 
 
@@ -80,7 +84,7 @@ public:
 
     void loadUpdatesBuffer();
 
-    void emptyUpdatesBuffer();
+    void emptyUpdatesBuffer(bool preserve_received = false);
 
     void checkAuthState(const nlohmann::json &update);
     tdlua::RouteKind dispatch(nlohmann::json &update, bool managed_receive = false);

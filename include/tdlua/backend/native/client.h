@@ -44,6 +44,12 @@ public:
     void push(NativeResponse response);
     NativeResponse pop();
     bool takeQueuedResponse(std::uint64_t request_id, NativeResponse &response);
+    void restoreReceived(NativeResponse response) {
+        response.dispatched = true;
+        response.delivery_pending = true;
+        updates_.push_front(std::move(response));
+    }
+
     bool empty() const;
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
@@ -52,7 +58,7 @@ public:
     void setDBIfParameters(lua_State *L, int request_index);
     void saveUpdatesBuffer();
     void loadUpdatesBuffer();
-    void emptyUpdatesBuffer();
+    void emptyUpdatesBuffer(bool preserve_received = false);
 
 private:
     void closeInternal(bool drain, bool persist_updates);

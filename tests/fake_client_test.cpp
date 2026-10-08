@@ -445,7 +445,7 @@ void testRollbackAndCallbackErrors(lua_State *L, TDLua *client, Fake &fake)
     fake.response(fake.sent.back().first, 9);
     runLua(L,
            "local ok, error_message = pcall(c.receive, c, 0); "
-           "assert(not ok and error_message:find('fake callback boom'))");
+           "assert(not ok and error_message:find('fake callback boom')); assert(c:receive(0).value==9)");
 
     runLua(L,
            "legacy_order_event = false; "
@@ -478,7 +478,7 @@ void testHandlers(lua_State *L, Fake &fake)
     runLua(L,
            "local ok, error_message = pcall(c.receive, c, 0); "
            "assert(not ok and error_message:find('fake handler boom')); "
-           "c.onUpdateOption = nil");
+           "c.onUpdateOption = nil; assert(c:receive(0).name=='fake')");
 
     runLua(L,
            "old_handler_calls = 0; new_handler_calls = 0; "
@@ -634,7 +634,7 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
     runLua(L,
            "local ok, message = pcall(function() c:receive(0) end); "
            "assert(not ok and message:find('m3 handler error 51')); "
-           "assert(m3_after_error == 2)");
+           "assert(m3_after_error == 2); assert(c:receive(0).value==51)");
 
     runLua(L,
            "false_result_seen = false; "
@@ -954,7 +954,7 @@ void testManagedDrivers(lua_State *L, TestTransports &transports, bool fail_afte
     if (fail_after_attach) throw std::runtime_error("intentional harness failure");
     runLua(L, R"lua(
         c:loop()
-        for _, args in ipairs({{1}, {0.5}, {false}, {{}}, {function() end, 1}}) do
+        for _, args in ipairs({{-1}, {math.huge}, {false}, {{}}, {function() end, false}, {1, 2}}) do
             local ok, message = pcall(c.poll, c, (table.unpack or unpack)(args))
             assert(not ok and message:find('poll'))
         end

@@ -236,15 +236,63 @@ backend; callbacks versus Futures selects the control-flow style. Async calls
 do not make an individual TDLib request faster, but allow independent requests
 to overlap while Futures preserve sequential-looking Lua.
 
-`client:poll()` and `client:poll(callback)` are the valid poll forms.
-`client:poll(1)` is invalid; use `receive(timeout)` for a timed polling loop.
-`poll()` and `loop()` are blocking managed drivers intended for applications
-where TDLua owns update driving. While idle, they may stay inside C++ and delay
-the standalone Lua interpreter's SIGINT hook. Use `receive(timeout)` when the
-host must periodically regain Lua control for external I/O, custom timers, or
-shutdown. TDLua does not install signal handlers or promise POSIX signal handling.
-For a manual reproduction, run `lua -e 'require("tdlua")():loop(function() end)'`
-and send SIGINT while the client is idle.
+The managed poll forms are `poll()`, `poll(callback)`, `poll(timeout)` and
+`poll(callback, timeout)`. `poll(nil, timeout)` also selects an update directly.
+The optional timeout is a finite, non-negative number of seconds. Omitted or
+`nil` means indefinite selection; positive values use one monotonic deadline,
+including managed responses and cross-client dependencies. Timeout or closure
+returns `nil`. Zero gives one nonblocking progress opportunity, including
+current-client and dependency reads, without an idle sleep. An update behind
+other transport objects may require another zero-timeout call.
+
+```lua
+local future = client:getMe()
+local me = future:wait()
+client:poll(function(update)
+    -- Managed callback. It may suspend on a Future.
+end, 0.1)
+```
+
+The timeout covers update selection only. A selected callback runs in exactly
+one Task, whose handle is returned without joining it. Timeouts never cancel
+requests. Lua callbacks and transport-lock contention can exceed the I/O waiting
+budget; arbitrary Lua execution is not bounded by a wall-clock deadline.
+`loop()` retains its existing continuous behavior and has no timeout argument.
+
+`receive()` retains its 10-second default. `receive(0)` makes a nonblocking TDLib
+read even when the local queue is empty; it returns an available object or `nil`.
+Objects already buffered remain FIFO. If scheduler draining raises after raw
+acquisition, the call raises that error and preserves the unreturned object at
+the front of the receive queue. The next receive returns it without redispatch,
+including after closure. Further pending errors can still raise before delivery.
+These recovered objects stay in the original client across `save()` and close;
+they are excluded from disk persistence. Explicit `clearBuffer()` discards them.
+
+`poll()` and `loop()` execute a protected Lua checkpoint between driver
+iterations so the standalone interpreter can process its existing SIGINT debug
+hook when the driver runs on the main thread. An idle first interrupt is
+observed after the current receive slice,
+normally within about one second. Long Lua callbacks, cross-client work and
+transport-lock contention can delay this. A repeated SIGINT before the first
+is processed can still terminate abruptly under the interpreter's own signal
+policy. When `poll()` or `loop()` runs inside a coroutine, the standalone
+interpreter can install its hook on the main state instead of the driver state;
+the first interrupt may remain deferred. That limitation is deferred to v0.5.
+TDLua installs no signal handlers. Use timed `poll()` or `receive()` when
+the host needs periodic control. Background receiving and external event-loop
+integration are deferred to v0.5.
+
+`client:request(req, callback, ctx)` is deprecated compatibility syntax. It
+submits once, returns the canonical request ID, and calls `callback(response,
+ctx)` with the original context. `request(req)` and `request(req, nil)` are raw
+submission, equivalent to `send(req)`, without a Future or Task. Invalid callbacks
+raise before submission. Use `send(req)` for raw requests, `execute(req)` for a
+Future, or `execute(req, callback, ctx)` for a Task. `await(req)` remains a separate
+legacy coroutine interface that submits a request and waits. It accepts a
+request table or JSON string, never a request ID.
+
+Independent Lua VMs may run on separate OS threads. Each VM and its coroutines
+must remain on its owning thread; concurrent access to one VM is unsupported.
 
 Request callback Tasks retain their failures for `task:wait()`. If the last
 Task handle is collected without observing its failure, the owning client's

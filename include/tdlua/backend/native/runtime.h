@@ -20,6 +20,7 @@ struct NativeResponse {
     td::ClientManager::RequestId request_id;
     td::td_api::object_ptr<td::td_api::Object> object;
     bool dispatched;
+    bool delivery_pending;
 
     NativeResponse();
     NativeResponse(NativeResponse &&other) noexcept;

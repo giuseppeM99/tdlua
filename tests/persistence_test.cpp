@@ -72,6 +72,8 @@ void test_json_persistence(lua_State *lua,
         require(source.pump(0),
                 "JSON managed pump did not preserve raw response");
     }
+    source.restoreReceived({{"@type", "optionValueString"}, {"value", "retained"},
+                            {"_request_id", 1000}});
     source.saveUpdatesBuffer();
 
     TDLua restored(lua);
@@ -90,6 +92,13 @@ void test_json_persistence(lua_State *lua,
     require(new_id > buffered_request_ids.back(),
             "JSON allocator did not advance past restored request IDs");
     restored.dispatcher().cancel(new_id);
+    require(restored.empty(), "failed receive was duplicated in persistence");
+    source.close();
+    require(!source.empty(), "close destroyed undelivered receive object");
+    const auto retained = source.pop();
+    require(retained.delivery_pending && retained.value["value"] == "retained",
+            "save/close changed retained receive object");
+    require(source.empty(), "retained receive object duplicated");
 }
 
 #else
@@ -123,6 +132,10 @@ void test_native_persistence(lua_State *lua,
         require(source.pump(0),
                 "native managed pump did not preserve raw response");
     }
+    NativeResponse retained;
+    retained.request_id = 1000;
+    retained.object = td::td_api::make_object<td::td_api::optionValueString>("retained");
+    source.restoreReceived(std::move(retained));
     source.saveUpdatesBuffer();
 
     NativeTDLua restored(lua);
@@ -148,6 +161,13 @@ void test_native_persistence(lua_State *lua,
     const std::uint64_t new_id = restored.nextRequestId();
     require(new_id > buffered_request_ids.back(),
             "native allocator did not advance past restored request IDs");
+    require(restored.empty(), "failed receive was duplicated in persistence");
+    source.close();
+    require(!source.empty(), "close destroyed undelivered receive object");
+    const auto delivered = source.pop();
+    require(delivered.delivery_pending && delivered.request_id == 1000,
+            "save/close changed retained receive object");
+    require(source.empty(), "retained receive object duplicated");
 }
 
 #endif

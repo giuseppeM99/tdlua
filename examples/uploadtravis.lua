@@ -98,7 +98,7 @@ local function check_auth_error()
 end
 
 local function request_authentication(operation, request)
-    return client:request(request, function(result, context)
+    return client:execute(request, function(result, context)
         if result._ == "error" then
             fail_auth(context.operation .. " failed: " .. error_text(result))
         end
@@ -180,7 +180,7 @@ auth_thread = coroutine.create(function(state)
     end
 end)
 
-client:request({_ = "getAuthorizationState"}, function(state)
+client:execute({_ = "getAuthorizationState"}, function(state)
     if state._ == "error" then
         fail_auth("getAuthorizationState failed: " .. error_text(state))
     else

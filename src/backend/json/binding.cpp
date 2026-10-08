@@ -124,35 +124,31 @@ static int tdclient_receive(lua_State *L)
         if (!td) {
             throw std::runtime_error("invalid tdlua client");
         }
-        if (!td->empty()) {
-            {
-                TDLua::QueuedUpdate queued = td->pop();
-                if (!queued.dispatched) {
-                    td->dispatch(queued.value);
-                }
-                lua_pushjson(L, queued.value);
-            }
-            td->dispatcher().drain();
-            return 1;
-        }
-        if (td->closed()) {
-            lua_pushnil(L);
-            return 1;
-        }
         lua_Number timeout = 10.0;
-        if (lua_type(L, 2) == LUA_TNUMBER) {
-            timeout = lua_tonumber(L, 2);
+        if (lua_type(L, 2) == LUA_TNUMBER) timeout = lua_tonumber(L, 2);
+        json result;
+        bool dispatched = false;
+        if (!td->empty()) {
+            auto queued = td->pop();
+            result = std::move(queued.value);
+            dispatched = queued.dispatched;
+        } else if (!td->closed()) {
+            result = td->receive(timeout);
         }
-        {
-            json result = td->receive(timeout);
-            if (result.empty()) {
-                lua_pushnil(L);
-            } else {
-                td->dispatch(result);
-                lua_pushjson(L, result);
-            }
+        if (result.empty()) {
+            lua_pushnil(L);
+        } else {
+            if (!dispatched) td->dispatch(result);
+            lua_pushjson(L, result);
         }
-        td->dispatcher().drain();
+        try {
+            td->dispatcher().drain();
+        } catch (...) {
+            // Routing already happened. Preserve public delivery without
+            // repeating callbacks or response classification on the retry.
+            if (!result.empty()) td->restoreReceived(result);
+            throw;
+        }
         return 1;
     });
 }

@@ -121,14 +121,12 @@ void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
 
 NativeResponse NativeTDLua::receive(double timeout)
 {
-    if (closed_) {
-        return NativeResponse();
-    }
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
         return response;
     }
+    if (closed_) return NativeResponse();
     NativeResponse response = transport().receive(timeout);
     return response;
 }
@@ -295,7 +293,7 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
     } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosed::ID) {
         saveUpdatesBuffer();
-        emptyUpdatesBuffer();
+        emptyUpdatesBuffer(true);
         ready_ = false;
         closed_ = true;
         closing_ = false;
@@ -358,7 +356,7 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
     if (persist_updates) {
         saveUpdatesBuffer();
     }
-    emptyUpdatesBuffer();
+    emptyUpdatesBuffer(true);
     closed_ = true;
     closing_ = false;
     dispatcher_.detachTransport();
@@ -384,16 +382,16 @@ void NativeTDLua::saveUpdatesBuffer()
 
     const int stack_top = lua_gettop(lua_);
     nlohmann::json stored = nlohmann::json::array();
-    while (!updates_.empty()) {
-        NativeResponse response(std::move(updates_.front()));
-        updates_.pop_front();
-        if (response.object) {
-            pushResponse(lua_, response);
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (it->delivery_pending) { ++it; continue; }
+        if (it->object) {
+            pushResponse(lua_, *it);
             nlohmann::json value;
             lua_getjson(lua_, value);
             lua_pop(lua_, 1);
             stored.push_back(std::move(value));
         }
+        it = updates_.erase(it);
     }
     lua_settop(lua_, stack_top);
 
@@ -448,10 +446,10 @@ void NativeTDLua::loadUpdatesBuffer()
     }
 }
 
-void NativeTDLua::emptyUpdatesBuffer()
+void NativeTDLua::emptyUpdatesBuffer(bool preserve_received)
 {
-    while (!updates_.empty()) {
-        NativeResponse response(std::move(updates_.front()));
-        updates_.pop_front();
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (preserve_received && it->delivery_pending) ++it;
+        else it = updates_.erase(it);
     }
 }

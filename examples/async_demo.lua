@@ -11,6 +11,8 @@
 local tdlua = require "tdlua"
 local logic = assert(dofile("examples/async_demo_logic.lua"))
 
+tdlua.setLogLevel(0)
+
 local function required(name)
     local value = os.getenv(name)
     if not value or value == "" then

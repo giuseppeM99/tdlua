@@ -594,6 +594,7 @@ local callback_error_ok = pcall(function()
 end)
 assert(not callback_error_ok, "callback failure was swallowed")
 assert(client:pendingCount() == 0)
+assert(client:receive(0)) -- already dispatched response survives the error
 
 local handler_error_ok = pcall(function()
     client:on("authorizationStateWaitTdlibParameters", function()
@@ -604,6 +605,7 @@ local handler_error_ok = pcall(function()
 end)
 assert(not handler_error_ok, "handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
+assert(client:receive(0))
 
 -- An error in a handler for the response currently awaited by execute() must
 -- release its pending request exactly once and leave the client reusable.
@@ -635,6 +637,7 @@ for _ = 1, 20 do
 end
 assert(await_error_seen, "await failure was swallowed")
 assert(client:pendingCount() == 0)
+assert(client:receive(0)) -- receive retains the response when a resumed waiter fails
 
 -- Unknown constructors are rejected by the native schema codec. The JSON
 -- backend may send them to TDLib and return a normal TDLib error object; both

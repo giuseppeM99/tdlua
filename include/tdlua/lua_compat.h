@@ -230,3 +230,28 @@ inline void tdlua_lua_push_integer(lua_State *L, std::int64_t value)
     lua_pushnumber(L, static_cast<lua_Number>(value));
 #endif
 }
+
+/* Execute a bounded Lua frame so interpreter debug hooks, including its
+ * ordinary SIGINT hook, can run while a managed driver otherwise stays in C++.
+ * Protect the hook error so C++ scopes unwind before the binding raises it. */
+inline void tdlua_lua_vm_checkpoint(lua_State *L)
+{
+    static const char key = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &key);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        if (luaL_loadbuffer(L, "return", 6, "=tdlua checkpoint") != LUA_OK) {
+            const std::string error = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            throw std::runtime_error(error);
+        }
+        lua_pushvalue(L, -1);
+        lua_rawsetp(L, LUA_REGISTRYINDEX, &key);
+    }
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        const char *message = lua_tostring(L, -1);
+        const std::string error = message ? message : "tdlua: VM checkpoint failed";
+        lua_pop(L, 1);
+        throw std::runtime_error(error);
+    }
+}

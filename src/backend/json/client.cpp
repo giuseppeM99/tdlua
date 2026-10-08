@@ -121,15 +121,17 @@ public:
         }
 
         const auto started = std::chrono::steady_clock::now();
+        bool attempted = false;
         while (true) {
             const std::chrono::duration<double> elapsed =
                 std::chrono::steady_clock::now() - started;
             const double remaining = timeout - elapsed.count();
-            if (remaining <= 0.0) {
+            if ((attempted || timeout < 0.0) && remaining <= 0.0) {
                 return nullptr;
             }
 
-            json result = parse(td_receive(remaining), "receive");
+            attempted = true;
+            json result = parse(td_receive(std::max(0.0, remaining)), "receive");
             if (!result.is_object()) {
                 return nullptr;
             }
@@ -373,8 +375,11 @@ void TDLua::saveUpdatesBuffer()
 {
     if (!_ready || dbpath.empty()) return;
     nlohmann::json jupdates = nlohmann::json::array();
-    while (!updates.empty()) {
-        jupdates.push_back(this->pop().value);
+    for (auto it = updates.begin(); it != updates.end();) {
+        // A failed receive still owns public delivery, even across close/save.
+        if (it->delivery_pending) { ++it; continue; }
+        jupdates.push_back(it->value);
+        it = updates.erase(it);
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();
@@ -420,10 +425,11 @@ void TDLua::loadUpdatesBuffer()
     _ready = true;
 }
 
-void TDLua::emptyUpdatesBuffer()
+void TDLua::emptyUpdatesBuffer(bool preserve_received)
 {
-    while (!updates.empty()) {
-        updates.pop_front();
+    for (auto it = updates.begin(); it != updates.end();) {
+        if (preserve_received && it->delivery_pending) ++it;
+        else it = updates.erase(it);
     }
 }
 
@@ -434,7 +440,7 @@ void TDLua::checkAuthState(const nlohmann::json &update)
             loadUpdatesBuffer();
         } else if (update["authorization_state"]["@type"] == "authorizationStateClosed") {
             saveUpdatesBuffer();
-            emptyUpdatesBuffer();
+            emptyUpdatesBuffer(true);
             _ready = false;
             state = ClientState::Closed;
         }

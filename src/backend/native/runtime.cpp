@@ -7,13 +7,14 @@
 #include <utility>
 
 NativeResponse::NativeResponse()
-    : client_id(0), request_id(0), object(nullptr), dispatched(false)
+    : client_id(0), request_id(0), object(nullptr), dispatched(false), delivery_pending(false)
 {
 }
 
 NativeResponse::NativeResponse(NativeResponse &&other) noexcept
     : client_id(other.client_id), request_id(other.request_id),
-      object(std::move(other.object)), dispatched(other.dispatched)
+      object(std::move(other.object)), dispatched(other.dispatched),
+      delivery_pending(other.delivery_pending)
 {
 }
 
@@ -24,6 +25,7 @@ NativeResponse &NativeResponse::operator=(NativeResponse &&other) noexcept
         request_id = other.request_id;
         object = std::move(other.object);
         dispatched = other.dispatched;
+        delivery_pending = other.delivery_pending;
     }
     return *this;
 }
@@ -73,15 +75,17 @@ NativeResponse NativeRuntime::receive(td::ClientManager::ClientId client_id,
     }
 
     const auto started = std::chrono::steady_clock::now();
+    bool attempted = false;
     while (true) {
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         const double remaining = timeout - elapsed;
-        if (remaining <= 0.0) {
+        if ((attempted || timeout < 0.0) && remaining <= 0.0) {
             return NativeResponse();
         }
 
-        td::ClientManager::Response response = manager_.receive(remaining);
+        attempted = true;
+        td::ClientManager::Response response = manager_.receive(std::max(0.0, remaining));
         if (!response.object) {
             return NativeResponse();
         }

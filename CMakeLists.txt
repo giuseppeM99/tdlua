@@ -562,6 +562,38 @@ if(TDLUA_BUILD_TESTS)
         set_tests_properties(tdlua_lua51_managed PROPERTIES TIMEOUT 30)
     endif()
 
+    find_package(Threads REQUIRED)
+    add_executable(tdlua_vm_threads_test "tests/vm_threads_test.cpp")
+    target_include_directories(tdlua_vm_threads_test PRIVATE ${LUA_INCLUDE_DIRS}
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_vm_threads_test PRIVATE ${LUA_LIBRARIES}
+        tdlua_lua_runtime Threads::Threads)
+    target_compile_features(tdlua_vm_threads_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_vm_threads_test)
+    add_test(NAME tdlua_vm_threads COMMAND tdlua_vm_threads_test)
+    set_tests_properties(tdlua_vm_threads PROPERTIES TIMEOUT 30)
+
+    add_executable(tdlua_release_test "tests/release_test.cpp")
+    target_include_directories(tdlua_release_test PRIVATE ${LUA_INCLUDE_DIRS}
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(tdlua_release_test PRIVATE tdlua ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_definitions(tdlua_release_test PRIVATE TDLUA_TESTING)
+    target_compile_features(tdlua_release_test PRIVATE cxx_std_11)
+    if(_tdlua_backend STREQUAL "native")
+        target_compile_definitions(tdlua_release_test PRIVATE TDLUA_NATIVE_BACKEND)
+        target_include_directories(tdlua_release_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+        target_compile_features(tdlua_release_test PRIVATE cxx_std_23)
+    endif()
+    tdlua_enable_sanitizers(tdlua_release_test)
+    add_test(NAME tdlua_release COMMAND tdlua_release_test)
+    set_tests_properties(tdlua_release PROPERTIES TIMEOUT 30)
+    if(TDLUA_USE_LUAJIT_CONTINUATION)
+        add_test(NAME tdlua_release_jit_off COMMAND tdlua_release_test --jit-off)
+        add_test(NAME tdlua_vm_threads_jit_off COMMAND tdlua_vm_threads_test --jit-off)
+        set_tests_properties(tdlua_release_jit_off tdlua_vm_threads_jit_off PROPERTIES TIMEOUT 30)
+    endif()
+
     add_executable(tdlua_persistence_test
         "tests/persistence_test.cpp"
     )
@@ -697,6 +729,17 @@ if(TDLUA_BUILD_TESTS)
             tdlua_managed_driver_backend
         )
     endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TDLUA_LUA_EXECUTABLE
+       AND NOT TDLUA_ENABLE_SANITIZERS)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME tdlua_signals
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/signals.py"
+                    "${TDLUA_LUA_EXECUTABLE}" "$<TARGET_FILE_DIR:tdlua>")
+            set_tests_properties(tdlua_signals PROPERTIES TIMEOUT 15)
+        endif()
+    endif()
+
 endif()
 
 # Apply the VM capability only to TDLua code. TDLib remains untouched.

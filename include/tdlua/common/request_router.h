@@ -155,6 +155,8 @@ struct DeferredEvent {
     int update_ref = LUA_NOREF;
 };
 
+// Independent VMs on different threads must not share mutable indexes. A VM
+// and its coroutines must stay on their owning thread.
 // These indexes are weak bookkeeping only. They never root a coroutine or
 // keep a SchedulerCore alive.
 struct TaskBinding {
@@ -163,24 +165,24 @@ struct TaskBinding {
 };
 inline std::map<lua_State *, TaskBinding> &taskBindings()
 {
-    static std::map<lua_State *, TaskBinding> bindings;
+    static thread_local std::map<lua_State *, TaskBinding> bindings;
     return bindings;
 }
 inline std::map<lua_State *, std::weak_ptr<SchedulerCore>> &waitBindings()
 {
-    static std::map<lua_State *, std::weak_ptr<SchedulerCore>> bindings;
+    static thread_local std::map<lua_State *, std::weak_ptr<SchedulerCore>> bindings;
     return bindings;
 }
 
 inline std::size_t &liveSchedulerCores()
 {
-    static std::size_t count = 0;
+    static thread_local std::size_t count = 0;
     return count;
 }
 
 inline std::size_t &liveContinuations()
 {
-    static std::size_t count = 0;
+    static thread_local std::size_t count = 0;
     return count;
 }
 
@@ -229,7 +231,7 @@ struct Lua51WaitPreparation {
 #ifdef TDLUA_TESTING
 enum class Lua51WaitStage { Prepared, YieldAccepted, WaiterInserted, BindingInserted };
 using Lua51WaitHook = void (*)(lua_State *, ContinuationState *, Lua51WaitStage);
-inline Lua51WaitHook &lua51WaitHook() { static Lua51WaitHook hook = nullptr; return hook; }
+inline Lua51WaitHook &lua51WaitHook() { static thread_local Lua51WaitHook hook = nullptr; return hook; }
 inline void testLua51WaitStage(lua_State *L, ContinuationState *c, Lua51WaitStage stage)
 {
     if (lua51WaitHook()) lua51WaitHook()(L, c, stage);
@@ -1157,14 +1159,15 @@ public:
     }
 
     void pumpCrossClientDependencies(
-        const std::vector<std::shared_ptr<SchedulerCore>> &dependencies)
+        const std::vector<std::shared_ptr<SchedulerCore>> &dependencies,
+        const std::chrono::steady_clock::time_point *deadline)
     {
         for (const auto &dependency : dependencies) {
             // Pin Lua storage as well as C++ ownership across arbitrary resumes.
             const int base = lua_gettop(lua_owner_);
             pushCoreAnchor(lua_owner_, dependency.get());
             try {
-                dependency->driveStep(crossClientReceiveSlice());
+                dependency->driveStep(crossClientReceiveSlice(), deadline);
             } catch (...) {
                 lua_settop(lua_owner_, base);
                 throw;
@@ -1185,7 +1188,8 @@ public:
 
     // Deadline-aware effect boundary shared by waits, poll and loop. Backend
     // pumps never consume their already-preserved raw response queue again.
-    bool driveStep(double wait)
+    bool driveStep(double wait,
+                   const std::chrono::steady_clock::time_point *deadline = nullptr)
     {
         if (managed_driver_.drive_active) return false;
         struct DrivingScope {
@@ -1197,9 +1201,22 @@ public:
         if (!pump_) return false;
         const auto dependencies = crossClientDependencies();
         wait = receiveBudget(wait, dependencies);
+        if (deadline) {
+            wait = std::min(wait, std::max(0.0, std::chrono::duration<double>(
+                *deadline - std::chrono::steady_clock::now()).count()));
+        }
         const bool progressed = pumpCurrentTransport(wait);
-        pumpCrossClientDependencies(dependencies);
-        backoffAfterEmptyPump(progressed);
+        pumpCrossClientDependencies(dependencies, deadline);
+        if (!deadline) {
+            backoffAfterEmptyPump(progressed);
+        } else if (!progressed && pump_) {
+            const auto remaining = *deadline - std::chrono::steady_clock::now();
+            if (remaining > std::chrono::steady_clock::duration::zero()) {
+                std::this_thread::sleep_for(std::min(remaining,
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        emptyPumpBackoff())));
+            }
+        }
         tick();
         return progressed;
     }
@@ -1248,11 +1265,22 @@ public:
         managed_driver_.consumer_active = false;
     }
 
-    State selectPollUpdate(lua_State *L, int callback)
+    State selectPollUpdate(lua_State *L, int callback, bool timed = false,
+                           double timeout = 0.0)
     {
+        if (timed && (!std::isfinite(timeout) || timeout < 0))
+            throw std::runtime_error("tdlua: poll timeout must be finite and non-negative");
+        const auto deadline = timed ? deadlineFor(timeout)
+                                    : std::chrono::steady_clock::time_point::max();
         managed_driver_.poll_selecting = true;
-        while (managed_driver_.selected_update == LUA_NOREF && pump_)
-            driveStep(managedReceiveSlice());
+        bool attempted = false;
+        while (managed_driver_.selected_update == LUA_NOREF && pump_) {
+            if (timed && attempted && std::chrono::steady_clock::now() >= deadline)
+                break;
+            tdlua_lua_vm_checkpoint(L);
+            driveStep(managedReceiveSlice(), timed ? &deadline : nullptr);
+            attempted = true;
+        }
         tick();
         if (managed_driver_.selected_update == LUA_NOREF) {
             lua_pushnil(L);
@@ -1296,6 +1324,7 @@ public:
             managed_driver_.loop_observer->callback_ref = createLuaReference(L, callback);
         }
         while (true) {
+            tdlua_lua_vm_checkpoint(L);
             tick();
             if (!pump_) return;
             // After explicit stop, a standalone Future is not required Task
@@ -1368,6 +1397,7 @@ public:
     }
     std::uint64_t request(lua_State *L, int callback, int context)
     {
+        if (!callback) return raw();
         const State state = task(L, callback, context, false);
         state->kind = RequestKind::LegacyRequest;
         return state->request_id;

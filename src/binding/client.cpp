@@ -44,12 +44,34 @@ struct UpdateConsumerScope {
     ~UpdateConsumerScope() { core->endUpdateConsumer(); }
 };
 
-static void validatePollArguments(lua_State *L, int top)
+struct PollArguments {
+    int callback = 0;
+    bool timed = false;
+    double timeout = 0.0;
+};
+
+static PollArguments pollArguments(lua_State *L, int top)
 {
-    if (top > 2 || (top == 2 && !lua_isfunction(L, 2))) {
-        throw std::runtime_error(
-            "tdlua: poll accepts only an optional callback function, not a timeout");
+    PollArguments args;
+    if (top > 3)
+        throw std::runtime_error("tdlua: poll accepts an optional callback and timeout");
+    int timeout_index = 0;
+    if (top >= 2) {
+        if (lua_isfunction(L, 2)) args.callback = 2;
+        else if (lua_type(L, 2) == LUA_TNUMBER && top == 2) timeout_index = 2;
+        else if (!lua_isnil(L, 2))
+            throw std::runtime_error("tdlua: poll expects a callback function or timeout number");
     }
+    if (top == 3) timeout_index = 3;
+    if (timeout_index && !lua_isnil(L, timeout_index)) {
+        if (lua_type(L, timeout_index) != LUA_TNUMBER)
+            throw std::runtime_error("tdlua: poll timeout must be a number");
+        args.timeout = lua_tonumber(L, timeout_index);
+        if (!std::isfinite(args.timeout) || args.timeout < 0)
+            throw std::runtime_error("tdlua: poll timeout must be finite and non-negative");
+        args.timed = true;
+    }
+    return args;
 }
 
 static bool loopConcurrency(lua_State *L, int top)
@@ -80,9 +102,9 @@ static int tdclient_poll(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
         const int top = lua_gettop(L);
-        validatePollArguments(L, top);
+        const auto args = pollArguments(L, top);
         UpdateConsumerScope consumer(clientCore(L));
-        const auto task = consumer.core->selectPollUpdate(L, top == 2 ? 2 : 0);
+        const auto task = consumer.core->selectPollUpdate(L, args.callback, args.timed, args.timeout);
         if (task) {
             tdlua::pushManagedHandle(L, task, "tdlua.task");
             consumer.core->tick();

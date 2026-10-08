@@ -185,16 +185,19 @@ static int tdclient_receive(lua_State *L)
             timeout = lua_tonumber(L, 2);
         }
         int result_count = 1;
-        {
-            NativeResponse response = td->receive(timeout);
-            if (!response.object) {
-                lua_pushnil(L);
-            } else {
-                td->dispatch(response);
-                result_count = return_response(L, td, response);
-            }
+        NativeResponse response = td->receive(timeout);
+        if (!response.object) {
+            lua_pushnil(L);
+        } else {
+            td->dispatch(response);
+            result_count = return_response(L, td, response);
         }
-        td->dispatcher().drain();
+        try {
+            td->dispatcher().drain();
+        } catch (...) {
+            if (response.object) td->restoreReceived(std::move(response));
+            throw;
+        }
         return result_count;
     });
 }
@@ -595,6 +598,11 @@ static int tdclient_request(lua_State *L)
         NativeTDLua *td = getTD(L);
         if (!td) throw std::runtime_error("invalid tdlua client");
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
+        const int top = lua_gettop(L);
+        const int callback_index = top >= 3 && !lua_isnil(L, 3) ? 3 : 0;
+        const int context_index = callback_index && top >= 4 ? 4 : 0;
+        if (callback_index && !lua_isfunction(L, callback_index))
+            throw std::runtime_error("request callback must be a function");
         std::string error;
         int table_index = 0;
         bool owned = false;
@@ -607,12 +615,6 @@ static int tdclient_request(lua_State *L)
                 throw std::runtime_error(error);
             }
             request = codec_error_request(error);
-        }
-        const int callback_index = lua_gettop(L) >= 3 && !lua_isnil(L, 3) ? 3 : 0;
-        const int context_index = callback_index && lua_gettop(L) >= 4 ? 4 : 0;
-        if (callback_index && !lua_isfunction(L, callback_index)) {
-            pop_owned(L, owned);
-            throw std::runtime_error("request callback must be a function");
         }
         const std::uint64_t id = td->dispatcher().request(
             L, table_index, callback_index, context_index);
