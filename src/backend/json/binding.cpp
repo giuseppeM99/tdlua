@@ -51,7 +51,9 @@ static void json_save_updates(tdlua_binding::ClientHandle client)
 
 static void json_clear_updates(tdlua_binding::ClientHandle client)
 {
-    static_cast<TDLua *>(client)->emptyUpdatesBuffer();
+    TDLua *td = static_cast<TDLua *>(client);
+    td->dispatcher().discardSelectedUpdate();
+    td->emptyUpdatesBuffer();
 }
 
 static void json_unload(tdlua_binding::ClientHandle client)

@@ -161,3 +161,15 @@ void NativeDispatcher::clear()
 {
     router_.clear();
 }
+
+void NativeDispatcher::discardSelectedUpdate()
+{
+    router_.discardSelectedUpdate();
+}
+
+#ifdef TDLUA_TESTING
+bool NativeDispatcher::pushSelectedUpdateForTesting(lua_State *L)
+{
+    return router_.pushSelectedUpdateForTesting(L);
+}
+#endif

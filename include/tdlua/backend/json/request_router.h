@@ -84,6 +84,10 @@ public:
     void tick() { router_.tick(); }
     void drainForFinalizer() { router_.drainForFinalizer(); }
     void clear();
+    void discardSelectedUpdate();
+#ifdef TDLUA_TESTING
+    bool pushSelectedUpdateForTesting(lua_State *L);
+#endif
 
 private:
     tdlua::RequestRouter router_;

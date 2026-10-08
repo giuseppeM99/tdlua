@@ -53,7 +53,9 @@ static void native_save_updates(tdlua_binding::ClientHandle client)
 
 static void native_clear_updates(tdlua_binding::ClientHandle client)
 {
-    static_cast<NativeTDLua *>(client)->emptyUpdatesBuffer();
+    NativeTDLua *td = static_cast<NativeTDLua *>(client);
+    td->dispatcher().discardSelectedUpdate();
+    td->emptyUpdatesBuffer();
 }
 
 static void native_unload(tdlua_binding::ClientHandle client)

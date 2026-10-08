@@ -131,3 +131,15 @@ void RequestRouter::clear()
 {
     router_.clear();
 }
+
+void RequestRouter::discardSelectedUpdate()
+{
+    router_.discardSelectedUpdate();
+}
+
+#ifdef TDLUA_TESTING
+bool RequestRouter::pushSelectedUpdateForTesting(lua_State *L)
+{
+    return router_.pushSelectedUpdateForTesting(L);
+}
+#endif

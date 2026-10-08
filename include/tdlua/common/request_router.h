@@ -1256,7 +1256,8 @@ public:
     void endUpdateConsumer()
     {
         managed_driver_.poll_selecting = false;
-        releaseLuaReference(managed_driver_.selected_update);
+        // Preserve a selected update after poll() unwinds so the next
+        // poll() or loop(callback) can consume it without redispatch.
         if (managed_driver_.loop_observer) {
             requestLoopStop(managed_driver_.loop_observer);
             releaseLuaReference(managed_driver_.loop_observer->callback_ref);
@@ -1264,6 +1265,20 @@ public:
         }
         managed_driver_.consumer_active = false;
     }
+
+    void discardSelectedUpdate()
+    {
+        releaseLuaReference(managed_driver_.selected_update);
+    }
+
+#ifdef TDLUA_TESTING
+    bool pushSelectedUpdateForTesting(lua_State *L)
+    {
+        if (managed_driver_.selected_update == LUA_NOREF) return false;
+        pushLuaReference(L, managed_driver_.selected_update);
+        return true;
+    }
+#endif
 
     State selectPollUpdate(lua_State *L, int callback, bool timed = false,
                            double timeout = 0.0)
@@ -1322,6 +1337,11 @@ public:
             managed_driver_.loop_observer.reset(new LoopObserver());
             managed_driver_.loop_observer->concurrent = concurrent;
             managed_driver_.loop_observer->callback_ref = createLuaReference(L, callback);
+            if (managed_driver_.selected_update != LUA_NOREF) {
+                const int update_ref = managed_driver_.selected_update;
+                queueOrScheduleLoopUpdate(managed_driver_.loop_observer, update_ref);
+                managed_driver_.selected_update = LUA_NOREF;
+            }
         }
         while (true) {
             tdlua_lua_vm_checkpoint(L);
@@ -1662,6 +1682,7 @@ public:
         pump_ = nullptr;
         pump_context_ = nullptr;
         events_enabled_ = false;
+        discardSelectedUpdate();
         if (managed_driver_.loop_observer) {
             requestLoopStop(managed_driver_.loop_observer);
         }
@@ -1933,6 +1954,14 @@ public:
         core->detachTransport();
         core->tick();
     }
+
+    void discardSelectedUpdate() { core_->discardSelectedUpdate(); }
+#ifdef TDLUA_TESTING
+    bool pushSelectedUpdateForTesting(lua_State *L)
+    {
+        return core_->pushSelectedUpdateForTesting(L);
+    }
+#endif
     int wait(lua_State *L, const ManagedStatePtr &state, bool timed, double timeout,
              WaitKind kind = WaitKind::Result, const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t id, bool timed, double timeout,

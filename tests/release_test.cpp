@@ -77,6 +77,9 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     luaL_requiref(L, "tdlua", luaopen_tdlua, 0); lua_pop(L, 1);
     run(L, "t=require'tdlua'; t.setLogLevel(0); c=t(); d=t()");
     auto *client = attach(L, "c", f); attach(L, "d", other);
+    Fake recovery;
+    run(L, "z=t()");
+    auto *recovery_client = attach(L, "z", recovery);
     run(L, R"lua(
         for _,args in ipairs({{-1},{math.huge},{0/0},{false},{{}},
                               {1,2},{function() end,false},{nil,'bad',n=2}}) do
@@ -172,6 +175,91 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     f.before={}; other.before={};
     other.object(other.sent.back(),103);
     run(L,"assert(c:poll(0)==nil and cross:ready() and cross:wait()==103); cross=nil");
+    f.object(0,16);
+    run(L,R"lua(
+        poll_handler_calls=0
+        c:on('updateOption',function(u)
+            poll_handler_calls=poll_handler_calls+1
+            if u.name=='16' then error('poll handler boom') end
+        end)
+        local ok,e=pcall(c.poll,c,0)
+        assert(not ok and e:find('poll handler boom'))
+        assert(c:poll(0).name=='16' and poll_handler_calls==1)
+        c:off('updateOption')
+    )lua");
+    recovery.object(0,17);
+    run(L,R"lua(
+        recovered_loop_handler_calls=0
+        z:on('updateOption',function(u)
+            recovered_loop_handler_calls=recovered_loop_handler_calls+1
+            if u.name=='17' then error('recovered loop handler boom') end
+        end)
+        local ok,e=pcall(z.poll,z,0)
+        assert(not ok and e:find('recovered loop handler boom'))
+    )lua");
+    recovery.object(0,18);
+    run(L,R"lua(
+        recovered_loop_seen={}
+        z:loop(function(u)
+            recovered_loop_seen[#recovered_loop_seen+1]=u.name
+            return u.name~='18'
+        end)
+        assert(table.concat(recovered_loop_seen,',')=='17,18')
+        assert(recovered_loop_handler_calls==2)
+        z:off('updateOption')
+    )lua");
+    recovery.object(0,19);
+    run(L,R"lua(
+        z:on('updateOption',function() error('recovered task handler boom') end)
+        local ok,e=pcall(z.poll,z,0)
+        assert(not ok and e:find('recovered task handler boom'))
+        z:off('updateOption')
+        poll_callback_calls=0
+        local recovered_task=z:poll(function(u)
+            poll_callback_calls=poll_callback_calls+1
+            return u.name
+        end,0)
+        assert(recovered_task._request_id==nil)
+        z:clearBuffer()
+        assert(recovered_task:wait()=='19' and poll_callback_calls==1)
+    )lua");
+    recovery.object(0,20);
+    run(L,R"lua(
+        z:on('updateOption',function() error('clear buffer handler boom') end)
+        local ok,e=pcall(z.poll,z,0)
+        assert(not ok and e:find('clear buffer handler boom'))
+        z:off('updateOption')
+        z:clearBuffer()
+        assert(z:poll(0)==nil)
+    )lua");
+    recovery.object(0,21);
+    run(L,R"lua(
+        selected_weak=setmetatable({}, {__mode='v'})
+        z:on('updateOption',function()
+            error('close selected handler boom')
+        end)
+        local ok,e=pcall(z.poll,z,0)
+        assert(not ok and e:find('close selected handler boom'))
+        z:off('updateOption')
+    )lua");
+    lua_getglobal(L, "selected_weak");
+    require(recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
+            "selected update missing before close");
+    lua_rawseti(L, -2, 1);
+    lua_pop(L, 1);
+    run(L,R"lua(
+        collectgarbage('collect')
+        assert(selected_weak[1]~=nil)
+        z:close()
+        assert(z:poll(0)==nil)
+    )lua");
+    require(!recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
+            "selected update remained after close");
+    run(L,R"lua(
+        z=nil
+        collectgarbage('collect'); collectgarbage('collect')
+        assert(selected_weak[1]==nil)
+    )lua");
     f.object(0,10);
     run(L,R"lua(
         resumes=0; weak=setmetatable({}, {__mode='v'})

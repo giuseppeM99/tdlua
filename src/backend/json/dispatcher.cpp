@@ -153,3 +153,15 @@ void LuaDispatcher::clear()
 {
     router_.clear();
 }
+
+void LuaDispatcher::discardSelectedUpdate()
+{
+    router_.discardSelectedUpdate();
+}
+
+#ifdef TDLUA_TESTING
+bool LuaDispatcher::pushSelectedUpdateForTesting(lua_State *L)
+{
+    return router_.pushSelectedUpdateForTesting(L);
+}
+#endif

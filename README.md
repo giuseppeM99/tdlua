@@ -258,6 +258,10 @@ one Task, whose handle is returned without joining it. Timeouts never cancel
 requests. Lua callbacks and transport-lock contention can exceed the I/O waiting
 budget; arbitrary Lua execution is not bounded by a wall-clock deadline.
 `loop()` retains its existing continuous behavior and has no timeout argument.
+If an event handler raises during `poll()`, the selected update stays pending
+for the next `poll()` or `loop(callback)` without another event-handler dispatch.
+`clearBuffer()` and closing the client discard a selection still pending in the
+scheduler. A selection already transferred to a Task remains owned by that Task.
 
 `receive()` retains its 10-second default. `receive(0)` makes a nonblocking TDLib
 read even when the local queue is empty; it returns an available object or `nil`.

@@ -50,6 +50,10 @@ public:
     void drain();
     void drainForFinalizer() { router_.drainForFinalizer(); }
     void clear();
+    void discardSelectedUpdate();
+#ifdef TDLUA_TESTING
+    bool pushSelectedUpdateForTesting(lua_State *L);
+#endif
     // Storage belongs to the Lua client uservalue. The dispatcher only passes
     // the attachment and transport-detach operations to the common router.
     void attachStorage(lua_State *L, int client)
