@@ -197,6 +197,7 @@ client:off("updateAuthorizationState")
 
 local upload_error
 local upload_succeeded = false
+local upload_update_waiting = false
 
 client:on("updateMessageSendSucceeded", function(update)
     upload_succeeded = true
@@ -266,7 +267,12 @@ local upload_thread = coroutine.create(function()
         print("Message accepted by TDLib for " .. artifact)
 
         while not upload_error and not upload_succeeded do
-            client:poll()
+            -- The coroutine is resumed by the scheduler from inside poll()
+            -- when the send request completes. Yield explicitly here so the
+            -- outer driver can finish that poll before driving again.
+            upload_update_waiting = true
+            coroutine.yield()
+            upload_update_waiting = false
         end
         if upload_error then
             return
@@ -284,6 +290,12 @@ while coroutine.status(upload_thread) ~= "dead" do
         break
     end
     client:poll()
+    if upload_update_waiting and coroutine.status(upload_thread) == "suspended" then
+        local ok, resume_error = coroutine.resume(upload_thread)
+        if not ok then
+            upload_error = tostring(resume_error)
+        end
+    end
 end
 
 client:off("updateMessageSendSucceeded")
