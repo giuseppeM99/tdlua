@@ -66,7 +66,7 @@ end
 -- API. The response callback only records errors; authorization progress is
 -- delivered by updateAuthorizationState below.
 local function request_authentication(operation, request)
-    return client:request(request, function(result, context)
+    return client:execute(request, function(result, context)
         if result._ == "error" then
             fail(context.operation .. " failed: " .. tostring(result.code) .. ": " .. tostring(result.message))
         end
@@ -200,7 +200,7 @@ end)
 
 -- The initial state is a response, while subsequent states are dispatcher
 -- updates. Both paths resume the same authentication coroutine.
-client:request({_ = "getAuthorizationState"}, function(state)
+client:execute({_ = "getAuthorizationState"}, function(state)
     if state._ == "error" then
         fail("getAuthorizationState failed: " .. tostring(state.code) .. ": " .. tostring(state.message))
     else
@@ -210,7 +210,7 @@ end)
 
 while coroutine.status(auth_thread) ~= "dead" do
     check_auth_error()
-    client:poll(1.0)
+    client:poll()
 end
 check_auth_error()
 client:off("updateAuthorizationState")
@@ -231,7 +231,7 @@ if not resumed then
     error(resume_error)
 end
 while coroutine.status(verification_thread) ~= "dead" do
-    client:poll(1.0)
+    client:poll()
 end
 
 client:close()

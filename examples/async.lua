@@ -17,15 +17,15 @@ client:getAuthorizationState(function(result, context)
 end, {origin = "dynamic-helper"})
 
 local thread = coroutine.create(function()
-    -- Inside a coroutine, a dynamic helper without a callback awaits implicitly.
+    -- Accessing a pending Future from a coroutine waits cooperatively.
     local state = client:getAuthorizationState()
-    print("implicit await:", state._)
+    print("cooperative Future wait:", state._)
 end)
 
 assert(coroutine.resume(thread))
 
 while not callback_done or coroutine.status(thread) ~= "dead" do
-    client:poll(1.0)
+    client:poll()
 end
 
 client.onUpdateAuthorizationState = nil

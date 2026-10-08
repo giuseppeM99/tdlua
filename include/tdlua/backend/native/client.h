@@ -23,21 +23,33 @@ public:
               std::uint64_t request_id);
     NativeResponse receive(double timeout);
     NativeResponse receiveBackend(double timeout);
+    bool pump(double timeout);
     using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
     Transport transport();
+#ifdef TDLUA_TESTING
+    void injectTransport(Transport transport) { injected_transport_ = transport; }
+#endif
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
 
-    void close();
+    // Detach/fail work first. A true drain then performs phase two while the
+    // caller still has a protected Lua boundary.
+    void close(bool drain = true);
     bool closed() const;
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
 
-    void dispatch(NativeResponse &response);
+    tdlua::RouteKind dispatch(NativeResponse &response, bool managed_receive = false);
     NativeDispatcher &dispatcher();
     void push(NativeResponse response);
     NativeResponse pop();
     bool takeQueuedResponse(std::uint64_t request_id, NativeResponse &response);
+    void restoreReceived(NativeResponse response) {
+        response.dispatched = true;
+        response.delivery_pending = true;
+        updates_.push_front(std::move(response));
+    }
+
     bool empty() const;
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
@@ -46,9 +58,11 @@ public:
     void setDBIfParameters(lua_State *L, int request_index);
     void saveUpdatesBuffer();
     void loadUpdatesBuffer();
-    void emptyUpdatesBuffer();
+    void emptyUpdatesBuffer(bool preserve_received = false);
 
 private:
+    void closeInternal(bool drain, bool persist_updates);
+
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;
@@ -57,4 +71,5 @@ private:
     bool closing_;
     bool closed_;
     NativeDispatcher dispatcher_;
+    Transport injected_transport_ = {nullptr, nullptr};
 };

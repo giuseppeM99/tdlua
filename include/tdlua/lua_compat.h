@@ -5,10 +5,47 @@
 
 #include <compat-5.3/compat-5.3.h>
 
+#ifdef TDLUA_USE_LUAJIT_CONTINUATION
+#include <luajit.h>
+#elif LUA_VERSION_NUM < 502 && !defined(TDLUA_USE_LUA51_CONTINUATION)
+#error "TDLua requires configured stock Lua 5.1, Lua 5.2+, or LuaJIT 2.1"
+#endif
+
+#if defined(TDLUA_USE_LUAJIT_CONTINUATION) || defined(TDLUA_USE_LUA51_CONTINUATION)
+#define TDLUA_USE_LUA_CONTINUATION
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <stdexcept>
+
+/* Value uservalues are direct values on Lua 5.3+ but must be tables on Lua
+ * 5.1 and 5.2. Keep this adapter separate from the reference-table uservalues
+ * used by continuations and scheduler storage. */
+inline void tdlua_lua_set_value_uservalue(lua_State *L, int index)
+{
+    index = lua_absindex(L, index);
+#if LUA_VERSION_NUM <= 502
+    lua_newtable(L);
+    lua_pushvalue(L, -2);
+    lua_rawseti(L, -2, 1);
+    lua_remove(L, -2);
+#endif
+    lua_setuservalue(L, index);
+}
+
+inline void tdlua_lua_get_value_uservalue(lua_State *L, int index)
+{
+    lua_getuservalue(L, index);
+#if LUA_VERSION_NUM <= 502
+    if (lua_istable(L, -1)) {
+        lua_rawgeti(L, -1, 1);
+        lua_remove(L, -2);
+    }
+#endif
+}
 
 /* Resume on the calling thread. Return the Lua status and leave yielded
  * values, return values, or the error on the coroutine's stack. */
@@ -20,6 +57,77 @@ inline int tdlua_lua_resume(lua_State *coroutine, lua_State *from, int arguments
 #else
     // compat-5.3 adapts the three-argument call for Lua 5.1 and LuaJIT.
     return lua_resume(coroutine, from, arguments);
+#endif
+}
+
+/* Long-lived scheduler/backend storage uses the VM's main thread rather than a
+ * collectible coroutine that happened to create the client. */
+inline lua_State *tdlua_lua_main_thread(lua_State *L)
+{
+#if LUA_VERSION_NUM >= 502
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    lua_State *main = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return main;
+#elif defined(TDLUA_USE_LUA_CONTINUATION)
+    static const char main_thread_key = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &main_thread_key);
+    lua_State *main = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    if (main) return main;
+    const bool is_main = lua_pushthread(L) != 0;
+    if (!is_main) {
+        lua_pop(L, 1);
+        throw std::runtime_error(
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+            "tdlua: initialize the module on the Lua 5.1 main thread first");
+#else
+            "tdlua: initialize the module on the LuaJIT main thread first");
+#endif
+    }
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &main_thread_key);
+    return L;
+#endif
+}
+
+inline void tdlua_lua_clear_uservalue(lua_State *L, int index)
+{
+    index = lua_absindex(L, index);
+#if LUA_VERSION_NUM <= 502
+    lua_newtable(L);
+#else
+    lua_pushnil(L);
+#endif
+    lua_setuservalue(L, index);
+}
+
+/* Lua 5.3 and later expose exact yieldability. Lua 5.2 uses the
+ * coroutine/non-main approximation below and cannot detect a non-yieldable C
+ * frame between the caller and this check. */
+inline bool tdlua_lua_is_yieldable(lua_State *L)
+{
+#if LUA_VERSION_NUM >= 503 || defined(TDLUA_USE_LUAJIT_CONTINUATION)
+    return lua_isyieldable(L) != 0;
+#elif LUA_VERSION_NUM == 502 || defined(TDLUA_USE_LUA51_CONTINUATION)
+    const int is_main = lua_pushthread(L);
+    lua_pop(L, 1);
+    return is_main == 0;
+#else
+    (void)L;
+    return false;
+#endif
+}
+
+// Call inside the binding's protected_call, before creating/submitting a
+// request whose result is returned through an explicit wait without a handle.
+inline void tdlua_lua_require_explicit_submission_context(lua_State *L)
+{
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+    if (!tdlua_lua_is_yieldable(L)) {
+        throw std::runtime_error("tdlua: Lua 5.1 explicit request wait requires a coroutine");
+    }
+#else
+    (void)L;
 #endif
 }
 
@@ -121,4 +229,29 @@ inline void tdlua_lua_push_integer(lua_State *L, std::int64_t value)
 #else
     lua_pushnumber(L, static_cast<lua_Number>(value));
 #endif
+}
+
+/* Execute a bounded Lua frame so interpreter debug hooks, including its
+ * ordinary SIGINT hook, can run while a managed driver otherwise stays in C++.
+ * Protect the hook error so C++ scopes unwind before the binding raises it. */
+inline void tdlua_lua_vm_checkpoint(lua_State *L)
+{
+    static const char key = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &key);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        if (luaL_loadbuffer(L, "return", 6, "=tdlua checkpoint") != LUA_OK) {
+            const std::string error = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            throw std::runtime_error(error);
+        }
+        lua_pushvalue(L, -1);
+        lua_rawsetp(L, LUA_REGISTRYINDEX, &key);
+    }
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        const char *message = lua_tostring(L, -1);
+        const std::string error = message ? message : "tdlua: VM checkpoint failed";
+        lua_pop(L, 1);
+        throw std::runtime_error(error);
+    }
 }

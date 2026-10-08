@@ -1,19 +1,19 @@
 rockspec_format = "3.0"
 
 package = "tdlua"
-version = "scm-1"
+version = "0.4.0-1"
 
 source = {
    url = "git+https://github.com/giuseppeM99/tdlua.git",
-   branch = "master"
+   tag = "v0.4.0"
 }
 
 description = {
    summary = "Lua binding for TDLib with JSON and native backends",
    detailed = [[
-       TDLua exposes TDLib to Lua through the raw send/receive API and the v0.4
-       managed Future/Task API, including callbacks, event handlers, and
-       cooperative poll/loop drivers. Stock Lua 5.1.5 uses Managed Explicit;
+      TDLua exposes TDLib to Lua through the raw send/receive API and the v0.4
+      managed Future/Task API, including callbacks, event handlers, and
+      cooperative poll/loop drivers. Stock Lua 5.1.5 uses Managed Explicit;
       Lua 5.2-5.5 use Full Managed. Stock support was verified with the
       unmodified Lua 5.1.5 reference VM on Linux x64. The dependency range
       permits the 5.1 ABI; older patch releases and modified VMs are unverified.

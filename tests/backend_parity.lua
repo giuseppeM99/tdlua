@@ -42,8 +42,6 @@ local control_probe = tdlua.new()
 local invalid_controls = {
     {label = "string", value = "invalid"},
     {label = "table", value = {}},
-    {label = "function", value = function() end},
-    {label = "thread", value = coroutine.create(function() end)},
 }
 for _, control in ipairs(invalid_controls) do
     local ok, error_message = pcall(function()
@@ -70,7 +68,7 @@ assert(not dynamic_params_number_ok,
 assert(control_probe:pendingCount() == 0)
 
 local nil_control_response = control_probe:execute(
-    {_ = "getAuthorizationState"}, nil)
+    {_ = "getAuthorizationState"}, nil):wait()
 assert_td_object(nil_control_response, "nil execute control")
 local false_control_response = control_probe:execute(
     {_ = "getAuthorizationState"}, false)
@@ -199,12 +197,12 @@ for _ = 1, 20 do
 end
 assert_td_object(helper_fire_response, "helper fire-and-forget response")
 
-local helper_response = client:getAuthorizationState()
+local helper_response = client:getAuthorizationState():wait()
 assert_td_object(helper_response, "legacy helper")
 
 -- A string is accepted as helper parameters for compatibility.  It is
 -- parsed before the generated request table is built.
-local string_helper_response = client:getAuthorizationState("{}")
+local string_helper_response = client:getAuthorizationState("{}"):wait()
 assert_td_object(string_helper_response, "string helper")
 local malformed_ok = pcall(function()
     client:getAuthorizationState("{")
@@ -226,7 +224,7 @@ client:getChats({
     nested_response = result
 end)
 for _ = 1, 20 do
-    client:poll(0.1)
+    client:receive(0.1)
     if nested_response then break end
 end
 assert_td_object(nested_response, "nested helper")
@@ -381,7 +379,7 @@ local invalid_callback_id = client:request(
     end)
 assert(type(invalid_callback_id) == "number")
 for _ = 1, 20 do
-    client:poll(0.1)
+    client:receive(0.1)
     if invalid_callback_result then break end
 end
 assert_td_error(invalid_callback_result, "invalid request callback")
@@ -545,15 +543,15 @@ client:off(mutation_type)
 -- Callback context and dynamic helpers must follow the same contract.
 local callback_result
 local context = {origin = "parity"}
-local request_id
-request_id = client:getAuthorizationState(function(result, extra)
+local callback_task = client:getAuthorizationState(function(result, extra)
     callback_result = result
-    assert(result._request_id == request_id)
+    assert(result._request_id == callback_task._request_id)
     assert(extra == context)
 end, context)
-assert(type(request_id) == "number")
+assert(type(callback_task) == "userdata")
+local request_id = callback_task._request_id
 for _ = 1, 20 do
-    client:poll(0.1)
+    client:receive(0.1)
     if callback_result then break end
 end
 assert_td_object(callback_result, "helper callback")
@@ -596,6 +594,7 @@ local callback_error_ok = pcall(function()
 end)
 assert(not callback_error_ok, "callback failure was swallowed")
 assert(client:pendingCount() == 0)
+assert(client:receive(0)) -- already dispatched response survives the error
 
 local handler_error_ok = pcall(function()
     client:on("authorizationStateWaitTdlibParameters", function()
@@ -606,6 +605,7 @@ local handler_error_ok = pcall(function()
 end)
 assert(not handler_error_ok, "handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
+assert(client:receive(0))
 
 -- An error in a handler for the response currently awaited by execute() must
 -- release its pending request exactly once and leave the client reusable.
@@ -637,6 +637,7 @@ for _ = 1, 20 do
 end
 assert(await_error_seen, "await failure was swallowed")
 assert(client:pendingCount() == 0)
+assert(client:receive(0)) -- receive retains the response when a resumed waiter fails
 
 -- Unknown constructors are rejected by the native schema codec. The JSON
 -- backend may send them to TDLib and return a normal TDLib error object; both

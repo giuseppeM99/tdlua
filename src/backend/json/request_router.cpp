@@ -21,6 +21,42 @@ std::uint64_t RequestRouter::addAwaiter(lua_State *L, nlohmann::json &)
     return router_.await(L);
 }
 
+std::shared_ptr<tdlua::ManagedState> RequestRouter::future()
+{
+    return router_.future();
+}
+
+std::shared_ptr<tdlua::ManagedState> RequestRouter::task(
+    lua_State *L, int callback_index, int context_index, bool supplied_thread)
+{
+    return router_.task(L, callback_index, context_index, supplied_thread);
+}
+
+std::shared_ptr<tdlua::ManagedState> RequestRouter::awaitState(lua_State *L)
+{
+    return router_.awaitState(L);
+}
+
+int RequestRouter::wait(lua_State *L,
+                         const std::shared_ptr<tdlua::ManagedState> &state,
+                         bool has_timeout, double timeout, tdlua::WaitKind kind,
+                         const char *field)
+{
+    return router_.wait(L, state, has_timeout, timeout, kind, field);
+}
+
+int RequestRouter::waitById(lua_State *L, std::uint64_t request_id,
+                             bool has_timeout, double timeout,
+                             tdlua::WaitKind kind, const char *field)
+{
+    return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
+}
+
+void RequestRouter::setPump(void *context, tdlua::RequestRouter::Pump pump)
+{
+    router_.setPump(context, pump);
+}
+
 std::uint64_t RequestRouter::addRaw(nlohmann::json &)
 {
     return router_.raw();
@@ -69,21 +105,41 @@ bool RequestRouter::responseRequestId(const nlohmann::json &response,
     return true;
 }
 
-bool RequestRouter::dispatch(nlohmann::json &response)
+tdlua::RouteKind RequestRouter::dispatchRoute(nlohmann::json &response)
 {
     std::uint64_t id = 0;
     const bool correlated = responseRequestId(response, id);
     response.erase("@extra");
     if (!correlated) {
-        return false;
+        return tdlua::RouteKind::Update;
     }
     response["_request_id"] = id;
-    return router_.dispatch(id, [&](lua_State *L) {
+    return router_.dispatchRoute(id, [&](lua_State *L) {
         lua_pushjson(L, response);
     });
+}
+
+bool RequestRouter::dispatch(nlohmann::json &response)
+{
+    const tdlua::RouteKind route = dispatchRoute(response);
+    router_.tick();
+    return route != tdlua::RouteKind::Unknown &&
+           route != tdlua::RouteKind::Update;
 }
 
 void RequestRouter::clear()
 {
     router_.clear();
 }
+
+void RequestRouter::discardSelectedUpdate()
+{
+    router_.discardSelectedUpdate();
+}
+
+#ifdef TDLUA_TESTING
+bool RequestRouter::pushSelectedUpdateForTesting(lua_State *L)
+{
+    return router_.pushSelectedUpdateForTesting(L);
+}
+#endif

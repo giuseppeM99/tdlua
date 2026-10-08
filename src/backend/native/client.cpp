@@ -60,6 +60,11 @@ NativeResponse native_transport_execute_sync(
     return response;
 }
 
+bool native_transport_pump(void *context, double timeout)
+{
+    return static_cast<NativeTDLua *>(context)->pump(timeout);
+}
+
 void native_transport_close(void *context)
 {
     static_cast<NativeTDLua *>(context)->close();
@@ -81,15 +86,22 @@ const NativeTDLua::Transport::Operations native_transport_operations = {
 }
 
 NativeTDLua::NativeTDLua(lua_State *lua)
-    : lua_(lua), client_id_(NativeRuntime::instance().create_client()),
+    : lua_(tdlua_lua_main_thread(lua)), client_id_(NativeRuntime::instance().create_client()),
       updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
       dispatcher_(lua)
 {
+    dispatcher_.setPump(this, native_transport_pump);
 }
 
 NativeTDLua::~NativeTDLua()
 {
-    close();
+    // Destruction cannot safely enter Lua. The binding performs the protected
+    // drain before this destructor runs; this path only detaches transport.
+    try {
+        closeInternal(false, false);
+    } catch (...) {
+        dispatcher_.detachTransport();
+    }
 }
 
 td::td_api::object_ptr<td::td_api::Function> NativeTDLua::makeRequest(
@@ -109,14 +121,12 @@ void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
 
 NativeResponse NativeTDLua::receive(double timeout)
 {
-    if (closed_) {
-        return NativeResponse();
-    }
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
         return response;
     }
+    if (closed_) return NativeResponse();
     NativeResponse response = transport().receive(timeout);
     return response;
 }
@@ -130,8 +140,37 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
     return response;
 }
 
+bool NativeTDLua::pump(const double timeout)
+{
+    if (closed_) {
+        return false;
+    }
+    {
+        NativeResponse response;
+        if (!updates_.empty() && !updates_.front().dispatched) {
+            response = pop();
+        } else {
+            response = transport().receive(timeout);
+        }
+        if (!response.object) {
+            dispatcher_.drain();
+            return false;
+        }
+        // The common router owns update observation; this flag distinguishes
+        // managed pumping from the public raw receive path.
+        const tdlua::RouteKind route = dispatch(response, true);
+        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
+            response.dispatched = true;
+            push(std::move(response));
+        }
+    }
+    dispatcher_.drain();
+    return true;
+}
+
 NativeTDLua::Transport NativeTDLua::transport()
 {
+    if (injected_transport_.operations) return injected_transport_;
     return {this, &native_transport_operations};
 }
 
@@ -141,14 +180,21 @@ td::td_api::object_ptr<td::td_api::Object> NativeTDLua::executeSync(
     return NativeRuntime::instance().execute(std::move(request));
 }
 
-void NativeTDLua::dispatch(NativeResponse &response)
+tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response, bool managed_receive)
 {
     if (response.dispatched) {
-        return;
+        return tdlua::RouteKind::Unknown;
     }
     checkAuthState(response);
-    dispatcher_.dispatch(lua_, response);
-    response.dispatched = true;
+    try {
+        const auto route = dispatcher_.dispatch(lua_, response, managed_receive);
+        response.dispatched = true;
+        if (closed_) dispatcher_.detachAfterDrain();
+        return route;
+    } catch (...) {
+        if (closed_) dispatcher_.detachTransport();
+        throw;
+    }
 }
 
 NativeDispatcher &NativeTDLua::dispatcher()
@@ -247,17 +293,35 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
     } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosed::ID) {
         saveUpdatesBuffer();
-        emptyUpdatesBuffer();
+        emptyUpdatesBuffer(true);
         ready_ = false;
         closed_ = true;
         closing_ = false;
     }
 }
 
-void NativeTDLua::close()
+void NativeTDLua::close(bool drain)
 {
+    closeInternal(drain, true);
+}
+
+void NativeTDLua::closeInternal(bool drain, bool persist_updates)
+{
+    // Phase one detaches the scheduler before backend shutdown can reenter the
+    // client. The optional drain is phase two and is safe only at the binding
+    // boundary that called close().
+    if (injected_transport_.operations) {
+        dispatcher_.detachTransport();
+        injected_transport_.close();
+        closed_ = true;
+        closing_ = false;
+        if (drain) dispatcher_.clear();
+        NativeRuntime::instance().forget(client_id_);
+        return;
+    }
     if (closed_) {
-        dispatcher_.clear();
+        dispatcher_.detachTransport();
+        if (drain) dispatcher_.clear();
         NativeRuntime::instance().forget(client_id_);
         return;
     }
@@ -265,6 +329,7 @@ void NativeTDLua::close()
     const std::uint64_t close_request_id = nextRequestId();
     if (!closing_) {
         closing_ = true;
+        dispatcher_.detachTransport();
         transport().send(close_request_id, td::td_api::make_object<td::td_api::close>());
     }
     while (!closed_) {
@@ -288,15 +353,20 @@ void NativeTDLua::close()
             updates_.push_back(std::move(response));
         }
     }
-    saveUpdatesBuffer();
-    emptyUpdatesBuffer();
-    dispatcher_.clear();
+    if (persist_updates) {
+        saveUpdatesBuffer();
+    }
+    emptyUpdatesBuffer(true);
+    closed_ = true;
+    closing_ = false;
+    dispatcher_.detachTransport();
+    if (drain) dispatcher_.clear();
     NativeRuntime::instance().forget(client_id_);
 }
 
 bool NativeTDLua::closed() const
 {
-    return closed_;
+    return closed_ || closing_;
 }
 
 bool NativeTDLua::ready() const
@@ -312,16 +382,16 @@ void NativeTDLua::saveUpdatesBuffer()
 
     const int stack_top = lua_gettop(lua_);
     nlohmann::json stored = nlohmann::json::array();
-    while (!updates_.empty()) {
-        NativeResponse response(std::move(updates_.front()));
-        updates_.pop_front();
-        if (response.object) {
-            pushResponse(lua_, response);
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (it->delivery_pending) { ++it; continue; }
+        if (it->object) {
+            pushResponse(lua_, *it);
             nlohmann::json value;
             lua_getjson(lua_, value);
             lua_pop(lua_, 1);
             stored.push_back(std::move(value));
         }
+        it = updates_.erase(it);
     }
     lua_settop(lua_, stack_top);
 
@@ -376,10 +446,10 @@ void NativeTDLua::loadUpdatesBuffer()
     }
 }
 
-void NativeTDLua::emptyUpdatesBuffer()
+void NativeTDLua::emptyUpdatesBuffer(bool preserve_received)
 {
-    while (!updates_.empty()) {
-        NativeResponse response(std::move(updates_.front()));
-        updates_.pop_front();
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (preserve_received && it->delivery_pending) ++it;
+        else it = updates_.erase(it);
     }
 }

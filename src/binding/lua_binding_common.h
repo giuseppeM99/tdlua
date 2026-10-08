@@ -5,6 +5,7 @@
 #define TDLUA_LUA_BINDING_COMMON_H
 
 #include "tdlua/lua_compat.h"
+#include "tdlua/common/request_router.h"
 
 #include <cctype>
 #include <cstddef>
@@ -43,7 +44,7 @@ struct ClientOperations final {
     lua_CFunction request;
     lua_CFunction await;
     bool (*push_handler)(ClientHandle, lua_State *, const char *);
-    void (*on)(ClientHandle, lua_State *, const char *, int);
+    void (*on)(ClientHandle, lua_State *, const char *, int, bool);
     void (*off)(ClientHandle, const char *);
     void (*save_updates)(ClientHandle);
     void (*clear_updates)(ClientHandle);
@@ -64,6 +65,8 @@ struct HelperArguments final {
     int callback_index = 0;
     int context_index = 0;
     bool fire_and_forget = false;
+    bool explicit_wait = false;
+    bool supplied_thread = false;
 };
 
 inline bool is_integer(lua_State *L, int index)
@@ -79,7 +82,8 @@ inline void validate_execute_control(lua_State *L)
     }
 
     const int type = lua_type(L, 3);
-    if (type == LUA_TNIL || type == LUA_TBOOLEAN || type == LUA_TNUMBER) {
+    if (type == LUA_TNIL || type == LUA_TBOOLEAN || type == LUA_TNUMBER ||
+        type == LUA_TFUNCTION || type == LUA_TTHREAD) {
         return;
     }
 
@@ -123,6 +127,11 @@ int new_client(lua_State *L, ClientFactory factory, lua_CFunction index,
     luaL_newmetatable(L, "tdclient");
     lua_createtable(L, 0, static_cast<int>(MethodCount - 1));
     luaL_setfuncs(L, methods, 0);
+    for (const char *name : {"await", "execute"}) {
+        lua_getfield(L, -1, name);
+        tdlua::wrapManagedFunction(L, tdlua::completeManagedTrampoline);
+        lua_setfield(L, -2, name);
+    }
     lua_setfield(L, -2, "__methods");
     lua_pushcfunction(L, index);
     lua_setfield(L, -2, "__index");
@@ -146,8 +155,9 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
     }
 
     const int first_type = lua_type(L, 2);
-    if (first_type == LUA_TFUNCTION) {
+    if (first_type == LUA_TFUNCTION || first_type == LUA_TTHREAD) {
         arguments.callback_index = 2;
+        arguments.supplied_thread = first_type == LUA_TTHREAD;
         if (top >= 3) {
             arguments.context_index = 3;
         }
@@ -164,13 +174,16 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
             return false;
         }
         arguments.fire_and_forget = lua_toboolean(L, 2) != 0;
+        arguments.explicit_wait = !arguments.fire_and_forget;
         return true;
     }
 
     if (first_type == LUA_TTABLE || first_type == LUA_TSTRING) {
         arguments.params_index = 2;
-        if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
+        if (top >= 3 && (lua_type(L, 3) == LUA_TFUNCTION ||
+                         lua_type(L, 3) == LUA_TTHREAD)) {
             arguments.callback_index = 3;
+            arguments.supplied_thread = lua_type(L, 3) == LUA_TTHREAD;
             if (top >= 4) {
                 arguments.context_index = 4;
             }
@@ -186,6 +199,7 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
                 return false;
             }
             arguments.fire_and_forget = lua_toboolean(L, 3) != 0;
+            arguments.explicit_wait = !arguments.fire_and_forget;
             return true;
         }
         if (top > 2) {
@@ -196,8 +210,10 @@ inline bool parse_helper_arguments(lua_State *L, HelperArguments &arguments,
     }
 
     if (first_type == LUA_TNIL) {
-        if (top >= 3 && lua_type(L, 3) == LUA_TFUNCTION) {
+        if (top >= 3 && (lua_type(L, 3) == LUA_TFUNCTION ||
+                         lua_type(L, 3) == LUA_TTHREAD)) {
             arguments.callback_index = 3;
+            arguments.supplied_thread = lua_type(L, 3) == LUA_TTHREAD;
             if (top >= 4) {
                 arguments.context_index = 4;
             }
@@ -229,6 +245,34 @@ inline bool handler_property(const char *name, std::string &type)
     return true;
 }
 
+inline bool parse_event_concurrency(lua_State *L, int index)
+{
+    if (index == 0 || lua_isnoneornil(L, index)) {
+        return true;
+    }
+    if (!lua_istable(L, index)) {
+        throw std::runtime_error("tdlua: event options must be a table");
+    }
+    bool concurrent = true;
+    lua_pushnil(L);
+    while (lua_next(L, index) != 0) {
+        const bool is_concurrent = lua_type(L, -2) == LUA_TSTRING &&
+            std::string(lua_tostring(L, -2)) == "concurrent";
+        if (!is_concurrent) {
+            lua_pop(L, 2);
+            throw std::runtime_error(
+                "tdlua: event supports only the boolean option 'concurrent'");
+        }
+        if (!lua_isboolean(L, -1)) {
+            lua_pop(L, 2);
+            throw std::runtime_error("tdlua: event option 'concurrent' must be boolean");
+        }
+        concurrent = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+    }
+    return concurrent;
+}
+
 inline int index(lua_State *L, ClientHandle client,
                  const ClientOperations &operations, lua_CFunction helper)
 {
@@ -256,8 +300,7 @@ inline int index(lua_State *L, ClientHandle client,
         }
         lua_pop(L, 3);
 
-        lua_pushstring(L, name);
-        lua_pushcclosure(L, helper, 1);
+        tdlua::pushManagedHelper(L, name, helper, tdlua::completeManagedTrampoline);
         return 1;
     });
 }
@@ -281,7 +324,7 @@ inline int newindex(lua_State *L, ClientHandle client,
             if (!lua_isfunction(L, 3)) {
                 throw std::runtime_error("tdlua: event handler must be a function");
             }
-            operations.on(client, L, type.c_str(), 3);
+            operations.on(client, L, type.c_str(), 3, true);
         }
         return 0;
     });
@@ -300,7 +343,11 @@ inline int on(lua_State *L, ClientHandle client,
         if (!lua_isfunction(L, 3)) {
             throw std::runtime_error("tdlua: event handler must be a function");
         }
-        operations.on(client, L, lua_tostring(L, 2), 3);
+        if (lua_gettop(L) > 4) {
+            throw std::runtime_error("tdlua: invalid event registration arity");
+        }
+        const bool concurrent = parse_event_concurrency(L, 4);
+        operations.on(client, L, lua_tostring(L, 2), 3, concurrent);
         return 0;
     });
 }
@@ -338,13 +385,17 @@ inline int clear(lua_State *, ClientHandle client,
     return 0;
 }
 
-inline int unload(lua_State *, ClientHandle client,
-                  const ClientOperations &operations)
+inline int unload(lua_State *L, ClientHandle client,
+                   const ClientOperations &operations)
 {
-    if (client) {
-        operations.unload(client);
+    // Invalidate the userdata before lifecycle code can resume arbitrary Lua.
+    if (lua_type(L, 1) == LUA_TUSERDATA) {
+        *static_cast<ClientHandle *>(lua_touserdata(L, 1)) = nullptr;
     }
-    return 0;
+    return protected_call(L, [&]() -> int {
+        if (client) operations.unload(client);
+        return 0;
+    });
 }
 
 inline int close(lua_State *L, ClientHandle client,

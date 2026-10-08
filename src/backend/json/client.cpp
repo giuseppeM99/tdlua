@@ -55,6 +55,11 @@ json json_transport_execute_sync(void *context, json request)
     return static_cast<TDLua *>(context)->execute(std::move(request));
 }
 
+bool json_transport_pump(void *context, double timeout)
+{
+    return static_cast<TDLua *>(context)->pump(timeout);
+}
+
 void json_transport_close(void *context)
 {
     static_cast<TDLua *>(context)->close();
@@ -116,15 +121,17 @@ public:
         }
 
         const auto started = std::chrono::steady_clock::now();
+        bool attempted = false;
         while (true) {
             const std::chrono::duration<double> elapsed =
                 std::chrono::steady_clock::now() - started;
             const double remaining = timeout - elapsed.count();
-            if (remaining <= 0.0) {
+            if ((attempted || timeout < 0.0) && remaining <= 0.0) {
                 return nullptr;
             }
 
-            json result = parse(td_receive(remaining), "receive");
+            attempted = true;
+            json result = parse(td_receive(std::max(0.0, remaining)), "receive");
             if (!result.is_object()) {
                 return nullptr;
             }
@@ -180,11 +187,18 @@ TDLua::TDLua(lua_State *lua)
       updates(), dbpath(), _ready(false), state(ClientState::Running),
       dispatcher_(lua)
 {
+    dispatcher_.setPump(this, json_transport_pump);
 }
 
 TDLua::~TDLua()
 {
-    close();
+    // Destruction cannot safely enter Lua. The binding performs the protected
+    // drain before this destructor runs; this path only detaches transport.
+    try {
+        close(false);
+    } catch (...) {
+        dispatcher_.detachTransport();
+    }
 }
 
 TDLua::QueuedUpdate TDLua::pop()
@@ -227,6 +241,36 @@ nlohmann::json TDLua::receive(const double timeout)
     return transport().receive(timeout);
 }
 
+bool TDLua::pump(const double timeout)
+{
+    if (closed()) {
+        return false;
+    }
+    {
+        nlohmann::json value;
+        if (!updates.empty() && !updates.front().dispatched) {
+            QueuedUpdate queued = pop();
+            value = std::move(queued.value);
+        } else {
+            // Use the configured non-owning transport, including deterministic
+            // test transports injected below the common router.
+            value = transport().receive(timeout);
+        }
+        if (!value.is_object() || value.empty()) {
+            dispatcher_.drain();
+            return false;
+        }
+        // The common router owns update observation; this flag distinguishes
+        // managed pumping from the public raw receive path.
+        const tdlua::RouteKind route = dispatch(value, true);
+        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
+            push(value, true);
+        }
+    }
+    dispatcher_.drain();
+    return true;
+}
+
 nlohmann::json TDLua::receiveBackend(const double timeout)
 {
     return JsonRuntime::instance().receive(client_id, timeout);
@@ -256,17 +300,23 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
     return false;
 }
 
-void TDLua::close()
+void TDLua::close(bool drain)
 {
+    // Phase one detaches the scheduler before backend shutdown can reenter the
+    // client. The optional drain is phase two and is safe only at the binding
+    // boundary that called close().
     if (injected_transport_.operations) {
+        state = ClientState::Closed;
+        dispatcher_.detachTransport();
         injected_transport_.close();
-        dispatcher_.clear();
+        if (drain) dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
         state = ClientState::Closed;
         return;
     }
     if (state == ClientState::Closed) {
-        dispatcher_.clear();
+        dispatcher_.detachTransport();
+        if (drain) dispatcher_.clear();
         JsonRuntime::instance().forget(client_id);
         state = ClientState::Closed;
         return;
@@ -275,8 +325,9 @@ void TDLua::close()
     if (state == ClientState::Running) {
         nlohmann::json close_request = {{"@type", "close"}};
         const auto id = dispatcher_.raw(close_request);
-        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
         state = ClientState::Closing;
+        dispatcher_.detachTransport();
+        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -293,13 +344,15 @@ void TDLua::close()
             checkAuthState(update);
         }
     }
-    dispatcher_.clear();
+    state = ClientState::Closed;
+    dispatcher_.detachTransport();
+    if (drain) dispatcher_.clear();
     JsonRuntime::instance().forget(client_id);
 }
 
 bool TDLua::closed() const
 {
-    return state == ClientState::Closed;
+    return state != ClientState::Running;
 }
 
 LuaDispatcher &TDLua::dispatcher()
@@ -322,8 +375,11 @@ void TDLua::saveUpdatesBuffer()
 {
     if (!_ready || dbpath.empty()) return;
     nlohmann::json jupdates = nlohmann::json::array();
-    while (!updates.empty()) {
-        jupdates.push_back(this->pop().value);
+    for (auto it = updates.begin(); it != updates.end();) {
+        // A failed receive still owns public delivery, even across close/save.
+        if (it->delivery_pending) { ++it; continue; }
+        jupdates.push_back(it->value);
+        it = updates.erase(it);
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();
@@ -369,10 +425,11 @@ void TDLua::loadUpdatesBuffer()
     _ready = true;
 }
 
-void TDLua::emptyUpdatesBuffer()
+void TDLua::emptyUpdatesBuffer(bool preserve_received)
 {
-    while (!updates.empty()) {
-        updates.pop_front();
+    for (auto it = updates.begin(); it != updates.end();) {
+        if (preserve_received && it->delivery_pending) ++it;
+        else it = updates.erase(it);
     }
 }
 
@@ -383,10 +440,23 @@ void TDLua::checkAuthState(const nlohmann::json &update)
             loadUpdatesBuffer();
         } else if (update["authorization_state"]["@type"] == "authorizationStateClosed") {
             saveUpdatesBuffer();
-            emptyUpdatesBuffer();
+            emptyUpdatesBuffer(true);
             _ready = false;
             state = ClientState::Closed;
         }
+    }
+}
+
+tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive)
+{
+    checkAuthState(update);
+    try {
+        const auto route = dispatcher_.dispatch(update, managed_receive);
+        if (state == ClientState::Closed) dispatcher_.detachAfterDrain();
+        return route;
+    } catch (...) {
+        if (state == ClientState::Closed) dispatcher_.detachTransport();
+        throw;
     }
 }
 

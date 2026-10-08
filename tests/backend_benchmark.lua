@@ -116,7 +116,7 @@ for _, workload in ipairs(workloads) do
             end
             while completed < target do
                 assert(clock() < deadline, "callback benchmark timed out")
-                client:poll(0.1)
+                client:receive(0.1)
             end
         end
         assert(completed == count)
@@ -141,7 +141,7 @@ for _, workload in ipairs(workloads) do
             end
             while completed < target do
                 assert(clock() < deadline, "await benchmark timed out")
-                client:poll(0.1)
+                client:receive(0.1)
             end
         end
         for _, thread in ipairs(threads) do assert(coroutine.status(thread) == "dead") end

@@ -16,9 +16,11 @@ public:
     struct QueuedUpdate {
         nlohmann::json value;
         bool dispatched;
+        bool delivery_pending;
 
-        QueuedUpdate(const nlohmann::json &value, const bool dispatched)
-            : value(value), dispatched(dispatched)
+        QueuedUpdate(const nlohmann::json &value, const bool dispatched,
+                     bool delivery_pending = false)
+            : value(value), dispatched(dispatched), delivery_pending(delivery_pending)
         {
         }
     };
@@ -59,16 +61,21 @@ public:
     nlohmann::json execute(const nlohmann::json &json);
 
     nlohmann::json receive(const double timeout = 10.0);
+    bool pump(double timeout);
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 
-    void close();
+    // Detach/fail work first. A true drain then performs phase two while the
+    // caller still has a protected Lua boundary.
+    void close(bool drain = true);
 
     bool closed() const;
 
     LuaDispatcher &dispatcher();
 
     void push(const nlohmann::json &update, bool dispatched = false);
+
+    void restoreReceived(const nlohmann::json &value) { updates.emplace_front(value, true, true); }
 
     bool empty() const;
 
@@ -77,9 +84,10 @@ public:
 
     void loadUpdatesBuffer();
 
-    void emptyUpdatesBuffer();
+    void emptyUpdatesBuffer(bool preserve_received = false);
 
     void checkAuthState(const nlohmann::json &update);
+    tdlua::RouteKind dispatch(nlohmann::json &update, bool managed_receive = false);
 
     bool ready() const;
 

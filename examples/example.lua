@@ -32,14 +32,14 @@ client:getAuthorizationState(function(result, context)
 end, {origin = 'example.lua'})
 
 while true do
-    local res = client:poll(1.0)
+    local res = client:poll()
     if res then
         vardump(res)
         if callback_done then
             break
         end
     else
-        print('timeout waiting for response')
+        print('client closed before the managed update arrived')
         break
     end
 end

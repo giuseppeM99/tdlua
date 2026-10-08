@@ -98,7 +98,7 @@ local function check_auth_error()
 end
 
 local function request_authentication(operation, request)
-    return client:request(request, function(result, context)
+    return client:execute(request, function(result, context)
         if result._ == "error" then
             fail_auth(context.operation .. " failed: " .. error_text(result))
         end
@@ -180,7 +180,7 @@ auth_thread = coroutine.create(function(state)
     end
 end)
 
-client:request({_ = "getAuthorizationState"}, function(state)
+client:execute({_ = "getAuthorizationState"}, function(state)
     if state._ == "error" then
         fail_auth("getAuthorizationState failed: " .. error_text(state))
     else
@@ -190,7 +190,7 @@ end)
 
 while coroutine.status(auth_thread) ~= "dead" do
     check_auth_error()
-    client:poll(1.0)
+    client:poll()
 end
 check_auth_error()
 client:off("updateAuthorizationState")
@@ -266,7 +266,7 @@ local upload_thread = coroutine.create(function()
         print("Message accepted by TDLib for " .. artifact)
 
         while not upload_error and not upload_succeeded do
-            client:poll(1.0)
+            client:poll()
         end
         if upload_error then
             return
@@ -283,7 +283,7 @@ while coroutine.status(upload_thread) ~= "dead" do
     if upload_error then
         break
     end
-    client:poll(1.0)
+    client:poll()
 end
 
 client:off("updateMessageSendSucceeded")
