@@ -878,6 +878,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         removeRegistration(thread);
         const int status = tdlua_lua_resume(thread, lua_owner_, arguments);
+        if (status == LUA_OK && !task) lua_settop(thread, 0);
         const char *message = status != LUA_OK && status != LUA_YIELD
             ? lua_tostring(thread, -1) : nullptr;
         // lua_error delivers the exact dependency error to the waiter.

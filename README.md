@@ -451,6 +451,12 @@ touches an unresolved Future, TDLua yields that coroutine. The managed driver
 keeps receiving objects, routes responses, may start later update Tasks, and
 resumes the suspended coroutine when its response arrives.
 
+If an application-created coroutine is resumed automatically after a Future
+completes, its final return values have no pending `coroutine.resume()` caller
+and are discarded. Use a managed Task when those values must be observed with
+`Task:wait()`. A coroutine that yields again remains suspended and can still be
+resumed by its owner.
+
 Futures submit requests eagerly and synchronize lazily. In this example, both
 requests are in flight before either result is read:
 

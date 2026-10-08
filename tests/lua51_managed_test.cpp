@@ -241,7 +241,7 @@ bool zero()
 int main()
 {
     const std::vector<std::string> tests = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
-        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V"};
+        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W"};
     std::cout << "Stock " << LUA_RELEASE << "; LUA_VERSION_NUM=" << LUA_VERSION_NUM
         << "; LuaJIT compile macros absent\n";
     int failures = 0;

@@ -68,6 +68,20 @@ void scenarios(lua_State *L, bool jit_off)
                "assert(type(pending.wait)=='function' and type(pending.ready)=='function'); "
                "assert(pending._request_id~=999 and pending:ready())");
     }
+
+    // A coroutine resumed by the scheduler has no Lua caller to receive its
+    // final values. Its thread must nevertheless be retired as dead.
+    const auto external = dependency.future();
+    publish(L, external, "pending");
+    run(L, "external_co=coroutine.create(function() "
+           "local result=pending:wait(); return 'fine', 42 end); "
+           "assert(coroutine.resume(external_co)); "
+           "assert(coroutine.status(external_co)=='suspended')");
+    response(dependency, external);
+    run(L, "assert(coroutine.status(external_co)=='dead'); "
+           "local resumed,message=coroutine.resume(external_co); "
+           "assert(not resumed and tostring(message):find('dead'))");
+
     const auto future = dependency.future();
     publish(L, future, "pending");
     run(L, "return function() "

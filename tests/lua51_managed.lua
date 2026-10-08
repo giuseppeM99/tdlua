@@ -452,3 +452,15 @@ scenarios.V = function()
     error_contains(function() f:wait() end,'client closed')
     P.tick(c); assert(deliveries==1); co=nil; clean_waits()
 end
+
+scenarios.W = function()
+    local c=client(); local f=c:getMe()
+    local co=coroutine.create(function()
+        local result=f:wait(); return 'fine', 42
+    end)
+    assert(coroutine.resume(co)); suspended(co)
+    respond(c,f._request_id); dead(co)
+    local ok,e=coroutine.resume(co)
+    assert(not ok and tostring(e):find('dead'))
+    clean_waits()
+end
