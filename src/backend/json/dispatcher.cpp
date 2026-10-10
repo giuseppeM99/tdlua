@@ -58,15 +58,15 @@ LuaDispatcher::~LuaDispatcher()
     router_.detachTransport();
 }
 
-std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &, int callback_index,
-                                     int context_index)
+std::uint64_t LuaDispatcher::registerRequest(lua_State *L, int callback_index,
+                                            int context_index)
 {
     return router_.request(L, callback_index, context_index);
 }
 
-std::uint64_t LuaDispatcher::await(lua_State *L, nlohmann::json &)
+std::uint64_t LuaDispatcher::registerRawRequest()
 {
-    return router_.await(L);
+    return router_.raw();
 }
 
 std::shared_ptr<tdlua::ManagedState> LuaDispatcher::future()
@@ -103,11 +103,6 @@ int LuaDispatcher::waitById(lua_State *L, std::uint64_t request_id,
 void LuaDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
 {
     router_.setPump(context, pump);
-}
-
-std::uint64_t LuaDispatcher::raw(nlohmann::json &)
-{
-    return router_.raw();
 }
 
 bool LuaDispatcher::responseRequestId(const nlohmann::json &response,

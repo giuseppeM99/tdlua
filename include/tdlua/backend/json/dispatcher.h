@@ -17,9 +17,12 @@ public:
     explicit LuaDispatcher(lua_State *owner);
     ~LuaDispatcher();
 
-    std::uint64_t request(lua_State *L, nlohmann::json &request,
-                          int callback_index, int context_index);
-    std::uint64_t await(lua_State *L, nlohmann::json &request);
+    // These methods create router state and return its request ID; they do not
+    // inspect or send the payload. submit() sends it and cancels the state if
+    // transport submission throws.
+    std::uint64_t registerRequest(lua_State *L, int callback_index, int context_index);
+    // Creates a RequestKind::Raw state; this is more than allocating an ID.
+    std::uint64_t registerRawRequest();
     std::shared_ptr<tdlua::ManagedState> future();
     std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
                                               int context_index,
@@ -33,7 +36,6 @@ public:
                   double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
                   const char *field = nullptr);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
-    std::uint64_t raw(nlohmann::json &request);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;

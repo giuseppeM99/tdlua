@@ -287,7 +287,7 @@ static int tdclient_send(lua_State *L)
             if (codec_error) {
                 std::uint64_t id = 0;
                 try {
-                    id = td->dispatcher().raw(L, table_index);
+                    id = td->dispatcher().registerRawRequest();
                     tdlua::submit(td->dispatcher(), td->transport(), id, codec_error_request(error));
                     pop_owned(L, owned);
                     tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
@@ -304,7 +304,7 @@ static int tdclient_send(lua_State *L)
             throw std::runtime_error(error);
         }
         try {
-            const std::uint64_t id = td->dispatcher().raw(L, table_index);
+            const std::uint64_t id = td->dispatcher().registerRawRequest();
             tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
@@ -337,7 +337,7 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
         // execute() waits for its own response but lets the dispatcher make
         // progress on unrelated asynchronous responses in the same receive
         // loop. This is the async-first behavior shared with the JSON path.
-        const std::uint64_t id = td->dispatcher().raw(L, table_index);
+        const std::uint64_t id = td->dispatcher().registerRawRequest();
         tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         pop_owned(L, owned);
 
@@ -540,7 +540,7 @@ static int call(lua_State *L)
             request = codec_error_request(error);
         }
         if (fire_and_forget) {
-            const std::uint64_t id = td->dispatcher().raw(L, encoded_table_index);
+            const std::uint64_t id = td->dispatcher().registerRawRequest();
             tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             pop_owned(L, owned);
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
@@ -647,8 +647,8 @@ static int tdclient_request(lua_State *L)
             }
             request = codec_error_request(error);
         }
-        const std::uint64_t id = td->dispatcher().request(
-            L, table_index, callback_index, context_index);
+        const std::uint64_t id = td->dispatcher().registerRequest(
+            L, callback_index, context_index);
         tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         pop_owned(L, owned);
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));

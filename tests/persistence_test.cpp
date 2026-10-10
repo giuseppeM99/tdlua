@@ -59,8 +59,7 @@ void test_json_persistence(lua_State *lua,
     mark_ready(source);
     for (std::size_t i = 0; i < buffered_values.size(); ++i) {
         source.dispatcher().observeRequestId(buffered_request_ids[i] - 1);
-        nlohmann::json request = {{"@type", "getMe"}};
-        require(source.dispatcher().raw(request) == buffered_request_ids[i],
+        require(source.dispatcher().registerRawRequest() == buffered_request_ids[i],
                 "JSON raw ownership ID changed");
         source.push({
             {"@type", "optionValueString"},
@@ -87,8 +86,7 @@ void test_json_persistence(lua_State *lua,
                 "JSON persistence changed a request ID");
     }
 
-    nlohmann::json request = {{"@type", "getMe"}};
-    const std::uint64_t new_id = restored.dispatcher().raw(request);
+    const std::uint64_t new_id = restored.dispatcher().registerRawRequest();
     require(new_id > buffered_request_ids.back(),
             "JSON allocator did not advance past restored request IDs");
     restored.dispatcher().cancel(new_id);
@@ -120,7 +118,7 @@ void test_native_persistence(lua_State *lua,
     mark_ready(source);
     for (std::size_t i = 0; i < buffered_values.size(); ++i) {
         source.dispatcher().observeRequestId(buffered_request_ids[i] - 1);
-        require(source.dispatcher().raw(lua, 0) == buffered_request_ids[i],
+        require(source.dispatcher().registerRawRequest() == buffered_request_ids[i],
                 "native raw ownership ID changed");
         NativeResponse response;
         response.request_id = buffered_request_ids[i];

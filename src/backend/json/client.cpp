@@ -258,7 +258,7 @@ void TDLua::close(bool drain)
 
         if (state == ClientState::Running) {
             nlohmann::json close_request = {{"@type", "close"}};
-            const auto id = dispatcher_.raw(close_request);
+            const auto id = dispatcher_.registerRawRequest();
             state = ClientState::Closing;
             dispatcher_.detachTransport();
             tdlua::submit(dispatcher_, transport(), id, std::move(close_request));

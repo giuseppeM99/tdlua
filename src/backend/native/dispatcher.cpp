@@ -21,20 +21,15 @@ std::uint64_t NativeDispatcher::nextRequestId()
     return router_.nextRequestId();
 }
 
-std::uint64_t NativeDispatcher::request(lua_State *L, int, int callback,
-                                        int context)
+std::uint64_t NativeDispatcher::registerRequest(lua_State *L, int callback,
+                                               int context)
 {
     return router_.request(L, callback, context);
 }
 
-std::uint64_t NativeDispatcher::raw(lua_State *, int)
+std::uint64_t NativeDispatcher::registerRawRequest()
 {
     return router_.raw();
-}
-
-std::uint64_t NativeDispatcher::await(lua_State *L, int)
-{
-    return router_.await(L);
 }
 
 std::shared_ptr<tdlua::ManagedState> NativeDispatcher::future()

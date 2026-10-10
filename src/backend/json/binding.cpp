@@ -203,7 +203,7 @@ static int tdclient_send(lua_State *L)
         if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
             td->setDB(j["database_directory"]);
         }
-        const std::uint64_t id = td->dispatcher().raw(j);
+        const std::uint64_t id = td->dispatcher().registerRawRequest();
         tdlua::submit(td->dispatcher(), td->transport(), id, std::move(j));
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
@@ -222,7 +222,7 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
         return 0;
     }
     reject_reserved_json_fields(request);
-    const std::uint64_t id = td->dispatcher().raw(request);
+    const std::uint64_t id = td->dispatcher().registerRawRequest();
     if (!td->ready() && request["@type"] == "setTdlibParameters" &&
         request["database_directory"].is_string()) {
         td->setDB(request["database_directory"]);
@@ -419,7 +419,7 @@ static int call(lua_State *L)
                 request["database_directory"].is_string()) {
                 td->setDB(request["database_directory"]);
             }
-            const std::uint64_t id = td->dispatcher().raw(request);
+            const std::uint64_t id = td->dispatcher().registerRawRequest();
             tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
             return 1;
@@ -526,8 +526,8 @@ static int tdclient_request(lua_State *L)
             throw std::runtime_error("request callback must be a function");
         }
 
-        const std::uint64_t id = td->dispatcher().request(
-            L, request, callback_index, context_index);
+        const std::uint64_t id = td->dispatcher().registerRequest(
+            L, callback_index, context_index);
         if (!td->ready() && request["@type"] == "setTdlibParameters" &&
             request["database_directory"].is_string()) {
             td->setDB(request["database_directory"]);
