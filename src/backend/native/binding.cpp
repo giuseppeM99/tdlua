@@ -16,6 +16,33 @@
 #include <string>
 #include <utility>
 
+namespace {
+
+std::uint64_t attachNativeVm() { return NativeRuntime::instance().attachVm(); }
+void detachNativeVm(std::uint64_t owner)
+{
+    NativeRuntime::instance().detachVm(owner);
+}
+
+}
+
+void tdlua_native_initialize_vm(lua_State *L)
+{
+    tdlua_binding::initializeVm(L, "tdlua.native.vm", attachNativeVm,
+                                detachNativeVm);
+}
+
+std::uint64_t tdlua_native_vm_owner(lua_State *L)
+{
+    return tdlua_binding::vmOwner(L, "tdlua.native.vm", attachNativeVm,
+                                  detachNativeVm);
+}
+
+void tdlua_native_retain_vm(lua_State *L, int client)
+{
+    tdlua_binding::retainVm(L, client);
+}
+
 static NativeTDLua *getTD(lua_State *L)
 {
     return static_cast<NativeTDLua *>(tdlua_binding::get_client(L));

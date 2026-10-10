@@ -4,7 +4,6 @@
 #pragma once
 
 #include "tdlua/backend/native/codec.h"
-#include "tdlua/lua_compat.h"
 #include "tdlua/common/receiver.h"
 #include "tdlua/common/failure_cleanup.h"
 
@@ -16,6 +15,8 @@
 #include <mutex>
 #include <queue>
 #include <set>
+
+struct lua_State;
 
 struct NativeResponse {
     td::ClientManager::ClientId client_id;

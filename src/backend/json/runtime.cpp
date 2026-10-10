@@ -8,7 +8,6 @@
 namespace {
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
-char vm_key;
 #ifdef TDLUA_TESTING
 std::mutex test_mutex;
 std::condition_variable test_changed;
@@ -25,12 +24,6 @@ JsonRuntime::Engine::Hooks testHooks() {
     return hooks;
 }
 #endif
-struct VmToken {
-    std::uint64_t owner;
-    bool live;
-    std::thread::id thread;
-};
-
 class JsonSource final : public tdlua::receiver::Source<json>, private tdlua::receiver::FailureCleanup::Transport {
 public:
     explicit JsonSource(std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle) : lifecycle_(std::move(lifecycle)) {}
@@ -113,25 +106,6 @@ private:
 #endif
 };
 
-int vmGc(lua_State *L) {
-    VmToken *token = static_cast<VmToken *>(lua_touserdata(L, 1));
-    if (token->live) {
-        token->live = false;
-        // No Lua callback, registry lookup, or TDLib client destruction here.
-        // Last owner has priority over tombstone leases and completes join.
-        try { JsonRuntime::instance().detachVm(token->owner); }
-        catch (...) { /* best effort on exceptional host/mutex failure */ }
-    }
-    token->~VmToken();
-    return 0;
-}
-
-VmToken *vmToken(lua_State *L) {
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &vm_key);
-    VmToken *token = static_cast<VmToken *>(luaL_testudata(L, -1, "tdlua.json.vm"));
-    lua_pop(L, 1);
-    return token;
-}
 } // namespace
 
 JsonRuntime &JsonRuntime::instance() {
@@ -149,36 +123,6 @@ JsonRuntime::JsonRuntime() : lifecycle_(std::make_shared<tdlua::receiver::Failur
 std::uint64_t JsonRuntime::attachVm() { return engine_.attachOwner(); }
 void JsonRuntime::detachVm(std::uint64_t owner) { engine_.detachOwner(owner); }
 
-void tdlua_json_initialize_vm(lua_State *L) {
-    if (VmToken *token = vmToken(L)) {
-        if (!token->live || token->thread != std::this_thread::get_id())
-            throw std::runtime_error("tdlua: VM owner unavailable");
-        return;
-    }
-    // Allocate/register userdata before obtaining a C++ owner lease. A Lua
-    // allocation error cannot leave an unfinalizable runtime registration.
-    luaL_newmetatable(L, "tdlua.json.vm");
-    lua_pushcfunction(L, vmGc); lua_setfield(L, -2, "__gc");
-    lua_pop(L, 1);
-    VmToken *token = new (lua_newuserdata(L, sizeof(VmToken))) VmToken{0, false, std::this_thread::get_id()};
-    luaL_setmetatable(L, "tdlua.json.vm");
-    lua_pushvalue(L, -1); lua_rawsetp(L, LUA_REGISTRYINDEX, &vm_key);
-    lua_pop(L, 1);
-    token->owner = JsonRuntime::instance().attachVm();
-    token->live = true;
-}
-std::uint64_t tdlua_json_vm_owner(lua_State *L) {
-    tdlua_json_initialize_vm(L);
-    return vmToken(L)->owner;
-}
-void tdlua_json_retain_vm(lua_State *L, int client) {
-    client = lua_absindex(L, client);
-    tdlua_lua_get_value_uservalue(L, client); // existing core anchor
-    lua_getuservalue(L, -1); // core's reference table; no replacement of scheduler storage
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &vm_key);
-    lua_rawsetp(L, -2, &vm_key);
-    lua_pop(L, 2);
-}
 std::int32_t JsonRuntime::createClient(std::uint64_t owner) {
     int reserved_id = 0;
     try {

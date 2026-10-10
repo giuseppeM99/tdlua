@@ -10,9 +10,12 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <new>
 #include <string>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace tdlua_binding {
@@ -36,6 +39,85 @@ int protected_call(lua_State *L, Function &&function)
 
 using ClientHandle = void *;
 using ClientFactory = ClientHandle (*)(lua_State *);
+
+using VmAttach = std::uint64_t (*)();
+using VmDetach = void (*)(std::uint64_t);
+
+struct VmToken final {
+    std::uint64_t owner;
+    bool live;
+    std::thread::id thread;
+    VmDetach detach;
+};
+
+inline char *vmRegistryKey()
+{
+    static char key;
+    return &key;
+}
+
+inline int vmTokenGc(lua_State *L)
+{
+    VmToken *token = static_cast<VmToken *>(lua_touserdata(L, 1));
+    if (token->live) {
+        token->live = false;
+        try { token->detach(token->owner); }
+        catch (...) { /* VM finalization remains best-effort. */ }
+    }
+    token->~VmToken();
+    return 0;
+}
+
+inline VmToken *getVmToken(lua_State *L, const char *metatable)
+{
+    lua_rawgetp(L, LUA_REGISTRYINDEX, vmRegistryKey());
+    VmToken *token = static_cast<VmToken *>(luaL_testudata(L, -1, metatable));
+    lua_pop(L, 1);
+    return token;
+}
+
+inline void initializeVm(lua_State *L, const char *metatable,
+                         VmAttach attach, VmDetach detach)
+{
+    if (VmToken *token = getVmToken(L, metatable)) {
+        if (!token->live || token->thread != std::this_thread::get_id()) {
+            throw std::runtime_error("tdlua: VM owner unavailable");
+        }
+        return;
+    }
+
+    // Register the finalizer and root the inert token before acquiring a
+    // runtime owner lease. A Lua allocation failure cannot orphan that lease.
+    luaL_newmetatable(L, metatable);
+    lua_pushcfunction(L, vmTokenGc);
+    lua_setfield(L, -2, "__gc");
+    lua_pop(L, 1);
+    VmToken *token = new (lua_newuserdata(L, sizeof(VmToken)))
+        VmToken{0, false, std::this_thread::get_id(), detach};
+    luaL_setmetatable(L, metatable);
+    lua_pushvalue(L, -1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, vmRegistryKey());
+    lua_pop(L, 1);
+    token->owner = attach();
+    token->live = true;
+}
+
+inline std::uint64_t vmOwner(lua_State *L, const char *metatable,
+                             VmAttach attach, VmDetach detach)
+{
+    initializeVm(L, metatable, attach, detach);
+    return getVmToken(L, metatable)->owner;
+}
+
+inline void retainVm(lua_State *L, int client)
+{
+    client = lua_absindex(L, client);
+    tdlua_lua_get_value_uservalue(L, client);
+    lua_getuservalue(L, -1);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, vmRegistryKey());
+    lua_rawsetp(L, -2, vmRegistryKey());
+    lua_pop(L, 2);
+}
 
 struct ClientOperations final {
     ClientFactory factory;

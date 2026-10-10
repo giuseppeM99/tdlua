@@ -15,6 +15,32 @@
 #include <string>
 #include "tdlua/backend/json/runtime.h"
 
+namespace {
+
+std::uint64_t attachJsonVm() { return JsonRuntime::instance().attachVm(); }
+void detachJsonVm(std::uint64_t owner)
+{
+    JsonRuntime::instance().detachVm(owner);
+}
+
+}
+
+void tdlua_json_initialize_vm(lua_State *L)
+{
+    tdlua_binding::initializeVm(L, "tdlua.json.vm", attachJsonVm, detachJsonVm);
+}
+
+std::uint64_t tdlua_json_vm_owner(lua_State *L)
+{
+    return tdlua_binding::vmOwner(L, "tdlua.json.vm", attachJsonVm,
+                                  detachJsonVm);
+}
+
+void tdlua_json_retain_vm(lua_State *L, int client)
+{
+    tdlua_binding::retainVm(L, client);
+}
+
 static TDLua * getTD(lua_State *L)
 {
     return static_cast<TDLua *>(tdlua_binding::get_client(L));

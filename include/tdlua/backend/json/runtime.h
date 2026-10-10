@@ -1,8 +1,9 @@
 #pragma once
 #include "tdlua/common/receiver.h"
 #include "tdlua/common/failure_cleanup.h"
-#include "tdlua/lua_compat.h"
 #include <nlohmann/json.hpp>
+
+struct lua_State;
 
 class JsonRuntime {
 public:

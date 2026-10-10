@@ -35,7 +35,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Ledger = tdlua::receiver::FailureCleanup;
 using Envelope = tdlua::receiver::Envelope<NativeResponse>;
-char vm_key;
 #ifdef TDLUA_TESTING
 std::mutex test_mutex;
 std::condition_variable test_changed;
@@ -123,19 +122,6 @@ private:
     std::deque<Envelope> held_;
 #endif
 };
-struct VmToken { std::uint64_t owner; bool live; std::thread::id thread; };
-int vmGc(lua_State *L) {
-    auto *token=static_cast<VmToken *>(lua_touserdata(L,1));
-    if (token->live) {
-        token->live=false;
-        try { NativeRuntime::instance().detachVm(token->owner); } catch (...) {}
-    }
-    token->~VmToken(); return 0;
-}
-VmToken *vmToken(lua_State *L) {
-    lua_rawgetp(L,LUA_REGISTRYINDEX,&vm_key);
-    auto *token=static_cast<VmToken *>(luaL_testudata(L,-1,"tdlua.native.vm")); lua_pop(L,1); return token;
-}
 }
 NativeRuntime &NativeRuntime::instance() {
     // The resident runtime/manager outlive VM handles. NODELETE prevents unload;
@@ -151,21 +137,6 @@ NativeRuntime::NativeRuntime() : manager_(std::make_shared<td::ClientManager>())
     ) { static_cast<NativeSource *>(source_.get())->engine=&engine_; }
 std::uint64_t NativeRuntime::attachVm() { return engine_.attachOwner(); }
 void NativeRuntime::detachVm(std::uint64_t owner) { engine_.detachOwner(owner); }
-void tdlua_native_initialize_vm(lua_State *L) {
-    if (auto *token=vmToken(L)) {
-        if (!token->live || token->thread!=std::this_thread::get_id()) throw std::runtime_error("tdlua: VM owner unavailable");
-        return;
-    }
-    luaL_newmetatable(L,"tdlua.native.vm"); lua_pushcfunction(L,vmGc); lua_setfield(L,-2,"__gc"); lua_pop(L,1);
-    auto *token=new(lua_newuserdata(L,sizeof(VmToken))) VmToken{0,false,std::this_thread::get_id()};
-    luaL_setmetatable(L,"tdlua.native.vm"); lua_pushvalue(L,-1); lua_rawsetp(L,LUA_REGISTRYINDEX,&vm_key); lua_pop(L,1);
-    token->owner=NativeRuntime::instance().attachVm(); token->live=true;
-}
-std::uint64_t tdlua_native_vm_owner(lua_State *L) { tdlua_native_initialize_vm(L); return vmToken(L)->owner; }
-void tdlua_native_retain_vm(lua_State *L,int client) {
-    client=lua_absindex(L,client); tdlua_lua_get_value_uservalue(L,client); lua_getuservalue(L,-1);
-    lua_rawgetp(L,LUA_REGISTRYINDEX,&vm_key); lua_rawsetp(L,-2,&vm_key); lua_pop(L,2);
-}
 td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner) {
     int reserved=0;
     try {
