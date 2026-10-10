@@ -18,6 +18,34 @@ std::string eventType(const nlohmann::json &event)
     return type->get<std::string>();
 }
 
+bool extractJsonResponseRequestId(const nlohmann::json &response,
+                                 std::uint64_t &request_id)
+{
+    const auto extra = response.find("@extra");
+    if (extra == response.end() || !extra->is_object()) {
+        return false;
+    }
+
+    const auto marker = extra->find("__tdlua_request_id");
+    if (marker == extra->end()) {
+        return false;
+    }
+    if (marker->is_number_unsigned()) {
+        request_id = marker->get<std::uint64_t>();
+        return true;
+    }
+    if (!marker->is_number_integer()) {
+        return false;
+    }
+
+    const auto signed_id = marker->get<std::int64_t>();
+    if (signed_id < 0) {
+        return false;
+    }
+    request_id = static_cast<std::uint64_t>(signed_id);
+    return true;
+}
+
 }
 
 LuaDispatcher::LuaDispatcher(lua_State *owner)
@@ -32,15 +60,15 @@ LuaDispatcher::~LuaDispatcher()
     router_.detachTransport();
 }
 
-std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &request,
+std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &,
                                      int callback_index, int context_index)
 {
-    return router_.addCallback(L, request, callback_index, context_index);
+    return router_.request(L, callback_index, context_index);
 }
 
-std::uint64_t LuaDispatcher::await(lua_State *L, nlohmann::json &request)
+std::uint64_t LuaDispatcher::await(lua_State *L, nlohmann::json &)
 {
-    return router_.addAwaiter(L, request);
+    return router_.await(L);
 }
 
 std::shared_ptr<tdlua::ManagedState> LuaDispatcher::future()
@@ -79,15 +107,15 @@ void LuaDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
     router_.setPump(context, pump);
 }
 
-std::uint64_t LuaDispatcher::raw(nlohmann::json &request)
+std::uint64_t LuaDispatcher::raw(nlohmann::json &)
 {
-    return router_.addRaw(request);
+    return router_.raw();
 }
 
 bool LuaDispatcher::responseRequestId(const nlohmann::json &response,
                                       std::uint64_t &request_id)
 {
-    return RequestRouter::responseRequestId(response, request_id);
+    return extractJsonResponseRequestId(response, request_id);
 }
 
 void LuaDispatcher::cancel(std::uint64_t request_id)
@@ -124,7 +152,7 @@ bool LuaDispatcher::pushHandler(lua_State *L, const std::string &type)
 tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event, bool managed_receive)
 {
     std::uint64_t id = 0;
-    const bool correlated = RequestRouter::responseRequestId(event, id);
+    const bool correlated = extractJsonResponseRequestId(event, id);
     event.erase("@extra");
     if (correlated) {
         event["_request_id"] = id;

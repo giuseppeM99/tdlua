@@ -260,7 +260,6 @@ else()
       "src/backend/json/runtime.cpp"
       "src/common/lua_json.cpp"
       "src/backend/json/binding.cpp"
-      "src/backend/json/request_router.cpp"
       "src/backend/json/dispatcher.cpp"
   )
 endif()

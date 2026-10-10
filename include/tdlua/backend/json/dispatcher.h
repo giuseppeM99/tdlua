@@ -10,7 +10,7 @@
 #include "tdlua/lua_compat.h"
 
 #include <nlohmann/json.hpp>
-#include "tdlua/backend/json/request_router.h"
+#include "tdlua/common/request_router.h"
 
 class LuaDispatcher {
 public:
@@ -65,9 +65,9 @@ public:
 
     void detachTransport(const std::string &message = "tdlua: client closed")
     {
-        router_.detachTransport(message);
+        router_.core()->detachTransport(message);
     }
 
 private:
-    RequestRouter router_;
+    tdlua::RequestRouter router_;
 };
