@@ -27,6 +27,7 @@ public:
     using PumpValue = NativeResponse;
     bool hasUndispatchedPumpItem() const;
     PumpValue popPumpItem();
+    PumpValue receivePumpItem(double timeout);
     bool isValidPumpItem(const PumpValue &response) const;
     tdlua::RouteKind dispatchPumpItem(PumpValue &response);
     void preservePumpItem(PumpValue &response);

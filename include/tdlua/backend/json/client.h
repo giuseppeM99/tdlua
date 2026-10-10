@@ -66,6 +66,7 @@ public:
     using PumpValue = nlohmann::json;
     bool hasUndispatchedPumpItem() const;
     PumpValue popPumpItem();
+    PumpValue receivePumpItem(double timeout);
     bool isValidPumpItem(const PumpValue &value) const;
     tdlua::RouteKind dispatchPumpItem(PumpValue &value);
     void preservePumpItem(PumpValue &value);

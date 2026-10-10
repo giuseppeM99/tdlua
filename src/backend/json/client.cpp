@@ -171,6 +171,11 @@ TDLua::PumpValue TDLua::popPumpItem()
     return std::move(queued.value);
 }
 
+TDLua::PumpValue TDLua::receivePumpItem(const double timeout)
+{
+    return transport().receive(timeout);
+}
+
 bool TDLua::isValidPumpItem(const PumpValue &value) const
 {
     return value.is_object() && !value.empty();

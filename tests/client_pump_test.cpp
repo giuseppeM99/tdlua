@@ -33,6 +33,7 @@ struct FakePumpClient {
     std::deque<Payload> source;
     std::vector<int> dispatched;
     int drains = 0;
+    int transport_reads = 0;
     double last_timeout = -1.0;
 
     bool closed() const { return is_closed; }
@@ -46,8 +47,9 @@ struct FakePumpClient {
         local.pop_front();
         return value;
     }
-    PumpValue receive(double timeout)
+    PumpValue receivePumpItem(double timeout)
     {
+        ++transport_reads;
         last_timeout = timeout;
         if (source.empty()) return PumpValue();
         PumpValue value(std::move(source.front()));
@@ -94,6 +96,11 @@ int main()
         require(tdlua::pumpClient(client, 0.5), "source pump returned false");
         require(client.dispatched.size() == 2 && client.dispatched[1] == 2,
                 "dispatched local item was selected again");
+        require(client.local.size() == 2 && client.local.front().value == 1 &&
+                    client.local.back().value == 2,
+                "dispatched local item was consumed instead of skipped");
+        require(client.transport_reads == 1,
+                "pump did not read exactly once from the transport");
         require(client.last_timeout == 0.5, "timeout was not forwarded");
 
         require(!tdlua::pumpClient(client, 0.0), "empty pump returned true");

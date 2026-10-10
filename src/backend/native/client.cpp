@@ -160,6 +160,11 @@ NativeTDLua::PumpValue NativeTDLua::popPumpItem()
     return pop();
 }
 
+NativeTDLua::PumpValue NativeTDLua::receivePumpItem(const double timeout)
+{
+    return transport().receive(timeout);
+}
+
 bool NativeTDLua::isValidPumpItem(const PumpValue &response) const
 {
     return static_cast<bool>(response.object);

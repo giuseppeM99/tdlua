@@ -19,7 +19,7 @@ bool pumpClient(Client &client, double timeout)
     {
         typename Client::PumpValue value = client.hasUndispatchedPumpItem()
             ? client.popPumpItem()
-            : client.receive(timeout);
+            : client.receivePumpItem(timeout);
         if (!client.isValidPumpItem(value)) {
             client.drainPump();
             return false;
