@@ -24,6 +24,13 @@ public:
     NativeResponse receive(double timeout);
     NativeResponse receiveBackend(double timeout);
     bool pump(double timeout);
+    using PumpValue = NativeResponse;
+    bool hasUndispatchedPumpItem() const;
+    PumpValue popPumpItem();
+    bool isValidPumpItem(const PumpValue &response) const;
+    tdlua::RouteKind dispatchPumpItem(PumpValue &response);
+    void preservePumpItem(PumpValue &response);
+    void drainPump();
     using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
     Transport transport();
 #ifdef TDLUA_TESTING

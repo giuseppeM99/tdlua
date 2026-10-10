@@ -6,6 +6,7 @@
 #include "tdlua/backend/native/codec.h"
 #include "tdlua/backend/native/codec_runtime.h"
 #include "tdlua/backend/native/runtime.h"
+#include "tdlua/common/client_pump.h"
 #include "tdlua/common/lua_json.h"
 
 #include <fstream>
@@ -146,30 +147,38 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
 
 bool NativeTDLua::pump(const double timeout)
 {
-    if (closed_) {
-        return false;
-    }
-    {
-        NativeResponse response;
-        if (!updates_.empty() && !updates_.front().dispatched) {
-            response = pop();
-        } else {
-            response = transport().receive(timeout);
-        }
-        if (!response.object) {
-            dispatcher_.drain();
-            return false;
-        }
-        // The common router owns update observation; this flag distinguishes
-        // managed pumping from the public raw receive path.
-        const tdlua::RouteKind route = dispatch(response, true);
-        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
-            response.dispatched = true;
-            push(std::move(response));
-        }
-    }
+    return tdlua::pumpClient(*this, timeout);
+}
+
+bool NativeTDLua::hasUndispatchedPumpItem() const
+{
+    return !updates_.empty() && !updates_.front().dispatched;
+}
+
+NativeTDLua::PumpValue NativeTDLua::popPumpItem()
+{
+    return pop();
+}
+
+bool NativeTDLua::isValidPumpItem(const PumpValue &response) const
+{
+    return static_cast<bool>(response.object);
+}
+
+tdlua::RouteKind NativeTDLua::dispatchPumpItem(PumpValue &response)
+{
+    return dispatch(response, true);
+}
+
+void NativeTDLua::preservePumpItem(PumpValue &response)
+{
+    response.dispatched = true;
+    push(std::move(response));
+}
+
+void NativeTDLua::drainPump()
+{
     dispatcher_.drain();
-    return true;
 }
 
 NativeTDLua::Transport NativeTDLua::transport()

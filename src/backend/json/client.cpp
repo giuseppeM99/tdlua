@@ -3,6 +3,7 @@
 
 #include "tdlua/backend/json/client.h"
 #include "tdlua/backend/json/runtime.h"
+#include "tdlua/common/client_pump.h"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -156,32 +157,38 @@ nlohmann::json TDLua::receive(const double timeout)
 
 bool TDLua::pump(const double timeout)
 {
-    if (closed()) {
-        return false;
-    }
-    {
-        nlohmann::json value;
-        if (!updates.empty() && !updates.front().dispatched) {
-            QueuedUpdate queued = pop();
-            value = std::move(queued.value);
-        } else {
-            // Use the configured non-owning transport, including deterministic
-            // test transports injected below the common router.
-            value = transport().receive(timeout);
-        }
-        if (!value.is_object() || value.empty()) {
-            dispatcher_.drain();
-            return false;
-        }
-        // The common router owns update observation; this flag distinguishes
-        // managed pumping from the public raw receive path.
-        const tdlua::RouteKind route = dispatch(value, true);
-        if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route)) {
-            push(value, true);
-        }
-    }
+    return tdlua::pumpClient(*this, timeout);
+}
+
+bool TDLua::hasUndispatchedPumpItem() const
+{
+    return !updates.empty() && !updates.front().dispatched;
+}
+
+TDLua::PumpValue TDLua::popPumpItem()
+{
+    QueuedUpdate queued = pop();
+    return std::move(queued.value);
+}
+
+bool TDLua::isValidPumpItem(const PumpValue &value) const
+{
+    return value.is_object() && !value.empty();
+}
+
+tdlua::RouteKind TDLua::dispatchPumpItem(PumpValue &value)
+{
+    return dispatch(value, true);
+}
+
+void TDLua::preservePumpItem(PumpValue &value)
+{
+    push(value, true);
+}
+
+void TDLua::drainPump()
+{
     dispatcher_.drain();
-    return true;
 }
 
 nlohmann::json TDLua::receiveBackend(const double timeout)

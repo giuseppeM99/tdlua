@@ -63,6 +63,13 @@ public:
 
     nlohmann::json receive(const double timeout = 10.0);
     bool pump(double timeout);
+    using PumpValue = nlohmann::json;
+    bool hasUndispatchedPumpItem() const;
+    PumpValue popPumpItem();
+    bool isValidPumpItem(const PumpValue &value) const;
+    tdlua::RouteKind dispatchPumpItem(PumpValue &value);
+    void preservePumpItem(PumpValue &value);
+    void drainPump();
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 

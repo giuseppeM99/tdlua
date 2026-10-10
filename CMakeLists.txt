@@ -425,6 +425,16 @@ install(FILES
 
 if(TDLUA_BUILD_TESTS)
     enable_testing()
+    add_executable(tdlua_client_pump_test "tests/client_pump_test.cpp")
+    target_include_directories(tdlua_client_pump_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_client_pump_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_client_pump_test PRIVATE cxx_std_11)
+    target_compile_options(tdlua_client_pump_test PRIVATE -Wall -Wextra -Wpedantic)
+    tdlua_enable_sanitizers(tdlua_client_pump_test)
+    add_test(NAME tdlua_client_pump COMMAND tdlua_client_pump_test)
+
     add_executable(tdlua_userdata_allocator_test experiments/threading/lua_userdata/allocator_probe.cpp)
     target_include_directories(tdlua_userdata_allocator_test PRIVATE ${LUA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(tdlua_userdata_allocator_test PRIVATE ${LUA_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
