@@ -34,6 +34,7 @@ private:
 
     std::int32_t client_id;
     std::deque<QueuedUpdate> updates;
+    std::uint64_t buffer_revision_ = 0;
     std::string dbpath;
     bool _ready;
     ClientState state;
@@ -54,7 +55,7 @@ public:
     Transport transport();
     // Test injection is below the normal Lua binding and shared router.
 #ifdef TDLUA_TESTING
-    void injectTransport(Transport transport) { injected_transport_ = transport; }
+    void injectTransport(Transport transport);
 #endif
     nlohmann::json receiveBackend(double timeout);
 
@@ -75,9 +76,10 @@ public:
 
     void push(const nlohmann::json &update, bool dispatched = false);
 
-    void restoreReceived(const nlohmann::json &value) { updates.emplace_front(value, true, true); }
+    void restoreReceived(const nlohmann::json &value) { updates.emplace_front(value, true, true); ++buffer_revision_; }
 
     bool empty() const;
+    std::uint64_t bufferRevision() const noexcept { return buffer_revision_; }
 
 
     void saveUpdatesBuffer();

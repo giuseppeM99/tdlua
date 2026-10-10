@@ -63,9 +63,9 @@ public:
 
     void detachAfterDrain() { router_.detachAfterDrain(); }
 
-    void detachTransport()
+    void detachTransport(const std::string &message = "tdlua: client closed")
     {
-        router_.detachTransport();
+        router_.detachTransport(message);
     }
 
 private:

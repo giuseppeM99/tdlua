@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include "tdlua/backend/json/runtime.h"
 
 static TDLua * getTD(lua_State *L)
 {
@@ -21,9 +22,14 @@ static TDLua * getTD(lua_State *L)
 
 static void *createTD(lua_State *L)
 {
-    auto *client = new TDLua(L);
+    return new TDLua(L);
+}
+
+static void initializeTD(tdlua_binding::ClientHandle handle, lua_State *L)
+{
+    auto *client = static_cast<TDLua *>(handle);
     client->dispatcher().attachStorage(L, -1);
-    return client;
+    tdlua_json_retain_vm(L, -1);
 }
 
 static bool json_push_handler(tdlua_binding::ClientHandle client,
@@ -233,7 +239,8 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
     const auto wait_policy = tdlua::makeResponseWaitPolicy(
         take_queued_response, is_valid_response, dispatch_response,
         response_id, buffer_response, remaining_timeout,
-        tdlua::QueueCheckOrder::BeforeTimeout);
+        tdlua::QueueCheckOrder::BeforeTimeout,
+        [td]() { return td->bufferRevision(); });
     if (tdlua::waitResponse(td->transport(), id, response, wait_policy)) {
         lua_pushjson(L, response);
         return 1;
@@ -606,6 +613,7 @@ static int tdclient_setlogverbosity(lua_State *L)
 
 static const tdlua_binding::ClientOperations json_operations = {
     createTD,
+    initializeTD,
     tdclient_receive,
     tdclient_send,
     tdclient_execute,

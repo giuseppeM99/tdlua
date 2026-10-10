@@ -5,6 +5,8 @@
 
 #include "tdlua/backend/native/codec.h"
 #include "tdlua/lua_compat.h"
+#include "tdlua/common/receiver.h"
+#include "tdlua/common/failure_cleanup.h"
 
 #include <td/telegram/Client.h>
 
@@ -33,20 +35,37 @@ class NativeRuntime final {
 public:
     static NativeRuntime &instance();
 
-    td::ClientManager::ClientId create_client();
+    using Engine = tdlua::receiver::Runtime<NativeResponse>;
+    using Box = Engine::Box;
+    std::uint64_t attachVm();
+    void detachVm(std::uint64_t owner);
+    td::ClientManager::ClientId create_client(std::uint64_t owner);
     void send(td::ClientManager::ClientId client_id,
               td::ClientManager::RequestId request_id,
               td::td_api::object_ptr<td::td_api::Function> request);
     NativeResponse receive(td::ClientManager::ClientId client_id, double timeout);
     td::td_api::object_ptr<td::td_api::Object> execute(
         td::td_api::object_ptr<td::td_api::Function> request);
-    void forget(td::ClientManager::ClientId client_id);
+    void forget(td::ClientManager::ClientId client_id, bool timed_out = false);
+    tdlua::receiver::RuntimeStats stats() const { return engine_.stats(); }
+    tdlua::receiver::FailureCleanup::Stats cleanupStats() const { return lifecycle_->stats(); }
+#ifdef TDLUA_TESTING
+    bool waitForNoOwners() { return engine_.waitForNoOwners(std::chrono::seconds(3)); }
+    void replaceWithFake(td::ClientManager::ClientId client_id);
+    int concurrentOfflineSend();
+#endif
 
 private:
     NativeRuntime();
 
-    td::ClientManager manager_;
-    std::mutex receive_mutex_;
-    std::map<td::ClientManager::ClientId, std::queue<NativeResponse> > pending_;
-    std::set<td::ClientManager::ClientId> active_clients_;
+    std::shared_ptr<td::ClientManager> manager_;
+    std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle_;
+    std::shared_ptr<tdlua::receiver::Source<NativeResponse>> source_;
+    Engine engine_;
+    std::mutex mutex_;
+    std::map<int, std::shared_ptr<Box>> clients_;
 };
+
+void tdlua_native_initialize_vm(lua_State *L);
+void tdlua_native_retain_vm(lua_State *L, int client);
+std::uint64_t tdlua_native_vm_owner(lua_State *L);

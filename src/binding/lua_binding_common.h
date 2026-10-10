@@ -6,6 +6,7 @@
 
 #include "tdlua/lua_compat.h"
 #include "tdlua/common/request_router.h"
+#include "tdlua/common/lua_protected.h"
 
 #include <cctype>
 #include <cstddef>
@@ -21,6 +22,8 @@ int protected_call(lua_State *L, Function &&function)
 {
     try {
         return std::forward<Function>(function)();
+    } catch (const TDLuaLuaError &) {
+        // A protected Lua operation already left its original error on top.
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
     } catch (...) {
@@ -36,6 +39,7 @@ using ClientFactory = ClientHandle (*)(lua_State *);
 
 struct ClientOperations final {
     ClientFactory factory;
+    void (*initialize)(ClientHandle, lua_State *);
     lua_CFunction receive;
     lua_CFunction send;
     lua_CFunction execute;
@@ -120,10 +124,14 @@ inline ClientHandle get_client(lua_State *L)
 }
 
 template <std::size_t MethodCount>
-int new_client(lua_State *L, ClientFactory factory, lua_CFunction index,
+int new_client(lua_State *L, ClientFactory factory,
+               void (*initialize)(ClientHandle, lua_State *), lua_CFunction index,
                lua_CFunction newindex, lua_CFunction unload,
                const luaL_Reg (&methods)[MethodCount])
 {
+    if (!lua_checkstack(L, 32)) throw std::bad_alloc();
+    // Cache the stock 5.1/LuaJIT main-thread identity before C++ construction.
+    tdlua_lua_main_thread(L);
     luaL_newmetatable(L, "tdclient");
     lua_createtable(L, 0, static_cast<int>(MethodCount - 1));
     luaL_setfuncs(L, methods, 0);
@@ -141,8 +149,13 @@ int new_client(lua_State *L, ClientFactory factory, lua_CFunction index,
     lua_setfield(L, -2, "__gc");
     ClientHandle *client = static_cast<ClientHandle *>(
         lua_newuserdata(L, sizeof(ClientHandle)));
+    *client = nullptr;
     *client = factory(L);
-    luaL_setmetatable(L, "tdclient");
+    // Both values already exist and stack space is reserved. These operations
+    // do not allocate; the anchor was registered for GC before this client.
+    lua_pushvalue(L, -2);
+    lua_setmetatable(L, -2);
+    initialize(*client, L);
     return 1;
 }
 

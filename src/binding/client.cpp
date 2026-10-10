@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "binding/lua_binding.h"
+#ifdef TDLUA_JSON_BACKEND
+#include "tdlua/backend/json/runtime.h"
+#elif defined(TDLUA_NATIVE_BACKEND)
+#include "tdlua/backend/native/runtime.h"
+#endif
 
 namespace {
 
@@ -245,7 +250,7 @@ static int tdclient_new(lua_State *L)
     return tdlua_binding::protected_call(L, [&]() -> int {
         const auto &ops = operations();
         return tdlua_binding::new_client(
-            L, ops.factory, tdclient_index, tdclient_newindex, tdclient_unload,
+            L, ops.factory, ops.initialize, tdclient_index, tdclient_newindex, tdclient_unload,
             methods);
     });
 }
@@ -275,6 +280,11 @@ extern "C" {
 LUALIB_API int luaopen_tdlua(lua_State *L)
 {
     const int initialized = tdlua_binding::protected_call(L, [&]() -> int {
+#ifdef TDLUA_JSON_BACKEND
+        tdlua_json_initialize_vm(L);
+#elif defined(TDLUA_NATIVE_BACKEND)
+        tdlua_native_initialize_vm(L);
+#endif
         tdlua::initializeManagedContinuations(L);
         return 0;
     });

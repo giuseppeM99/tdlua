@@ -23,9 +23,14 @@ static NativeTDLua *getTD(lua_State *L)
 
 static void *createNativeTDLua(lua_State *L)
 {
-    auto *client = new NativeTDLua(L);
+    return new NativeTDLua(L);
+}
+
+static void initializeNativeTDLua(tdlua_binding::ClientHandle handle, lua_State *L)
+{
+    auto *client = static_cast<NativeTDLua *>(handle);
     client->dispatcher().attachStorage(L, -1);
-    return client;
+    tdlua_native_retain_vm(L, -1);
 }
 
 static bool native_push_handler(tdlua_binding::ClientHandle client,
@@ -344,7 +349,8 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
             response_id,
             buffer_response,
             remaining_timeout,
-            tdlua::QueueCheckOrder::AfterTimeout);
+            tdlua::QueueCheckOrder::AfterTimeout,
+            [td]() { return td->bufferRevision(); });
         if (tdlua::waitResponse(td->transport(), id, response, wait_policy))
             return return_response(L, td, response);
         return 0;
@@ -728,6 +734,7 @@ static int tdclient_setlogverbosity(lua_State *L)
 
 static const tdlua_binding::ClientOperations native_operations = {
     createNativeTDLua,
+    initializeNativeTDLua,
     tdclient_receive,
     tdclient_send,
     tdclient_execute,

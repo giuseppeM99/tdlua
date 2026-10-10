@@ -1,6 +1,7 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
+#include "tdlua/common/lua_protected.h"
 
 #include "tdlua/lua_compat.h"
 #include "tdlua/common/managed_continuation.h"
@@ -1838,18 +1839,25 @@ public:
     // ----- CoreAnchor lifetime -----
 
     explicit RequestRouter(lua_State *L)
-        : core_(new SchedulerCore(L)), lua_owner_(tdlua_lua_main_thread(L))
+        : lua_owner_(nullptr)
     {
-        if (luaL_newmetatable(L, "tdlua.core")) {
+        protectedLua(L, [](lua_State *state, void *context) {
+            static_cast<RequestRouter *>(context)->lua_owner_ = tdlua_lua_main_thread(state);
+        }, this);
+        core_.reset(new SchedulerCore(L));
+        protectedLua(L, [](lua_State *L, void *context) {
+            auto *router = static_cast<RequestRouter *>(context);
+            // An earlier Lua OOM can leave the registry metatable incomplete.
+            luaL_newmetatable(L, "tdlua.core");
             lua_pushcfunction(L, coreAnchorGc); lua_setfield(L, -2, "__gc");
-        }
-        lua_pop(L, 1);
-        new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{core_};
-        luaL_setmetatable(L, "tdlua.core");
-        lua_newtable(L); lua_setuservalue(L, -2);
-        pushCoreAnchors(L);
-        lua_pushvalue(L, -2); lua_rawsetp(L, -2, core_.get()); lua_pop(L, 1);
-        anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
+            lua_pop(L, 1);
+            new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{router->core_};
+            luaL_setmetatable(L, "tdlua.core");
+            lua_newtable(L); lua_setuservalue(L, -2);
+            pushCoreAnchors(L);
+            lua_pushvalue(L, -2); lua_rawsetp(L, -2, router->core_.get()); lua_pop(L, 1);
+            router->anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
+        }, this);
     }
 
     ~RequestRouter()

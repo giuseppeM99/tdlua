@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "tdlua/backend/json/client.h"
+#include "tdlua/backend/json/runtime.h"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -78,116 +79,27 @@ const TDLua::Transport::Operations json_transport_operations = {
     json_transport_closed
 };
 
-class JsonRuntime {
-public:
-    static JsonRuntime &instance()
-    {
-        static JsonRuntime runtime;
-        return runtime;
-    }
-
-    std::int32_t createClient()
-    {
-        const std::int32_t client_id = td_create_client_id();
-        std::lock_guard<std::mutex> lock(receive_mutex);
-        active_clients.insert(client_id);
-        return client_id;
-    }
-
-    void send(const std::int32_t client_id, const json &request)
-    {
-        const std::string serialized = request.dump();
-        td_send(client_id, serialized.c_str());
-    }
-
-    json execute(const json &request)
-    {
-        const std::string serialized = request.dump();
-        return parse(td_execute(serialized.c_str()), "execute");
-    }
-
-    json receive(const std::int32_t client_id, const double timeout)
-    {
-        std::lock_guard<std::mutex> lock(receive_mutex);
-        if (active_clients.find(client_id) == active_clients.end()) {
-            return nullptr;
-        }
-        const std::map<std::int32_t, std::queue<json> >::iterator queued =
-            pending.find(client_id);
-        if (queued != pending.end() && !queued->second.empty()) {
-            json result = queued->second.front();
-            queued->second.pop();
-            return result;
-        }
-
-        const auto started = std::chrono::steady_clock::now();
-        bool attempted = false;
-        while (true) {
-            const std::chrono::duration<double> elapsed =
-                std::chrono::steady_clock::now() - started;
-            const double remaining = timeout - elapsed.count();
-            if ((attempted || timeout < 0.0) && remaining <= 0.0) {
-                return nullptr;
-            }
-
-            attempted = true;
-            json result = parse(td_receive(std::max(0.0, remaining)), "receive");
-            if (!result.is_object()) {
-                return nullptr;
-            }
-
-            const auto client_field = result.find("@client_id");
-            if (client_field == result.end() || !client_field->is_number_integer()) {
-                return result;
-            }
-
-            const std::int32_t result_client_id = client_field->get<std::int32_t>();
-            result.erase("@client_id");
-            if (result_client_id == client_id) {
-                return result;
-            }
-            if (active_clients.find(result_client_id) != active_clients.end()) {
-                pending[result_client_id].push(result);
-            }
-        }
-    }
-
-    void forget(const std::int32_t client_id)
-    {
-        std::lock_guard<std::mutex> lock(receive_mutex);
-        active_clients.erase(client_id);
-        pending.erase(client_id);
-    }
-
-private:
-    static json parse(const char *serialized, const char *operation)
-    {
-        if (!serialized) {
-            return nullptr;
-        }
-        try {
-            return json::parse(serialized);
-        } catch (const json::parse_error &error) {
-            std::cerr << "[TDCLIENT " << operation << "] JSON parse error "
-                      << error.what() << "\n";
-            return nullptr;
-        }
-    }
-
-    std::mutex receive_mutex;
-    std::map<std::int32_t, std::queue<json> > pending;
-    std::set<std::int32_t> active_clients;
-};
 
 }
 
 
 TDLua::TDLua(lua_State *lua)
-    : client_id(JsonRuntime::instance().createClient()),
+    : client_id(0),
       updates(), dbpath(), _ready(false), state(ClientState::Running),
-      dispatcher_(lua)
+      dispatcher_(
+#ifdef TDLUA_TESTING
+          (tdlua_json_test_creation_stage(5), lua)
+#else
+          lua
+#endif
+      )
 {
     dispatcher_.setPump(this, json_transport_pump);
+#ifdef TDLUA_TESTING
+    tdlua_json_test_creation_stage(6);
+#endif
+    // All other members and pump setup are complete before reserving an ID.
+    client_id = JsonRuntime::instance().createClient(tdlua_json_vm_owner(lua));
 }
 
 TDLua::~TDLua()
@@ -205,6 +117,7 @@ TDLua::QueuedUpdate TDLua::pop()
 {
     QueuedUpdate res = updates.front();
     updates.pop_front();
+    ++buffer_revision_;
     return res;
 }
 
@@ -273,7 +186,13 @@ bool TDLua::pump(const double timeout)
 
 nlohmann::json TDLua::receiveBackend(const double timeout)
 {
-    return JsonRuntime::instance().receive(client_id, timeout);
+    try { return JsonRuntime::instance().receive(client_id, timeout); }
+    catch (...) {
+        // Fail pending work once on the Lua owner after the published prefix.
+        dispatcher_.detachTransport("tdlua: receiver failed");
+        dispatcher_.drain();
+        throw;
+    }
 }
 
 bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
@@ -295,6 +214,7 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
         }
         response = std::move(*it);
         updates.erase(it);
+        ++buffer_revision_;
         return true;
     }
     return false;
@@ -302,52 +222,61 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
 
 void TDLua::close(bool drain)
 {
-    // Phase one detaches the scheduler before backend shutdown can reenter the
-    // client. The optional drain is phase two and is safe only at the binding
-    // boundary that called close().
-    if (injected_transport_.operations) {
-        state = ClientState::Closed;
-        dispatcher_.detachTransport();
-        injected_transport_.close();
-        if (drain) dispatcher_.clear();
-        JsonRuntime::instance().forget(client_id);
-        state = ClientState::Closed;
-        return;
-    }
-    if (state == ClientState::Closed) {
-        dispatcher_.detachTransport();
-        if (drain) dispatcher_.clear();
-        JsonRuntime::instance().forget(client_id);
-        state = ClientState::Closed;
-        return;
-    }
-
-    if (state == ClientState::Running) {
-        nlohmann::json close_request = {{"@type", "close"}};
-        const auto id = dispatcher_.raw(close_request);
-        state = ClientState::Closing;
-        dispatcher_.detachTransport();
-        tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
-    }
-
-    const auto started = std::chrono::steady_clock::now();
-    while (state != ClientState::Closed) {
-        const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started).count();
-        const double remaining = 5.0 - elapsed;
-        if (remaining <= 0.0) {
+    try {
+        // Phase one detaches the scheduler before backend shutdown can reenter the
+        // client. The optional drain is phase two and is safe only at the binding
+        // boundary that called close().
+        if (injected_transport_.operations) {
             state = ClientState::Closed;
-            break;
+            dispatcher_.detachTransport();
+            injected_transport_.close();
+            if (drain) dispatcher_.clear();
+            JsonRuntime::instance().forget(client_id);
+            state = ClientState::Closed;
+            return;
         }
-        nlohmann::json update = receive(remaining);
-        if (update.is_object()) {
-            checkAuthState(update);
+        if (state == ClientState::Closed) {
+            dispatcher_.detachTransport();
+            if (drain) dispatcher_.clear();
+            JsonRuntime::instance().forget(client_id);
+            state = ClientState::Closed;
+            return;
         }
+
+        if (state == ClientState::Running) {
+            nlohmann::json close_request = {{"@type", "close"}};
+            const auto id = dispatcher_.raw(close_request);
+            state = ClientState::Closing;
+            dispatcher_.detachTransport();
+            tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
+        }
+
+        bool timed_out = false;
+        const auto started = std::chrono::steady_clock::now();
+        while (state != ClientState::Closed) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            const double remaining = 5.0 - elapsed;
+            if (remaining <= 0.0) {
+                timed_out = true;
+                state = ClientState::Closed;
+                break;
+            }
+            nlohmann::json update = receive(remaining);
+            if (update.is_object()) {
+                checkAuthState(update);
+            }
+        }
+        state = ClientState::Closed;
+        dispatcher_.detachTransport();
+        if (drain) dispatcher_.clear();
+        JsonRuntime::instance().forget(client_id, timed_out);
+    } catch (...) {
+        state = ClientState::Closed;
+        dispatcher_.detachTransport();
+        JsonRuntime::instance().forget(client_id);
+        throw;
     }
-    state = ClientState::Closed;
-    dispatcher_.detachTransport();
-    if (drain) dispatcher_.clear();
-    JsonRuntime::instance().forget(client_id);
 }
 
 bool TDLua::closed() const
@@ -363,6 +292,7 @@ LuaDispatcher &TDLua::dispatcher()
 void TDLua::push(const nlohmann::json &update, const bool dispatched)
 {
     updates.push_back(QueuedUpdate(update, dispatched));
+    ++buffer_revision_;
 }
 
 bool TDLua::empty() const
@@ -380,6 +310,7 @@ void TDLua::saveUpdatesBuffer()
         if (it->delivery_pending) { ++it; continue; }
         jupdates.push_back(it->value);
         it = updates.erase(it);
+        ++buffer_revision_;
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();
@@ -412,6 +343,7 @@ void TDLua::loadUpdatesBuffer()
                         dispatcher_.observeRequestId(request_id);
                     }
                     updates.push_back(QueuedUpdate(elem, false));
+                    ++buffer_revision_;
                 }
             }
         } catch (nlohmann::json::parse_error &e){
@@ -429,7 +361,7 @@ void TDLua::emptyUpdatesBuffer(bool preserve_received)
 {
     for (auto it = updates.begin(); it != updates.end();) {
         if (preserve_received && it->delivery_pending) ++it;
-        else it = updates.erase(it);
+        else { it = updates.erase(it); ++buffer_revision_; }
     }
 }
 
@@ -464,3 +396,14 @@ bool TDLua::ready() const
 {
     return _ready;
 }
+
+#ifdef TDLUA_TESTING
+void TDLua::injectTransport(Transport transport) {
+    if (!injected_transport_.operations) {
+        // The fake replaces an otherwise unused real client. Preserve teardown
+        // of that real identity instead of leaving a permanent tombstone.
+        JsonRuntime::instance().replaceWithFake(client_id);
+    }
+    injected_transport_ = transport;
+}
+#endif

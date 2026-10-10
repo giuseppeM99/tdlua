@@ -27,7 +27,7 @@ public:
     using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
     Transport transport();
 #ifdef TDLUA_TESTING
-    void injectTransport(Transport transport) { injected_transport_ = transport; }
+    void injectTransport(Transport transport);
 #endif
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
@@ -48,9 +48,11 @@ public:
         response.dispatched = true;
         response.delivery_pending = true;
         updates_.push_front(std::move(response));
+        ++buffer_revision_;
     }
 
     bool empty() const;
+    std::uint64_t bufferRevision() const noexcept { return buffer_revision_; }
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
     std::uint64_t nextRequestId();
@@ -66,6 +68,7 @@ private:
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;
+    std::uint64_t buffer_revision_ = 0;
     std::string dbpath_;
     bool ready_;
     bool closing_;
