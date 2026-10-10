@@ -84,11 +84,17 @@ public:
 
     void push(const nlohmann::json &update, bool dispatched = false);
 
-    void restoreReceived(const nlohmann::json &value) { updates.emplace_front(value, true, true); ++buffer_revision_; }
+    void restoreReceived(const nlohmann::json &value)
+    {
+        updates.emplace_front(value, true, true);
+        ++buffer_revision_;
+    }
 
     bool empty() const;
-    std::uint64_t bufferRevision() const noexcept { return buffer_revision_; }
-
+    std::uint64_t bufferRevision() const noexcept
+    {
+        return buffer_revision_;
+    }
 
     void saveUpdatesBuffer();
 

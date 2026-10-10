@@ -87,9 +87,8 @@ const NativeTDLua::Transport::Operations native_transport_operations = {
 }
 
 NativeTDLua::NativeTDLua(lua_State *lua)
-    : lua_(tdlua_lua_main_thread(lua)), client_id_((tdlua_native_vm_owner(lua), 0)),
-      updates_(), dbpath_(), ready_(false), closing_(false), closed_(false),
-      dispatcher_(lua)
+    : lua_(tdlua_lua_main_thread(lua)), client_id_((tdlua_native_vm_owner(lua), 0)), updates_(),
+      dbpath_(), ready_(false), closing_(false), closed_(false), dispatcher_(lua)
 {
     client_id_ = NativeRuntime::instance().create_client(tdlua_native_vm_owner(lua));
     dispatcher_.setPump(this, native_transport_pump);
@@ -139,9 +138,12 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
     if (closed_) {
         return NativeResponse();
     }
-    try { return NativeRuntime::instance().receive(client_id_, timeout); }
-    catch (...) {
-        dispatcher_.detachTransport("tdlua: receiver failed"); dispatcher_.drain(); throw;
+    try {
+        return NativeRuntime::instance().receive(client_id_, timeout);
+    } catch (...) {
+        dispatcher_.detachTransport("tdlua: receiver failed");
+        dispatcher_.drain();
+        throw;
     }
 }
 
@@ -329,7 +331,7 @@ void NativeTDLua::close(bool drain)
 void NativeTDLua::closeInternal(bool drain, bool persist_updates)
 {
     try {
-        bool timed_out=false;
+        bool timed_out = false;
         // Phase one detaches the scheduler before backend shutdown can reenter the
         // client. The optional drain is phase two and is safe only at the binding
         // boundary that called close().
@@ -338,13 +340,15 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
             injected_transport_.close();
             closed_ = true;
             closing_ = false;
-            if (drain) dispatcher_.clear();
+            if (drain)
+                dispatcher_.clear();
             NativeRuntime::instance().forget(client_id_);
             return;
         }
         if (closed_) {
             dispatcher_.detachTransport();
-            if (drain) dispatcher_.clear();
+            if (drain)
+                dispatcher_.clear();
             NativeRuntime::instance().forget(client_id_);
             return;
         }
@@ -356,11 +360,11 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
             transport().send(close_request_id, td::td_api::make_object<td::td_api::close>());
         }
         while (!closed_) {
-            const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started).count();
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double remaining = 5.0 - elapsed;
             if (remaining <= 0.0) {
-                timed_out=true;
+                timed_out = true;
                 closed_ = true;
                 closing_ = false;
                 break;
@@ -385,11 +389,15 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
         closed_ = true;
         closing_ = false;
         dispatcher_.detachTransport();
-        if (drain) dispatcher_.clear();
+        if (drain)
+            dispatcher_.clear();
         NativeRuntime::instance().forget(client_id_, timed_out);
     } catch (...) {
-        closed_=true; closing_=false; dispatcher_.detachTransport();
-        NativeRuntime::instance().forget(client_id_); throw;
+        closed_ = true;
+        closing_ = false;
+        dispatcher_.detachTransport();
+        NativeRuntime::instance().forget(client_id_);
+        throw;
     }
 }
 
@@ -481,13 +489,18 @@ void NativeTDLua::emptyUpdatesBuffer(bool preserve_received)
 {
     for (auto it = updates_.begin(); it != updates_.end();) {
         if (preserve_received && it->delivery_pending) ++it;
-        else { it = updates_.erase(it); ++buffer_revision_; }
+        else {
+            it = updates_.erase(it);
+            ++buffer_revision_;
+        }
     }
 }
 
 #ifdef TDLUA_TESTING
-void NativeTDLua::injectTransport(Transport transport) {
-    if (!injected_transport_.operations) NativeRuntime::instance().replaceWithFake(client_id_);
-    injected_transport_=transport;
+void NativeTDLua::injectTransport(Transport transport)
+{
+    if (!injected_transport_.operations)
+        NativeRuntime::instance().replaceWithFake(client_id_);
+    injected_transport_ = transport;
 }
 #endif

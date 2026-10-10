@@ -17,7 +17,9 @@ struct Payload {
     bool dispatched = false;
 
     Payload() = default;
-    explicit Payload(int value) : value(value), valid(true) {}
+    explicit Payload(int value) : value(value), valid(true)
+    {
+    }
     Payload(const Payload &) = delete;
     Payload &operator=(const Payload &) = delete;
     Payload(Payload &&) = default;
@@ -36,7 +38,10 @@ struct FakePumpClient {
     int transport_reads = 0;
     double last_timeout = -1.0;
 
-    bool closed() const { return is_closed; }
+    bool closed() const
+    {
+        return is_closed;
+    }
     bool hasUndispatchedPumpItem() const
     {
         return !local.empty() && !local.front().dispatched;
@@ -51,15 +56,20 @@ struct FakePumpClient {
     {
         ++transport_reads;
         last_timeout = timeout;
-        if (source.empty()) return PumpValue();
+        if (source.empty())
+            return PumpValue();
         PumpValue value(std::move(source.front()));
         source.pop_front();
         return value;
     }
-    bool isValidPumpItem(const PumpValue &value) const { return value.valid; }
+    bool isValidPumpItem(const PumpValue &value) const
+    {
+        return value.valid;
+    }
     tdlua::RouteKind dispatchPumpItem(PumpValue &value)
     {
-        if (throw_dispatch) throw std::runtime_error("injected dispatch failure");
+        if (throw_dispatch)
+            throw std::runtime_error("injected dispatch failure");
         dispatched.push_back(value.value);
         value.dispatched = true;
         return tdlua::RouteKind::Raw;
@@ -68,15 +78,19 @@ struct FakePumpClient {
     {
         local.push_back(std::move(value));
     }
-    void drainPump() { ++drains; }
+    void drainPump()
+    {
+        ++drains;
+    }
 };
 
 void require(bool condition, const char *message)
 {
-    if (!condition) throw std::runtime_error(message);
+    if (!condition)
+        throw std::runtime_error(message);
 }
 
-}
+} // namespace
 
 int main()
 {
@@ -99,8 +113,7 @@ int main()
         require(client.local.size() == 2 && client.local.front().value == 1 &&
                     client.local.back().value == 2,
                 "dispatched local item was consumed instead of skipped");
-        require(client.transport_reads == 1,
-                "pump did not read exactly once from the transport");
+        require(client.transport_reads == 1, "pump did not read exactly once from the transport");
         require(client.last_timeout == 0.5, "timeout was not forwarded");
 
         require(!tdlua::pumpClient(client, 0.0), "empty pump returned true");
@@ -114,10 +127,12 @@ int main()
         throwing.source.emplace_back(9);
         throwing.throw_dispatch = true;
         bool threw = false;
-        try { tdlua::pumpClient(throwing, 0.0); }
-        catch (const std::runtime_error &) { threw = true; }
-        require(threw && throwing.drains == 0,
-                "dispatch exception was swallowed or drained");
+        try {
+            tdlua::pumpClient(throwing, 0.0);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        require(threw && throwing.drains == 0, "dispatch exception was swallowed or drained");
 
         std::cout << "client pump ordering and move-only payload: PASS\n";
         return 0;

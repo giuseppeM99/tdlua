@@ -9,8 +9,8 @@
 
 #include "tdlua/lua_compat.h"
 
-#include <nlohmann/json.hpp>
 #include "tdlua/common/request_router.h"
+#include <nlohmann/json.hpp>
 
 class LuaDispatcher {
 public:
@@ -69,5 +69,5 @@ public:
     }
 
 private:
-    tdlua::RequestRouter router_;
+  tdlua::RequestRouter router_;
 };

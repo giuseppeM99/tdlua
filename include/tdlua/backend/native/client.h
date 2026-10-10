@@ -60,7 +60,10 @@ public:
     }
 
     bool empty() const;
-    std::uint64_t bufferRevision() const noexcept { return buffer_revision_; }
+    std::uint64_t bufferRevision() const noexcept
+    {
+        return buffer_revision_;
+    }
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
     std::uint64_t nextRequestId();

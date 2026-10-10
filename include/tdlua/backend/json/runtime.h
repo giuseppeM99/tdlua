@@ -1,12 +1,12 @@
 #pragma once
-#include "tdlua/common/receiver.h"
 #include "tdlua/common/failure_cleanup.h"
+#include "tdlua/common/receiver.h"
 #include <nlohmann/json.hpp>
 
 struct lua_State;
 
 class JsonRuntime {
-public:
+  public:
     using Engine = tdlua::receiver::Runtime<nlohmann::json>;
     using Box = Engine::Box;
     static JsonRuntime &instance();
@@ -18,15 +18,27 @@ public:
     nlohmann::json receive(std::int32_t client, double timeout);
     void forget(std::int32_t client, bool timed_out = false);
 #ifdef TDLUA_TESTING
-    bool waitForNoOwners() { return engine_.waitForNoOwners(std::chrono::seconds(3)); }
+    bool waitForNoOwners()
+    {
+        return engine_.waitForNoOwners(std::chrono::seconds(3));
+    }
     void replaceWithFake(std::int32_t client);
-    std::size_t testClientRegistrySize() {
-        std::lock_guard<std::mutex> lock(mutex_); return clients_.size();
+    std::size_t testClientRegistrySize()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return clients_.size();
     }
 #endif
-    tdlua::receiver::FailureCleanup::Stats cleanupStats() const { return lifecycle_->stats(); }
-    tdlua::receiver::RuntimeStats stats() const { return engine_.stats(); }
-private:
+    tdlua::receiver::FailureCleanup::Stats cleanupStats() const
+    {
+        return lifecycle_->stats();
+    }
+    tdlua::receiver::RuntimeStats stats() const
+    {
+        return engine_.stats();
+    }
+
+  private:
     JsonRuntime();
     std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle_;
     std::shared_ptr<tdlua::receiver::Source<nlohmann::json>> source_;

@@ -4,17 +4,17 @@
 #ifndef TDLUA_LUA_BINDING_COMMON_H
 #define TDLUA_LUA_BINDING_COMMON_H
 
-#include "tdlua/lua_compat.h"
-#include "tdlua/common/request_router.h"
 #include "tdlua/common/lua_protected.h"
+#include "tdlua/common/request_router.h"
+#include "tdlua/lua_compat.h"
 
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <new>
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -61,8 +61,10 @@ inline int vmTokenGc(lua_State *L)
     VmToken *token = static_cast<VmToken *>(lua_touserdata(L, 1));
     if (token->live) {
         token->live = false;
-        try { token->detach(token->owner); }
-        catch (...) { /* VM finalization remains best-effort. */ }
+        try {
+            token->detach(token->owner);
+        } catch (...) { /* VM finalization remains best-effort. */
+        }
     }
     token->~VmToken();
     return 0;
@@ -76,8 +78,7 @@ inline VmToken *getVmToken(lua_State *L, const char *metatable)
     return token;
 }
 
-inline void initializeVm(lua_State *L, const char *metatable,
-                         VmAttach attach, VmDetach detach)
+inline void initializeVm(lua_State *L, const char *metatable, VmAttach attach, VmDetach detach)
 {
     if (VmToken *token = getVmToken(L, metatable)) {
         if (!token->live || token->thread != std::this_thread::get_id()) {
@@ -102,8 +103,7 @@ inline void initializeVm(lua_State *L, const char *metatable,
     token->live = true;
 }
 
-inline std::uint64_t vmOwner(lua_State *L, const char *metatable,
-                             VmAttach attach, VmDetach detach)
+inline std::uint64_t vmOwner(lua_State *L, const char *metatable, VmAttach attach, VmDetach detach)
 {
     initializeVm(L, metatable, attach, detach);
     return getVmToken(L, metatable)->owner;
@@ -206,15 +206,16 @@ inline ClientHandle get_client(lua_State *L)
 }
 
 template <std::size_t MethodCount>
-int new_client(lua_State *L, ClientFactory factory,
-               void (*initialize)(ClientHandle, lua_State *), lua_CFunction index,
-               lua_CFunction newindex, lua_CFunction unload,
+int new_client(lua_State *L, ClientFactory factory, void (*initialize)(ClientHandle, lua_State *),
+               lua_CFunction index, lua_CFunction newindex, lua_CFunction unload,
                const luaL_Reg (&methods)[MethodCount])
 {
-    if (!lua_checkstack(L, 32)) throw std::bad_alloc();
+    if (!lua_checkstack(L, 32))
+        throw std::bad_alloc();
     // Cache the stock 5.1/LuaJIT main-thread identity before C++ construction.
     tdlua_lua_main_thread(L);
     luaL_newmetatable(L, "tdclient");
+    const int client_metatable = lua_gettop(L);
     lua_createtable(L, 0, static_cast<int>(MethodCount - 1));
     luaL_setfuncs(L, methods, 0);
     for (const char *name : {"await", "execute"}) {
@@ -235,7 +236,7 @@ int new_client(lua_State *L, ClientFactory factory,
     *client = factory(L);
     // Both values already exist and stack space is reserved. These operations
     // do not allocate; the anchor was registered for GC before this client.
-    lua_pushvalue(L, -2);
+    lua_pushvalue(L, client_metatable);
     lua_setmetatable(L, -2);
     initialize(*client, L);
     return 1;

@@ -5,13 +5,13 @@
 #include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/client_pump.h"
 #include <chrono>
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <queue>
 #include <set>
-#include <utility>
 #include <td/telegram/td_json_client.h>
+#include <utility>
 
 namespace {
 
@@ -83,10 +83,8 @@ const TDLua::Transport::Operations json_transport_operations = {
 
 }
 
-
 TDLua::TDLua(lua_State *lua)
-    : client_id(0),
-      updates(), dbpath(), _ready(false), state(ClientState::Running),
+    : client_id(0), updates(), dbpath(), _ready(false), state(ClientState::Running),
       dispatcher_(
 #ifdef TDLUA_TESTING
           (tdlua_json_test_creation_stage(5), lua)
@@ -198,8 +196,9 @@ void TDLua::drainPump()
 
 nlohmann::json TDLua::receiveBackend(const double timeout)
 {
-    try { return JsonRuntime::instance().receive(client_id, timeout); }
-    catch (...) {
+    try {
+        return JsonRuntime::instance().receive(client_id, timeout);
+    } catch (...) {
         // Fail pending work once on the Lua owner after the published prefix.
         dispatcher_.detachTransport("tdlua: receiver failed");
         dispatcher_.drain();
@@ -242,14 +241,16 @@ void TDLua::close(bool drain)
             state = ClientState::Closed;
             dispatcher_.detachTransport();
             injected_transport_.close();
-            if (drain) dispatcher_.clear();
+            if (drain)
+                dispatcher_.clear();
             JsonRuntime::instance().forget(client_id);
             state = ClientState::Closed;
             return;
         }
         if (state == ClientState::Closed) {
             dispatcher_.detachTransport();
-            if (drain) dispatcher_.clear();
+            if (drain)
+                dispatcher_.clear();
             JsonRuntime::instance().forget(client_id);
             state = ClientState::Closed;
             return;
@@ -266,8 +267,8 @@ void TDLua::close(bool drain)
         bool timed_out = false;
         const auto started = std::chrono::steady_clock::now();
         while (state != ClientState::Closed) {
-            const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started).count();
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double remaining = 5.0 - elapsed;
             if (remaining <= 0.0) {
                 timed_out = true;
@@ -373,7 +374,10 @@ void TDLua::emptyUpdatesBuffer(bool preserve_received)
 {
     for (auto it = updates.begin(); it != updates.end();) {
         if (preserve_received && it->delivery_pending) ++it;
-        else { it = updates.erase(it); ++buffer_revision_; }
+        else {
+            it = updates.erase(it);
+            ++buffer_revision_;
+        }
     }
 }
 
@@ -410,7 +414,8 @@ bool TDLua::ready() const
 }
 
 #ifdef TDLUA_TESTING
-void TDLua::injectTransport(Transport transport) {
+void TDLua::injectTransport(Transport transport)
+{
     if (!injected_transport_.operations) {
         // The fake replaces an otherwise unused real client. Preserve teardown
         // of that real identity instead of leaving a permanent tombstone.

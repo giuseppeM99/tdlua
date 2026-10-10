@@ -1,29 +1,31 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 
-
 #include "binding/lua_binding.h"
 #include "binding/lua_binding_common.h"
 #include "tdlua/backend/json/client.h"
+#include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/lua_json.h"
-#include <td/telegram/td_log.h>
 #include <chrono>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include "tdlua/backend/json/runtime.h"
+#include <td/telegram/td_log.h>
 
 namespace {
 
-std::uint64_t attachJsonVm() { return JsonRuntime::instance().attachVm(); }
+std::uint64_t attachJsonVm()
+{
+    return JsonRuntime::instance().attachVm();
+}
 void detachJsonVm(std::uint64_t owner)
 {
     JsonRuntime::instance().detachVm(owner);
 }
 
-}
+} // namespace
 
 void tdlua_json_initialize_vm(lua_State *L)
 {
@@ -32,8 +34,7 @@ void tdlua_json_initialize_vm(lua_State *L)
 
 std::uint64_t tdlua_json_vm_owner(lua_State *L)
 {
-    return tdlua_binding::vmOwner(L, "tdlua.json.vm", attachJsonVm,
-                                  detachJsonVm);
+    return tdlua_binding::vmOwner(L, "tdlua.json.vm", attachJsonVm, detachJsonVm);
 }
 
 void tdlua_json_retain_vm(lua_State *L, int client)
@@ -263,9 +264,8 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
             std::chrono::steady_clock::now() - started).count();
     };
     const auto wait_policy = tdlua::makeResponseWaitPolicy(
-        take_queued_response, is_valid_response, dispatch_response,
-        response_id, buffer_response, remaining_timeout,
-        tdlua::QueueCheckOrder::BeforeTimeout,
+        take_queued_response, is_valid_response, dispatch_response, response_id, buffer_response,
+        remaining_timeout, tdlua::QueueCheckOrder::BeforeTimeout,
         [td]() { return td->bufferRevision(); });
     if (tdlua::waitResponse(td->transport(), id, response, wait_policy)) {
         lua_pushjson(L, response);
@@ -636,7 +636,6 @@ static int tdclient_setlogverbosity(lua_State *L)
     return 1;
 }
 
-
 static const tdlua_binding::ClientOperations json_operations = {
     createTD,
     initializeTD,
@@ -661,8 +660,7 @@ static const tdlua_binding::ClientOperations json_operations = {
     tdclient_setlogpath,
     tdclient_setlogmaxsize,
     tdclient_setlogverbosity,
-    []() { td_set_log_fatal_error_callback(tdclient_fatalerrorcb); }
-};
+    []() { td_set_log_fatal_error_callback(tdclient_fatalerrorcb); }};
 
 const tdlua_binding::ClientOperations &tdlua_backend_operations()
 {

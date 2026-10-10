@@ -9,8 +9,7 @@ namespace tdlua {
 
 // Client supplies backend payload operations; this helper owns the managed
 // pump ordering and drain behavior.
-template <class Client>
-bool pumpClient(Client &client, double timeout)
+template <class Client> bool pumpClient(Client &client, double timeout)
 {
     if (client.closed()) {
         return false;
@@ -18,8 +17,8 @@ bool pumpClient(Client &client, double timeout)
 
     {
         typename Client::PumpValue value = client.hasUndispatchedPumpItem()
-            ? client.popPumpItem()
-            : client.receivePumpItem(timeout);
+                                               ? client.popPumpItem()
+                                               : client.receivePumpItem(timeout);
         if (!client.isValidPumpItem(value)) {
             client.drainPump();
             return false;

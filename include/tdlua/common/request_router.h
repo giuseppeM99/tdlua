@@ -879,7 +879,8 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         removeRegistration(thread);
         const int status = tdlua_lua_resume(thread, lua_owner_, arguments);
-        if (status == LUA_OK && !task) lua_settop(thread, 0);
+        if (status == LUA_OK && !task)
+            lua_settop(thread, 0);
         const char *message = status != LUA_OK && status != LUA_YIELD
             ? lua_tostring(thread, -1) : nullptr;
         // lua_error delivers the exact dependency error to the waiter.
@@ -1276,7 +1277,8 @@ public:
 #ifdef TDLUA_TESTING
     bool pushSelectedUpdateForTesting(lua_State *L)
     {
-        if (managed_driver_.selected_update == LUA_NOREF) return false;
+        if (managed_driver_.selected_update == LUA_NOREF)
+            return false;
         pushLuaReference(L, managed_driver_.selected_update);
         return true;
     }
@@ -1838,26 +1840,35 @@ public:
 
     // ----- CoreAnchor lifetime -----
 
-    explicit RequestRouter(lua_State *L)
-        : lua_owner_(nullptr)
+    explicit RequestRouter(lua_State *L) : lua_owner_(nullptr)
     {
-        protectedLua(L, [](lua_State *state, void *context) {
-            static_cast<RequestRouter *>(context)->lua_owner_ = tdlua_lua_main_thread(state);
-        }, this);
+        protectedLua(
+            L,
+            [](lua_State *state, void *context) {
+                static_cast<RequestRouter *>(context)->lua_owner_ = tdlua_lua_main_thread(state);
+            },
+            this);
         core_.reset(new SchedulerCore(L));
-        protectedLua(L, [](lua_State *L, void *context) {
-            auto *router = static_cast<RequestRouter *>(context);
-            // An earlier Lua OOM can leave the registry metatable incomplete.
-            luaL_newmetatable(L, "tdlua.core");
-            lua_pushcfunction(L, coreAnchorGc); lua_setfield(L, -2, "__gc");
-            lua_pop(L, 1);
-            new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{router->core_};
-            luaL_setmetatable(L, "tdlua.core");
-            lua_newtable(L); lua_setuservalue(L, -2);
-            pushCoreAnchors(L);
-            lua_pushvalue(L, -2); lua_rawsetp(L, -2, router->core_.get()); lua_pop(L, 1);
-            router->anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
-        }, this);
+        protectedLua(
+            L,
+            [](lua_State *L, void *context) {
+                auto *router = static_cast<RequestRouter *>(context);
+                // An earlier Lua OOM can leave the registry metatable incomplete.
+                luaL_newmetatable(L, "tdlua.core");
+                lua_pushcfunction(L, coreAnchorGc);
+                lua_setfield(L, -2, "__gc");
+                lua_pop(L, 1);
+                new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{router->core_};
+                luaL_setmetatable(L, "tdlua.core");
+                lua_newtable(L);
+                lua_setuservalue(L, -2);
+                pushCoreAnchors(L);
+                lua_pushvalue(L, -2);
+                lua_rawsetp(L, -2, router->core_.get());
+                lua_pop(L, 1);
+                router->anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
+            },
+            this);
     }
 
     ~RequestRouter()
@@ -1964,7 +1975,10 @@ public:
         core->tick();
     }
 
-    void discardSelectedUpdate() { core_->discardSelectedUpdate(); }
+    void discardSelectedUpdate()
+    {
+        core_->discardSelectedUpdate();
+    }
 #ifdef TDLUA_TESTING
     bool pushSelectedUpdateForTesting(lua_State *L)
     {

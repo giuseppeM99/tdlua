@@ -104,7 +104,7 @@ void scenarios(lua_State *L, bool jit_off)
     run(L, "assert(coroutine.status(yielding_co)=='suspended'); "
            "local ok,a,b=coroutine.resume(yielding_co); "
            "assert(ok and a=='after' and b==43 and "
-                  "coroutine.status(yielding_co)=='dead')");
+           "coroutine.status(yielding_co)=='dead')");
 
     // Task results must continue to be collected by finishTask().
     run(L, "return function() return 'task-result', nil, 44 end");

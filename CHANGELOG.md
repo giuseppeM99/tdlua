@@ -58,7 +58,9 @@ without requiring parallel Lua execution.
 
 ### Reliability
 
-- Both transports make an actual nonblocking receive attempt for `receive(0)`.
+- `receive(0)` checks only objects already available in the client and never
+  waits for the TDLib receiver. An update not yet routed may appear on a later
+  call.
 - Raw objects acquired before a scheduler error survive for the next receive,
   marked as dispatched to prevent duplicate callback/event delivery.
 - Poll selection uses one monotonic deadline across managed routing and

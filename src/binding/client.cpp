@@ -249,9 +249,8 @@ static int tdclient_new(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
         const auto &ops = operations();
-        return tdlua_binding::new_client(
-            L, ops.factory, ops.initialize, tdclient_index, tdclient_newindex, tdclient_unload,
-            methods);
+        return tdlua_binding::new_client(L, ops.factory, ops.initialize, tdclient_index,
+                                         tdclient_newindex, tdclient_unload, methods);
     });
 }
 

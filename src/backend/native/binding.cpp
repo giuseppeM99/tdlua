@@ -18,24 +18,25 @@
 
 namespace {
 
-std::uint64_t attachNativeVm() { return NativeRuntime::instance().attachVm(); }
+std::uint64_t attachNativeVm()
+{
+    return NativeRuntime::instance().attachVm();
+}
 void detachNativeVm(std::uint64_t owner)
 {
     NativeRuntime::instance().detachVm(owner);
 }
 
-}
+} // namespace
 
 void tdlua_native_initialize_vm(lua_State *L)
 {
-    tdlua_binding::initializeVm(L, "tdlua.native.vm", attachNativeVm,
-                                detachNativeVm);
+    tdlua_binding::initializeVm(L, "tdlua.native.vm", attachNativeVm, detachNativeVm);
 }
 
 std::uint64_t tdlua_native_vm_owner(lua_State *L)
 {
-    return tdlua_binding::vmOwner(L, "tdlua.native.vm", attachNativeVm,
-                                  detachNativeVm);
+    return tdlua_binding::vmOwner(L, "tdlua.native.vm", attachNativeVm, detachNativeVm);
 }
 
 void tdlua_native_retain_vm(lua_State *L, int client)
@@ -370,13 +371,8 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
                        .count();
         };
         const auto wait_policy = tdlua::makeResponseWaitPolicy(
-            take_queued_response,
-            is_valid_response,
-            dispatch_response,
-            response_id,
-            buffer_response,
-            remaining_timeout,
-            tdlua::QueueCheckOrder::AfterTimeout,
+            take_queued_response, is_valid_response, dispatch_response, response_id,
+            buffer_response, remaining_timeout, tdlua::QueueCheckOrder::AfterTimeout,
             [td]() { return td->bufferRevision(); });
         if (tdlua::waitResponse(td->transport(), id, response, wait_policy))
             return return_response(L, td, response);
@@ -758,7 +754,6 @@ static int tdclient_setlogverbosity(lua_State *L)
     return 1;
 }
 
-
 static const tdlua_binding::ClientOperations native_operations = {
     createNativeTDLua,
     initializeNativeTDLua,
@@ -783,8 +778,7 @@ static const tdlua_binding::ClientOperations native_operations = {
     tdclient_setlogpath,
     tdclient_setlogmaxsize,
     tdclient_setlogverbosity,
-    []() { td::Log::set_fatal_error_callback(tdclient_fatalerrorcb); }
-};
+    []() { td::Log::set_fatal_error_callback(tdclient_fatalerrorcb); }};
 
 const tdlua_binding::ClientOperations &tdlua_backend_operations()
 {

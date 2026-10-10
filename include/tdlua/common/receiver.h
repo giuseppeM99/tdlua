@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "tdlua/common/identity_history.h"
 #include "tdlua/common/failure_cleanup.h"
+#include "tdlua/common/identity_history.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -18,38 +18,50 @@
 #include <thread>
 #include <utility>
 
-namespace tdlua { namespace receiver {
+namespace tdlua {
+namespace receiver {
 
 enum class Failure { None, Source, Routing, OutOfMemory };
-inline const char *failureMessage(Failure failure) noexcept {
+inline const char *failureMessage(Failure failure) noexcept
+{
     switch (failure) {
-    case Failure::OutOfMemory: return "tdlua: receiver out of memory";
-    case Failure::Routing: return "tdlua: receiver routing failure";
-    case Failure::Source: return "tdlua: receiver failed";
-    default: return "tdlua: receiver unavailable";
+    case Failure::OutOfMemory:
+        return "tdlua: receiver out of memory";
+    case Failure::Routing:
+        return "tdlua: receiver routing failure";
+    case Failure::Source:
+        return "tdlua: receiver failed";
+    default:
+        return "tdlua: receiver unavailable";
     }
 }
 enum class State { Stopped, Running, Stopping, Failed };
 enum class Pop { Item, Timeout, Closed, Failed };
 
-template<class Value> struct Envelope {
+template <class Value> struct Envelope {
     int client = 0;
     bool terminal = false;
     std::uint64_t sequence = 0;
     Value value;
 };
 
-template<class Value> class Source {
-public:
-    virtual ~Source() {}
+template <class Value> class Source {
+  public:
+    virtual ~Source()
+    {
+    }
     // Assign a source to one Runtime only. Shared ownership permits producer
     // and test controls, never a second receive consumer. JsonRuntime creates
     // its private source once and preserves it across worker generations.
     // False means timeout. Failure is an exception; lifetime belongs to Runtime.
     virtual bool receive(std::chrono::milliseconds timeout, Envelope<Value> &item) = 0;
     // Same receive owner, after public failure. No dispatch or runtime locks.
-    virtual void cleanupAfterFailure(std::chrono::milliseconds) noexcept {}
-    virtual void terminalPublished(int) {}
+    virtual void cleanupAfterFailure(std::chrono::milliseconds) noexcept
+    {
+    }
+    virtual void terminalPublished(int)
+    {
+    }
 };
 
 struct MailboxStats {
@@ -57,50 +69,61 @@ struct MailboxStats {
     std::size_t depth = 0, high_water = 0;
 };
 
-template<class Value> class Mailbox {
-public:
-    Pop popUntil(std::chrono::steady_clock::time_point deadline, Envelope<Value> &item) {
+template <class Value> class Mailbox {
+  public:
+    Pop popUntil(std::chrono::steady_clock::time_point deadline, Envelope<Value> &item)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         changed_.wait_until(lock, deadline, [this] {
             return !queue_.empty() || failure_ != Failure::None || terminal_ || orphan_;
         });
         return popLocked(item);
     }
-    Pop tryPop(Envelope<Value> &item) {
+    Pop tryPop(Envelope<Value> &item)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         return popLocked(item);
     }
-    MailboxStats stats() const {
+    MailboxStats stats() const
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         return stats_;
     }
-    Failure failure() const {
+    Failure failure() const
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         return failure_;
     }
-    void publish(Envelope<Value> item) {
+    void publish(Envelope<Value> item)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (orphan_) ++stats_.abandoned;
+        if (orphan_)
+            ++stats_.abandoned;
         else {
             queue_.push_back(std::move(item));
             ++stats_.enqueued;
             stats_.depth = queue_.size();
-            if (stats_.depth > stats_.high_water) stats_.high_water = stats_.depth;
+            if (stats_.depth > stats_.high_water)
+                stats_.high_water = stats_.depth;
         }
         changed_.notify_all();
     }
-    void terminal() {
+    void terminal()
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         terminal_ = true;
         changed_.notify_all();
     }
-    void fail(Failure failure) {
+    void fail(Failure failure)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (failure_ == Failure::None) failure_ = failure;
+        if (failure_ == Failure::None)
+            failure_ = failure;
         changed_.notify_all();
     }
     // Explicit abandonment on close/VM teardown, never a pressure drop.
-    void abandon() {
+    void abandon()
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         orphan_ = true;
         stats_.abandoned += queue_.size();
@@ -109,10 +132,14 @@ public:
         changed_.notify_all();
     }
 #ifdef TDLUA_TESTING
-    void notifySpurious() { changed_.notify_all(); }
+    void notifySpurious()
+    {
+        changed_.notify_all();
+    }
 #endif
-private:
-    Pop popLocked(Envelope<Value> &item) {
+  private:
+    Pop popLocked(Envelope<Value> &item)
+    {
         if (!queue_.empty()) {
             item = std::move(queue_.front());
             queue_.pop_front();
@@ -120,8 +147,10 @@ private:
             stats_.depth = queue_.size();
             return Pop::Item;
         }
-        if (failure_ != Failure::None) return Pop::Failed;
-        if (terminal_ || orphan_) return Pop::Closed;
+        if (failure_ != Failure::None)
+            return Pop::Failed;
+        if (terminal_ || orphan_)
+            return Pop::Closed;
         return Pop::Timeout;
     }
     mutable std::mutex mutex_;
@@ -146,8 +175,8 @@ struct RuntimeStats {
 // Payload and Source have no Lua dependency. Registry -> mailbox is the
 // lock order for routing. Admission also nests registry -> ledger. Source
 // receive, terminal acknowledgments, join and hooks execute without those locks.
-template<class Value> class Runtime {
-public:
+template <class Value> class Runtime {
+  public:
     using Box = Mailbox<Value>;
     struct Hooks {
         std::function<void(const Envelope<Value> &)> before_publish;
@@ -156,29 +185,44 @@ public:
     explicit Runtime(std::shared_ptr<Source<Value>> source,
                      std::chrono::milliseconds timeout = std::chrono::milliseconds(100),
                      Hooks hooks = Hooks())
-        : source_(std::move(source)), timeout_(timeout), hooks_(std::move(hooks)) {
-        if (!source_ || timeout_.count() <= 0) throw std::invalid_argument("invalid receiver source/timeout");
+        : source_(std::move(source)), timeout_(timeout), hooks_(std::move(hooks))
+    {
+        if (!source_ || timeout_.count() <= 0)
+            throw std::invalid_argument("invalid receiver source/timeout");
     }
-    ~Runtime() { stopAndJoin(); }
+    ~Runtime()
+    {
+        stopAndJoin();
+    }
     Runtime(const Runtime &) = delete;
     Runtime &operator=(const Runtime &) = delete;
 
-    std::uint64_t attachOwner() {
+    std::uint64_t attachOwner()
+    {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (failure_ != Failure::None) throw std::runtime_error(failureMessage(failure_));
+        if (failure_ != Failure::None)
+            throw std::runtime_error(failureMessage(failure_));
         reapLocked(lock);
-        if (failure_ != Failure::None) throw std::runtime_error(failureMessage(failure_));
+        if (failure_ != Failure::None)
+            throw std::runtime_error(failureMessage(failure_));
         const auto owner = ++next_owner_;
         owners_.insert(owner);
-        try { if (hasLeasesLocked()) startLocked(); }
-        catch (...) { owners_.erase(owner); throw; }
+        try {
+            if (hasLeasesLocked())
+                startLocked();
+        } catch (...) {
+            owners_.erase(owner);
+            throw;
+        }
         return owner;
     }
     // Cleanup observes TDLib termination independently of public dispatch.
-    void cleanupTerminal(int id) {
+    void cleanupTerminal(int id)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(id);
-        if (it == entries_.end()) return;
+        if (it == entries_.end())
+            return;
         it->second.terminal = true;
         it->second.box->terminal();
         if (it->second.orphan) {
@@ -186,7 +230,8 @@ public:
             entries_.erase(it);
         }
     }
-    void detachOwner(std::uint64_t owner) {
+    void detachOwner(std::uint64_t owner)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         owners_.erase(owner);
         for (auto it = entries_.begin(); it != entries_.end();) {
@@ -198,21 +243,28 @@ public:
             if (entry.owner == owner && entry.terminal) {
                 accumulateRetiredLocked(entry.box);
                 it = entries_.erase(it);
-            } else ++it;
+            } else
+                ++it;
         }
-        if (owners_.empty()) requestStopLocked();
+        if (owners_.empty())
+            requestStopLocked();
         reapLocked(lock);
     }
     std::pair<int, std::shared_ptr<Box>> createClient(std::uint64_t owner,
-                                                    const std::function<int()> &create_id) {
+                                                      const std::function<int()> &create_id)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (failure_ != Failure::None) throw std::runtime_error(failureMessage(failure_));
+        if (failure_ != Failure::None)
+            throw std::runtime_error(failureMessage(failure_));
         reapLocked(lock);
-        if (!owners_.count(owner)) throw std::logic_error("tdlua: VM owner unavailable");
-        if (failure_ != Failure::None) throw std::runtime_error(failureMessage(failure_));
+        if (!owners_.count(owner))
+            throw std::logic_error("tdlua: VM owner unavailable");
+        if (failure_ != Failure::None)
+            throw std::runtime_error(failureMessage(failure_));
         std::shared_ptr<Box> box(new Box());
         const int id = create_id(); // nonblocking ID allocator, no receive
-        if (known_ids_.contains(id)) throw std::logic_error("receiver client ID reused");
+        if (known_ids_.contains(id))
+            throw std::logic_error("receiver client ID reused");
         // Reserve identity metadata during create. Retirement and VM teardown
         // must not allocate while handling an out-of-memory worker failure.
         known_ids_.insert(id);
@@ -220,61 +272,77 @@ public:
         entry.owner = owner;
         entry.box = box;
         entries_.emplace(id, std::move(entry));
-        try { startLocked(); }
-        catch (...) { entries_.erase(id); throw; }
+        try {
+            startLocked();
+        } catch (...) {
+            entries_.erase(id);
+            throw;
+        }
         return {id, box};
     }
-    void forget(int id, bool timed_out = false) {
+    void forget(int id, bool timed_out = false)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         auto found = entries_.find(id);
         if (found != entries_.end() && !found->second.orphan) {
             Entry &entry = found->second;
             entry.orphan = true;
             entry.box->abandon();
-            if (timed_out && !entry.terminal) ++stats_.close_timeouts;
+            if (timed_out && !entry.terminal)
+                ++stats_.close_timeouts;
             if (entry.terminal) {
                 accumulateRetiredLocked(entry.box);
                 entries_.erase(found);
             }
         }
-        if (!hasLeasesLocked()) requestStopLocked();
+        if (!hasLeasesLocked())
+            requestStopLocked();
         // Failed cleanup is runtime work, not a per-client close operation.
         // Keep it asynchronous while VM owners exist; last-owner detach joins.
-        if (state_ != State::Failed || owners_.empty()) reapLocked(lock);
+        if (state_ != State::Failed || owners_.empty())
+            reapLocked(lock);
     }
-    bool clientTerminal(int id) const {
+    bool clientTerminal(int id) const
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto found = entries_.find(id);
         return found == entries_.end() || found->second.terminal;
     }
-    void stopAndJoin() {
+    void stopAndJoin()
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         requestStopLocked();
         reapLocked(lock);
     }
-    void coordinate() {
+    void coordinate()
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         reapLocked(lock);
     }
     // Registry -> ledger. fail() uses the same registry mutex, so a successful
     // admission precedes the public Failed transition or is rejected. No I/O,
     // hooks or user callbacks execute inside this critical section.
-    bool admitSend(FailureCleanup &ledger,int id,bool close) {
+    bool admitSend(FailureCleanup &ledger, int id, bool close)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failure_ != Failure::None) {
-            if (close) return false;
+            if (close)
+                return false;
             throw std::runtime_error(failureMessage(failure_));
         }
-        return ledger.beginSend(id,close);
+        return ledger.beginSend(id, close);
     }
-    void checkHealthy() const {
+    void checkHealthy() const
+    {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (failure_ != Failure::None) throw std::runtime_error(failureMessage(failure_));
+        if (failure_ != Failure::None)
+            throw std::runtime_error(failureMessage(failure_));
     }
 #ifdef TDLUA_TESTING
     // Test transport substitution only: the source has not materialized this
     // allocated identity and cannot have any response in flight.
-    void discardUnmaterializedClient(int id) {
+    void discardUnmaterializedClient(int id)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         auto found = entries_.find(id);
         if (found != entries_.end()) {
@@ -282,91 +350,119 @@ public:
             accumulateRetiredLocked(found->second.box);
             entries_.erase(found);
         }
-        if (!hasLeasesLocked()) requestStopLocked();
+        if (!hasLeasesLocked())
+            requestStopLocked();
         reapLocked(lock);
     }
-    bool waitForNoOwners(std::chrono::milliseconds timeout) {
+    bool waitForNoOwners(std::chrono::milliseconds timeout)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         return changed_.wait_for(lock, timeout, [this] { return owners_.empty(); });
     }
-    bool waitForState(State state, std::chrono::milliseconds timeout) {
+    bool waitForState(State state, std::chrono::milliseconds timeout)
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         return changed_.wait_for(lock, timeout, [&] { return state_ == state; });
     }
 #endif
-    RuntimeStats stats() const {
+    RuntimeStats stats() const
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         RuntimeStats result = stats_;
         result.state = state_;
         result.owners = owners_.size();
         result.clients = entries_.size();
         for (const auto &pair : entries_) {
-            if (pair.second.orphan && !pair.second.terminal) ++result.tombstones;
+            if (pair.second.orphan && !pair.second.terminal)
+                ++result.tombstones;
             const auto box = pair.second.box->stats();
             result.abandoned += box.abandoned;
             result.enqueued += box.enqueued;
             result.dequeued += box.dequeued;
             result.depth += box.depth;
-            if (box.high_water > result.high_water) result.high_water = box.high_water;
+            if (box.high_water > result.high_water)
+                result.high_water = box.high_water;
         }
         result.identities = known_ids_.identities();
         result.identity_blocks = known_ids_.blocks();
         result.joinable = joining_ || worker_.joinable();
         return result;
     }
-private:
+
+  private:
     struct Entry {
         std::uint64_t owner = 0;
         std::shared_ptr<Box> box;
         bool orphan = false, terminal = false;
     };
-    bool hasLeasesLocked() const {
-        for (const auto &pair : entries_) if (!pair.second.terminal) return true;
+    bool hasLeasesLocked() const
+    {
+        for (const auto &pair : entries_)
+            if (!pair.second.terminal)
+                return true;
         return false;
     }
-    void accumulateRetiredLocked(const std::shared_ptr<Box> &box) {
+    void accumulateRetiredLocked(const std::shared_ptr<Box> &box)
+    {
         const auto value = box->stats();
         stats_.abandoned += value.abandoned;
         stats_.enqueued += value.enqueued;
         stats_.dequeued += value.dequeued;
-        if (value.high_water > stats_.high_water) stats_.high_water = value.high_water;
+        if (value.high_water > stats_.high_water)
+            stats_.high_water = value.high_water;
     }
-    void startLocked() {
-        if (state_ == State::Failed) throw std::runtime_error(failureMessage(failure_));
-        if (state_ == State::Running || entries_.empty()) return;
-        if (worker_.joinable() || joining_) throw std::logic_error("receiver generation not joined");
+    void startLocked()
+    {
+        if (state_ == State::Failed)
+            throw std::runtime_error(failureMessage(failure_));
+        if (state_ == State::Running || entries_.empty())
+            return;
+        if (worker_.joinable() || joining_)
+            throw std::logic_error("receiver generation not joined");
         stop_.store(false);
         worker_ = std::thread(&Runtime::run, this);
         worker_id_ = worker_.get_id();
         state_ = State::Running;
         ++stats_.generation;
     }
-    void requestStopLocked() {
+    void requestStopLocked()
+    {
         stop_.store(true);
-        if (state_ == State::Running) state_ = State::Stopping;
+        if (state_ == State::Running)
+            state_ = State::Stopping;
         changed_.notify_all();
     }
-    void reapLocked(std::unique_lock<std::mutex> &lock) {
+    void reapLocked(std::unique_lock<std::mutex> &lock)
+    {
         // Check the cached identity before waiting on another coordinator's
         // ticket. The worker cannot wait for a join that is waiting for it.
         if (worker_id_ == std::this_thread::get_id())
             throw std::logic_error("receiver self join forbidden");
-        while (joining_) changed_.wait(lock, [this] { return !joining_; });
-        if (state_ != State::Stopping && state_ != State::Failed) return;
-        if (!worker_.joinable()) return;
+        while (joining_)
+            changed_.wait(lock, [this] { return !joining_; });
+        if (state_ != State::Stopping && state_ != State::Failed)
+            return;
+        if (!worker_.joinable())
+            return;
         joining_ = true; // exclusive ticket; thread object untouched by other coordinators
         lock.unlock();
-        try { worker_.join(); }
-        catch (...) {
-            lock.lock(); joining_ = false; changed_.notify_all(); throw;
+        try {
+            worker_.join();
+        } catch (...) {
+            lock.lock();
+            joining_ = false;
+            changed_.notify_all();
+            throw;
         }
         lock.lock();
         joining_ = false;
         worker_id_ = std::thread::id();
-        if (state_ != State::Failed) state_ = State::Stopped;
+        if (state_ != State::Failed)
+            state_ = State::Stopped;
         changed_.notify_all();
     }
-    void publish(Envelope<Value> item) {
+    void publish(Envelope<Value> item)
+    {
         std::shared_ptr<Box> box;
         const int id = item.client;
         const bool terminal = item.terminal;
@@ -376,17 +472,27 @@ private:
             item.sequence = ++sequence_;
             const auto found = entries_.find(id);
             if (found == entries_.end()) {
-                if (known_ids_.contains(id)) { ++stats_.abandoned; return; }
+                if (known_ids_.contains(id)) {
+                    ++stats_.abandoned;
+                    return;
+                }
                 throw std::logic_error("unknown receiver client");
             }
-            if (found->second.terminal) { ++stats_.abandoned; return; }
+            if (found->second.terminal) {
+                ++stats_.abandoned;
+                return;
+            }
             box = found->second.box;
         }
-        if (hooks_.before_publish) hooks_.before_publish(item);
+        // Keep the mailbox alive, then publish without the registry lock. Close
+        // or detach may remove the entry while this item is in flight.
+        if (hooks_.before_publish)
+            hooks_.before_publish(item);
         box->publish(std::move(item));
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++stats_.published;
+            // Re-find the entry: it may have been erased during publication.
             auto found = entries_.find(id);
             if (terminal && found != entries_.end()) {
                 found->second.terminal = true;
@@ -395,12 +501,15 @@ private:
                     accumulateRetiredLocked(box);
                     entries_.erase(found);
                 }
-                if (!hasLeasesLocked()) requestStopLocked();
+                if (!hasLeasesLocked())
+                    requestStopLocked();
             }
         }
-        if (hooks_.after_publish) hooks_.after_publish();
+        if (hooks_.after_publish)
+            hooks_.after_publish();
     }
-    void fail(Failure failure) noexcept {
+    void fail(Failure failure) noexcept
+    {
         // No strings, envelope allocations or user callbacks on this path.
         std::lock_guard<std::mutex> lock(mutex_);
         if (failure_ == Failure::None) {
@@ -409,10 +518,12 @@ private:
         }
         state_ = State::Failed;
         stop_.store(true);
-        for (auto &pair : entries_) pair.second.box->fail(failure_);
+        for (auto &pair : entries_)
+            pair.second.box->fail(failure_);
         changed_.notify_all();
     }
-    void run() noexcept {
+    void run() noexcept
+    {
         Failure stage = Failure::Source;
         try {
             while (!stop_.load()) {
@@ -425,16 +536,23 @@ private:
                 }
                 if (source_->receive(timeout_, item)) {
                     stage = Failure::Routing;
-                    const int id=item.client; const bool terminal=item.terminal;
+                    const int id = item.client;
+                    const bool terminal = item.terminal;
                     publish(std::move(item));
-                    if (terminal) source_->terminalPublished(id);
+                    if (terminal)
+                        source_->terminalPublished(id);
                 } else if (std::chrono::steady_clock::now() < started + timeout_) {
                     std::unique_lock<std::mutex> lock(mutex_);
                     changed_.wait_until(lock, started + timeout_, [this] { return stop_.load(); });
                 }
             }
-        } catch (const std::bad_alloc &) { fail(Failure::OutOfMemory); source_->cleanupAfterFailure(timeout_); }
-          catch (...) { fail(stage); source_->cleanupAfterFailure(timeout_); }
+        } catch (const std::bad_alloc &) {
+            fail(Failure::OutOfMemory);
+            source_->cleanupAfterFailure(timeout_);
+        } catch (...) {
+            fail(stage);
+            source_->cleanupAfterFailure(timeout_);
+        }
         changed_.notify_all();
     }
     std::shared_ptr<Source<Value>> source_;
@@ -455,4 +573,5 @@ private:
     RuntimeStats stats_;
 };
 
-} } // namespace tdlua::receiver
+} // namespace receiver
+} // namespace tdlua

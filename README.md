@@ -263,14 +263,16 @@ for the next `poll()` or `loop(callback)` without another event-handler dispatch
 `clearBuffer()` and closing the client discard a selection still pending in the
 scheduler. A selection already transferred to a Task remains owned by that Task.
 
-`receive()` retains its 10-second default. `receive(0)` makes a nonblocking TDLib
-read even when the local queue is empty; it returns an available object or `nil`.
-Objects already buffered remain FIFO. If scheduler draining raises after raw
-acquisition, the call raises that error and preserves the unreturned object at
-the front of the receive queue. The next receive returns it without redispatch,
-including after closure. Further pending errors can still raise before delivery.
-These recovered objects stay in the original client across `save()` and close;
-they are excluded from disk persistence. Explicit `clearBuffer()` discards them.
+`receive()` retains its 10-second default. `receive(0)` checks objects already
+available to the client and returns immediately; it does not call TDLib's
+receive function. An object not yet routed by the receiver may become available
+on a later call. Objects already buffered remain FIFO. If scheduler draining
+raises after raw acquisition, the call raises that error and preserves the
+unreturned object at the front of the receive queue. The next receive returns it
+without redispatch, including after closure. Further pending errors can still
+raise before delivery. These recovered objects stay in the original client
+across `save()` and close; they are excluded from disk persistence. Explicit
+`clearBuffer()` discards them.
 
 `poll()` and `loop()` execute a protected Lua checkpoint between driver
 iterations so the standalone interpreter can process its existing SIGINT debug
@@ -281,10 +283,10 @@ transport-lock contention can delay this. A repeated SIGINT before the first
 is processed can still terminate abruptly under the interpreter's own signal
 policy. When `poll()` or `loop()` runs inside a coroutine, the standalone
 interpreter can install its hook on the main state instead of the driver state;
-the first interrupt may remain deferred. That limitation is deferred to v0.5.
-TDLua installs no signal handlers. Use timed `poll()` or `receive()` when
-the host needs periodic control. Background receiving and external event-loop
-integration are deferred to v0.5.
+the first interrupt may remain deferred; this remains an open limitation.
+TDLua installs no signal handlers. Use timed `poll()` or `receive()` when the
+host needs periodic control. The receiver runs in the background; integration
+with external event loops is not provided.
 
 `client:request(req, callback, ctx)` is deprecated compatibility syntax. It
 submits once, returns the canonical request ID, and calls `callback(response,

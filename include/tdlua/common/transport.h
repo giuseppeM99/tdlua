@@ -48,13 +48,16 @@ enum class QueueCheckOrder {
 
 // Policies without a queue revision retain the original search behavior.
 struct UntrackedResponseQueue {
-    std::uint64_t operator()() const noexcept { return 0; }
+    std::uint64_t operator()() const noexcept
+    {
+        return 0;
+    }
 };
 
 // These operations keep backend response types and state out of the common
 // loop. They are stored as concrete callable types, not type-erased objects.
-template<class Queued, class Valid, class Dispatch, class ResponseId,
-         class Buffer, class Remaining, class Revision = UntrackedResponseQueue>
+template <class Queued, class Valid, class Dispatch, class ResponseId, class Buffer,
+          class Remaining, class Revision = UntrackedResponseQueue>
 struct ResponseWaitPolicy {
     Queued take_queued_response;
     Valid is_valid_response;
@@ -74,30 +77,23 @@ makeResponseWaitPolicy(Queued queued, Valid valid, Dispatch dispatch,
                        ResponseId response_id, Buffer buffer,
                        Remaining remaining, QueueCheckOrder queue_check_order)
 {
-    return {
-        std::move(queued),
-        std::move(valid),
-        std::move(dispatch),
-        std::move(response_id),
-        std::move(buffer),
-        std::move(remaining),
-        queue_check_order, UntrackedResponseQueue(), false
-    };
+    return {std::move(queued),      std::move(valid),         std::move(dispatch),
+            std::move(response_id), std::move(buffer),        std::move(remaining),
+            queue_check_order,      UntrackedResponseQueue(), false};
 }
 
 // Revision changes on every successful backend buffer mutation. The buffer
 // operation only appends the unrelated object and must not invoke callbacks.
-template<class Queued, class Valid, class Dispatch, class ResponseId,
-         class Buffer, class Remaining, class Revision>
+template <class Queued, class Valid, class Dispatch, class ResponseId, class Buffer,
+          class Remaining, class Revision>
 ResponseWaitPolicy<Queued, Valid, Dispatch, ResponseId, Buffer, Remaining, Revision>
-makeResponseWaitPolicy(Queued queued, Valid valid, Dispatch dispatch,
-                       ResponseId response_id, Buffer buffer,
-                       Remaining remaining, QueueCheckOrder queue_check_order,
+makeResponseWaitPolicy(Queued queued, Valid valid, Dispatch dispatch, ResponseId response_id,
+                       Buffer buffer, Remaining remaining, QueueCheckOrder queue_check_order,
                        Revision revision)
 {
-    return {std::move(queued), std::move(valid), std::move(dispatch),
-            std::move(response_id), std::move(buffer), std::move(remaining),
-            queue_check_order, std::move(revision), true};
+    return {std::move(queued),      std::move(valid),    std::move(dispatch),
+            std::move(response_id), std::move(buffer),   std::move(remaining),
+            queue_check_order,      std::move(revision), true};
 }
 
 // Native and JSON retain their historical queue/timeout ordering. The policy
@@ -131,8 +127,7 @@ bool waitResponse(const RequestTransport &transport, std::uint64_t id,
             return false;
         }
 
-        const bool queued = !queue_before_timeout &&
-                            take_queued();
+        const bool queued = !queue_before_timeout && take_queued();
         if (!queued) {
             response = transport.receive(timeout);
         }
@@ -148,8 +143,7 @@ bool waitResponse(const RequestTransport &transport, std::uint64_t id,
         policy.buffer_unrelated_response(std::move(response));
         // Skip only our known unrelated append. Mutations from dispatch or a
         // nested wait leave the cache invalid and force a fresh search.
-        if (policy.cache_queue_search && searched &&
-            searched_revision == before_append) {
+        if (policy.cache_queue_search && searched && searched_revision == before_append) {
             searched_revision = policy.queue_revision();
         }
     }

@@ -18,8 +18,7 @@ std::string eventType(const nlohmann::json &event)
     return type->get<std::string>();
 }
 
-bool extractJsonResponseRequestId(const nlohmann::json &response,
-                                 std::uint64_t &request_id)
+bool extractJsonResponseRequestId(const nlohmann::json &response, std::uint64_t &request_id)
 {
     const auto extra = response.find("@extra");
     if (extra == response.end() || !extra->is_object()) {
@@ -45,7 +44,6 @@ bool extractJsonResponseRequestId(const nlohmann::json &response,
     request_id = static_cast<std::uint64_t>(signed_id);
     return true;
 }
-
 }
 
 LuaDispatcher::LuaDispatcher(lua_State *owner)
@@ -60,8 +58,8 @@ LuaDispatcher::~LuaDispatcher()
     router_.detachTransport();
 }
 
-std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &,
-                                     int callback_index, int context_index)
+std::uint64_t LuaDispatcher::request(lua_State *L, nlohmann::json &, int callback_index,
+                                     int context_index)
 {
     return router_.request(L, callback_index, context_index);
 }

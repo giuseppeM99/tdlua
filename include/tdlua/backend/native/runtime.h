@@ -4,8 +4,8 @@
 #pragma once
 
 #include "tdlua/backend/native/codec.h"
-#include "tdlua/common/receiver.h"
 #include "tdlua/common/failure_cleanup.h"
+#include "tdlua/common/receiver.h"
 
 #include <td/telegram/Client.h>
 
@@ -48,15 +48,24 @@ public:
     td::td_api::object_ptr<td::td_api::Object> execute(
         td::td_api::object_ptr<td::td_api::Function> request);
     void forget(td::ClientManager::ClientId client_id, bool timed_out = false);
-    tdlua::receiver::RuntimeStats stats() const { return engine_.stats(); }
-    tdlua::receiver::FailureCleanup::Stats cleanupStats() const { return lifecycle_->stats(); }
+    tdlua::receiver::RuntimeStats stats() const
+    {
+        return engine_.stats();
+    }
+    tdlua::receiver::FailureCleanup::Stats cleanupStats() const
+    {
+        return lifecycle_->stats();
+    }
 #ifdef TDLUA_TESTING
-    bool waitForNoOwners() { return engine_.waitForNoOwners(std::chrono::seconds(3)); }
+    bool waitForNoOwners()
+    {
+        return engine_.waitForNoOwners(std::chrono::seconds(3));
+    }
     void replaceWithFake(td::ClientManager::ClientId client_id);
     int concurrentOfflineSend();
 #endif
 
-private:
+  private:
     NativeRuntime();
 
     std::shared_ptr<td::ClientManager> manager_;

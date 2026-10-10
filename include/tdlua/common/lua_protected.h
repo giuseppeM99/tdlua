@@ -15,23 +15,29 @@ struct Call {
     void *context;
     std::exception_ptr exception;
 };
-inline int invoke(lua_State *L) {
+inline int invoke(lua_State *L)
+{
     auto *call = static_cast<Call *>(lua_touserdata(L, 1));
-    bool lua_error = false;
-    try { call->function(L, call->context); }
-    catch (const TDLuaLuaError &) { lua_error = true; }
-    catch (const std::exception &) {
+    bool has_lua_error = false;
+    try {
+        call->function(L, call->context);
+    } catch (const TDLuaLuaError &) {
+        has_lua_error = true;
+    } catch (const std::exception &) {
         call->exception = std::current_exception();
     }
-    if (lua_error) return ::lua_error(L);
+    if (has_lua_error)
+        return ::lua_error(L);
     return 0;
 }
-}
+} // namespace lua_protected_detail
 // Only the callback uses fallible Lua APIs. No owning C++ automatic object is
 // placed in that frame. Standard C++ exceptions return to this owner; Lua's
 // longjmp or foreign unwind is handled by Lua, never by a C++ catch-all.
-inline void protectedLua(lua_State *L, void (*function)(lua_State *, void *), void *context) {
-    if (!lua_checkstack(L, 8)) throw std::bad_alloc();
+inline void protectedLua(lua_State *L, void (*function)(lua_State *, void *), void *context)
+{
+    if (!lua_checkstack(L, 8))
+        throw std::bad_alloc();
     lua_protected_detail::Call call{function, context, std::exception_ptr()};
 #if LUA_VERSION_NUM < 502
     // pushcfunction itself allocates on stock 5.1; cpcall protects that too.
@@ -41,7 +47,9 @@ inline void protectedLua(lua_State *L, void (*function)(lua_State *, void *), vo
     lua_pushlightuserdata(L, &call);
     const int status = lua_pcall(L, 1, 0, 0);
 #endif
-    if (call.exception) std::rethrow_exception(call.exception);
-    if (status != LUA_OK) throw TDLuaLuaError{};
+    if (call.exception)
+        std::rethrow_exception(call.exception);
+    if (status != LUA_OK)
+        throw TDLuaLuaError{};
 }
-}
+} // namespace tdlua
