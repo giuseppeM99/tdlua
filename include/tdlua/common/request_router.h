@@ -64,7 +64,8 @@ enum class WaitOutcome {
     Success,
     Failed,
     Timeout,
-    ExternalResume
+    ExternalResume,
+    DeliveryError
 };
 
 // These indexes are part of the Lua uservalue owned by a continuation.
@@ -86,6 +87,7 @@ struct ManagedState {
     int thread_ref = LUA_NOREF;
     int response_ref = LUA_NOREF;
     int result_ref = LUA_NOREF;
+    int result_count = 0;
     std::string error;
     bool callback_is_thread = false;
     bool failure_observed = false;
@@ -156,6 +158,57 @@ struct DeferredEvent {
     int update_ref = LUA_NOREF;
 };
 
+struct ContinuationState;
+inline void pushManagedField(lua_State *L, const char *field);
+
+enum class ContinuationPushKind {
+    Error,
+    Timeout,
+    Field
+};
+
+struct ContinuationPush {
+    ContinuationPushKind kind;
+    const char *text;
+};
+
+inline void pushContinuationResult(lua_State *L, void *context)
+{
+    const auto *push = static_cast<const ContinuationPush *>(context);
+    switch (push->kind) {
+    case ContinuationPushKind::Error:
+        lua_pushstring(L, push->text);
+        break;
+    case ContinuationPushKind::Timeout:
+        if (push->text) {
+            lua_pushliteral(L, "tdlua: Future wait timeout");
+        } else {
+            lua_pushnil(L);
+            lua_pushliteral(L, "timeout");
+        }
+        break;
+    case ContinuationPushKind::Field:
+        pushManagedField(L, push->text);
+        break;
+    }
+}
+
+inline void pushContinuationUservalue(lua_State *L, void *)
+{
+#if LUA_VERSION_NUM <= 502
+    lua_newtable(L);
+#else
+    lua_pushnil(L);
+#endif
+    lua_setuservalue(L, 2);
+}
+
+inline void clearContinuationUservalue(lua_State *L, int continuation_index)
+{
+    protectedLuaValues(L, pushContinuationUservalue, nullptr,
+                       continuation_index, 1, 0);
+}
+
 // Independent VMs on different threads must not share mutable indexes. A VM
 // and its coroutines must stay on their owning thread.
 // These indexes are weak bookkeeping only. They never root a coroutine or
@@ -163,6 +216,7 @@ struct DeferredEvent {
 struct TaskBinding {
     std::weak_ptr<SchedulerCore> core;
     std::weak_ptr<ManagedState> state;
+    ContinuationState *continuation = nullptr;
 };
 inline std::map<lua_State *, TaskBinding> &taskBindings()
 {
@@ -186,6 +240,18 @@ inline std::size_t &liveContinuations()
     static thread_local std::size_t count = 0;
     return count;
 }
+#ifdef TDLUA_TESTING
+using TaskThreadCreationHook = void (*)(lua_State *);
+inline TaskThreadCreationHook &taskThreadCreationHook()
+{
+    static thread_local TaskThreadCreationHook hook = nullptr;
+    return hook;
+}
+inline void setTaskThreadCreationHookForTesting(TaskThreadCreationHook hook)
+{
+    taskThreadCreationHook() = hook;
+}
+#endif
 
 // The userdata lives on the suspended coroutine's stack, independently of
 // WaitRegistration. Its uservalue holds both Lua core anchors.
@@ -371,13 +437,18 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
 
     int createLuaReference(lua_State *L, int index)
     {
-        index = lua_absindex(L, index);
-        if (!pushCoreReferences(L, this))
-            throw std::runtime_error("tdlua: scheduler storage unavailable");
-        lua_pushvalue(L, index);
-        const int ref = luaL_ref(L, -2);
-        lua_pop(L, 1);
-        return ref;
+        struct Reference {
+            SchedulerCore *core;
+            int value;
+        } reference = {this, LUA_NOREF};
+        protectedLua(L, [](lua_State *state, void *context) {
+            auto *reference = static_cast<Reference *>(context);
+            if (!pushCoreReferences(state, reference->core))
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            lua_pushvalue(state, 2);
+            reference->value = luaL_ref(state, -2);
+        }, &reference, index, 0);
+        return reference.value;
     }
 
     void releaseLuaReference(int &ref)
@@ -539,6 +610,108 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         releaseLuaReference(state->thread_ref);
     }
 
+    void rollbackTaskCreation(const State &state)
+    {
+        if (isUpdateCallbackTask(state->kind)) {
+            event_states_.erase(
+                std::remove(event_states_.begin(), event_states_.end(), state),
+                event_states_.end());
+        } else {
+            const auto pending = pending_.find(state->request_id);
+            if (pending != pending_.end()) {
+                untrackPendingRequest(pending->second);
+                pending_.erase(pending);
+            }
+            live_states_.erase(state->request_id);
+        }
+        releaseLuaReferences(state);
+    }
+
+    void failTaskSetup(const State &state, const char *message)
+    {
+        if (isTerminalState(state)) return;
+        for (const auto &binding : taskBindings()) {
+            const State running = binding.second.state.lock();
+            if (running == state) {
+                clearTaskContinuation(binding.first);
+                break;
+            }
+        }
+        failState(state, message);
+        releaseLuaReference(state->response_ref);
+        if (state->kind == RequestKind::EventTask ||
+            state->kind == RequestKind::LoopTask) {
+            scheduler_errors_.push_back(state->error);
+            finishSerializedEvent(state);
+            finishLoopTask(state);
+        }
+        wake(state);
+        const bool legacy_request_failed =
+            state->kind == RequestKind::LegacyRequest;
+        retireState(state);
+        if (legacy_request_failed) throw std::runtime_error(state->error);
+    }
+
+    void clearTaskContinuation(lua_State *thread)
+    {
+        const auto binding = taskBindings().find(thread);
+        if (binding == taskBindings().end() || !binding->second.continuation) return;
+        ContinuationState *continuation = binding->second.continuation;
+        const int top = lua_gettop(thread);
+        int index = 0;
+        for (int candidate = 1; candidate <= top; ++candidate) {
+            if (lua_type(thread, candidate) == LUA_TUSERDATA &&
+                lua_touserdata(thread, candidate) == continuation) {
+                index = candidate;
+                break;
+            }
+        }
+        if (!index) return;
+        // This userdata stores the raw anchor table, not the wrapped Lua
+        // 5.1/5.2 public-value convention.
+        protectedLuaValues(thread, [](lua_State *L, void *) {
+            lua_getuservalue(L, 2);
+            if (lua_istable(L, -1)) {
+                lua_pushnil(L);
+                lua_rawseti(L, -2, DependencyCoreSlot);
+                lua_pushnil(L);
+                lua_rawseti(L, -2, TaskOwnerCoreSlot);
+            }
+        }, nullptr, index, 1, 0);
+        binding->second.continuation = nullptr;
+        continuation->consumed = true;
+#ifdef TDLUA_USE_LUA51_CONTINUATION
+        releaseLuaReference(continuation->prepared_thread_ref);
+#endif
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+    }
+
+    void failTaskResume(const State &state, lua_State *thread,
+                        const char *message)
+    {
+        clearTaskContinuation(thread);
+        removeRegistration(thread);
+        removeRunningTask(thread);
+        lua_settop(thread, 0);
+        failTaskSetup(state, message);
+    }
+
+    void failStrandedTasks()
+    {
+        for (auto current = running_tasks_.begin(); current != running_tasks_.end();) {
+            lua_State *thread = current->first;
+            const State state = current->second;
+            ++current;
+            if (waitBindings().count(thread) == 0 &&
+                waiters_.count(thread) == 0 && notifications_.count(thread) == 0) {
+                failTaskResume(state, thread, "tdlua: task continuation failed");
+            }
+        }
+    }
+
     void removeRunningTask(lua_State *thread)
     {
         running_tasks_.erase(thread);
@@ -548,20 +721,50 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             taskBindings().erase(found);
         }
     }
+
+    int resumeLuaThread(lua_State *thread, int arguments)
+    {
+        struct ResumeCall {
+            lua_State *thread;
+            lua_State *owner;
+            int arguments;
+            int status;
+        } call = {thread, lua_owner_, arguments, LUA_ERRRUN};
+        protectedLua(lua_owner_, [](lua_State *, void *context) {
+            auto *call = static_cast<ResumeCall *>(context);
+            call->status = tdlua_lua_resume(
+                call->thread, call->owner, call->arguments);
+        }, &call);
+        return call.status;
+    }
     // ----- Task execution -----
 
     void storeTaskResults(const State &state, lua_State *thread)
     {
-        const int result_count = lua_gettop(thread);
-        lua_newtable(thread);
-        const int result_table = lua_gettop(thread);
-        lua_pushinteger(thread, result_count);
-        lua_setfield(thread, result_table, "n");
-        for (int index = 1; index <= result_count; ++index) {
-            lua_pushvalue(thread, index);
-            lua_rawseti(thread, result_table, index);
-        }
-        state->result_ref = createLuaReference(thread, result_table);
+        struct ResultTable {
+            SchedulerCore *core;
+            int count;
+            int reference;
+        } result = {this, lua_gettop(thread), LUA_NOREF};
+        protectedLuaValues(thread, [](lua_State *L, void *context) {
+            auto *result = static_cast<ResultTable *>(context);
+            lua_newtable(L);
+            const int table = lua_gettop(L);
+            lua_pushinteger(L, result->count);
+            lua_setfield(L, table, "n");
+            for (int index = 0; index < result->count; ++index) {
+                lua_pushvalue(L, index + 2);
+                lua_rawseti(L, table, index + 1);
+            }
+            if (!pushCoreReferences(L, result->core)) {
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            }
+            lua_pushvalue(L, table);
+            result->reference = luaL_ref(L, -2);
+            lua_pop(L, 1);
+        }, &result, 1, result.count, 0);
+        state->result_ref = result.reference;
+        state->result_count = result.count;
         lua_settop(thread, 0);
         state->status = ManagedStatus::Done;
         releaseLuaReference(state->thread_ref);
@@ -729,9 +932,18 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         if (status == LUA_YIELD && waitBindings().count(thread)) {
             return;
         }
+        clearTaskContinuation(thread);
         removeRunningTask(thread);
         if (status == LUA_OK) {
-            storeTaskResults(state, thread);
+            try {
+                storeTaskResults(state, thread);
+            } catch (const TDLuaLuaError &) {
+                lua_settop(thread, 0);
+                failState(state, "tdlua: task result allocation failed");
+            } catch (const std::exception &) {
+                lua_settop(thread, 0);
+                failState(state, "tdlua: task result storage failed");
+            }
         } else {
             failTaskExecution(state, thread, status);
         }
@@ -759,33 +971,86 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         if (state->status != ManagedStatus::Pending) {
             return;
         }
-        lua_State *thread;
-        if (state->callback_is_thread) {
-            pushLuaReference(lua_owner_, state->thread_ref);
-            thread = lua_tothread(lua_owner_, -1);
-            lua_pop(lua_owner_, 1);
-        } else {
-            thread = lua_newthread(lua_owner_);
-            state->thread_ref = createLuaReference(lua_owner_, -1);
-            lua_pop(lua_owner_, 1);
-            pushLuaReference(thread, state->callback_ref);
-        }
-        if (!thread) {
-            failState(state, "tdlua: task coroutine unavailable");
-            if (state->kind == RequestKind::EventTask || state->kind == RequestKind::LoopTask) {
-                scheduler_errors_.push_back(state->error);
-                finishSerializedEvent(state);
-                finishLoopTask(state);
+        struct TaskThread {
+            SchedulerCore *core;
+            const State *state;
+            lua_State *thread;
+            int reference;
+        } task_thread = {this, &state, nullptr, LUA_NOREF};
+        const int owner_top = lua_gettop(lua_owner_);
+        int thread_top = 0;
+        const int argument_count = isUpdateCallbackTask(state->kind) ? 1 : 2;
+        try {
+            protectedLua(lua_owner_, [](lua_State *L, void *context) {
+                auto *task = static_cast<TaskThread *>(context);
+                if ((*task->state)->callback_is_thread) {
+                    task->core->pushLuaReference(
+                        L, (*task->state)->thread_ref);
+                    task->thread = lua_tothread(L, -1);
+                    lua_pop(L, 1);
+                    if (!task->thread) {
+                        throw std::runtime_error(
+                            "tdlua: task coroutine unavailable");
+                    }
+                    return;
+                }
+#ifdef TDLUA_TESTING
+                if (taskThreadCreationHook()) {
+                    taskThreadCreationHook()(L);
+                }
+#endif
+                lua_State *thread = lua_newthread(L);
+                const int thread_index = lua_gettop(L);
+                if (!pushCoreReferences(L, task->core)) {
+                    throw std::runtime_error(
+                        "tdlua: scheduler storage unavailable");
+                }
+                lua_pushvalue(L, thread_index);
+                task->reference = luaL_ref(L, -2);
+                lua_pop(L, 1);
+                task->thread = thread;
+            }, &task_thread);
+            if (task_thread.reference != LUA_NOREF) {
+                state->thread_ref = task_thread.reference;
             }
-            wake(state);
-            retireState(state);
+            if (!task_thread.thread) {
+                throw std::runtime_error("tdlua: task coroutine unavailable");
+            }
+
+            lua_State *thread = task_thread.thread;
+            thread_top = lua_gettop(thread);
+            const int pushed_values = argument_count +
+                (state->callback_is_thread ? 0 : 1);
+            struct TaskArguments {
+                SchedulerCore *core;
+                const State *state;
+                bool push_callback;
+            } arguments = {this, &state, !state->callback_is_thread};
+            protectedLua(thread, [](lua_State *L, void *context) {
+                auto *arguments = static_cast<TaskArguments *>(context);
+                if (arguments->push_callback) {
+                    arguments->core->pushLuaReference(
+                        L, (*arguments->state)->callback_ref);
+                }
+                arguments->core->pushLuaReference(
+                    L, (*arguments->state)->response_ref);
+                if (!isUpdateCallbackTask((*arguments->state)->kind)) {
+                    arguments->core->pushLuaReference(
+                        L, (*arguments->state)->context_ref);
+                }
+            }, &arguments, 0, pushed_values);
+        } catch (const TDLuaLuaError &) {
+            if (task_thread.thread) lua_settop(task_thread.thread, thread_top);
+            lua_settop(lua_owner_, owner_top);
+            failTaskSetup(state, "tdlua: task setup allocation failed");
+            return;
+        } catch (const std::exception &) {
+            if (task_thread.thread) lua_settop(task_thread.thread, thread_top);
+            lua_settop(lua_owner_, owner_top);
+            failTaskSetup(state, "tdlua: task setup failed");
             return;
         }
-        pushLuaReference(thread, state->response_ref);
-        const int argument_count = isUpdateCallbackTask(state->kind) ? 1 : 2;
-        if (argument_count == 2) {
-            pushLuaReference(thread, state->context_ref);
-        }
+        lua_State *thread = task_thread.thread;
         releaseLuaReference(state->response_ref);
         releaseLuaReference(state->callback_ref);
         releaseLuaReference(state->context_ref);
@@ -797,7 +1062,18 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         taskBindings()[thread] = binding;
         // Pin the owner core before the initial callback can enter Lua and
         // yield into a dependency owned by another core.
-        const int status = tdlua_lua_resume(thread, lua_owner_, argument_count);
+        int status = LUA_ERRRUN;
+        try {
+            status = resumeLuaThread(thread, argument_count);
+        } catch (const TDLuaLuaError &) {
+            lua_settop(lua_owner_, owner_top);
+            failTaskResume(state, thread, "tdlua: task execution allocation failed");
+            return;
+        } catch (const std::exception &) {
+            lua_settop(lua_owner_, owner_top);
+            failTaskResume(state, thread, "tdlua: task execution failed");
+            return;
+        }
         finishTask(state, thread, status);
     }
     // ----- Wait registration and resumption -----
@@ -827,14 +1103,23 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
 
         State dependency;
+        ContinuationState *continuation = nullptr;
         if (found != waiters_.end()) {
             dependency = found->second.dependency;
+            continuation = found->second.continuation;
             releaseLuaReference(found->second.thread_ref);
             waiters_.erase(found);
         } else {
             dependency = notification->second.dependency;
+            continuation = notification->second.continuation;
             releaseLuaReference(notification->second.thread_ref);
             notifications_.erase(notification);
+        }
+
+        const auto task_binding = taskBindings().find(thread);
+        if (task_binding != taskBindings().end() &&
+            task_binding->second.continuation == continuation) {
+            task_binding->second.continuation = nullptr;
         }
 
         const auto global = waitBindings().find(thread);
@@ -863,23 +1148,78 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         const auto task_core = continuation ? continuation->task_core.lock() : nullptr;
         const State task = continuation ? continuation->task : State();
         const int base = lua_gettop(lua_owner_);
+        const int thread_base = lua_gettop(thread);
         struct ResumeStack {
             lua_State *L;
             int base;
             ~ResumeStack() { lua_settop(L, base); }
         } stack{lua_owner_, base};
-        pushCoreAnchor(lua_owner_, this);
-        if (task_core) pushCoreAnchor(lua_owner_, task_core.get());
-        pushLuaReference(lua_owner_, registration->thread_ref);
         int arguments = 0;
         if (continuation) continuation->outcome = outcome;
         if (outcome == WaitOutcome::Failed) dependency->failure_observed = true;
-        if (outcome == WaitOutcome::Success) {
-            arguments = pushResult(thread, dependency);
-            if (continuation) continuation->result_count = arguments;
+        struct ResumeRoots {
+            SchedulerCore *dependency_core;
+            SchedulerCore *task_core;
+            int thread_ref;
+        } roots = {this, task_core.get(), registration->thread_ref};
+        try {
+            protectedLuaValues(lua_owner_, [](lua_State *L, void *context) {
+                auto *roots = static_cast<ResumeRoots *>(context);
+                if (!pushCoreAnchor(L, roots->dependency_core))
+                    throw std::runtime_error("tdlua: scheduler anchor unavailable");
+                if (roots->task_core &&
+                    !pushCoreAnchor(L, roots->task_core))
+                    throw std::runtime_error("tdlua: task scheduler anchor unavailable");
+                roots->dependency_core->pushLuaReference(L, roots->thread_ref);
+            }, &roots, 0, 0, task_core ? 3 : 2);
+            if (outcome == WaitOutcome::Success) {
+                arguments = pushResult(thread, dependency);
+                if (continuation) continuation->result_count = arguments;
+            }
+        } catch (const TDLuaLuaError &) {
+            if (task && task_core) {
+                task_core->failTaskResume(
+                    task, thread, "tdlua: managed result delivery allocation failed");
+                return;
+            }
+            // A Lua allocation failure while preparing the resume values is
+            // already represented by the error object left on the affected
+            // stack. If it occurred on the owner stack, make a delivery error
+            // on the coroutine stack under its own protected boundary.
+            if (lua_gettop(thread) == thread_base) {
+                struct DeliveryFailure { } failure;
+                try {
+                    protectedLuaValues(thread, [](lua_State *L, void *) {
+                        lua_pushliteral(L, "tdlua: managed result delivery failed");
+                    }, &failure, 0, 0, 1);
+                } catch (...) {
+                    throw;
+                }
+            }
+            if (continuation) continuation->outcome = WaitOutcome::DeliveryError;
+            arguments = 1;
         }
         removeRegistration(thread);
-        const int status = tdlua_lua_resume(thread, lua_owner_, arguments);
+        int status = LUA_ERRRUN;
+        try {
+            status = resumeLuaThread(thread, arguments);
+        } catch (const TDLuaLuaError &) {
+            if (task && task_core) {
+                task_core->failTaskResume(
+                    task, thread, "tdlua: managed task resume allocation failed");
+                return;
+            }
+            stack.base = lua_gettop(lua_owner_);
+            throw;
+        } catch (const std::exception &) {
+            if (task && task_core) {
+                task_core->failTaskResume(
+                    task, thread, "tdlua: managed task resume failed");
+                return;
+            }
+            stack.base = lua_gettop(lua_owner_);
+            throw;
+        }
         if (status == LUA_OK && !task)
             lua_settop(thread, 0);
         const char *message = status != LUA_OK && status != LUA_YIELD
@@ -914,19 +1254,16 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
     }
 
-    void anchorContinuation(lua_State *L, int continuation_index)
+    void anchorContinuation(lua_State *L, int continuation_index,
+                            SchedulerCore *task_core)
     {
         lua_newtable(L);
         pushCoreAnchor(L, this);
         lua_rawseti(L, -2, DependencyCoreSlot);
 
-        const auto binding = taskBindings().find(L);
-        if (binding != taskBindings().end()) {
-            const auto task_core = binding->second.core.lock();
-            if (task_core) {
-                pushCoreAnchor(L, task_core.get());
-                lua_rawseti(L, -2, TaskOwnerCoreSlot);
-            }
+        if (task_core) {
+            pushCoreAnchor(L, task_core);
+            lua_rawseti(L, -2, TaskOwnerCoreSlot);
         }
         lua_setuservalue(L, continuation_index);
     }
@@ -947,7 +1284,9 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
                    const char *field, bool timed, double timeout)
     {
         if (waitBindings().count(L)) {
-            lua_pushliteral(L, "tdlua: coroutine is already waiting on TDLua");
+            ContinuationPush push = {ContinuationPushKind::Error,
+                                    "tdlua: coroutine is already waiting on TDLua"};
+            protectedLuaValues(L, pushContinuationResult, &push, 0, 0, 1);
             return -1;
         }
 #ifdef TDLUA_USE_LUA51_CONTINUATION
@@ -970,6 +1309,9 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         if (lua_pcall(L, 1, 1, 0) != LUA_OK) return -1;
         auto *continuation = static_cast<ContinuationState *>(lua_touserdata(L, -1));
         const int context = lua_gettop(L);
+        const auto task_binding = taskBindings().find(L);
+        if (task_binding != taskBindings().end())
+            task_binding->second.continuation = continuation;
 #ifdef TDLUA_TESTING
         testLua51WaitStage(L, continuation, Lua51WaitStage::Prepared);
 #endif
@@ -980,26 +1322,51 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         return context;
 #else
-        if (luaL_newmetatable(L, "tdlua.continuation")) {
-            lua_pushcfunction(L, continuationGc);
-            lua_setfield(L, -2, "__gc");
-        }
-        lua_pop(L, 1);
-        auto *continuation = new (lua_newuserdata(L, sizeof(ContinuationState)))
-            ContinuationState();
-        const int context = lua_gettop(L);
-        luaL_setmetatable(L, "tdlua.continuation");
-        continuation->dependency_core = shared_from_this();
-        continuation->dependency = state;
-        continuation->coroutine = L;
-        continuation->kind = kind;
-        if (field) continuation->field = field;
+        State task;
+        std::shared_ptr<SchedulerCore> task_core;
         const auto binding = taskBindings().find(L);
         if (binding != taskBindings().end()) {
-            continuation->task_core = binding->second.core;
-            continuation->task = binding->second.state.lock();
+            task_core = binding->second.core.lock();
+            task = binding->second.state.lock();
         }
-        anchorContinuation(L, context);
+        struct YieldPreparation {
+            SchedulerCore *core;
+            const State *dependency;
+            const State *task;
+            const std::shared_ptr<SchedulerCore> *task_core;
+            WaitKind kind;
+            const char *field;
+            ContinuationState *continuation;
+        } preparation = {this, &state, &task, &task_core, kind, field, nullptr};
+        // The preparation frame borrows all C++ owners. An incomplete userdata
+        // already has its finalizer before uservalue storage can allocate.
+        protectedLuaValues(L, [](lua_State *L, void *context) {
+            auto *preparation = static_cast<YieldPreparation *>(context);
+            luaL_newmetatable(L, "tdlua.continuation");
+            lua_pushcfunction(L, continuationGc);
+            lua_setfield(L, -2, "__gc");
+            auto *continuation = new (lua_newuserdata(L, sizeof(ContinuationState)))
+                ContinuationState();
+            lua_pushvalue(L, -2);
+            lua_setmetatable(L, -2);
+            lua_remove(L, -2);
+            preparation->continuation = continuation;
+            continuation->consumed = true;
+            continuation->dependency_core = preparation->core->shared_from_this();
+            continuation->dependency = *preparation->dependency;
+            continuation->task_core = *preparation->task_core;
+            continuation->task = *preparation->task;
+            continuation->coroutine = L;
+            continuation->kind = preparation->kind;
+            if (preparation->field) continuation->field = preparation->field;
+            preparation->core->anchorContinuation(
+                L, lua_gettop(L), preparation->task_core->get());
+        }, &preparation, 0, 0, 1);
+        auto *continuation = preparation.continuation;
+        const int context = lua_gettop(L);
+        const auto current_binding = taskBindings().find(L);
+        if (current_binding != taskBindings().end())
+            current_binding->second.continuation = continuation;
 
         WaitRegistration registration;
         registration.continuation = continuation;
@@ -1024,6 +1391,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         waiters_[L] = registration;
         waitBindings()[L] = shared_from_this();
         ++state->waiter_count;
+        continuation->consumed = false;
         return context;
 #endif
     }
@@ -1366,9 +1734,14 @@ public:
             throw std::runtime_error("tdlua: invalid task callback");
         const State state = createState(RequestKind::Task);
         state->callback_is_thread = supplied_thread;
-        if (supplied_thread) state->thread_ref = createLuaReference(L, callback);
-        else state->callback_ref = createLuaReference(L, callback);
-        if (context) state->context_ref = createLuaReference(L, context);
+        try {
+            if (supplied_thread) state->thread_ref = createLuaReference(L, callback);
+            else state->callback_ref = createLuaReference(L, callback);
+            if (context) state->context_ref = createLuaReference(L, context);
+        } catch (...) {
+            rollbackTaskCreation(state);
+            throw;
+        }
         return state;
     }
 
@@ -1500,15 +1873,25 @@ public:
             state->failure_observed = true;
             throw std::runtime_error(state->error);
         }
-        if (!isTaskState(state)) { pushLuaReference(L, state->response_ref); return 1; }
-        if (state->result_ref == LUA_NOREF) return 0;
-        pushLuaReference(L, state->result_ref);
-        const int table = lua_gettop(L);
-        lua_getfield(L, table, "n");
-        const int count = static_cast<int>(lua_tointeger(L, -1));
-        lua_pop(L, 1);
-        for (int i = 1; i <= count; ++i) lua_rawgeti(L, table, i);
-        lua_remove(L, table);
+        const bool task = isTaskState(state);
+        struct ResultValues {
+            SchedulerCore *core;
+            int reference;
+            int count;
+            bool task;
+        } values = {this, task ? state->result_ref : state->response_ref,
+                    task ? state->result_count : 1, task};
+        if (values.reference == LUA_NOREF) return 0;
+        const int count = values.count;
+        protectedLuaValues(L, [](lua_State *target, void *context) {
+            auto *values = static_cast<ResultValues *>(context);
+            values->core->pushLuaReference(target, values->reference);
+            if (!values->task) return;
+            const int table = lua_gettop(target);
+            for (int index = 1; index <= values->count; ++index)
+                lua_rawgeti(target, table, index);
+            lua_remove(target, table);
+        }, &values, 0, 0, count);
         return count;
     }
 
@@ -1517,8 +1900,8 @@ public:
         if (kind == WaitKind::Field) {
             throw std::runtime_error("tdlua: Future wait timeout");
         }
-        lua_pushnil(L);
-        lua_pushliteral(L, "timeout");
+        ContinuationPush push = {ContinuationPushKind::Timeout, nullptr};
+        protectedLuaValues(L, pushContinuationResult, &push, 0, 0, 2);
         results = 2;
     }
 
@@ -1600,7 +1983,8 @@ public:
 
         results = pushResult(L, state);
         if (kind == WaitKind::Field) {
-            pushManagedField(L, field ? field : "");
+            ContinuationPush push = {ContinuationPushKind::Field, field ? field : ""};
+            protectedLuaValues(L, pushContinuationResult, &push, -1, 1, 1);
             results = 1;
         }
         retireState(state);
@@ -1610,7 +1994,11 @@ public:
     int completeContinuation(lua_State *L, ContinuationState *continuation)
     {
         if (continuation->consumed) {
-            lua_pushliteral(L, "tdlua: managed continuation already consumed");
+            ContinuationPush push = {
+                ContinuationPushKind::Error,
+                "tdlua: managed continuation already consumed"};
+            protectedLuaValues(L, pushContinuationResult,
+                               &push, 0, 0, 1);
             return -1;
         }
         continuation->consumed = true;
@@ -1630,22 +2018,41 @@ public:
                 task_core->wake(task);
                 task_core->retireState(task);
             }
-            lua_pushliteral(L, "tdlua: coroutine resumed externally while waiting");
+            ContinuationPush push = {
+                ContinuationPushKind::Error,
+                "tdlua: coroutine resumed externally while waiting"};
+            protectedLuaValues(L, pushContinuationResult,
+                               &push, 0, 0, 1);
             results = -1;
         } else if (outcome == WaitOutcome::Failed) {
-            lua_pushstring(L, dependency->error.c_str());
+            ContinuationPush push = {
+                ContinuationPushKind::Error, dependency->error.c_str()};
+            protectedLuaValues(L, pushContinuationResult,
+                               &push, 0, 0, 1);
+            results = -1;
+        } else if (outcome == WaitOutcome::DeliveryError) {
+            // resume() left a Lua error object on the coroutine stack. Reuse
+            // it so continuation completion cannot allocate across C++ state.
             results = -1;
         } else if (outcome == WaitOutcome::Timeout) {
             if (continuation->kind == WaitKind::Field) {
-                lua_pushliteral(L, "tdlua: Future wait timeout");
+                ContinuationPush push = {
+                    ContinuationPushKind::Timeout, "field"};
+                protectedLuaValues(L, pushContinuationResult,
+                                   &push, 0, 0, 1);
                 results = -1;
             } else {
-                lua_pushnil(L);
-                lua_pushliteral(L, "timeout");
+                ContinuationPush push = {
+                    ContinuationPushKind::Timeout, nullptr};
+                protectedLuaValues(L, pushContinuationResult,
+                                   &push, 0, 0, 2);
                 results = 2;
             }
         } else if (continuation->kind == WaitKind::Field) {
-            pushManagedField(L, continuation->field.c_str());
+            ContinuationPush push = {
+                ContinuationPushKind::Field, continuation->field.c_str()};
+            protectedLuaValues(L, pushContinuationResult,
+                               &push, -1, 1, 1);
             results = 1;
         }
         continuation->dependency.reset();
@@ -1809,12 +2216,17 @@ public:
                 detachTransport("tdlua: client closed", preserve);
             }
             draining_ = false;
+            // A Lua allocation failure may escape a resumed coroutine on
+            // older Lua ABIs. Do not leave its Task Running after the wait
+            // registration has been rolled back.
+            try { failStrandedTasks(); } catch (...) {}
             throw;
         }
         draining_ = false;
         if (delivery == ErrorDelivery::PublicCall && !scheduler_errors_.empty()) {
             const std::string error = scheduler_errors_.front();
             scheduler_errors_.pop_front();
+            try { failStrandedTasks(); } catch (...) {}
             throw std::runtime_error(error);
         }
     }
@@ -2084,6 +2496,8 @@ inline int RequestRouter::wait(lua_State *L, const ManagedStatePtr &state, bool 
     int results = 0, context = 0;
     try {
         context = core_->prepareWait(L, state, timed, timeout, kind, field, results);
+    } catch (const TDLuaLuaError &) {
+        results = -1;
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
         results = -1;
@@ -2101,6 +2515,8 @@ inline int RequestRouter::waitById(lua_State *L, std::uint64_t id, bool timed,
     try {
         const auto state = core_->stateById(id);
         context = core_->prepareWait(L, state, timed, timeout, kind, field, results);
+    } catch (const TDLuaLuaError &) {
+        results = -1;
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
         results = -1;
@@ -2166,6 +2582,8 @@ inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char
             throw std::runtime_error("tdlua: scheduler storage unavailable");
         }
         context = core->prepareWait(L, handle->state, timed, timeout, kind, field, results);
+    } catch (const TDLuaLuaError &) {
+        results = -1;
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
         results = -1;
@@ -2241,16 +2659,59 @@ inline int managedWaitContinuation(lua_State *L, int, lua_KContext ctx)
         return luaL_error(L, "tdlua: invalid managed continuation");
     }
     try {
-        const auto core = continuation->dependency_core.lock();
-        if (!core) {
-            throw std::runtime_error("tdlua: scheduler storage unavailable");
+        {
+            const auto core = continuation->dependency_core.lock();
+            if (!core) {
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            }
+            results = core->completeContinuation(L, continuation);
+            clearContinuationUservalue(L, static_cast<int>(ctx));
         }
-        results = core->completeContinuation(L, continuation);
-        tdlua_lua_clear_uservalue(L, static_cast<int>(ctx));
+    } catch (const TDLuaLuaError &) {
+        results = -1;
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+        try {
+            clearContinuationUservalue(L, static_cast<int>(ctx));
+        } catch (...) {
+            // The continuation's Lua-owned uservalue remains collectible.
+        }
     } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
+        ContinuationPush push = {ContinuationPushKind::Error, error.what()};
+        try {
+            protectedLuaValues(L, pushContinuationResult, &push, 0, 0, 1);
+        } catch (const TDLuaLuaError &) {
+            results = -1;
+        }
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+        try {
+            clearContinuationUservalue(L, static_cast<int>(ctx));
+        } catch (...) {
+            // Preserve the original Lua error object if even cleanup allocates.
+        }
+        results = -1;
     } catch (...) {
-        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        ContinuationPush push = {
+            ContinuationPushKind::Error, "tdlua: unknown C++ exception"};
+        try {
+            protectedLuaValues(L, pushContinuationResult, &push, 0, 0, 1);
+        } catch (const TDLuaLuaError &) {
+            results = -1;
+        }
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+        try {
+            clearContinuationUservalue(L, static_cast<int>(ctx));
+        } catch (...) {
+        }
+        results = -1;
     }
     return finishManagedWait(L, results);
 }

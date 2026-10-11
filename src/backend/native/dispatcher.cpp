@@ -2,7 +2,31 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "tdlua/backend/native/dispatcher.h"
 #include "tdlua/backend/native/codec.h"
+#include "tdlua/backend/native/codec_runtime.h"
+#include "tdlua/common/lua_protected.h"
+#include <cstdint>
 #include <stdexcept>
+
+namespace {
+struct NativeResponsePush {
+    const NativeResponse *response;
+};
+
+void push_native_response(lua_State *L, void *context)
+{
+    const auto *push = static_cast<const NativeResponsePush *>(context);
+    const NativeResponse &response = *push->response;
+    if (!response.object) {
+        lua_pushnil(L);
+        return;
+    }
+    tdlua_native::push_object(L, *response.object);
+    if (response.request_id != 0) {
+        tdlua_native::push_integer(L, static_cast<std::int64_t>(response.request_id));
+        lua_setfield(L, -2, "_request_id");
+    }
+}
+} // namespace
 
 NativeDispatcher::NativeDispatcher(lua_State *owner)
     : router_(owner)
@@ -84,15 +108,10 @@ std::size_t NativeDispatcher::pendingCount() const
 
 void NativeDispatcher::pushResponse(lua_State *L, const NativeResponse &response) const
 {
-    if (!response.object) {
-        lua_pushnil(L);
-        return;
-    }
-    tdlua_native::push_object(L, *response.object);
-    if (response.request_id != 0) {
-        tdlua_lua_push_integer(L, static_cast<std::int64_t>(response.request_id));
-        lua_setfield(L, -2, "_request_id");
-    }
+    NativeResponsePush push = {&response};
+    // Generated pushers call allocating Lua APIs. Keep a Lua OOM inside the
+    // protected frame so the owning NativeResponse/object_ptr can unwind.
+    tdlua::protectedLuaValues(L, push_native_response, &push, 0, 0, 1);
 }
 
 namespace {

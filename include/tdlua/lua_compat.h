@@ -16,7 +16,9 @@
 #endif
 
 #include <cmath>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <stdexcept>
@@ -239,8 +241,12 @@ inline bool tdlua_can_push_integer(std::int64_t value)
 inline void tdlua_lua_push_integer(lua_State *L, std::int64_t value)
 {
     if (!tdlua_can_push_integer(value)) {
-        const std::string text = std::to_string(value);
-        lua_pushlstring(L, text.c_str(), text.size());
+        char text[32];
+        const int length = std::snprintf(text, sizeof(text), "%" PRId64, value);
+        if (length < 0 || static_cast<std::size_t>(length) >= sizeof(text)) {
+            throw std::runtime_error("tdlua: integer conversion failed");
+        }
+        lua_pushlstring(L, text, static_cast<std::size_t>(length));
         return;
     }
 #if LUA_VERSION_NUM >= 503

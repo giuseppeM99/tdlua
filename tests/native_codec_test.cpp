@@ -3,18 +3,55 @@
 
 #include "tdlua/backend/native/codec_runtime.h"
 #include "tdlua/backend/native/codec.h"
+#include "tdlua/backend/native/dispatcher.h"
+#include "tdlua/backend/native/runtime.h"
 #include "tdlua/common/lua_json.h"
 #include <td/telegram/td_api_json.h>
 
 #include <td/telegram/td_api.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace {
+
+struct LuaFaultAllocator {
+    std::size_t calls = 0;
+    std::size_t fail_at = 0;
+    std::size_t rejected = 0;
+#if LUA_VERSION_NUM >= 502
+    std::size_t rejection_budget = 2;
+#else
+    std::size_t rejection_budget = 1;
+#endif
+    std::size_t live_blocks = 0;
+
+    static void *allocate(void *context, void *old, std::size_t old_size,
+                          std::size_t new_size)
+    {
+        auto *allocator = static_cast<LuaFaultAllocator *>(context);
+        if (new_size == 0) {
+            if (old) --allocator->live_blocks;
+            std::free(old);
+            return nullptr;
+        }
+        ++allocator->calls;
+        if (allocator->fail_at && allocator->calls >= allocator->fail_at &&
+            (!old || new_size > old_size)) {
+            ++allocator->rejected;
+            if (--allocator->rejection_budget == 0) allocator->fail_at = 0;
+            return nullptr;
+        }
+        const bool fresh = old == nullptr;
+        void *result = std::realloc(old, new_size);
+        if (result && fresh) ++allocator->live_blocks;
+        return result;
+    }
+};
 
 void require(const bool condition, const std::string &message)
 {
@@ -164,6 +201,66 @@ void test_int64_parity(lua_State *L)
     }
 }
 
+void test_native_response_push_oom()
+{
+    int injected = 0;
+    int errors = 0;
+    std::size_t rejected_calls = 0;
+    for (std::size_t offset = 1; offset <= 80; ++offset) {
+        LuaFaultAllocator allocator;
+#if LUA_VERSION_NUM >= 505
+        lua_State *L = lua_newstate(LuaFaultAllocator::allocate, &allocator, 0);
+#else
+        lua_State *L = lua_newstate(LuaFaultAllocator::allocate, &allocator);
+#endif
+        require(L != nullptr, "unable to create Lua state for native push OOM");
+        {
+            NativeDispatcher dispatcher(L);
+            NativeResponse response;
+            response.request_id = 81;
+            response.object = td::td_api::make_object<
+                td::td_api::stickerFullTypeCustomEmoji>();
+            static_cast<td::td_api::stickerFullTypeCustomEmoji &>(
+                *response.object).custom_emoji_id_ = 9007199254740993LL;
+
+            const int top = lua_gettop(L);
+            allocator.fail_at = allocator.calls + offset;
+            bool failed = false;
+            try {
+                dispatcher.pushResponse(L, response);
+            } catch (const TDLuaLuaError &) {
+                failed = true;
+            }
+            allocator.fail_at = 0;
+            if (allocator.rejected) ++injected;
+            rejected_calls += allocator.rejected;
+            require(static_cast<bool>(response.object),
+                    "Lua OOM consumed the native object_ptr");
+            if (failed) {
+                ++errors;
+                require(lua_gettop(L) == top + 1 && lua_type(L, -1) == LUA_TSTRING,
+                        "native push OOM did not preserve the Lua error object");
+                lua_settop(L, top);
+                dispatcher.pushResponse(L, response);
+            }
+            require(lua_istable(L, -1), "native response was not pushed as a table");
+            lua_getfield(L, -1, "_request_id");
+            require(lua_tointeger(L, -1) == 81,
+                    "native response request ID changed after push");
+            lua_settop(L, top);
+        }
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_close(L);
+        require(allocator.live_blocks == 0,
+                "native response push left Lua allocations after close");
+    }
+    require(injected != 0, "native response sweep injected no Lua allocator errors");
+    require(errors != 0, "native response sweep reached no Lua OOM boundary");
+    std::cout << "Native response push: 80 offsets passed; injected="
+              << injected << " errors=" << errors
+              << " rejected_calls=" << rejected_calls << '\n';
+}
+
 }  // namespace
 
 int main()
@@ -186,6 +283,7 @@ int main()
         expect_invalid_int64(L, "123suffix");
         expect_invalid_int64(L, "");
         expect_omitted_set_tdlib_parameters(L);
+        test_native_response_push_oom();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         lua_close(L);

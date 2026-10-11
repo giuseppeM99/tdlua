@@ -1,7 +1,9 @@
 #include "tdlua/common/lua_json.h"
+#include "tdlua/common/lua_protected.h"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 /*
     This code was originally wrote by vysheng for tdbot
@@ -33,6 +35,62 @@ static bool lua_isarray(lua_State *L)
 }
 
 namespace {
+
+using JsonIterator = json::const_iterator;
+static_assert(std::is_trivially_destructible<JsonIterator>::value,
+              "Lua JSON pushes must not skip a non-trivial iterator destructor");
+
+struct JsonPushContext {
+    const json *value;
+};
+
+void push_json_value(lua_State *L, const json &j)
+{
+    if (j.is_null()) {
+        lua_pushnil(L);
+    } else if (j.is_boolean()) {
+        lua_pushboolean(L, j.get<bool>());
+    } else if (j.is_string()) {
+        const auto &value = j.get_ref<const json::string_t &>();
+        lua_pushlstring(L, value.data(), value.size());
+    } else if (j.is_number_integer()) {
+        const std::int64_t value = j.get<std::int64_t>();
+        tdlua_lua_push_integer(L, value);
+    } else if (j.is_number_float()) {
+        lua_pushnumber(L, j.get<double>());
+    } else if (j.is_array()) {
+        lua_newtable(L);
+        lua_Integer index = 1;
+        for (auto it = j.begin(); it != j.end(); ++it, ++index) {
+            // Preserve the pre-existing numeric representation of array keys.
+            lua_pushnumber(L, static_cast<lua_Number>(index));
+            push_json_value(L, *it);
+            lua_settable(L, -3);
+        }
+    } else if (j.is_object()) {
+        lua_newtable(L);
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            const auto &key = it.key();
+            lua_pushlstring(L, key.data(), key.size());
+            push_json_value(L, it.value());
+            lua_settable(L, -3);
+
+            if (key == "@type" && j.find("_") == j.end()) {
+                lua_pushliteral(L, "_");
+                push_json_value(L, it.value());
+                lua_rawset(L, -3);
+            }
+        }
+    } else {
+        lua_pushnil(L);
+    }
+}
+
+void push_json_value_protected(lua_State *L, void *context)
+{
+    const auto *push = static_cast<const JsonPushContext *>(context);
+    push_json_value(L, *push->value);
+}
 
 std::string lua_json_path_for_key(lua_State *L, int index, const std::string &path)
 {
@@ -125,43 +183,9 @@ void lua_getjson(lua_State *L, json &j)
     lua_getjson_value(L, j, "");
 }
 
-void lua_pushjson (lua_State *L, const json j) {
-    if (j.is_null()) {
-        lua_pushnil(L);
-    } else if (j.is_boolean()) {
-        lua_pushboolean(L, j.get<bool>());
-    } else if (j.is_string()) {
-        auto s = j.get<std::string>();
-        lua_pushlstring(L, s.c_str(), s.length());
-    } else if (j.is_number_integer()) {
-        tdlua_lua_push_integer(L, j.get<std::int64_t>());
-    } else if (j.is_number_float()) {
-        auto v = j.get<double>();
-        lua_pushnumber(L, v);
-    } else if (j.is_array()) {
-        lua_newtable (L);
-        int p = 1;
-        for (auto it = j.begin(); it != j.end(); it++, p++) {
-            lua_pushnumber(L, p);
-            lua_pushjson(L, *it);
-            lua_settable(L, -3);
-        }
-    } else if (j.is_object()) {
-        lua_newtable(L);
-        for (auto it = j.begin(); it != j.end(); it++) {
-            auto s = it.key();
-
-            lua_pushlstring(L, s.c_str(), s.length());
-            lua_pushjson(L, it.value());
-            lua_settable(L, -3);
-
-            if (s == "@type" && j.find("_") == j.end()) {
-                lua_pushliteral(L, "_");
-                lua_pushjson(L, it.value());
-                lua_rawset(L, -3);
-            }
-        }
-    } else {
-        lua_pushnil(L);
-    }
+void lua_pushjson(lua_State *L, const json &j)
+{
+    JsonPushContext context = {&j};
+    tdlua::protectedLuaValues(L, push_json_value_protected, &context,
+                             0, 0, 1);
 }
