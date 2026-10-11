@@ -714,6 +714,28 @@ if(TDLUA_BUILD_TESTS)
         add_dependencies(tdlua_native_codec_test tdlua_native_generated)
         add_test(NAME tdlua_native_codec COMMAND tdlua_native_codec_test)
 
+        add_executable(tdlua_native_decoder_safety_test
+            "tests/native_decoder_safety_test.cpp"
+        )
+        target_include_directories(tdlua_native_decoder_safety_test PRIVATE
+            ${LUA_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td"
+            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${TDLUA_NATIVE_GENERATED_DIR}"
+        )
+        target_link_libraries(tdlua_native_decoder_safety_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        target_compile_features(tdlua_native_decoder_safety_test PRIVATE cxx_std_23)
+        tdlua_enable_sanitizers(tdlua_native_decoder_safety_test)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(tdlua_native_decoder_safety_test PRIVATE
+                -fno-sanitize=vptr)
+        endif()
+        add_dependencies(tdlua_native_decoder_safety_test tdlua_native_generated)
+        add_test(NAME tdlua_native_decoder_safety
+                 COMMAND tdlua_native_decoder_safety_test)
+
         add_executable(tdlua_native_schema_test
             "tests/native_schema_test.cpp"
         )
@@ -820,7 +842,8 @@ foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test
         tdlua_common_router_test
         tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
         tdlua_simple_bot_example_test tdlua_async_demo_test tdlua_persistence_test
-        tdlua_native_codec_test tdlua_model_benchmark)
+        tdlua_native_codec_test tdlua_native_decoder_safety_test
+        tdlua_model_benchmark)
     if(TARGET ${target})
         target_link_libraries(${target} PRIVATE tdlua_lua_runtime)
     endif()

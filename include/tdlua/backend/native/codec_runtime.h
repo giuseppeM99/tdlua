@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "tdlua/common/lua_protected.h"
+
 #include "tdlua/lua_compat.h"
 
 #include <cmath>
@@ -10,6 +12,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -51,18 +54,63 @@ inline void require_array(lua_State *L, int index, const std::string &path)
     }
 }
 
+struct FieldLookup final {
+    const char *name;
+};
+
+inline void protected_field_lookup(lua_State *L, void *opaque)
+{
+    const auto *lookup = static_cast<const FieldLookup *>(opaque);
+    // protectedLuaValues supplies context as argument 1 and the source table
+    // as argument 2, including on stock Lua 5.1's cpcall-based path.
+    lua_getfield(L, 2, lookup->name);
+}
+
+inline void push_field(lua_State *L, int table_index, const char *name)
+{
+    FieldLookup lookup = {name};
+    tdlua::protectedLuaValues(L, protected_field_lookup, &lookup,
+                              table_index, 1, 1);
+}
+
+struct StringCopy final {
+    std::string *value;
+};
+
+inline void protected_string_copy(lua_State *L, void *opaque)
+{
+    const auto *copy = static_cast<const StringCopy *>(opaque);
+    size_t length = 0;
+    const char *value = lua_tolstring(L, 2, &length);
+    if (!value) {
+        throw CodecError("tdlua: expected string");
+    }
+    copy->value->assign(value, length);
+}
+
+inline std::string string_value(lua_State *L, int index)
+{
+    std::string result;
+    StringCopy copy = {&result};
+    tdlua::protectedLuaValues(L, protected_string_copy, &copy, index, 1, 0);
+    return result;
+}
+
 class Field final {
 public:
     Field(lua_State *L, int table_index, const char *name)
-        : L_(L)
+        : L_(L), stack_index_(0)
     {
-        const int absolute = lua_absindex(L, table_index);
-        lua_getfield(L, absolute, name);
+        push_field(L, table_index, name);
+        stack_index_ = lua_gettop(L);
     }
 
     ~Field()
     {
-        lua_pop(L_, 1);
+        // A caught Lua error can be above this value while C++ unwinds.
+        if (stack_index_ != 0) {
+            lua_remove(L_, stack_index_);
+        }
     }
 
     int index() const { return -1; }
@@ -70,6 +118,7 @@ public:
 
 private:
     lua_State *L_;
+    int stack_index_;
     Field(const Field &) = delete;
     Field &operator=(const Field &) = delete;
 };
@@ -77,21 +126,28 @@ private:
 class Element final {
 public:
     Element(lua_State *L, int array_index, lua_Integer index)
-        : L_(L)
+        : L_(L), stack_index_(0)
     {
+        if (!lua_checkstack(L, 1)) {
+            throw std::bad_alloc();
+        }
         const int absolute = lua_absindex(L, array_index);
         lua_rawgeti(L, absolute, index);
+        stack_index_ = lua_gettop(L);
     }
 
     ~Element()
     {
-        lua_pop(L_, 1);
+        if (stack_index_ != 0) {
+            lua_remove(L_, stack_index_);
+        }
     }
 
     int index() const { return -1; }
 
 private:
     lua_State *L_;
+    int stack_index_;
     Element(const Element &) = delete;
     Element &operator=(const Element &) = delete;
 };
@@ -100,19 +156,28 @@ inline std::string type_name(lua_State *L, int index, const std::string &path)
 {
     require_table(L, index, path);
     const int absolute = lua_absindex(L, index);
-    lua_getfield(L, absolute, "_");
-    if (!lua_isstring(L, -1)) {
-        lua_pop(L, 1);
-        lua_getfield(L, absolute, "@type");
+    std::string result;
+    bool found_type = false;
+    {
+        Field type(L, absolute, "_");
+        if (type.has_value() && lua_isstring(L, type.index())) {
+            result = string_value(L, type.index());
+            found_type = true;
+        }
     }
-    if (!lua_isstring(L, -1)) {
-        lua_pop(L, 1);
+    if (found_type) {
+        return result;
+    }
+    {
+        Field type(L, absolute, "@type");
+        if (type.has_value() && lua_isstring(L, type.index())) {
+            result = string_value(L, type.index());
+            found_type = true;
+        }
+    }
+    if (!found_type) {
         throw CodecError("tdlua: missing type at " + path);
     }
-    size_t length = 0;
-    const char *value = lua_tolstring(L, -1, &length);
-    std::string result(value, length);
-    lua_pop(L, 1);
     return result;
 }
 
@@ -224,6 +289,9 @@ inline lua_Integer array_length(lua_State *L, int index, const std::string &path
 {
     require_array(L, index, path);
     const int absolute = lua_absindex(L, index);
+    if (!lua_checkstack(L, 2)) {
+        throw std::bad_alloc();
+    }
     lua_Integer maximum = 0;
     lua_Integer count = 0;
     lua_pushnil(L);
