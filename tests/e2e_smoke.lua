@@ -62,6 +62,12 @@ if parameter_result._ == "error" then
         "TDLib rejected omitted fields while parsing setTdlibParameters")
 end
 
-client:close()
-assert(client:isClosed())
+local close_future = client:close()
+assert(not client:isClosed())
+for _ = 1, 100 do
+    if client:isClosed() then break end
+    client:receive(0.1)
+end
+assert(client:isClosed(), "close did not deliver authorizationStateClosed")
+assert(close_future:ready() and close_future:wait()._ == "ok")
 print("e2e_smoke: passed")

@@ -217,7 +217,8 @@ std::int32_t JsonRuntime::createClient(std::uint64_t owner)
 }
 void JsonRuntime::send(std::int32_t client, const json &request)
 {
-    const bool close = request.value("@type", std::string()) == "close";
+    const std::string type = request.value("@type", std::string());
+    const bool close = type == "close" || type == "destroy";
     if (close) {
         try {
             engine_.checkHealthy();

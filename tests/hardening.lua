@@ -4,6 +4,20 @@ package.cpath = assert(arg[1]) .. '/?.so;' .. package.cpath
 local td = require 'tdlua'
 td.setLogLevel(0)
 
+local function finish_shutdown(client)
+    local future = client:close()
+    assert(not client:isClosed())
+    local first_error
+    for _ = 1, 100 do
+        if client:isClosed() then break end
+        local ok, message = pcall(client.receive, client, 0.05)
+        if not ok and not first_error then first_error = message end
+    end
+    assert(client:isClosed())
+    if first_error then error(first_error) end
+    if future:ready() then assert(future:wait()._ == 'ok') end
+end
+
 local c = td()
 for _,value in ipairs{42, false, function() end, coroutine.create(function() end)} do
     local ok, message = pcall(c.execute, c, value)
@@ -11,7 +25,7 @@ for _,value in ipairs{42, false, function() end, coroutine.create(function() end
 end
 local future = c:execute('{"@type":"getAuthorizationState"}')
 assert(future:wait()._request_id == future._request_id)
-c:close()
+finish_shutdown(c)
 
 -- Real TDLib replies offline. Discard before the callback runs.
 c = td()
@@ -29,7 +43,7 @@ for _ = 1, 40 do
 end
 assert(fired and failures == 1)
 for _ = 1, 3 do c:receive(0.01) end
-c:close()
+finish_shutdown(c)
 
 for _,mode in ipairs{'await', 'field', 'future'} do
     c = td()
@@ -40,13 +54,12 @@ for _,mode in ipairs{'await', 'field', 'future'} do
         if mode == 'field' then return pending.first_name end
     end)
     assert(coroutine.resume(co))
-    c:close()
+    finish_shutdown(c)
     assert(c:isClosed() and coroutine.status(co) == 'dead')
     if pending then
         local ok, message = pcall(function() pending:wait() end)
         assert(not ok and message:find('client closed'))
     end
-    c:close()
 end
 
 -- Discarded callback Tasks must not turn expected close failures into
@@ -71,7 +84,7 @@ for _,mode in ipairs{'pending', 'running', 'unrelated'} do
     end
     task = nil
     collectgarbage('collect')
-    local ok, message = pcall(c.close, c)
+    local ok, message = pcall(finish_shutdown, c)
     if mode == 'unrelated' then
         assert(not ok and message:find('offline unrelated task close boom'))
     else
@@ -80,7 +93,6 @@ for _,mode in ipairs{'pending', 'running', 'unrelated'} do
     if mode == 'pending' then assert(not started) end
     assert(c:isClosed() and c:poll() == nil)
     c:loop()
-    c:close()
 end
 
 -- Raw receive and managed loop must both deliver Closed before detach.
@@ -110,7 +122,6 @@ for _,managed in ipairs{false, true} do
         assert(ok ~= fail_handler)
         if fail_handler then assert(message:find('closed handler boom')) end
         assert(c:poll() == nil)
-        c:close()
     end
 end
 print('hardening backend regressions passed')

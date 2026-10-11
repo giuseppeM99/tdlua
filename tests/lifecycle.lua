@@ -6,6 +6,30 @@ package.cpath = module_dir .. "/?.so;" .. package.cpath
 
 local tdlua = require "tdlua"
 assert(tdlua.version == tdlua.api_version .. "-" .. tdlua.tdlib_version)
+
+local function finish_shutdown(client, request)
+    if request == "destroy" then
+        local destroy_future = client:destroy()
+        for _ = 1, 100 do
+            if destroy_future:ready() then break end
+            client:receive(0.1)
+        end
+        assert(destroy_future:ready(), "destroy request did not settle")
+        assert(destroy_future:wait()._ == "error",
+               "TDLib should reject destroy before parameters are set")
+        request = "close"
+    end
+    local future = client[request](client)
+    assert(not client:isClosed(), "shutdown request closed the client synchronously")
+    for _ = 1, 100 do
+        if client:isClosed() then break end
+        client:receive(0.1)
+    end
+    assert(client:isClosed(), request .. " did not deliver authorizationStateClosed")
+    assert(future:ready(), request .. " request Future did not settle")
+    assert(future:wait()._ == "ok")
+end
+
 local client = tdlua()
 
 assert(client:isClosed() == false)
@@ -50,13 +74,12 @@ end
 assert(wait_for_id(first, first_id))
 assert(wait_for_id(second, second_id))
 
-first:close()
-second:close()
-client:close()
+finish_shutdown(first, "close")
+finish_shutdown(second, "close")
+finish_shutdown(client, "close")
 assert(client:isClosed() == true)
 assert(client:receive(0.01) == nil)
-client:close()
 
 local legacy = tdlua()
-legacy:destroy()
+finish_shutdown(legacy, "destroy")
 assert(legacy:isClosed() == true)

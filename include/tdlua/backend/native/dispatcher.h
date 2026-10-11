@@ -65,11 +65,15 @@ public:
         router_.attachStorage(L, client);
     }
 
-    void detachAfterDrain() { router_.detachAfterDrain(); }
-
-    void detachTransport(const std::string &message = "tdlua: client closed")
+    void detachAfterDrain(bool preserve_selected_update = false)
     {
-        router_.core()->detachTransport(message);
+        router_.detachAfterDrain(preserve_selected_update);
+    }
+
+    void detachTransport(const std::string &message = "tdlua: client closed",
+                         bool preserve_selected_update = false)
+    {
+        router_.core()->detachTransport(message, preserve_selected_update);
     }
 
 private:

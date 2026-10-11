@@ -135,7 +135,6 @@ struct ClientOperations final {
     void (*save_updates)(ClientHandle);
     void (*clear_updates)(ClientHandle);
     void (*unload)(ClientHandle);
-    void (*close)(ClientHandle);
     bool (*closed)(ClientHandle);
 #ifdef TDLUA_TESTING
     lua_CFunction pending_count;
@@ -490,18 +489,6 @@ inline int unload(lua_State *L, ClientHandle client,
     }
     return protected_call(L, [&]() -> int {
         if (client) operations.unload(client);
-        return 0;
-    });
-}
-
-inline int close(lua_State *L, ClientHandle client,
-                 const ClientOperations &operations)
-{
-    return protected_call(L, [&]() -> int {
-        if (!client) {
-            throw std::runtime_error("invalid tdlua client");
-        }
-        operations.close(client);
         return 0;
     });
 }

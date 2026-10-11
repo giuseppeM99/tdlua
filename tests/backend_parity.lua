@@ -657,15 +657,26 @@ client.onUpdateAuthorizationState = nil
 assert(client.onUpdateAuthorizationState == nil)
 client:off("updateAuthorizationState")
 
--- Closing must release callbacks that are still waiting for a response.
+-- A response received before the terminal close update may settle normally.
+local function finish_shutdown(target, method)
+    local future = target[method](target)
+    assert(not target:isClosed())
+    for _ = 1, 100 do
+        if target:isClosed() then break end
+        target:receive(0.1)
+    end
+    assert(target:isClosed())
+    if future:ready() then assert(future:wait()._ == 'ok') end
+end
+
 local pending_callback_called = false
 client:request({_ = "getAuthorizationState"}, function()
     pending_callback_called = true
 end, {origin = "pending-close"})
 assert(client:pendingCount() == 1)
-client:close()
+finish_shutdown(client, 'close')
 assert(client:pendingCount() == 0)
-assert(not pending_callback_called, "pending callback ran during close")
+assert(pending_callback_called, "pre-terminal response was not dispatched")
 assert(client:isClosed() == true)
 assert(client:receive(0.01) == nil)
 
@@ -683,13 +694,14 @@ for i = 1, 200 do
     assert(not request_ok, "request unexpectedly succeeded on a closed client")
 end
 assert(client:pendingCount() == 0)
-client:destroy()
 
 -- Repeated construction and explicit close must leave each client reusable
 -- independently and must not depend on the previous client's registry slot.
 for _ = 1, 20 do
     local repeated = tdlua.new()
-    repeated:close()
+    finish_shutdown(repeated, 'close')
     assert(repeated:isClosed() == true)
-    repeated:destroy()
 end
+
+local destroyed = tdlua.new()
+finish_shutdown(destroyed, 'destroy')

@@ -5,10 +5,12 @@
 #include "tdlua/backend/json/client.h"
 
 #include <deque>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,6 +26,8 @@ struct Fake {
     json sync = {{"@type", "ok"}};
     bool closed = false;
     bool fail = false;
+    bool auto_shutdown = true;
+    unsigned close_calls = 0;
     std::function<void(double)> before_receive;
     std::vector<double> waits;
 
@@ -35,7 +39,17 @@ struct Fake {
                 if (fake.closed || fake.fail) {
                     throw std::runtime_error("fake local send failure");
                 }
+                const std::string type = request.value(
+                    "@type", request.value("_", std::string()));
                 fake.sent.emplace_back(id, std::move(request));
+                if (fake.auto_shutdown && (type == "close" || type == "destroy")) {
+                    fake.incoming.push_back({
+                        {"@type", "ok"},
+                        {"@extra", {{"__tdlua_request_id", id}}}});
+                    fake.authorizationState("authorizationStateClosing");
+                    fake.update("shutdownProgress", 1);
+                    fake.authorizationState("authorizationStateClosed");
+                }
             },
             [](void *context, double timeout) {
                 auto &fake = *static_cast<Fake *>(context);
@@ -52,7 +66,9 @@ struct Fake {
                 return static_cast<Fake *>(context)->sync;
             },
             [](void *context) {
-                static_cast<Fake *>(context)->closed = true;
+                auto &fake = *static_cast<Fake *>(context);
+                ++fake.close_calls;
+                fake.closed = true;
             },
             [](void *context) {
                 return static_cast<Fake *>(context)->closed;
@@ -92,12 +108,26 @@ struct Fake {
         });
     }
 
+    void okResponse(std::uint64_t id)
+    {
+        incoming.push_back({
+            {"@type", "ok"},
+            {"@extra", {{"__tdlua_request_id", id}}}});
+    }
+
     void update(const char *type, int value)
     {
         incoming.push_back({
             {"@type", type},
             {"value", value}
         });
+    }
+
+    void authorizationState(const char *state)
+    {
+        incoming.push_back({
+            {"@type", "updateAuthorizationState"},
+            {"authorization_state", {{"@type", state}}}});
     }
 };
 
@@ -116,7 +146,8 @@ void runLua(lua_State *L, const char *source)
 {
     if (luaL_dostring(L, source) != LUA_OK) {
         const char *message = lua_tostring(L, -1);
-        throw std::runtime_error(message ? message : "Lua script failed");
+        throw std::runtime_error(std::string(message ? message : "Lua script failed") +
+                                 "\nLua source:\n" + source);
     }
 }
 
@@ -688,9 +719,16 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
     closing_owner.update("m3Close", 1);
     runLua(L, "e:receive(0)");
     const auto close_dependency_request = second.sent.back().first;
-    runLua(L,
-           "e:close(); closing_owner_update_ignored = true; "
-           "assert(e:receive(0) == nil); e = nil; collectgarbage('collect')");
+    runLua(L, R"lua(
+        close_handle=e:close(); assert(not e:isClosed())
+        assert(e:receive(0)._=='ok')
+        assert(e:receive(0).authorization_state._=='authorizationStateClosing')
+        assert(e:receive(0)._=='shutdownProgress')
+        terminal=e:receive(0)
+        assert(terminal.authorization_state._=='authorizationStateClosed')
+        assert(e:isClosed()); closing_owner_update_ignored = true
+        e=nil; collectgarbage('collect')
+    )lua");
     closing_owner.update("m3Close", 2);
     second.response(close_dependency_request, 71);
     runLua(L, "d:receive(0); assert(close_event_value == 71)");
@@ -703,8 +741,13 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
            "  f:close(); reentrant_close_called = true end)");
     reentrant_close_transport.update("m3ReentrantClose", 1);
     runLua(L,
-           "f:receive(0); assert(reentrant_close_called and f:isClosed()); "
-           "assert(f:receive(0) == nil); f = nil; collectgarbage('collect')");
+           "f:receive(0); assert(reentrant_close_called and not f:isClosed()); "
+           "assert(f:receive(0)._ == 'ok'); "
+           "assert(f:receive(0).authorization_state._ == 'authorizationStateClosing'); "
+           "assert(f:receive(0)._ == 'shutdownProgress'); "
+           "local terminal=f:receive(0); "
+           "assert(terminal.authorization_state._ == 'authorizationStateClosed' "
+           "and f:isClosed()); f=nil; collectgarbage('collect')");
 
     runLua(L,
            "c.onM3False = function() end; assert(c.onM3False ~= nil); "
@@ -895,8 +938,10 @@ void testLifetimeAndAbandonment()
                "  assert(not ok and message:find('client closed')); "
                "  ok, message = pcall(function() return r:getMe() end); "
                "  assert(not ok and message:find('closed')); "
-               "  r:close(); r = nil; collectgarbage('collect') end); "
+               "  r = nil; collectgarbage('collect') end); "
                "assert(coroutine.resume(close_waiter)); r:close(); "
+               "assert(coroutine.status(close_waiter) == 'suspended'); "
+               "r:receive(0); r:receive(0); r:receive(0); r:receive(0); "
                "assert(coroutine.status(close_waiter) == 'dead')");
 
         runLua(L,
@@ -1329,7 +1374,7 @@ void testManagedDrivers(lua_State *L, TestTransports &transports, bool fail_afte
     const auto wait_count = fake.waits.size();
     fake.before_receive = [&](double timeout) {
         if (!(timeout > 0)) throw std::runtime_error("managed driver requested a zero wait");
-        client->close(false);
+        client->closeInternal();
     };
     runLua(L, R"lua(
         close_pending=c:getMe()
@@ -1366,7 +1411,7 @@ void testTaskCloseOwnership()
         luaL_openlibs(L);
         try {
             createClients(L);
-            attachTransport(L, "c", fake);
+            TDLua *client = attachTransport(L, "c", fake);
             attachTransport(L, "d", other);
             const bool running = scenario != TaskCloseCase::PendingDiscarded &&
                                  scenario != TaskCloseCase::PendingRetained;
@@ -1381,9 +1426,8 @@ void testTaskCloseOwnership()
                 runLua(L, "c:receive(0); assert(callback_started and not task:ready())");
             }
             if (!retained) runLua(L, "task=nil; collectgarbage('collect')");
-            runLua(L, unrelated
-                ? "local ok,e=pcall(c.close,c); assert(not ok and e:find('unrelated task close boom'))"
-                : "local ok,e=pcall(c.close,c); assert(ok,e)");
+            client->closeInternal();
+            client->dispatcher().drainForFinalizer();
             if (!running) runLua(L, "assert(not callback_started)");
             if (retained) {
                 runLua(L, R"lua(
@@ -1396,7 +1440,7 @@ void testTaskCloseOwnership()
             runLua(L, R"lua(
                 assert(c:isClosed() and c:pendingCount()==0)
                 assert(c:poll()==nil); c:loop(); assert(c:receive(0)==nil)
-                c:close(); assert(c:poll()==nil); d:close()
+                assert(c:poll()==nil); d:close()
             )lua");
         } catch (...) {
             lua_close(L);
@@ -1444,7 +1488,12 @@ void testHardening()
                 runLua(L, "c:on('trigger',function() c:receive(0); c:receive(0) end)");
             }
             if (mode == 3) {
-                runLua(L, "c:close(); assert(c:isClosed())");
+                runLua(L, R"lua(
+                    close_future=c:close(); assert(not c:isClosed())
+                    assert(c:receive(0).authorization_state._=='authorizationStateClosing')
+                    assert(c:receive(0).authorization_state._=='authorizationStateClosed')
+                    assert(c:isClosed())
+                )lua");
             } else {
                 runLua(L, mode == 1
                     ? "local ok,e=pcall(c.loop,c); assert(not ok and e:find('fake Closed handler failure'))"
@@ -1460,7 +1509,6 @@ void testHardening()
                 assert(coroutine.status(await_co)=='dead')
                 local ok,e=pcall(function() pending:wait() end)
                 assert(not ok and e:find('client closed'))
-                c:close(); d:close()
             )lua");
         } catch (...) {
             lua_close(L);
@@ -1468,6 +1516,157 @@ void testHardening()
         }
         lua_close(L);
     }
+}
+
+void testTerminalShutdownLifecycle()
+{
+    Fake fake, destroy_fake, raw_fake, raw_destroy_fake, spontaneous_fake, gc_fake;
+    fake.auto_shutdown = false;
+    destroy_fake.auto_shutdown = false;
+    raw_fake.auto_shutdown = false;
+    raw_destroy_fake.auto_shutdown = false;
+    spontaneous_fake.auto_shutdown = false;
+    gc_fake.auto_shutdown = false;
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    try {
+        createClients(L);
+        attachTransport(L, "c", fake);
+        runLua(L, "destroy_client=tdlua()");
+        attachTransport(L, "destroy_client", destroy_fake);
+        attachTransport(L, "d", raw_fake);
+        runLua(L, R"lua(
+            assert(c.close~=nil and c.destroy~=nil)
+            terminal_calls=0
+            c:on('updateAuthorizationState', function(update)
+                if update.authorization_state._=='authorizationStateClosed' then
+                    terminal_calls=terminal_calls+1
+                    assert(c:receive(0)==nil)
+                end
+            end)
+            close_future=c:close()
+            assert(not c:isClosed())
+        )lua");
+        const auto close_id = fake.sent.back().first;
+        if (fake.sent.back().second.value("@type", std::string()) != "close")
+            throw std::runtime_error("client:close did not send TDLib close");
+        runLua(L, "destroy_future=destroy_client:destroy(); assert(not destroy_client:isClosed())");
+        const auto destroy_id = destroy_fake.sent.back().first;
+        if (destroy_fake.sent.back().second.value("@type", std::string()) != "destroy")
+            throw std::runtime_error("client:destroy did not send TDLib destroy");
+        fake.okResponse(close_id);
+        fake.authorizationState("authorizationStateClosing");
+        fake.update("shutdownProgress", 9);
+        fake.authorizationState("authorizationStateClosed");
+        runLua(L, R"lua(
+            assert(c:receive(0)._=='ok')
+            assert(c:receive(0).authorization_state._=='authorizationStateClosing')
+            assert(c:receive(0)._=='shutdownProgress')
+            local terminal=c:receive(0)
+            assert(terminal.authorization_state._=='authorizationStateClosed')
+            assert(c:isClosed() and terminal_calls==1)
+            assert(close_future:ready() and close_future:wait()._=='ok')
+        )lua");
+        destroy_fake.okResponse(destroy_id);
+        destroy_fake.authorizationState("authorizationStateClosing");
+        destroy_fake.update("shutdownProgress", 2);
+        destroy_fake.authorizationState("authorizationStateClosed");
+        runLua(L, R"lua(
+            destroy_client:receive(0)
+            destroy_client:receive(0)
+            destroy_client:receive(0)
+            assert(destroy_client:receive(0).authorization_state._=='authorizationStateClosed')
+            assert(destroy_client:isClosed())
+            assert(destroy_future:ready() and destroy_future:wait()._=='ok')
+            assert(destroy_client:receive(0)==nil and destroy_client:poll()==nil)
+        )lua");
+
+        runLua(L, R"lua(
+            raw_close=d:send{_='close'}
+            assert(not d:isClosed())
+        )lua");
+        runLua(L, "raw_destroy_client=tdlua()");
+        attachTransport(L, "raw_destroy_client", raw_destroy_fake);
+        runLua(L, "raw_destroy=raw_destroy_client:send{_='destroy'}");
+        const auto raw_count = raw_fake.sent.size();
+        if (raw_count != 1 ||
+            raw_fake.sent[0].second.value("@type", std::string()) != "close" ||
+            raw_destroy_fake.sent.size() != 1 ||
+            raw_destroy_fake.sent[0].second.value("@type", std::string()) != "destroy")
+            throw std::runtime_error("client:send close/destroy did not preserve request types");
+        raw_fake.okResponse(raw_fake.sent[0].first);
+        raw_fake.authorizationState("authorizationStateClosing");
+        raw_fake.update("shutdownProgress", 10);
+        raw_fake.authorizationState("authorizationStateClosed");
+        raw_destroy_fake.okResponse(raw_destroy_fake.sent[0].first);
+        raw_destroy_fake.authorizationState("authorizationStateClosing");
+        raw_destroy_fake.update("shutdownProgress", 13);
+        raw_destroy_fake.authorizationState("authorizationStateClosed");
+        runLua(L, R"lua(
+            d:receive(0); d:receive(0); d:receive(0); d:receive(0)
+            assert(d:isClosed())
+            raw_destroy_client:receive(0); raw_destroy_client:receive(0)
+            raw_destroy_client:receive(0)
+            assert(raw_destroy_client:receive(0).authorization_state._=='authorizationStateClosed')
+            assert(raw_destroy_client:isClosed())
+        )lua");
+
+        runLua(L, "spontaneous=tdlua()");
+        attachTransport(L, "spontaneous", spontaneous_fake);
+        spontaneous_fake.authorizationState("authorizationStateClosing");
+        spontaneous_fake.update("shutdownProgress", 11);
+        spontaneous_fake.authorizationState("authorizationStateClosed");
+        runLua(L, R"lua(
+            assert(not spontaneous:isClosed())
+            spontaneous:receive(0); spontaneous:receive(0)
+            local terminal=spontaneous:receive(0)
+            assert(terminal.authorization_state._=='authorizationStateClosed')
+            assert(spontaneous:isClosed())
+        )lua");
+
+        runLua(L, "gc_client=tdlua()");
+        attachTransport(L, "gc_client", gc_fake);
+        runLua(L, "gc_client=nil; collectgarbage('collect')");
+        if (gc_fake.close_calls != 1)
+            throw std::runtime_error("GC fallback did not perform exactly one transport close");
+
+        runLua(L, "c=nil; destroy_client=nil; d=nil; raw_destroy_client=nil; spontaneous=nil; collectgarbage('collect')");
+        if (fake.close_calls != 0 || raw_fake.close_calls != 0 ||
+            spontaneous_fake.close_calls != 0)
+            throw std::runtime_error("GC repeated shutdown after terminal cleanup");
+    } catch (...) {
+        lua_close(L);
+        throw;
+    }
+    lua_close(L);
+
+    Fake delayed;
+    delayed.auto_shutdown = false;
+    lua_State *delayed_lua = luaL_newstate();
+    luaL_openlibs(delayed_lua);
+    try {
+        createClients(delayed_lua);
+        attachTransport(delayed_lua, "c", delayed);
+        const auto started = std::chrono::steady_clock::now();
+        runLua(delayed_lua, "delayed_close=c:close(); assert(not c:isClosed())");
+        const auto call_time = std::chrono::steady_clock::now() - started;
+        if (call_time >= std::chrono::seconds(1))
+            throw std::runtime_error("TDLib close helper blocked synchronously");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+        runLua(delayed_lua, "assert(not c:isClosed())");
+        delayed.authorizationState("authorizationStateClosing");
+        delayed.update("shutdownProgress", 12);
+        delayed.authorizationState("authorizationStateClosed");
+        runLua(delayed_lua, R"lua(
+            c:receive(0); c:receive(0)
+            assert(c:receive(0).authorization_state._=='authorizationStateClosed')
+            assert(c:isClosed() and delayed_close:ready())
+        )lua");
+    } catch (...) {
+        lua_close(delayed_lua);
+        throw;
+    }
+    lua_close(delayed_lua);
 }
 
 }  // namespace
@@ -1484,6 +1683,8 @@ int main(int argc, char **argv)
         if (argc > 1 && std::string(argv[1]) == "--hardening-only") {
             testTaskCloseOwnership();
             testHardening();
+        } else if (argc > 1 && std::string(argv[1]) == "--terminal-close-only") {
+            testTerminalShutdownLifecycle();
         } else if (argc > 1 && std::string(argv[1]) == "--m5-only") {
             createClients(L);
             attachTransport(L, "c", fake);

@@ -525,6 +525,8 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
         tdlua_enable_sanitizers(tdlua_fake_client_test)
         add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+        add_test(NAME tdlua_terminal_shutdown
+                 COMMAND tdlua_fake_client_test --terminal-close-only)
         add_test(NAME tdlua_harness_cleanup COMMAND tdlua_fake_client_test --harness-failure-only)
         add_test(NAME tdlua_hardening_fake
             COMMAND tdlua_fake_client_test --hardening-only)

@@ -225,7 +225,9 @@ td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner)
 void NativeRuntime::send(td::ClientManager::ClientId id, td::ClientManager::RequestId request_id,
                          td::td_api::object_ptr<td::td_api::Function> request)
 {
-    const bool close = request && request->get_id() == td::td_api::close::ID;
+    const bool close = request &&
+                       (request->get_id() == td::td_api::close::ID ||
+                        request->get_id() == td::td_api::destroy::ID);
     if (!engine_.admitSend(*lifecycle_, id, close))
         return;
     try {

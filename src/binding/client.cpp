@@ -179,11 +179,6 @@ static int tdclient_clear(lua_State *L)
     return tdlua_binding::clear(L, client(L), operations());
 }
 
-static int tdclient_close(lua_State *L)
-{
-    return tdlua_binding::close(L, client(L), operations());
-}
-
 static int tdclient_isclosed(lua_State *L)
 {
     return tdlua_binding::is_closed(L, client(L), operations());
@@ -233,8 +228,6 @@ static luaL_Reg methods[] = {
     {"await", tdclient_await},
     {"on", tdclient_on},
     {"off", tdclient_off},
-    {"close", tdclient_close},
-    {"destroy", tdclient_close},
     {"isClosed", tdclient_isclosed},
     {"save", tdclient_save},
     {"clearBuffer", tdclient_clear},

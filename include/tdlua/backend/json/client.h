@@ -29,7 +29,8 @@ private:
     enum class ClientState {
         Running,
         Closing,
-        Closed
+        Terminal,
+        Cleaned
     };
 
     std::int32_t client_id;
@@ -38,6 +39,9 @@ private:
     std::string dbpath;
     bool _ready;
     ClientState state;
+    bool shutdown_request_sent_ = false;
+    bool cleanup_complete_ = false;
+    unsigned drain_depth_ = 0;
     LuaDispatcher dispatcher_;
     tdlua::Transport<nlohmann::json, nlohmann::json> injected_transport_ = {nullptr, nullptr};
 public:
@@ -74,9 +78,9 @@ public:
 
     bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
 
-    // Detach/fail work first. A true drain then performs phase two while the
-    // caller still has a protected Lua boundary.
-    void close(bool drain = true);
+    // GC fallback: bounded, callback-free teardown using the existing receiver.
+    void closeInternal();
+    void finishTerminalCleanup();
 
     bool closed() const;
 

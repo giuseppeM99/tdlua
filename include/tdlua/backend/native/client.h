@@ -40,9 +40,10 @@ public:
     td::td_api::object_ptr<td::td_api::Object> executeSync(
         td::td_api::object_ptr<td::td_api::Function> request);
 
-    // Detach/fail work first. A true drain then performs phase two while the
-    // caller still has a protected Lua boundary.
-    void close(bool drain = true);
+    // GC fallback: bounded, callback-free teardown using the existing receiver.
+    void closeInternal();
+    void finishTerminalCleanup();
+    void drainPump();
     bool closed() const;
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
@@ -74,8 +75,6 @@ public:
     void emptyUpdatesBuffer(bool preserve_received = false);
 
 private:
-    void closeInternal(bool drain, bool persist_updates);
-
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;
@@ -84,6 +83,9 @@ private:
     bool ready_;
     bool closing_;
     bool closed_;
+    bool shutdown_request_sent_ = false;
+    bool cleanup_complete_ = false;
+    unsigned drain_depth_ = 0;
     NativeDispatcher dispatcher_;
     Transport injected_transport_ = {nullptr, nullptr};
 };

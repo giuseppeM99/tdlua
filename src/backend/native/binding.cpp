@@ -94,15 +94,8 @@ static void native_clear_updates(tdlua_binding::ClientHandle client)
 static void native_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<NativeTDLua> owned_client(static_cast<NativeTDLua *>(client));
-    owned_client->close(false);
+    owned_client->closeInternal();
     owned_client->dispatcher().drainForFinalizer();
-}
-
-static void native_close(tdlua_binding::ClientHandle client)
-{
-    NativeTDLua *td = static_cast<NativeTDLua *>(client);
-    td->close();
-    td->dispatcher().clear();
 }
 
 static bool native_closed(tdlua_binding::ClientHandle client)
@@ -228,7 +221,7 @@ static int tdclient_receive(lua_State *L)
             result_count = return_response(L, td, response);
         }
         try {
-            td->dispatcher().drain();
+            td->drainPump();
         } catch (...) {
             if (response.object) td->restoreReceived(std::move(response));
             throw;
@@ -356,7 +349,7 @@ static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
         };
         const auto dispatch_response = [td](NativeResponse &value) {
             td->dispatch(value);
-            td->dispatcher().drain();
+            td->drainPump();
         };
         const auto response_id = [](const NativeResponse &value) {
             return value.request_id;
@@ -770,7 +763,6 @@ static const tdlua_binding::ClientOperations native_operations = {
     native_save_updates,
     native_clear_updates,
     native_unload,
-    native_close,
     native_closed,
 #ifdef TDLUA_TESTING
     tdclient_pending_count,

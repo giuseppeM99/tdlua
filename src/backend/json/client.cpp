@@ -64,7 +64,7 @@ bool json_transport_pump(void *context, double timeout)
 
 void json_transport_close(void *context)
 {
-    static_cast<TDLua *>(context)->close();
+    static_cast<TDLua *>(context)->send(0, json{{"@type", "close"}});
 }
 
 bool json_transport_closed(void *context)
@@ -106,7 +106,7 @@ TDLua::~TDLua()
     // Destruction cannot safely enter Lua. The binding performs the protected
     // drain before this destructor runs; this path only detaches transport.
     try {
-        close(false);
+        closeInternal();
     } catch (...) {
         dispatcher_.detachTransport();
     }
@@ -133,6 +133,16 @@ void TDLua::setDB(const std::string &path)
 
 void TDLua::send(std::uint64_t request_id, nlohmann::json json)
 {
+    const std::string type = json.value("@type", std::string());
+    const bool shutdown = type == "close" || type == "destroy";
+    if (state == ClientState::Terminal || state == ClientState::Cleaned ||
+        (state == ClientState::Closing && !shutdown)) {
+        throw std::runtime_error("tdlua: client is closing or closed");
+    }
+    if (shutdown) {
+        state = ClientState::Closing;
+        shutdown_request_sent_ = true;
+    }
     json["@extra"] = {{"__tdlua_request_id", request_id}};
     JsonRuntime::instance().send(client_id, json);
 }
@@ -191,7 +201,16 @@ void TDLua::preservePumpItem(PumpValue &value)
 
 void TDLua::drainPump()
 {
-    dispatcher_.drain();
+    ++drain_depth_;
+    try {
+        dispatcher_.drain();
+    } catch (...) {
+        --drain_depth_;
+        throw;
+    }
+    --drain_depth_;
+    if (drain_depth_ == 0)
+        finishTerminalCleanup();
 }
 
 nlohmann::json TDLua::receiveBackend(const double timeout)
@@ -231,70 +250,79 @@ bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
     return false;
 }
 
-void TDLua::close(bool drain)
+void TDLua::closeInternal()
 {
     try {
-        // Phase one detaches the scheduler before backend shutdown can reenter the
-        // client. The optional drain is phase two and is safe only at the binding
-        // boundary that called close().
+        if (cleanup_complete_)
+            return;
+        // GC cannot invoke callbacks. Detach first, then use the existing
+        // receiver mailbox for a bounded terminal wait.
+        dispatcher_.detachTransport();
         if (injected_transport_.operations) {
-            state = ClientState::Closed;
-            dispatcher_.detachTransport();
             injected_transport_.close();
-            if (drain)
-                dispatcher_.clear();
             JsonRuntime::instance().forget(client_id);
-            state = ClientState::Closed;
+            state = ClientState::Cleaned;
+            cleanup_complete_ = true;
             return;
         }
-        if (state == ClientState::Closed) {
-            dispatcher_.detachTransport();
-            if (drain)
-                dispatcher_.clear();
-            JsonRuntime::instance().forget(client_id);
-            state = ClientState::Closed;
-            return;
-        }
-
-        if (state == ClientState::Running) {
-            nlohmann::json close_request = {{"@type", "close"}};
-            const auto id = dispatcher_.registerRawRequest();
+        if (state != ClientState::Terminal && !shutdown_request_sent_) {
+            shutdown_request_sent_ = true;
             state = ClientState::Closing;
-            dispatcher_.detachTransport();
-            tdlua::submit(dispatcher_, transport(), id, std::move(close_request));
+            JsonRuntime::instance().send(client_id,
+                                         nlohmann::json{{"@type", "close"}});
         }
 
         bool timed_out = false;
         const auto started = std::chrono::steady_clock::now();
-        while (state != ClientState::Closed) {
+        while (state != ClientState::Terminal) {
             const double elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double remaining = 5.0 - elapsed;
             if (remaining <= 0.0) {
                 timed_out = true;
-                state = ClientState::Closed;
                 break;
             }
-            nlohmann::json update = receive(remaining);
+            nlohmann::json update = JsonRuntime::instance().receive(client_id, remaining);
             if (update.is_object()) {
                 checkAuthState(update);
             }
         }
-        state = ClientState::Closed;
-        dispatcher_.detachTransport();
-        if (drain) dispatcher_.clear();
         JsonRuntime::instance().forget(client_id, timed_out);
+        cleanup_complete_ = true;
+        if (state == ClientState::Terminal)
+            state = ClientState::Cleaned;
     } catch (...) {
-        state = ClientState::Closed;
         dispatcher_.detachTransport();
-        JsonRuntime::instance().forget(client_id);
+        try {
+            JsonRuntime::instance().forget(client_id);
+            cleanup_complete_ = true;
+        } catch (...) {
+        }
         throw;
     }
 }
 
 bool TDLua::closed() const
 {
-    return state != ClientState::Running;
+    return state == ClientState::Terminal || state == ClientState::Cleaned;
+}
+
+void TDLua::finishTerminalCleanup()
+{
+    if (state != ClientState::Terminal)
+        return;
+    JsonRuntime::instance().forget(client_id);
+    for (auto it = updates.begin(); it != updates.end();) {
+        if (it->delivery_pending || it->dispatched) {
+            ++it;
+        } else {
+            it = updates.erase(it);
+            ++buffer_revision_;
+        }
+    }
+    _ready = false;
+    state = ClientState::Cleaned;
+    cleanup_complete_ = true;
 }
 
 LuaDispatcher &TDLua::dispatcher()
@@ -386,11 +414,12 @@ void TDLua::checkAuthState(const nlohmann::json &update)
     if (update["@type"] == "updateAuthorizationState") {
         if (!ready() && update["authorization_state"]["@type"] == "authorizationStateReady") {
             loadUpdatesBuffer();
+        } else if (update["authorization_state"]["@type"] == "authorizationStateClosing") {
+            if (state == ClientState::Running)
+                state = ClientState::Closing;
         } else if (update["authorization_state"]["@type"] == "authorizationStateClosed") {
-            saveUpdatesBuffer();
-            emptyUpdatesBuffer(true);
             _ready = false;
-            state = ClientState::Closed;
+            state = ClientState::Terminal;
         }
     }
 }
@@ -400,10 +429,12 @@ tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive)
     checkAuthState(update);
     try {
         const auto route = dispatcher_.dispatch(update, managed_receive);
-        if (state == ClientState::Closed) dispatcher_.detachAfterDrain();
+        if (state == ClientState::Terminal)
+            dispatcher_.detachAfterDrain(managed_receive);
         return route;
     } catch (...) {
-        if (state == ClientState::Closed) dispatcher_.detachTransport();
+        if (state == ClientState::Terminal)
+            dispatcher_.detachTransport("tdlua: client closed", managed_receive);
         throw;
     }
 }

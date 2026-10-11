@@ -364,6 +364,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     bool (*pump_)(void *, double) = nullptr;
     bool draining_ = false;
     bool detach_after_drain_ = false;
+    bool detach_after_drain_preserve_selected_ = false;
     ManagedDriverState managed_driver_;
 
     // ----- CoreAnchor reference-table helpers -----
@@ -1680,13 +1681,16 @@ public:
     }
     // Phase 1: no Lua resumes, snapshots or user callbacks. The pump/facade is
     // unreachable before pending failures can be observed from a later drain.
-    void detachTransport(const std::string &message = "tdlua: client closed")
+    void detachTransport(const std::string &message = "tdlua: client closed",
+                         bool preserve_selected_update = false)
     {
         detach_after_drain_ = false;
+        detach_after_drain_preserve_selected_ = false;
         pump_ = nullptr;
         pump_context_ = nullptr;
         events_enabled_ = false;
-        discardSelectedUpdate();
+        if (!preserve_selected_update)
+            discardSelectedUpdate();
         if (managed_driver_.loop_observer) {
             requestLoopStop(managed_driver_.loop_observer);
         }
@@ -1712,7 +1716,11 @@ public:
 
     // A live Closed update has already been routed. Finish its protected
     // delivery before phase one, even if received from a reentrant callback.
-    void detachAfterDrain() { detach_after_drain_ = true; }
+    void detachAfterDrain(bool preserve_selected_update = false)
+    {
+        detach_after_drain_ = true;
+        detach_after_drain_preserve_selected_ = preserve_selected_update;
+    }
 
     void clearEvents()
     {
@@ -1785,12 +1793,18 @@ public:
                 drainReadyStates();
                 drainDeferredEvents();
                 if (ready_.empty() && deferred_events_.empty() && detach_after_drain_) {
-                    detachTransport();
+                    const bool preserve = detach_after_drain_preserve_selected_;
+                    detach_after_drain_preserve_selected_ = false;
+                    detachTransport("tdlua: client closed", preserve);
                     drainDetachedNotifications();
                 }
             }
         } catch (...) {
-            if (detach_after_drain_) detachTransport();
+            if (detach_after_drain_) {
+                const bool preserve = detach_after_drain_preserve_selected_;
+                detach_after_drain_preserve_selected_ = false;
+                detachTransport("tdlua: client closed", preserve);
+            }
             draining_ = false;
             throw;
         }
@@ -1948,11 +1962,15 @@ public:
         core_->detachTransport();
     }
 
-    void detachTransport()
+    void detachTransport(const std::string &message = "tdlua: client closed",
+                         bool preserve_selected_update = false)
     {
-        core_->detachTransport();
+        core_->detachTransport(message, preserve_selected_update);
     }
-    void detachAfterDrain() { core_->detachAfterDrain(); }
+    void detachAfterDrain(bool preserve_selected_update = false)
+    {
+        core_->detachAfterDrain(preserve_selected_update);
+    }
 
     void tick()
     {

@@ -92,15 +92,8 @@ static void json_clear_updates(tdlua_binding::ClientHandle client)
 static void json_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<TDLua> owned_client(static_cast<TDLua *>(client));
-    owned_client->close(false);
+    owned_client->closeInternal();
     owned_client->dispatcher().drainForFinalizer();
-}
-
-static void json_close(tdlua_binding::ClientHandle client)
-{
-    TDLua *td = static_cast<TDLua *>(client);
-    td->close();
-    td->dispatcher().clear();
 }
 
 static bool json_closed(tdlua_binding::ClientHandle client)
@@ -177,7 +170,7 @@ static int tdclient_receive(lua_State *L)
             lua_pushjson(L, result);
         }
         try {
-            td->dispatcher().drain();
+            td->drainPump();
         } catch (...) {
             // Routing already happened. Preserve public delivery without
             // repeating callbacks or response classification on the retry.
@@ -247,7 +240,7 @@ static int execute_request(lua_State *L, TDLua *td, int request_index,
     };
     const auto dispatch_response = [td](json &value) {
         td->dispatch(value);
-        td->dispatcher().drain();
+        td->drainPump();
     };
     const auto response_id = [](const json &value) {
         const auto field = value.find("_request_id");
@@ -652,7 +645,6 @@ static const tdlua_binding::ClientOperations json_operations = {
     json_save_updates,
     json_clear_updates,
     json_unload,
-    json_close,
     json_closed,
 #ifdef TDLUA_TESTING
     tdclient_pending_count,

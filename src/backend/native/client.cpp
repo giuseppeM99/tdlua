@@ -68,7 +68,8 @@ bool native_transport_pump(void *context, double timeout)
 
 void native_transport_close(void *context)
 {
-    static_cast<NativeTDLua *>(context)->close();
+    static_cast<NativeTDLua *>(context)->send(
+        td::td_api::make_object<td::td_api::close>(), 0);
 }
 
 bool native_transport_closed(void *context)
@@ -99,7 +100,7 @@ NativeTDLua::~NativeTDLua()
     // Destruction cannot safely enter Lua. The binding performs the protected
     // drain before this destructor runs; this path only detaches transport.
     try {
-        closeInternal(false, false);
+        closeInternal();
     } catch (...) {
         dispatcher_.detachTransport();
     }
@@ -114,8 +115,15 @@ td::td_api::object_ptr<td::td_api::Function> NativeTDLua::makeRequest(
 void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
                        std::uint64_t request_id)
 {
-    if (closed_) {
-        throw tdlua_native::CodecError("tdlua: client is closed");
+    const auto request_type = request ? request->get_id() : 0;
+    const bool shutdown = request_type == td::td_api::close::ID ||
+                         request_type == td::td_api::destroy::ID;
+    if (closed_ || (closing_ && !shutdown)) {
+        throw tdlua_native::CodecError("tdlua: client is closing or closed");
+    }
+    if (shutdown) {
+        closing_ = true;
+        shutdown_request_sent_ = true;
     }
     NativeRuntime::instance().send(client_id_, request_id, std::move(request));
 }
@@ -185,7 +193,16 @@ void NativeTDLua::preservePumpItem(PumpValue &response)
 
 void NativeTDLua::drainPump()
 {
-    dispatcher_.drain();
+    ++drain_depth_;
+    try {
+        dispatcher_.drain();
+    } catch (...) {
+        --drain_depth_;
+        throw;
+    }
+    --drain_depth_;
+    if (drain_depth_ == 0)
+        finishTerminalCleanup();
 }
 
 NativeTDLua::Transport NativeTDLua::transport()
@@ -209,10 +226,11 @@ tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response, bool managed_re
     try {
         const auto route = dispatcher_.dispatch(lua_, response, managed_receive);
         response.dispatched = true;
-        if (closed_) dispatcher_.detachAfterDrain();
+        if (closed_) dispatcher_.detachAfterDrain(managed_receive);
         return route;
     } catch (...) {
-        if (closed_) dispatcher_.detachTransport();
+        if (closed_)
+            dispatcher_.detachTransport("tdlua: client closed", managed_receive);
         throw;
     }
 }
@@ -314,87 +332,73 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
         ready_ = true;
         loadUpdatesBuffer();
     } else if (update.authorization_state_->get_id() ==
+               td::td_api::authorizationStateClosing::ID) {
+        closing_ = true;
+    } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosed::ID) {
-        saveUpdatesBuffer();
-        emptyUpdatesBuffer(true);
         ready_ = false;
         closed_ = true;
         closing_ = false;
     }
 }
 
-void NativeTDLua::close(bool drain)
+void NativeTDLua::finishTerminalCleanup()
 {
-    closeInternal(drain, true);
+    if (!closed_ || cleanup_complete_)
+        return;
+    NativeRuntime::instance().forget(client_id_);
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (it->delivery_pending || it->dispatched) {
+            ++it;
+        } else {
+            it = updates_.erase(it);
+            ++buffer_revision_;
+        }
+    }
+    ready_ = false;
+    cleanup_complete_ = true;
 }
 
-void NativeTDLua::closeInternal(bool drain, bool persist_updates)
+void NativeTDLua::closeInternal()
 {
     try {
+        if (cleanup_complete_)
+            return;
+        dispatcher_.detachTransport();
         bool timed_out = false;
-        // Phase one detaches the scheduler before backend shutdown can reenter the
-        // client. The optional drain is phase two and is safe only at the binding
-        // boundary that called close().
         if (injected_transport_.operations) {
-            dispatcher_.detachTransport();
             injected_transport_.close();
+            NativeRuntime::instance().forget(client_id_);
             closed_ = true;
             closing_ = false;
-            if (drain)
-                dispatcher_.clear();
-            NativeRuntime::instance().forget(client_id_);
+            cleanup_complete_ = true;
             return;
         }
-        if (closed_) {
-            dispatcher_.detachTransport();
-            if (drain)
-                dispatcher_.clear();
-            NativeRuntime::instance().forget(client_id_);
-            return;
+        if (!closed_ && !shutdown_request_sent_) {
+            shutdown_request_sent_ = true;
+            closing_ = true;
+            NativeRuntime::instance().send(
+                client_id_, 0, td::td_api::make_object<td::td_api::close>());
         }
         const auto started = std::chrono::steady_clock::now();
-        const std::uint64_t close_request_id = nextRequestId();
-        if (!closing_) {
-            closing_ = true;
-            dispatcher_.detachTransport();
-            transport().send(close_request_id, td::td_api::make_object<td::td_api::close>());
-        }
         while (!closed_) {
             const double elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double remaining = 5.0 - elapsed;
             if (remaining <= 0.0) {
                 timed_out = true;
-                closed_ = true;
-                closing_ = false;
                 break;
             }
-            NativeResponse response = receiveBackend(remaining);
+            NativeResponse response = NativeRuntime::instance().receive(client_id_, remaining);
             if (!response.object) {
                 continue;
             }
-            // close() is a lifecycle operation. Match the JSON backend by
-            // updating the lifecycle state without invoking user callbacks or
-            // event handlers while the client is being destroyed.
             checkAuthState(response);
-            if (!closed_ && response.request_id != close_request_id) {
-                updates_.push_back(std::move(response));
-                ++buffer_revision_;
-            }
         }
-        if (persist_updates) {
-            saveUpdatesBuffer();
-        }
-        emptyUpdatesBuffer(true);
-        closed_ = true;
-        closing_ = false;
-        dispatcher_.detachTransport();
-        if (drain)
-            dispatcher_.clear();
         NativeRuntime::instance().forget(client_id_, timed_out);
+        if (closed_)
+            cleanup_complete_ = true;
     } catch (...) {
-        closed_ = true;
-        closing_ = false;
         dispatcher_.detachTransport();
         NativeRuntime::instance().forget(client_id_);
         throw;
@@ -403,7 +407,7 @@ void NativeTDLua::closeInternal(bool drain, bool persist_updates)
 
 bool NativeTDLua::closed() const
 {
-    return closed_ || closing_;
+    return closed_;
 }
 
 bool NativeTDLua::ready() const
