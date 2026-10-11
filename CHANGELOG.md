@@ -23,6 +23,11 @@
   their contracts match. Payload conversion, JSON correlation, native
   `object_ptr` ownership, and documented buffering differences remain specific
   to each backend.
+- Numeric `client:execute(request, timeout)` now uses managed Future routing and
+  timeout semantics. It may yield in a coroutine; after timeout, the eventual
+  response is consumed by the managed router instead of becoming visible through
+  raw `receive()`. The stock Lua 5.1 main-thread form uses the synchronous
+  SchedulerCore wait path. `executeSync()` remains unchanged.
 - Dispatcher request registration is separate from sending the request to
   TDLib. Existing Future, Task, callback and coroutine contracts remain in
   place. Full Managed Future and Task handles can be iterated as response

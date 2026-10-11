@@ -17,6 +17,10 @@ namespace {
 
 using json = nlohmann::json;
 
+#ifdef TDLUA_TESTING
+TDLua *client_with_injected_drain_failure = nullptr;
+#endif
+
 bool persistedRequestId(const json &value, std::uint64_t &request_id)
 {
     if (!value.is_object()) {
@@ -116,7 +120,6 @@ TDLua::QueuedUpdate TDLua::pop()
 {
     QueuedUpdate res = updates.front();
     updates.pop_front();
-    ++buffer_revision_;
     return res;
 }
 
@@ -221,6 +224,12 @@ void TDLua::drainPump()
 {
     ++drain_depth_;
     try {
+#ifdef TDLUA_TESTING
+        if (client_with_injected_drain_failure == this) {
+            client_with_injected_drain_failure = nullptr;
+            throw std::runtime_error("tdlua: injected drain failure");
+        }
+#endif
         dispatcher_.drain();
     } catch (...) {
         --drain_depth_;
@@ -241,31 +250,6 @@ nlohmann::json TDLua::receiveBackend(const double timeout)
         dispatcher_.drain();
         throw;
     }
-}
-
-bool TDLua::takeQueuedResponse(const std::uint64_t request_id,
-                               QueuedUpdate &response)
-{
-    for (std::deque<QueuedUpdate>::iterator it = updates.begin();
-         it != updates.end(); ++it) {
-        if (!it->dispatched || !it->value.is_object()) {
-            continue;
-        }
-        const nlohmann::json::const_iterator request_id_value =
-            it->value.find("_request_id");
-        if (request_id_value == it->value.end() ||
-            !request_id_value->is_number_unsigned()) {
-            continue;
-        }
-        if (request_id_value->get<std::uint64_t>() != request_id) {
-            continue;
-        }
-        response = std::move(*it);
-        updates.erase(it);
-        ++buffer_revision_;
-        return true;
-    }
-    return false;
 }
 
 void TDLua::closeInternal()
@@ -356,7 +340,6 @@ LuaDispatcher &TDLua::dispatcher()
 void TDLua::push(const nlohmann::json &update, const bool dispatched)
 {
     updates.push_back(QueuedUpdate(update, dispatched));
-    ++buffer_revision_;
 }
 
 bool TDLua::empty() const
@@ -374,7 +357,6 @@ void TDLua::saveUpdatesBuffer()
         if (it->delivery_pending) { ++it; continue; }
         jupdates.push_back(it->value);
         it = updates.erase(it);
-        ++buffer_revision_;
     }
     std::ofstream out(dbpath);
     out << jupdates.dump();
@@ -407,7 +389,6 @@ void TDLua::loadUpdatesBuffer()
                         dispatcher_.observeRequestId(request_id);
                     }
                     updates.push_back(QueuedUpdate(elem, false));
-                    ++buffer_revision_;
                 }
             }
         } catch (nlohmann::json::parse_error &e){
@@ -427,7 +408,6 @@ void TDLua::emptyUpdatesBuffer(bool preserve_received)
         if (preserve_received && it->delivery_pending) ++it;
         else {
             it = updates.erase(it);
-            ++buffer_revision_;
         }
     }
 }
@@ -483,6 +463,11 @@ bool TDLua::ready() const
 }
 
 #ifdef TDLUA_TESTING
+void TDLua::failNextDrainForTesting() noexcept
+{
+    client_with_injected_drain_failure = this;
+}
+
 void TDLua::injectTransport(Transport transport)
 {
     if (!injected_transport_.operations) {

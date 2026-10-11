@@ -10,6 +10,7 @@
 #include <td/telegram/Log.h>
 
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -212,21 +213,39 @@ static int tdclient_receive(lua_State *L)
         if (lua_type(L, 2) == LUA_TNUMBER) {
             timeout = lua_tonumber(L, 2);
         }
-        int result_count = 1;
-        NativeResponse response = td->receive(timeout);
-        if (!response.object) {
-            lua_pushnil(L);
-        } else {
-            td->dispatch(response);
-            result_count = return_response(L, td, response);
+        const double requested_timeout = static_cast<double>(timeout);
+        const auto started = std::chrono::steady_clock::now();
+        for (;;) {
+            double remaining = requested_timeout;
+            if (requested_timeout > 0.0 && std::isfinite(requested_timeout)) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count();
+                remaining = elapsed >= requested_timeout
+                    ? 0.0 : requested_timeout - elapsed;
+            }
+            NativeResponse response = td->receive(remaining);
+            if (!response.object) {
+                lua_pushnil(L);
+            } else {
+                const auto route = td->dispatch(response);
+                if (route == tdlua::RouteKind::TransientFuture) {
+                    // The managed response has already been consumed. If
+                    // draining fails, propagate the error without restoring
+                    // this response to raw receive().
+                    td->drainPump();
+                    continue;
+                }
+                return_response(L, td, response);
+            }
+            try {
+                td->drainPump();
+            } catch (...) {
+                if (response.object)
+                    td->restoreReceived(std::move(response));
+                throw;
+            }
+            return 1;
         }
-        try {
-            td->drainPump();
-        } catch (...) {
-            if (response.object) td->restoreReceived(std::move(response));
-            throw;
-        }
-        return result_count;
     });
 }
 
@@ -309,77 +328,13 @@ static int tdclient_send(lua_State *L)
     });
 }
 
-static int execute_request(lua_State *L, NativeTDLua *td, int request_index,
-                           lua_Number timeout, bool fire_and_forget)
-{
-    std::string error;
-    td::td_api::object_ptr<td::td_api::Function> request;
-    int table_index = 0;
-    bool owned = false;
-    bool codec_error = false;
-    if (!make_request(L, td, request_index, request, table_index, owned,
-                      codec_error, error)) {
-        if (codec_error) {
-            request = codec_error_request(error);
-        } else {
-            pop_owned(L, owned);
-            throw std::runtime_error(error);
-        }
-    }
-    try {
-        // execute() waits for its own response but lets the dispatcher make
-        // progress on unrelated asynchronous responses in the same receive
-        // loop. This is the async-first behavior shared with the JSON path.
-        const std::uint64_t id = td->dispatcher().registerRawRequest();
-        tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
-        pop_owned(L, owned);
-
-        if (fire_and_forget) {
-            tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
-            return 1;
-        }
-
-        const auto started = std::chrono::steady_clock::now();
-        NativeResponse response;
-        const auto take_queued_response = [td, id](NativeResponse &value) {
-            return td->takeQueuedResponse(id, value);
-        };
-        const auto is_valid_response = [](const NativeResponse &value) {
-            return bool(value.object);
-        };
-        const auto dispatch_response = [td](NativeResponse &value) {
-            td->dispatch(value);
-            td->drainPump();
-        };
-        const auto response_id = [](const NativeResponse &value) {
-            return value.request_id;
-        };
-        const auto buffer_response = [td](NativeResponse value) {
-            td->push(std::move(value));
-        };
-        const auto remaining_timeout = [timeout, started]() {
-            return static_cast<double>(timeout) -
-                   std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - started)
-                       .count();
-        };
-        const auto wait_policy = tdlua::makeResponseWaitPolicy(
-            take_queued_response, is_valid_response, dispatch_response, response_id,
-            buffer_response, remaining_timeout, tdlua::QueueCheckOrder::AfterTimeout,
-            [td]() { return td->bufferRevision(); });
-        if (tdlua::waitResponse(td->transport(), id, response, wait_policy))
-            return return_response(L, td, response);
-        return 0;
-    } catch (...) {
-        pop_owned(L, owned);
-        throw;
-    }
-}
-
 static int tdclient_execute(lua_State *L)
 {
     std::uint64_t wait_id = 0;
     bool wait_for_result = false;
+    bool wait_timed = false;
+    lua_Number wait_timeout = 0;
+    tdlua::WaitContext wait_context = tdlua::WaitContext::Managed;
     NativeTDLua *wait_td = nullptr;
     const int result = tdlua_binding::protected_call(L, [&]() -> int {
         const int request_index = 2;
@@ -417,14 +372,17 @@ static int tdclient_execute(lua_State *L)
         if (td->closed()) {
             throw std::runtime_error("tdlua client is closed");
         }
-        if (control_type == LUA_TNUMBER) {
-            return execute_request(L, td, request_index,
-                                   lua_tonumber(L, control_index), false);
-        }
-        if (control_type == LUA_TBOOLEAN && lua_toboolean(L, control_index)) {
-            return execute_request(L, td, request_index, 0.0, true);
+        const bool numeric_execute = control_type == LUA_TNUMBER;
+        const bool fire_and_forget = control_type == LUA_TBOOLEAN &&
+                                     lua_toboolean(L, control_index);
+        if (numeric_execute) {
+            wait_timeout = lua_tonumber(L, control_index);
+            tdlua::validateManagedTimeout(wait_timeout);
+            wait_timed = true;
+            wait_context = tdlua::WaitContext::NumericExecute;
         }
         if (control_type != LUA_TNIL && control_type != LUA_TBOOLEAN &&
+            control_type != LUA_TNUMBER &&
             control_type != LUA_TFUNCTION && control_type != LUA_TTHREAD) {
             throw std::runtime_error(
                 std::string("tdlua: execute control type '") +
@@ -450,21 +408,31 @@ static int tdclient_execute(lua_State *L)
         }
         std::shared_ptr<tdlua::ManagedState> state;
         try {
+            if (fire_and_forget) {
+                const std::uint64_t id = td->dispatcher().registerRawRequest();
+                tdlua::submit(td->dispatcher(), td->transport(), id,
+                              std::move(request));
+                pop_owned(L, owned);
+                tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
+                return 1;
+            }
             if (control_type == LUA_TFUNCTION || control_type == LUA_TTHREAD) {
                 state = td->dispatcher().task(
                     L, control_index, extra_index,
                     control_type == LUA_TTHREAD);
             } else {
-                state = td->dispatcher().future();
+                state = td->dispatcher().future(numeric_execute);
             }
             tdlua::submit(td->dispatcher(), td->transport(),
                           state->request_id, std::move(request));
             pop_owned(L, owned);
-            if (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index)) {
+            if (numeric_execute ||
+                (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index))) {
                 wait_td = td;
                 wait_id = state->request_id;
                 state.reset();
                 wait_for_result = true;
+                if (!numeric_execute) wait_timeout = 0;
                 return 0;
             }
             tdlua::pushManagedHandle(
@@ -483,7 +451,9 @@ static int tdclient_execute(lua_State *L)
     });
     if (wait_for_result) {
         return tdlua::finishManagedWait(
-            L, wait_td->dispatcher().waitById(L, wait_id, false, 0.0));
+            L, wait_td->dispatcher().waitById(
+                   L, wait_id, wait_timed, wait_timeout, tdlua::WaitKind::Result,
+                   nullptr, wait_context));
     }
     return tdlua::finishManagedBinding(L, result);
 }

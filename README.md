@@ -76,9 +76,12 @@ currently require `TDLUA_BUNDLED_TDLIB=ON`. The JSON backend can instead link
 against an installed TDLib with `TDLUA_BUNDLED_TDLIB=OFF`; its C JSON ABI is
 the replaceable backend boundary.
 
-A timeout does not cancel the underlying TDLib request. With the legacy
-`execute(request, timeout)` form, a late response remains available through
-`receive()` with its `_request_id`. A timed-out Future can be waited on again.
+A timeout does not cancel the underlying TDLib request. The compact
+`execute(request, timeout)` form uses the managed Future router and returns the
+same result or `nil, "timeout"` as `execute(request):wait(timeout)`. If it times
+out, its eventual response is consumed by the managed router and is not later
+returned by raw `receive()`. Use an explicit Future when you need to retain its
+handle and wait again after a timeout.
 
 ## Runtime profiles
 
@@ -180,8 +183,11 @@ shared specification's non-yieldable synchronous fallback. It applies to
 `execute(request, false)`, dynamic methods with `false`, and `await(request)`
 reject main-thread calls before allocating a request ID or submitting to TDLib.
 Use a coroutine for these forms, or submit a Future and retain its handle.
-`executeSync`, `_execute`, and historical numeric timed `execute` retain their
-synchronous contracts. The Full Managed fallback on other runtimes is unchanged.
+`executeSync` and `_execute` retain their synchronous TDLib contracts. Numeric
+`execute(request, timeout)` uses the managed wait path: it can yield in a
+coroutine, and on stock Lua 5.1 its main-thread call uses the scheduler's
+synchronous managed wait. Other explicit waits retain the profile behavior
+described above.
 
 Request and event callbacks execute as canonical scheduler Tasks and can wait
 explicitly. Concurrent/serial events, `poll(callback)`, `loop(callback)`,

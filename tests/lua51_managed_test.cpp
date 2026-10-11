@@ -10,6 +10,8 @@ using Client = TDLua;
 #endif
 #include <cassert>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <map>
@@ -35,7 +37,12 @@ struct Fake {
     std::size_t receives = 0;
     bool closed = false;
     bool auto_response = false;
+    bool wait_when_empty = false;
+    bool update_when_empty = false;
+    bool space_transient_receives = false;
+    std::size_t spaced_receive_calls = 0;
     std::size_t budget = 500;
+    std::vector<double> receive_timeouts;
     Client::Transport transport()
     {
         static const Client::Transport::Operations ops = {
@@ -45,10 +52,37 @@ struct Fake {
                 f.sent.emplace_back(id, std::move(request));
                 if (f.auto_response) f.response(id, 88);
             },
-            [](void *p, double) {
+            [](void *p, double timeout) {
                 auto &f = *static_cast<Fake *>(p);
                 if (++f.receives > f.budget) throw std::runtime_error("fake receive budget exceeded");
-                if (f.incoming.empty()) return Response();
+                f.receive_timeouts.push_back(timeout);
+                if (f.space_transient_receives) {
+                    ++f.spaced_receive_calls;
+                    if (f.spaced_receive_calls <= 3) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    } else if (f.spaced_receive_calls == 4 && timeout > 0.0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        f.update_when_empty = true;
+                    }
+                }
+                if (f.incoming.empty()) {
+                    if (f.wait_when_empty && timeout > 0.0 && std::isfinite(timeout))
+                        std::this_thread::sleep_for(std::chrono::duration<double>(timeout));
+                    if (f.update_when_empty && timeout > 0.0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        f.update_when_empty = false;
+#ifdef TDLUA_NATIVE_BACKEND
+                        Response update;
+                        update.object = td::td_api::make_object<
+                            td::td_api::updateNewMessage>();
+                        f.incoming.push_back(std::move(update));
+#else
+                        f.incoming.push_back({{"@type", "updateNewMessage"},
+                                              {"value", 99}});
+#endif
+                    }
+                    if (f.incoming.empty()) return Response();
+                }
                 Response result = std::move(f.incoming.front());
                 f.incoming.pop_front();
                 return result;
@@ -75,10 +109,44 @@ struct Fake {
 #endif
     }
 };
+struct Allocator {
+    std::size_t calls = 0;
+    std::size_t fail_at = 0;
+    std::size_t live_blocks = 0;
+    std::size_t rejected = 0;
+
+    static void *allocate(void *context, void *old, std::size_t old_size,
+                          std::size_t new_size)
+    {
+        auto &allocator = *static_cast<Allocator *>(context);
+        if (new_size == 0) {
+            if (old) --allocator.live_blocks;
+            std::free(old);
+            return nullptr;
+        }
+        ++allocator.calls;
+        if (allocator.fail_at && allocator.calls >= allocator.fail_at &&
+            (!old || new_size > old_size)) {
+            ++allocator.rejected;
+            allocator.fail_at = 0;
+            return nullptr;
+        }
+        const bool fresh = old == nullptr;
+        void *result = std::realloc(old, new_size);
+        if (result && fresh) ++allocator.live_blocks;
+        return result;
+    }
+};
+std::size_t allocator_leak_failures = 0;
 struct Fixture {
-    lua_State *L = luaL_newstate();
+    Allocator allocator;
+    lua_State *L = lua_newstate(Allocator::allocate, &allocator);
     std::map<Client *, std::unique_ptr<Fake>> fakes;
-    ~Fixture() { lua_close(L); }
+    ~Fixture()
+    {
+        lua_close(L);
+        if (allocator.live_blocks != 0) ++allocator_leak_failures;
+    }
     Fake &fake(lua_State *thread, int index)
     {
         auto **slot = static_cast<void **>(luaL_checkudata(thread, index, "tdclient"));
@@ -112,6 +180,25 @@ int sent(lua_State *L)
     return 2;
 }
 int receives(lua_State *L) { lua_pushinteger(L, fixture(L).fake(L, 1).receives); return 1; }
+int spaceReceives(lua_State *L)
+{
+    Fake &fake = fixture(L).fake(L, 1);
+    fake.space_transient_receives = true;
+    fake.spaced_receive_calls = 0;
+    fake.receive_timeouts.clear();
+    return 0;
+}
+int receiveTimeout(lua_State *L)
+{
+    const Fake &fake = fixture(L).fake(L, 1);
+    const auto index = static_cast<std::size_t>(luaL_checkinteger(L, 2));
+    if (index == 0 || index > fake.receive_timeouts.size()) {
+        lua_pushnil(L);
+    } else {
+        lua_pushnumber(L, fake.receive_timeouts[index - 1]);
+    }
+    return 1;
+}
 int response(lua_State *L)
 {
     fixture(L).fake(L, 1).response(luaL_checkinteger(L, 2), luaL_checkinteger(L, 3));
@@ -142,6 +229,58 @@ int automatic(lua_State *L)
 {
     fixture(L).fake(L, 1).auto_response = lua_toboolean(L, 2);
     return 0;
+}
+int waitWhenEmpty(lua_State *L)
+{
+    fixture(L).fake(L, 1).wait_when_empty = lua_toboolean(L, 2);
+    return 0;
+}
+int updateWhenEmpty(lua_State *L)
+{
+    fixture(L).fake(L, 1).update_when_empty = lua_toboolean(L, 2);
+    return 0;
+}
+int failNextDrain(lua_State *L)
+{
+#ifdef TDLUA_NATIVE_BACKEND
+    fixture(L).fake(L, 1);
+    auto **slot = static_cast<void **>(luaL_checkudata(L, 1, "tdclient"));
+    static_cast<NativeTDLua *>(*slot)->failNextDrainForTesting();
+#else
+    fixture(L).fake(L, 1);
+    auto **slot = static_cast<void **>(luaL_checkudata(L, 1, "tdclient"));
+    static_cast<TDLua *>(*slot)->failNextDrainForTesting();
+#endif
+    return 0;
+}
+int armAllocator(lua_State *L)
+{
+    auto &allocator = fixture(L).allocator;
+    allocator.fail_at = allocator.calls +
+        static_cast<std::size_t>(luaL_checkinteger(L, 1));
+    return 0;
+}
+int disarmAllocator(lua_State *L)
+{
+    fixture(L).allocator.fail_at = 0;
+    return 0;
+}
+int rejectedAllocations(lua_State *L)
+{
+    lua_pushinteger(L, static_cast<lua_Integer>(fixture(L).allocator.rejected));
+    return 1;
+}
+int pendingCount(lua_State *L)
+{
+    auto **slot = static_cast<void **>(luaL_checkudata(L, 1, "tdclient"));
+#ifdef TDLUA_NATIVE_BACKEND
+    lua_pushinteger(L, static_cast<lua_Integer>(
+        static_cast<NativeTDLua *>(*slot)->dispatcher().pendingCount()));
+#else
+    lua_pushinteger(L, static_cast<lua_Integer>(
+        static_cast<TDLua *>(*slot)->dispatcher().pendingCount()));
+#endif
+    return 1;
 }
 int pause(lua_State *)
 {
@@ -221,7 +360,14 @@ void initialize(Fixture &f)
     lua_newtable(f.L);
     for (const auto &entry : std::map<const char *, lua_CFunction>{
         {"attach", attach}, {"sent", sent}, {"receives", receives}, {"reply", response},
-        {"update", update}, {"automatic", automatic}, {"pause", pause}, {"tick", tick},
+        {"space_receives", spaceReceives}, {"receive_timeout", receiveTimeout},
+        {"update", update}, {"automatic", automatic}, {"wait_empty", waitWhenEmpty},
+        {"delayed_update", updateWhenEmpty},
+        {"fail_drain", failNextDrain},
+        {"arm", armAllocator}, {"disarm", disarmAllocator},
+        {"rejected", rejectedAllocations},
+        {"pending", pendingCount},
+        {"pause", pause}, {"tick", tick},
         {"counts", counters}, {"state", handleState}, {"task_count", taskCount},
         {"ownership", ownership}, {"cross_owners", crossOwners},
         {"c_boundary", cBoundary}}) {
@@ -242,12 +388,13 @@ int main()
 {
     const std::vector<std::string> tests = {"A", "B", "C", "D", "E", "F", "G", "H",
                                             "I", "J", "K", "L", "M", "N", "O", "P",
-                                            "Q", "R", "S", "T", "U", "V", "W"};
+                                            "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"};
     std::cout << "Stock " << LUA_RELEASE << "; LUA_VERSION_NUM=" << LUA_VERSION_NUM
         << "; LuaJIT compile macros absent\n";
     int failures = 0;
     for (const auto &test : tests) {
         bool passed = true;
+        const std::size_t leaks_before = allocator_leak_failures;
         {
             Fixture f;
             try {
@@ -269,6 +416,10 @@ int main()
                 passed = false;
                 std::cerr << test << ": " << error.what() << '\n';
             }
+        }
+        if (allocator_leak_failures != leaks_before) {
+            passed = false;
+            std::cerr << test << ": Lua allocator blocks remain after lua_close\n";
         }
         if (!zero()) { passed = false; std::cerr << test << ": nonzero final counters\n"; }
         if (!passed) ++failures;

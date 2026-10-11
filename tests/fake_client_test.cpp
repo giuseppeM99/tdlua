@@ -7,6 +7,7 @@
 
 #include <deque>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -28,6 +29,9 @@ struct Fake {
     bool closed = false;
     bool fail = false;
     bool auto_shutdown = true;
+    bool auto_response = false;
+    bool wait_when_empty = false;
+    int auto_response_value = 17;
     unsigned close_calls = 0;
     std::function<void(double)> before_receive;
     std::vector<double> waits;
@@ -43,6 +47,9 @@ struct Fake {
                 const std::string type = request.value(
                     "@type", request.value("_", std::string()));
                 fake.sent.emplace_back(id, std::move(request));
+                if (fake.auto_response) {
+                    fake.response(id, fake.auto_response_value);
+                }
                 if (fake.auto_shutdown && (type == "close" || type == "destroy")) {
                     fake.incoming.push_back({
                         {"@type", "ok"},
@@ -57,6 +64,11 @@ struct Fake {
                 fake.waits.push_back(timeout);
                 if (fake.before_receive) fake.before_receive(timeout);
                 if (fake.incoming.empty()) {
+                    if (fake.wait_when_empty && timeout > 0.0 &&
+                        std::isfinite(timeout)) {
+                        std::this_thread::sleep_for(
+                            std::chrono::duration<double>(timeout));
+                    }
                     return json(nullptr);
                 }
                 json result = std::move(fake.incoming.front());
@@ -217,14 +229,171 @@ void testResponses(lua_State *L, Fake &fake)
            "received[2]._request_id == a); "
            "assert(received[1].value == 2 and received[2].value == 1); "
            "assert(update._request_id == nil and update['@extra'] == nil); "
-           "assert(c:execute({_='getMe'}, 0) == nil)");
+           "numeric_pending_before = c:pendingCount(); "
+           "local timed, timed_error = c:execute({_='getMe'}, 0); "
+           "assert(timed == nil and timed_error == 'timeout')");
 
     const auto late_id = fake.sent.back().first;
     fake.response(late_id, 3);
     runLua(L,
-           "local late = c:receive(0); "
-           "assert(late._request_id and late.value == 3 and "
-           "late['@extra'] == nil)");
+           "local late = c:receive(0); assert(late == nil); "
+           "assert(c:pendingCount() == numeric_pending_before)");
+
+    fake.auto_response = true;
+    const auto sends_before = fake.sent.size();
+    runLua(L,
+           "local result, err = c:execute({_='getMe'}, 0.1); "
+           "assert(err == nil and result.value == 17 and result._request_id)");
+    fake.auto_response = false;
+    if (fake.sent.size() != sends_before + 1) {
+        throw std::runtime_error("numeric execute did not submit exactly once");
+    }
+
+    fake.auto_response = true;
+    bool injected_update = false;
+    fake.before_receive = [&](double) {
+        if (injected_update) return;
+        injected_update = true;
+        fake.incoming.push_front({{"@type", "testUpdate"}, {"value", 1}});
+    };
+    runLua(L,
+           "local calls = 0; c:on('testUpdate', function() "
+           "  calls = calls + 1; error('compact wait handler failure') "
+           "end); "
+           "local ok, err = pcall(function() c:execute({_='getMe'}, 0.1) end); "
+           "assert(not ok, 'compact execute swallowed a handler failure'); "
+           "compact_handler_error = tostring(err); "
+           "assert(calls == 1, 'handler calls=' .. calls); c:off('testUpdate')");
+    fake.before_receive = {};
+    fake.auto_response = false;
+    runLua(L,
+           "assert(c:receive(0) == nil); "
+           "assert(c:pendingCount() == numeric_pending_before)");
+
+    fake.auto_response = true;
+    injected_update = false;
+    fake.before_receive = [&](double) {
+        if (injected_update) return;
+        injected_update = true;
+        fake.incoming.push_front({{"@type", "testUpdate"}, {"value", 1}});
+    };
+    runLua(L,
+           "local calls = 0; c:on('testUpdate', function() "
+           "  calls = calls + 1; error('compact wait handler failure') "
+           "end); "
+           "managed_future = c:execute({_='getMe'}); "
+           "local ok, err = pcall(function() managed_future:wait(0.1) end); "
+           "assert(not ok, 'Future:wait swallowed a handler failure'); "
+           "managed_handler_error = tostring(err); "
+           "assert(calls == 1, 'Future handler calls=' .. calls); "
+           "c:off('testUpdate')");
+    fake.before_receive = {};
+    fake.auto_response = false;
+    runLua(L,
+           "assert(type(c:receive(0)) == 'table'); "
+           "managed_future = nil; collectgarbage('collect')");
+
+    const auto coroutine_sends_before = fake.sent.size();
+    runLua(L,
+           "compact_co = coroutine.create(function() "
+           "  compact_value, compact_error = c:execute({_='getMe'}, 0.1) "
+           "end); "
+           "assert(coroutine.resume(compact_co)); "
+           "assert(coroutine.status(compact_co) == 'suspended')");
+    const auto coroutine_id = fake.sent.back().first;
+    fake.response(coroutine_id, 23);
+    const std::string coroutine_assertion =
+        "assert(c:receive(0) == nil); "
+        "assert(coroutine.status(compact_co) == 'dead'); "
+        "assert(compact_error == nil and compact_value.value == 23 and "
+        "compact_value._request_id == " + std::to_string(coroutine_id) + ")";
+    runLua(L, coroutine_assertion.c_str());
+    if (fake.sent.size() != coroutine_sends_before + 1) {
+        throw std::runtime_error("coroutine numeric execute submitted more than once");
+    }
+}
+
+void queueTransient(lua_State *L, Fake &fake, int value)
+{
+    runLua(L, "local result, err = c:execute({_='getMe'}, 0); "
+              "assert(result == nil and err == 'timeout')");
+    fake.response(fake.sent.back().first, value);
+}
+
+void testTransientReceive(lua_State *L, TDLua *client, Fake &fake)
+{
+    // A transient reply is hidden; receive(0) still returns the next queued
+    // object, preserving the original FIFO order.
+    fake.waits.clear();
+    queueTransient(L, fake, 30);
+    fake.update("updateOption", 31);
+    runLua(L, "local value = c:receive(0); "
+              "assert(value and value.value == 31)");
+    if (fake.waits.size() != 2 || fake.waits[1] != 0.0) {
+        throw std::runtime_error("receive(0) did not continue past a transient");
+    }
+
+    // The second receive is delayed, and gets only the time left from the
+    // caller's original deadline.
+    fake.waits.clear();
+    queueTransient(L, fake, 32);
+    unsigned calls = 0;
+    fake.before_receive = [&](double) {
+        ++calls;
+        if (calls == 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        } else if (calls == 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            fake.update("updateOption", 33);
+        }
+    };
+    runLua(L, "local value = c:receive(1); "
+              "assert(value and value.value == 33)");
+    fake.before_receive = {};
+    if (fake.waits.size() != 2 || fake.waits[1] <= 0.0 ||
+        fake.waits[1] >= 0.98) {
+        throw std::runtime_error(
+            "receive reset its timeout after a transient (calls=" +
+            std::to_string(fake.waits.size()) + ", second=" +
+            (fake.waits.size() > 1 ? std::to_string(fake.waits[1]) : "missing") +
+            ")");
+    }
+
+    // Several transient results are consumed before the public update.
+    fake.waits.clear();
+    queueTransient(L, fake, 34);
+    queueTransient(L, fake, 35);
+    fake.update("updateOption", 36);
+    runLua(L, "local value = c:receive(0); "
+              "assert(value and value.value == 36)");
+    if (fake.waits.size() != 3) {
+        throw std::runtime_error("receive did not consume consecutive transients");
+    }
+
+    // With no public item, receive waits only for the remainder of its
+    // original timeout after consuming the transient.
+    fake.waits.clear();
+    queueTransient(L, fake, 37);
+    fake.wait_when_empty = true;
+    const auto started = std::chrono::steady_clock::now();
+    runLua(L, "assert(c:receive(0.04) == nil)");
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    fake.wait_when_empty = false;
+    if (fake.waits.size() != 2 || fake.waits[1] <= 0.0 ||
+        elapsed < std::chrono::milliseconds(30) ||
+        elapsed > std::chrono::milliseconds(250)) {
+        throw std::runtime_error("receive did not honor the original deadline");
+    }
+
+    // A drain failure after dispatch must not restore the transient into the
+    // raw queue. The following update remains available.
+    queueTransient(L, fake, 38);
+    fake.update("updateOption", 39);
+    client->failNextDrainForTesting();
+    runLua(L, "local ok, err = pcall(function() c:receive(0) end); "
+              "assert(not ok and tostring(err):find('injected drain failure'))");
+    runLua(L, "local value = c:receive(0); "
+              "assert(value and value.value == 39)");
 }
 
 void testAwaitAndSynchronousCalls(lua_State *L, Fake &fake)
@@ -373,6 +542,15 @@ void testM5Conformance(lua_State *L, Fake &fake)
 
 void testReviewRegressions(lua_State *L, Fake &fake, Fake &second)
 {
+    const auto invalid_timeout_sends = fake.sent.size();
+    runLua(L,
+           "local pending_before = c:pendingCount(); "
+           "for _, timeout in ipairs({-1, math.huge, -math.huge, 0/0}) do "
+           "  assert(not pcall(function() c:execute({_='getMe'}, timeout) end)) "
+           "end; assert(c:pendingCount() == pending_before)");
+    if (fake.sent.size() != invalid_timeout_sends) {
+        throw std::runtime_error("invalid numeric execute timeout submitted a request");
+    }
     runLua(L,
            "timeout_future = c:getMe(); "
            "timeout_co = coroutine.create(function() "
@@ -837,6 +1015,7 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second, TestTransports &transp
 
     testPublicRequests(L, fake);
     testResponses(L, fake);
+    testTransientReceive(L, client, fake);
     testAwaitAndSynchronousCalls(L, fake);
     testManagedFutureAndTasks(L, fake);
     testM5Conformance(L, fake);

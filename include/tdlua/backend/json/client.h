@@ -36,7 +36,6 @@ private:
 
     std::int32_t client_id;
     std::deque<QueuedUpdate> updates;
-    std::uint64_t buffer_revision_ = 0;
     std::string dbpath;
     bool _ready;
     ClientState state;
@@ -67,6 +66,7 @@ public:
     // Test injection is below the normal Lua binding and shared router.
 #ifdef TDLUA_TESTING
     void injectTransport(Transport transport);
+    void failNextDrainForTesting() noexcept;
 #endif
     nlohmann::json receiveBackend(double timeout);
 
@@ -83,8 +83,6 @@ public:
     void preservePumpItem(PumpValue &value);
     void drainPump();
 
-    bool takeQueuedResponse(std::uint64_t request_id, QueuedUpdate &response);
-
     // GC fallback: bounded, callback-free teardown using the existing receiver.
     void closeInternal();
     void finishTerminalCleanup();
@@ -99,14 +97,9 @@ public:
     void restoreReceived(const nlohmann::json &value)
     {
         updates.emplace_front(value, true, true);
-        ++buffer_revision_;
     }
 
     bool empty() const;
-    std::uint64_t bufferRevision() const noexcept
-    {
-        return buffer_revision_;
-    }
 
     void saveUpdatesBuffer();
 

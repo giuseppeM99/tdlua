@@ -170,54 +170,6 @@ void testCallbacksAndUpdates(Scenario &scenario)
            "assert(update._request_id == nil)");
 }
 
-bool waitForResponse(Scenario &scenario, std::uint64_t id, int budget,
-                     Object &response, std::deque<Object> &buffered)
-{
-    auto remaining_budget = budget;
-    const auto policy = tdlua::makeResponseWaitPolicy(
-        [](Object &) { return false; },
-        [](const Object &value) { return value.present; },
-        [&](Object &value) { dispatchObject(scenario, value); },
-        [](const Object &value) { return value.id; },
-        [&](Object value) { buffered.push_back(std::move(value)); },
-        [&]() { return static_cast<double>(remaining_budget--); },
-        tdlua::QueueCheckOrder::AfterTimeout);
-
-    return tdlua::waitResponse(scenario.transport, id, response, policy);
-}
-
-void testWaitAndBuffering(Scenario &scenario)
-{
-    const auto timed_id = scenario.router.raw();
-    submit(scenario, timed_id, 55);
-
-    std::deque<Object> buffered;
-    Object response;
-    require(!waitForResponse(scenario, timed_id, 0, response, buffered),
-            "timed execute did not time out");
-
-    scenario.fake.inject(timed_id, 55);
-    response = scenario.transport.receive(0);
-    dispatchObject(scenario, response);
-    pushObject(scenario.lua, response);
-    lua_setglobal(scenario.lua, "late");
-    runLua(scenario.lua, "assert(late._request_id and late.value == 55)");
-    require(response.id == timed_id, "late ID changed");
-
-    const auto matching_id = scenario.router.raw();
-    submit(scenario, matching_id, 66);
-    scenario.fake.inject(scenario.first_raw_id, 11);
-    scenario.fake.inject(0, 77);
-    scenario.fake.inject(matching_id, 66);
-
-    require(waitForResponse(scenario, matching_id, 4, response, buffered) &&
-                response.id == matching_id,
-            "wait matching failed");
-    require(buffered.size() == 2 && buffered[0].id == scenario.first_raw_id &&
-                buffered[1].id == 0,
-            "raw buffering changed");
-}
-
 void testAwaiter(Scenario &scenario)
 {
     lua_State *coroutine = lua_newthread(scenario.lua);
@@ -241,12 +193,29 @@ void testAwaiter(Scenario &scenario)
     luaL_unref(scenario.lua, LUA_REGISTRYINDEX, thread_ref);
 }
 
+void testRawResponse(Scenario &scenario)
+{
+    scenario.fake.inject(scenario.first_raw_id, 11);
+    Object response = scenario.transport.receive(0);
+    const auto route = scenario.router.dispatchRoute(response.id, [&](lua_State *target) {
+        pushObject(target, response);
+    });
+    require(route == tdlua::RouteKind::Raw,
+            "raw response was not routed as raw");
+    pushObject(scenario.lua, response);
+    lua_setglobal(scenario.lua, "raw_response");
+    const std::string assertion = "assert(raw_response._request_id == " +
+        std::to_string(scenario.first_raw_id) + " and raw_response.value == 11)";
+    runLua(scenario.lua, assertion.c_str());
+}
+
 void testRollbackAndCallbackErrors(Scenario &scenario)
 {
     runLua(scenario.lua,
            "do local value = {}; weak[1] = value; "
            "function makecallback() return function() return value end end end");
     runLua(scenario.lua, "return makecallback()");
+    const std::size_t pending_before_failed_send = scenario.router.pendingCount();
     const auto failed_id = scenario.router.request(scenario.lua, -1, 0);
     lua_pop(scenario.lua, 1);
     runLua(scenario.lua, "makecallback = nil");
@@ -258,7 +227,7 @@ void testRollbackAndCallbackErrors(Scenario &scenario)
     } catch (const std::runtime_error &) {
         threw = true;
     }
-    require(threw && scenario.router.pendingCount() == 0,
+    require(threw && scenario.router.pendingCount() == pending_before_failed_send,
             "failed send left pending state");
     runLua(scenario.lua,
            "collectgarbage('collect'); assert(weak[1] == nil)");
@@ -321,7 +290,7 @@ void runScenarios(lua_State *L)
 {
     Scenario scenario(L);
     testCallbacksAndUpdates(scenario);
-    testWaitAndBuffering(scenario);
+    testRawResponse(scenario);
     testAwaiter(scenario);
     testRollbackAndCallbackErrors(scenario);
     testIsolationAndCleanup(scenario);

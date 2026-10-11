@@ -55,9 +55,9 @@ std::uint64_t NativeDispatcher::registerRawRequest()
     return router_.raw();
 }
 
-std::shared_ptr<tdlua::ManagedState> NativeDispatcher::future()
+std::shared_ptr<tdlua::ManagedState> NativeDispatcher::future(bool discard_raw_response)
 {
-    return router_.future();
+    return router_.future(discard_raw_response);
 }
 
 std::shared_ptr<tdlua::ManagedState> NativeDispatcher::task(
@@ -81,9 +81,11 @@ int NativeDispatcher::wait(lua_State *L,
 
 int NativeDispatcher::waitById(lua_State *L, std::uint64_t request_id,
                                 bool has_timeout, double timeout,
-                                tdlua::WaitKind kind, const char *field)
+                                tdlua::WaitKind kind, const char *field,
+                                tdlua::WaitContext context)
 {
-    return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
+    return router_.waitById(L, request_id, has_timeout, timeout, kind, field,
+                            context);
 }
 
 void NativeDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)

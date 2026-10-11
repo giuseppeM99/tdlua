@@ -43,6 +43,7 @@ enum class RouteKind {
     Update,
     Raw,
     Future,
+    TransientFuture,
     Task,
     LegacyRequest,
     LegacyAwait
@@ -57,7 +58,15 @@ enum class ManagedStatus {
 };
 
 enum class WaitKind { Result, Field };
+enum class WaitContext { Managed, NumericExecute };
 enum class ErrorDelivery { PublicCall, Finalizer };
+
+inline void validateManagedTimeout(double timeout)
+{
+    if (!std::isfinite(timeout) || timeout < 0) {
+        throw std::runtime_error("tdlua: timeout must be finite and non-negative");
+    }
+}
 
 enum class WaitOutcome {
     Pending,
@@ -93,6 +102,7 @@ struct ManagedState {
     bool failure_observed = false;
     bool failure_reported = false;
     bool teardown_failure = false;
+    bool discard_raw_response = false;
     std::size_t handle_count = 0;
     std::size_t waiter_count = 0;
     std::shared_ptr<EventRegistration> event_registration;
@@ -1727,7 +1737,12 @@ public:
         }
     }
     std::uint64_t raw() { return createState(RequestKind::Raw)->request_id; }
-    State future() { return createState(RequestKind::Future); }
+    State future(bool discard_raw_response = false)
+    {
+        const State state = createState(RequestKind::Future);
+        state->discard_raw_response = discard_raw_response;
+        return state;
+    }
     State task(lua_State *L, int callback, int context, bool supplied_thread)
     {
         if (supplied_thread ? !lua_isthread(L, callback) : !lua_isfunction(L, callback))
@@ -1861,7 +1876,9 @@ public:
         if (!isTaskState(state)) state->status = ManagedStatus::Resolved;
         ready_.push_back(state);
         switch (state->kind) {
-            case RequestKind::Future: return RouteKind::Future;
+            case RequestKind::Future:
+                return state->discard_raw_response ? RouteKind::TransientFuture
+                                                   : RouteKind::Future;
             case RequestKind::Task: return RouteKind::Task;
             case RequestKind::LegacyRequest: return RouteKind::LegacyRequest;
             default: return RouteKind::LegacyAwait;
@@ -1935,8 +1952,10 @@ public:
     // Returns a positive stack index for a newly installed continuation, or
     // zero for a completed/non-yielding wait. No C++ owner lives across yield.
     int prepareWait(lua_State *L, State state, bool timed, double timeout,
-                    WaitKind kind, const char *field, int &results)
+                    WaitKind kind, const char *field, int &results,
+                    WaitContext wait_context = WaitContext::Managed)
     {
+        (void)wait_context;
 #ifdef TDLUA_USE_LUA51_CONTINUATION
         if (kind == WaitKind::Field) {
             lua_rawgetp(L, LUA_REGISTRYINDEX, lua51FieldErrorKey());
@@ -1948,15 +1967,14 @@ public:
         // core alive until the continuation has installed its Lua anchors.
         const auto wait_core_lease = shared_from_this();
         (void)wait_core_lease;
-        if (timed && (!std::isfinite(timeout) || timeout < 0)) {
-            throw std::runtime_error("tdlua: timeout must be finite and non-negative");
-        }
+        if (timed) validateManagedTimeout(timeout);
         if (!isTerminalState(state) && timed && timeout == 0) {
             pushTimeout(L, kind, results);
             return 0;
         }
 #ifdef TDLUA_USE_LUA51_CONTINUATION
-        if (!isTerminalState(state) && !tdlua_lua_is_yieldable(L)) {
+        if (!isTerminalState(state) && !tdlua_lua_is_yieldable(L) &&
+            wait_context == WaitContext::Managed) {
             lua_rawgetp(L, LUA_REGISTRYINDEX, lua51MainWaitErrorKey());
             results = -1;
             return 0;
@@ -2366,7 +2384,10 @@ public:
     void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }
     std::size_t pendingCount() const { return core_->pendingCount(); }
     std::uint64_t raw() { return core_->raw(); }
-    ManagedStatePtr future() { return core_->future(); }
+    ManagedStatePtr future(bool discard_raw_response = false)
+    {
+        return core_->future(discard_raw_response);
+    }
     ManagedStatePtr task(lua_State *L, int callback, int context, bool thread)
     {
         return core_->task(L, callback, context, thread);
@@ -2460,7 +2481,8 @@ public:
     int wait(lua_State *L, const ManagedStatePtr &state, bool timed, double timeout,
              WaitKind kind = WaitKind::Result, const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t id, bool timed, double timeout,
-                 WaitKind kind = WaitKind::Result, const char *field = nullptr);
+                 WaitKind kind = WaitKind::Result, const char *field = nullptr,
+                 WaitContext context = WaitContext::Managed);
 };
 
 // The C++ scheduler methods above finish before this boundary enters Lua's
@@ -2509,12 +2531,14 @@ inline int RequestRouter::wait(lua_State *L, const ManagedStatePtr &state, bool 
 }
 
 inline int RequestRouter::waitById(lua_State *L, std::uint64_t id, bool timed,
-                                    double timeout, WaitKind kind, const char *field)
+                                    double timeout, WaitKind kind, const char *field,
+                                    WaitContext wait_context)
 {
     int results = 0, context = 0;
     try {
         const auto state = core_->stateById(id);
-        context = core_->prepareWait(L, state, timed, timeout, kind, field, results);
+        context = core_->prepareWait(L, state, timed, timeout, kind, field, results,
+                                     wait_context);
     } catch (const TDLuaLuaError &) {
         results = -1;
     } catch (const std::exception &error) {

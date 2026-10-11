@@ -451,38 +451,35 @@ local blocking_response = client:execute({
 }, 1.0)
 assert_td_object(blocking_response, "blocking execute")
 assert(type(blocking_response._request_id) == "number")
+for _ = 1, 20 do
+    client:receive(0.1)
+    if nested_response ~= nil then break end
+end
 assert_td_object(nested_response, "nested execute from callback")
 assert(callback_called == true,
        "execute did not dispatch an unrelated callback before returning")
 assert(response_handler_count == 1,
        "execute did not dispatch the unrelated response handler exactly once")
 
-local queued_response
-for _ = 1, 20 do
-    local event = client:receive(0.1)
-    if event and event._request_id == async_id then
-        queued_response = event
-        break
-    end
-end
-assert_td_object(queued_response, "already dispatched response")
 assert(response_handler_count == 1,
-       "receive dispatched an execute-processed response twice")
+       "managed waiting dispatched the unrelated response handler more than once")
 client:off("authorizationStateWaitTdlibParameters")
 
--- A timed-out blocking request remains observable through receive(), with its
--- internal request ID preserved when the backend eventually returns it.
+-- A timed compact execute uses a managed Future. Its timeout does not cancel
+-- the TDLib request, but the eventual response is consumed by the managed
+-- router rather than exposed later through raw receive().
+local pending_before_timed_execute = client:pendingCount()
 local timed_out = client:execute({_ = "getAuthorizationState"}, 0.0)
-assert(timed_out == nil, "zero-timeout execute unexpectedly returned a response")
-local late_response
+assert(timed_out == nil, "zero-timeout execute unexpectedly returned a result")
+assert(client:pendingCount() == pending_before_timed_execute + 1,
+       "timed-out compact execute did not remain managed-pending")
 for _ = 1, 20 do
-    local event = client:receive(0.1)
-    if event and event._request_id and event._ == "authorizationStateWaitTdlibParameters" then
-        late_response = event
-        break
-    end
+    assert(client:receive(0.1) == nil,
+           "late compact-execute response leaked through raw receive")
+    if client:pendingCount() == pending_before_timed_execute then break end
 end
-assert_td_object(late_response, "late timed-out response")
+assert(client:pendingCount() == pending_before_timed_execute,
+       "late compact-execute response was not settled by the managed router")
 
 -- An event handler may replace or remove itself while it is running. The
 -- dispatcher must keep the callback already copied to the Lua stack valid.
@@ -607,16 +604,8 @@ assert(not handler_error_ok, "handler failure was swallowed")
 client:off("authorizationStateWaitTdlibParameters")
 assert(client:receive(0))
 
--- An error in a handler for the response currently awaited by execute() must
--- release its pending request exactly once and leave the client reusable.
-local execute_handler_error_ok = pcall(function()
-    client:on("authorizationStateWaitTdlibParameters", function()
-        error("execute handler failure")
-    end)
-    client:execute({_ = "getAuthorizationState"}, 1.0)
-end)
-assert(not execute_handler_error_ok, "execute handler failure was swallowed")
-client:off("authorizationStateWaitTdlibParameters")
+-- The prior callback and handler failures must not poison a later managed
+-- request on the same client.
 local recovered_response = client:execute({_ = "getAuthorizationState"}, 1.0)
 assert_td_object(recovered_response, "execute after handler failure")
 

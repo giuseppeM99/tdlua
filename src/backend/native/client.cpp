@@ -16,6 +16,10 @@
 
 namespace {
 
+#ifdef TDLUA_TESTING
+NativeTDLua *client_with_injected_drain_failure = nullptr;
+#endif
+
 bool persistedRequestId(const nlohmann::json &value, std::uint64_t &request_id)
 {
     if (!value.is_object()) {
@@ -152,7 +156,6 @@ NativeResponse NativeTDLua::receive(double timeout)
     if (!updates_.empty()) {
         NativeResponse response(std::move(updates_.front()));
         updates_.pop_front();
-        ++buffer_revision_;
         return response;
     }
     if (closed_) return NativeResponse();
@@ -214,6 +217,12 @@ void NativeTDLua::drainPump()
 {
     ++drain_depth_;
     try {
+#ifdef TDLUA_TESTING
+        if (client_with_injected_drain_failure == this) {
+            client_with_injected_drain_failure = nullptr;
+            throw std::runtime_error("tdlua: injected drain failure");
+        }
+#endif
         dispatcher_.drain();
     } catch (...) {
         --drain_depth_;
@@ -275,30 +284,13 @@ NativeDispatcher &NativeTDLua::dispatcher()
 void NativeTDLua::push(NativeResponse response)
 {
     updates_.push_back(std::move(response));
-    ++buffer_revision_;
 }
 
 NativeResponse NativeTDLua::pop()
 {
     NativeResponse result(std::move(updates_.front()));
     updates_.pop_front();
-    ++buffer_revision_;
     return result;
-}
-
-bool NativeTDLua::takeQueuedResponse(std::uint64_t request_id,
-                                      NativeResponse &response)
-{
-    for (std::deque<NativeResponse>::iterator it = updates_.begin();
-         it != updates_.end(); ++it) {
-        if (it->request_id == request_id) {
-            response = std::move(*it);
-            updates_.erase(it);
-            ++buffer_revision_;
-            return true;
-        }
-    }
-    return false;
 }
 
 bool NativeTDLua::empty() const
@@ -388,7 +380,6 @@ void NativeTDLua::closeInternal()
         dispatcher_.detachTransport();
         // Finalizer cleanup cannot deliver buffered objects to Lua callers.
         updates_.clear();
-        ++buffer_revision_;
         if (cleanup_complete_)
             return;
         if (injected_transport_.operations) {
@@ -479,7 +470,6 @@ void NativeTDLua::saveUpdatesBuffer()
             stored.push_back(std::move(value));
         }
         it = updates_.erase(it);
-        ++buffer_revision_;
     }
     lua_settop(lua_, stack_top);
 
@@ -523,7 +513,6 @@ void NativeTDLua::loadUpdatesBuffer()
             response.object = tdlua_native::from_lua_object(
                 lua_, table_index, "updates[" + std::to_string(i + 1) + "]");
             updates_.push_back(std::move(response));
-            ++buffer_revision_;
             lua_pop(lua_, 1);
         }
         lua_settop(lua_, stack_top);
@@ -541,12 +530,16 @@ void NativeTDLua::emptyUpdatesBuffer(bool preserve_received)
         if (preserve_received && it->delivery_pending) ++it;
         else {
             it = updates_.erase(it);
-            ++buffer_revision_;
         }
     }
 }
 
 #ifdef TDLUA_TESTING
+void NativeTDLua::failNextDrainForTesting() noexcept
+{
+    client_with_injected_drain_failure = this;
+}
+
 void NativeTDLua::injectTransport(Transport transport)
 {
     if (!injected_transport_.operations)

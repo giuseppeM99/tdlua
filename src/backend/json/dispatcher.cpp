@@ -68,9 +68,9 @@ std::uint64_t LuaDispatcher::registerRawRequest()
     return router_.raw();
 }
 
-std::shared_ptr<tdlua::ManagedState> LuaDispatcher::future()
+std::shared_ptr<tdlua::ManagedState> LuaDispatcher::future(bool discard_raw_response)
 {
-    return router_.future();
+    return router_.future(discard_raw_response);
 }
 
 std::shared_ptr<tdlua::ManagedState> LuaDispatcher::task(
@@ -94,9 +94,11 @@ int LuaDispatcher::wait(lua_State *L,
 
 int LuaDispatcher::waitById(lua_State *L, std::uint64_t request_id,
                              bool has_timeout, double timeout,
-                             tdlua::WaitKind kind, const char *field)
+                             tdlua::WaitKind kind, const char *field,
+                             tdlua::WaitContext context)
 {
-    return router_.waitById(L, request_id, has_timeout, timeout, kind, field);
+    return router_.waitById(L, request_id, has_timeout, timeout, kind, field,
+                            context);
 }
 
 void LuaDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)

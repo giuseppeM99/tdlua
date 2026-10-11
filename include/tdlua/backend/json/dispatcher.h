@@ -23,7 +23,7 @@ public:
     std::uint64_t registerRequest(lua_State *L, int callback_index, int context_index);
     // Creates a RequestKind::Raw state; this is more than allocating an ID.
     std::uint64_t registerRawRequest();
-    std::shared_ptr<tdlua::ManagedState> future();
+    std::shared_ptr<tdlua::ManagedState> future(bool discard_raw_response = false);
     std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
                                               int context_index,
                                               bool supplied_thread);
@@ -34,7 +34,8 @@ public:
               const char *field = nullptr);
     int waitById(lua_State *L, std::uint64_t request_id, bool has_timeout,
                   double timeout, tdlua::WaitKind kind = tdlua::WaitKind::Result,
-                  const char *field = nullptr);
+                  const char *field = nullptr,
+                  tdlua::WaitContext context = tdlua::WaitContext::Managed);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);

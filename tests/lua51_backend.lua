@@ -17,9 +17,9 @@ for _, method in ipairs({'executeSync', '_execute'}) do
     local result=c[method](c, {_='getTextEntities', text='hello'})
     assert(result['@type']=='textEntities')
 end
-local legacy=c:execute({_='getAuthorizationState'},1)
-assert(legacy['@type']=='authorizationStateWaitTdlibParameters' and legacy._request_id)
-print('real backend synchronous and legacy timed APIs PASS')
+local timed=c:execute({_='getAuthorizationState'},1)
+assert(timed['@type']=='authorizationStateWaitTdlibParameters' and timed._request_id)
+print('real backend synchronous and managed timed execute PASS')
 local function start(fn)
     local co=coroutine.create(fn)
     local ok,e=coroutine.resume(co); assert(ok,e)

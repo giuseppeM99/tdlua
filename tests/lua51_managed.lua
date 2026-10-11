@@ -499,3 +499,186 @@ scenarios.W = function()
     assert(a=='task-result' and b==nil and d==44 and task:ready())
     clean_waits()
 end
+
+scenarios.X = function()
+    local c = client()
+    P.automatic(c, true)
+    local sent_before = P.sent(c)
+    local result, err = c:execute({_ = 'getMe'}, 0.1)
+    assert(err == nil and result.id == 88 and result.first_name == 'Ada')
+    local sent_after = P.sent(c)
+    assert(sent_after == sent_before + 1, 'numeric execute sent more than once')
+    P.automatic(c, false)
+
+    local future = c:getMe()
+    error_contains(function() future:wait(0.1) end, 'requires a coroutine')
+    assert(not future:ready())
+
+    local compact_result, compact_error
+    local co = start(function()
+        compact_result, compact_error = c:execute({_ = 'getMe'}, 0.1)
+    end)
+    suspended(co)
+    local id = last(c)
+    P.reply(c, id, 42)
+    local visible = c:receive(0)
+    assert(visible == nil, 'numeric response was exposed as raw receive')
+    assert(P.counts().waiters == 0, 'numeric wait registration was not consumed')
+    assert(coroutine.status(co) == 'dead', 'numeric coroutine remains ' .. coroutine.status(co))
+    assert(compact_error == nil and compact_result.id == 42 and
+        compact_result._request_id == id)
+
+    local timeout_result, timeout_error = c:execute({_ = 'getMe'}, 0)
+    assert(timeout_result == nil and timeout_error == 'timeout')
+    id = last(c)
+    P.reply(c, id, 43)
+    P.delayed_update(c, true)
+    local delayed = c:receive(1)
+    P.delayed_update(c, false)
+    assert(delayed ~= nil,
+        'receive(1) stopped after a transient instead of waiting for an update')
+
+    -- receive(0) skips a managed transient but still returns the next queued
+    -- update in FIFO order.
+    c:execute({_ = 'getMe'}, 0)
+    local first_transient = last(c)
+    c:execute({_ = 'getMe'}, 0)
+    local second_transient = last(c)
+    P.reply(c, first_transient, 44)
+    P.reply(c, second_transient, 45)
+    P.update(c, 'updateNewMessage', 0)
+    assert(c:receive(0) ~= nil, 'receive(0) stopped at queued transients')
+
+    -- A drain error after a transient is surfaced once. The response stays
+    -- managed, and the following public update remains available.
+    c:execute({_ = 'getMe'}, 0)
+    P.reply(c, last(c), 47)
+    P.update(c, 'updateNewMessage', 0)
+    P.fail_drain(c)
+    local drain_ok = pcall(function() c:receive(0) end)
+    assert(not drain_ok, 'injected drain error was swallowed')
+    assert(c:receive(0) ~= nil, 'update was lost after a transient drain error')
+
+    -- With only a transient response, a positive receive waits for the rest
+    -- of its timeout and returns nil when no public update follows.
+    c:execute({_ = 'getMe'}, 0)
+    P.reply(c, last(c), 46)
+    local receive_before = P.receives(c)
+    P.wait_empty(c, true)
+    assert(c:receive(0.02) == nil)
+    P.wait_empty(c, false)
+    assert(P.receives(c) == receive_before + 2,
+        'receive did not continue after a transient response')
+    clean_waits()
+end
+
+scenarios.Y = function()
+    local c = client()
+    local injected_main, controlled_main = 0, 0
+    P.automatic(c, true)
+    local function numeric_main()
+        return c:execute({_ = 'getMe'}, 0.05)
+    end
+
+    -- Exercise the compact managed wait on the stock 5.1 main thread at each
+    -- allocator offset. A one-shot allocator failure lets cleanup allocate.
+    for offset = 1, 80 do
+        gc()
+        local sent_before = P.sent(c)
+        local rejected_before = P.rejected()
+        P.arm(offset)
+        -- Keep closure creation outside the fault window.
+        local ok, result, err = pcall(numeric_main)
+        P.disarm()
+        local rejected = P.rejected() - rejected_before
+        if rejected > 0 then injected_main = injected_main + rejected
+        else controlled_main = controlled_main + 1 end
+        local sent_after = P.sent(c)
+        assert(sent_after == sent_before or sent_after == sent_before + 1,
+            'one numeric execute submitted more than once')
+        if sent_after == sent_before + 1 then c:receive(0) end
+        assert(P.pending(c) == 0, 'main-thread OOM left a pending request')
+        if not ok and rejected == 0 then
+            error('main-thread control offset failed without allocator OOM: ' ..
+                tostring(result))
+        end
+        if ok then assert(result ~= nil or err ~= nil) end
+        clean_waits()
+    end
+    assert(injected_main > 0 and controlled_main > 0,
+        'main-thread sweep did not include both fault and control offsets')
+
+    -- Repeat the sweep from a Lua 5.1 coroutine. Pending responses are supplied
+    -- only after the coroutine has yielded, so resumption uses the usual pump.
+    P.automatic(c, false)
+    local injected_coroutine, controlled_coroutine = 0, 0
+    for offset = 1, 80 do
+        gc()
+        local sent_before = P.sent(c)
+        local rejected_before = P.rejected()
+        local co = coroutine.create(function()
+            coroutine_result, coroutine_error = c:execute({_ = 'getMe'}, 0.05)
+        end)
+        P.arm(offset)
+        local resumed, resume_error = coroutine.resume(co)
+        P.disarm()
+        local rejected = P.rejected() - rejected_before
+        if rejected > 0 then injected_coroutine = injected_coroutine + rejected
+        else controlled_coroutine = controlled_coroutine + 1 end
+        if not resumed and rejected == 0 then
+            error('coroutine control offset failed without allocator OOM: ' ..
+                tostring(resume_error))
+        end
+        local sent_after, id = P.sent(c)
+        assert(sent_after == sent_before or sent_after == sent_before + 1,
+            'coroutine numeric execute submitted more than once')
+        if sent_after == sent_before + 1 then
+            P.reply(c, id, 90 + offset)
+            c:receive(0)
+        end
+        assert(coroutine.status(co) == 'dead' or
+            coroutine.status(co) == 'suspended', 'invalid compact wait coroutine state')
+        if coroutine.status(co) == 'suspended' then
+            error('coroutine did not resume after its response')
+        end
+        assert(P.pending(c) == 0, 'coroutine OOM left a pending request')
+        co = nil
+        clean_waits()
+    end
+    assert(injected_coroutine > 0 and controlled_coroutine > 0,
+        'coroutine sweep did not include both fault and control offsets')
+    print('numeric allocator sweep: main faults=' .. injected_main ..
+        ', main controls=' .. controlled_main ..
+        ', coroutine faults=' .. injected_coroutine ..
+        ', coroutine controls=' .. controlled_coroutine)
+    P.automatic(c, false)
+end
+
+scenarios.Z = function()
+    local c = client()
+    for value = 1, 3 do
+        local result, err = c:execute({_ = 'getMe'}, 0)
+        assert(result == nil and err == 'timeout')
+        local _, request_id = P.sent(c)
+        P.reply(c, request_id, value)
+    end
+
+    local receives_before = P.receives(c)
+    P.space_receives(c)
+    local update = c:receive(1.0)
+    assert(update ~= nil,
+        'receive returned before the original deadline after spaced transients')
+    assert(P.receives(c) == receives_before + 4,
+        'receive did not consume three transients before the public update')
+
+    local second = P.receive_timeout(c, 2)
+    local third = P.receive_timeout(c, 3)
+    local fourth = P.receive_timeout(c, 4)
+    assert(second > 0.65 and second < 0.9,
+        'second receive did not use the remaining original timeout')
+    assert(third > 0.4 and third < 0.75,
+        'third receive did not use the remaining original timeout')
+    assert(fourth > 0.2 and fourth < 0.55,
+        'fourth receive did not use the remaining original timeout')
+    clean_waits()
+end
