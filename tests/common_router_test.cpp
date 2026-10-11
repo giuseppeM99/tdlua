@@ -327,6 +327,88 @@ void runScenarios(lua_State *L)
     testIsolationAndCleanup(scenario);
 }
 
+void testManagedIteration(lua_State *L)
+{
+    tdlua::RequestRouter router(L);
+    const auto future = router.future();
+    tdlua::pushManagedHandle(L, future, "tdlua.future");
+    lua_setglobal(L, "iteration_future");
+    runLua(L, R"lua(
+        iteration_co = coroutine.create(function()
+            local iterate = _VERSION == 'Lua 5.1' and
+                getmetatable(iteration_future).__pairs or pairs
+            local iterator, value, key = iterate(iteration_future)
+            local count = 0
+            for k, v in iterator, value, key do count = count + 1 end
+            assert(count == 4)
+        end)
+        assert(coroutine.resume(iteration_co))
+        assert(coroutine.status(iteration_co) == 'suspended')
+    )lua");
+    router.dispatch(future->request_id, [](lua_State *target) {
+        lua_newtable(target);
+        lua_pushinteger(target, 11); lua_rawseti(target, -2, 1);
+        lua_pushinteger(target, 22); lua_rawseti(target, -2, 2);
+        lua_pushinteger(target, 44); lua_rawseti(target, -2, 4);
+        lua_pushliteral(target, "response"); lua_setfield(target, -2, "label");
+    });
+    router.tick();
+    runLua(L, "assert(coroutine.status(iteration_co) == 'dead')");
+    runLua(L, "return function() return iteration_future:wait(), 'second result' end");
+    const auto task = router.task(L, -1, 0, false);
+    lua_pop(L, 1);
+    tdlua::pushManagedHandle(L, task, "tdlua.task");
+    lua_setglobal(L, "iteration_task");
+    router.dispatch(task->request_id, [](lua_State *target) { lua_pushnil(target); });
+    runLua(L, R"lua(
+        for _, handle in ipairs({iteration_future, iteration_task}) do
+            local mt = getmetatable(handle)
+            assert(type(mt.__pairs) == 'function' and type(mt.__ipairs) == 'function')
+            local count = 0
+            for k, v in mt.__pairs(handle) do count = count + 1 end
+            assert(count == 4)
+            local sum = 0
+            for k, v in mt.__ipairs(handle) do sum = sum + v end
+            assert(sum == 33) -- ipairs stops at the hole, even though index 4 exists.
+            assert(handle[2] == 22 and handle[3] == nil)
+            if _VERSION ~= 'Lua 5.1' then
+                count = 0
+                for k, v in pairs(handle) do count = count + 1 end
+                assert(count == 4)
+                sum = 0
+                for k, v in ipairs(handle) do sum = sum + v end
+                assert(sum == 33)
+            end
+        end
+        local first, second = iteration_task:wait()
+        assert(first == iteration_future:wait() and second == 'second result')
+        assert(iteration_task.label == nil)
+    )lua");
+    const auto scalar = router.future();
+    tdlua::pushManagedHandle(L, scalar, "tdlua.future");
+    lua_setglobal(L, "iteration_scalar");
+    router.dispatch(scalar->request_id, [](lua_State *target) { lua_pushinteger(target, 7); });
+    const auto failed = router.future();
+    tdlua::pushManagedHandle(L, failed, "tdlua.future");
+    lua_setglobal(L, "iteration_failed");
+    router.detachTransport();
+    runLua(L, R"lua(
+        for _, method in ipairs({'__pairs', '__ipairs'}) do
+            local function first(handle)
+                local iterator, value, key = getmetatable(handle)[method](handle)
+                return iterator(value, key)
+            end
+            local ok, message = pcall(first, iteration_scalar)
+            assert(not ok and message:find('iteration requires a table result'))
+            ok, message = pcall(first, iteration_failed)
+            assert(not ok and message:find('client closed'))
+        end
+        iteration_future = nil; iteration_task = nil; iteration_scalar = nil
+        iteration_failed = nil; iteration_co = nil
+        collectgarbage('collect'); collectgarbage('collect')
+    )lua");
+}
+
 void testSharedCoreLifetime(lua_State *L)
 {
     runLua(L, "collectgarbage('collect'); collectgarbage('collect'); collectgarbage('collect')");
@@ -347,10 +429,14 @@ void testSharedCoreLifetime(lua_State *L)
         lua_getglobal(L, "deadline_co");
         lua_State *thread = lua_tothread(L, -1);
         lua_pop(L, 1);
-        require(!tdlua::waitBindings().count(thread),
-                "failed registration remained in the active timer index");
+        require(tdlua::waitBindings().count(thread),
+                "failure notification lost its dependency association");
+        require(owner.core()->deadlineBound(1.0) == 1.0,
+                "failed wait remained in the active timer index");
         runLua(L, "assert(coroutine.status(deadline_co) == 'suspended')");
         owner.tick();
+        require(!tdlua::waitBindings().count(thread),
+                "consumed failure retained its dependency association");
         runLua(L,
                "assert(not deadline_ok and deadline_message:find('client closed')); "
                "closing_deadline = nil; deadline_co = nil; "
@@ -450,7 +536,9 @@ int main()
     luaL_openlibs(L);
     int result = 0;
     try {
+        tdlua::initializeManagedContinuations(L);
         runScenarios(L);
+        testManagedIteration(L);
         testSharedCoreLifetime(L);
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

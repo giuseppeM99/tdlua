@@ -68,8 +68,8 @@ bool native_transport_pump(void *context, double timeout)
 
 void native_transport_close(void *context)
 {
-    static_cast<NativeTDLua *>(context)->send(
-        td::td_api::make_object<td::td_api::close>(), 0);
+    auto *client = static_cast<NativeTDLua *>(context);
+    client->send(td::td_api::make_object<td::td_api::close>(), client->nextRequestId());
 }
 
 bool native_transport_closed(void *context)
@@ -97,12 +97,12 @@ NativeTDLua::NativeTDLua(lua_State *lua)
 
 NativeTDLua::~NativeTDLua()
 {
-    // Destruction cannot safely enter Lua. The binding performs the protected
-    // drain before this destructor runs; this path only detaches transport.
+    // The binding disposes the transport before deleting this object.
+    // C++ callers still use the callback-free fallback below.
     try {
         closeInternal();
     } catch (...) {
-        dispatcher_.detachTransport();
+        dispatcher_.disposeStorage();
     }
 }
 
@@ -118,14 +118,33 @@ void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
     const auto request_type = request ? request->get_id() : 0;
     const bool shutdown = request_type == td::td_api::close::ID ||
                          request_type == td::td_api::destroy::ID;
-    if (closed_ || (closing_ && !shutdown)) {
+    if (closed_) {
         throw tdlua_native::CodecError("tdlua: client is closing or closed");
     }
     if (shutdown) {
-        closing_ = true;
-        shutdown_request_sent_ = true;
+        shutdown_requests_.insert(request_id);
     }
-    NativeRuntime::instance().send(client_id_, request_id, std::move(request));
+    try {
+        NativeRuntime::instance().send(client_id_, request_id, std::move(request));
+    } catch (...) {
+        if (shutdown) {
+            if (NativeRuntime::instance().shutdownPending(client_id_)) {
+                closing_ = true;
+                shutdown_request_sent_ = true;
+            } else {
+                shutdown_requests_.erase(request_id);
+            }
+        }
+        throw;
+    }
+    if (shutdown) {
+        if (NativeRuntime::instance().shutdownPending(client_id_)) {
+            closing_ = true;
+            shutdown_request_sent_ = true;
+        } else {
+            shutdown_requests_.erase(request_id);
+        }
+    }
 }
 
 NativeResponse NativeTDLua::receive(double timeout)
@@ -217,20 +236,33 @@ td::td_api::object_ptr<td::td_api::Object> NativeTDLua::executeSync(
     return NativeRuntime::instance().execute(std::move(request));
 }
 
+void NativeTDLua::observeShutdownResponse(const NativeResponse &response)
+{
+    if (shutdown_requests_.erase(response.request_id)) {
+        if (response.object && response.object->get_id() != td::td_api::error::ID)
+            shutdown_accepted_ = true;
+        if (shutdown_requests_.empty() && !shutdown_accepted_) {
+            shutdown_request_sent_ = false;
+            NativeRuntime::instance().rejectShutdown(client_id_);
+        }
+    }
+}
+
 tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response, bool managed_receive)
 {
     if (response.dispatched) {
         return tdlua::RouteKind::Unknown;
     }
+    observeShutdownResponse(response);
     checkAuthState(response);
     try {
         const auto route = dispatcher_.dispatch(lua_, response, managed_receive);
         response.dispatched = true;
-        if (closed_) dispatcher_.detachAfterDrain(managed_receive);
+        if (closed_) dispatcher_.detachAfterDrain(true);
         return route;
     } catch (...) {
         if (closed_)
-            dispatcher_.detachTransport("tdlua: client closed", managed_receive);
+            dispatcher_.detachTransport("tdlua: client closed", true);
         throw;
     }
 }
@@ -330,7 +362,6 @@ void NativeTDLua::checkAuthState(const NativeResponse &response)
     }
     if (update.authorization_state_->get_id() == td::td_api::authorizationStateReady::ID) {
         ready_ = true;
-        loadUpdatesBuffer();
     } else if (update.authorization_state_->get_id() ==
                td::td_api::authorizationStateClosing::ID) {
         closing_ = true;
@@ -347,14 +378,6 @@ void NativeTDLua::finishTerminalCleanup()
     if (!closed_ || cleanup_complete_)
         return;
     NativeRuntime::instance().forget(client_id_);
-    for (auto it = updates_.begin(); it != updates_.end();) {
-        if (it->delivery_pending || it->dispatched) {
-            ++it;
-        } else {
-            it = updates_.erase(it);
-            ++buffer_revision_;
-        }
-    }
     ready_ = false;
     cleanup_complete_ = true;
 }
@@ -362,10 +385,12 @@ void NativeTDLua::finishTerminalCleanup()
 void NativeTDLua::closeInternal()
 {
     try {
+        dispatcher_.detachTransport();
+        // Finalizer cleanup cannot deliver buffered objects to Lua callers.
+        updates_.clear();
+        ++buffer_revision_;
         if (cleanup_complete_)
             return;
-        dispatcher_.detachTransport();
-        bool timed_out = false;
         if (injected_transport_.operations) {
             injected_transport_.close();
             NativeRuntime::instance().forget(client_id_);
@@ -374,12 +399,23 @@ void NativeTDLua::closeInternal()
             cleanup_complete_ = true;
             return;
         }
+        if (NativeRuntime::instance().retireReserved(client_id_)) {
+            closed_ = true;
+            closing_ = false;
+            cleanup_complete_ = true;
+            return;
+        }
+        bool fallback_sent = false;
         if (!closed_ && !shutdown_request_sent_) {
+            fallback_sent = true;
             shutdown_request_sent_ = true;
             closing_ = true;
+            // ClientManager reserves request ID zero for updates. Disposal
+            // needs an ID, but creates no application router state.
             NativeRuntime::instance().send(
-                client_id_, 0, td::td_api::make_object<td::td_api::close>());
+                client_id_, dispatcher_.nextRequestId(), td::td_api::make_object<td::td_api::close>());
         }
+        bool timed_out = false;
         const auto started = std::chrono::steady_clock::now();
         while (!closed_) {
             const double elapsed =
@@ -393,14 +429,24 @@ void NativeTDLua::closeInternal()
             if (!response.object) {
                 continue;
             }
+            observeShutdownResponse(response);
             checkAuthState(response);
+            if (!closed_ && !shutdown_request_sent_ && !fallback_sent) {
+                fallback_sent = true;
+                shutdown_request_sent_ = true;
+                NativeRuntime::instance().send(
+                    client_id_, dispatcher_.nextRequestId(), td::td_api::make_object<td::td_api::close>());
+            }
         }
         NativeRuntime::instance().forget(client_id_, timed_out);
-        if (closed_)
-            cleanup_complete_ = true;
+        cleanup_complete_ = true;
     } catch (...) {
-        dispatcher_.detachTransport();
-        NativeRuntime::instance().forget(client_id_);
+        dispatcher_.disposeStorage();
+        try {
+            NativeRuntime::instance().forget(client_id_);
+            cleanup_complete_ = true;
+        } catch (...) {
+        }
         throw;
     }
 }

@@ -418,9 +418,49 @@ static void moveOnlyRuntime()
     engine.detachOwner(owner);
 }
 
+void reservedAndRejectedShutdown()
+{
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    check(ledger.retireReserved(1), "reserved identity was not retired");
+    check(ledger.stats().records == 0 && ledger.stats().reserved == 0,
+          "reserved disposal retained a ledger record");
+    check(ledger.retireReserved(1), "reserved retirement was not idempotent");
+    ledger.registerClient(2);
+    check(ledger.beginSend(2, true), "shutdown admission failed");
+    check(!ledger.retireReserved(2), "active send lost its record");
+    ledger.endSend(2, true, true);
+    check(ledger.shutdownPending(2), "accepted shutdown was not tracked");
+    check(!ledger.retireReserved(2), "materialized identity was retired as reserved");
+    ledger.rejectShutdown(2);
+    check(!ledger.shutdownPending(2), "rejected shutdown remained confirmed");
+    check(ledger.stats().close_work == 1, "rejected shutdown excluded fallback close");
+    check(ledger.beginSend(2, false), "rejected shutdown disabled ordinary admission");
+    ledger.endSend(2, false, true);
+    ledger.observe(2, true);
+    ledger.acknowledgeTerminal(2);
+    check(ledger.stats().remaining == 0 && ledger.stats().records == 0,
+          "terminal identity remained pinned");
+    ledger.registerClient(3);
+    ledger.beginSend(3, false);
+    ledger.endSend(3, false, false);
+    check(!ledger.retireReserved(3), "uncertain send was retired as unused");
+    ledger.observe(3, true);
+    ledger.acknowledgeTerminal(3);
+    ledger.registerClient(4);
+    ledger.beginSend(4, true);
+    ledger.endSend(4, true, false);
+    check(ledger.shutdownPending(4) && ledger.stats().uncertain == 1,
+          "uncertain shutdown lost duplicate-send protection");
+    check(ledger.stats().close_work == 0, "uncertain shutdown was scheduled for automatic retry");
+    ledger.observe(4, true);
+    ledger.acknowledgeTerminal(4);
+}
+
 int main(int argc, char **)
 {
     try {
+        reservedAndRejectedShutdown();
         fifoAndWakeup();
         tombstoneRestartAndJoin();
         independentConsumersAndCreateDuringStop();

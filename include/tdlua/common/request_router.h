@@ -1679,8 +1679,9 @@ public:
         if (state->handle_count) --state->handle_count;
         retireState(state);
     }
-    // Phase 1: no Lua resumes, snapshots or user callbacks. The pump/facade is
-    // unreachable before pending failures can be observed from a later drain.
+    // Phase 1 invokes no Lua resumes, snapshots or user callbacks. Clearing
+    // pump_ prevents later scheduler drains from calling the client; pending
+    // failures remain observable through their managed handles.
     void detachTransport(const std::string &message = "tdlua: client closed",
                          bool preserve_selected_update = false)
     {
@@ -1709,7 +1710,9 @@ public:
         for (auto it = waiters_.begin(); it != waiters_.end();) {
             if (!isTerminalState(it->second.dependency)) { ++it; continue; }
             notifications_[it->first] = static_cast<const WaitNotification &>(it->second);
-            waitBindings().erase(it->first);
+            // Keep the waiter binding discoverable by an ordinary owner-thread
+            // pump. GC never resumes Lua; removeRegistration erases the retained
+            // waitBindings entry when the notification is consumed or abandoned.
             it = waiters_.erase(it);
         }
     }
@@ -1847,6 +1850,9 @@ class RequestRouter {
     std::shared_ptr<SchedulerCore> core_;
     lua_State *lua_owner_;
     int anchor_reference_ = LUA_NOREF;
+    // True only after transport detachment succeeds; handles may still retain
+    // their CoreAnchor independently of this router.
+    bool storage_disposed_ = false;
 
 public:
     using Pump = SchedulerCore::Pump;
@@ -1869,16 +1875,24 @@ public:
                 auto *router = static_cast<RequestRouter *>(context);
                 // An earlier Lua OOM can leave the registry metatable incomplete.
                 luaL_newmetatable(L, "tdlua.core");
+                const int metatable = lua_gettop(L);
                 lua_pushcfunction(L, coreAnchorGc);
-                lua_setfield(L, -2, "__gc");
+                lua_setfield(L, metatable, "__gc");
                 lua_pop(L, 1);
+                tdlua_lua_prepare_unref(L, LUA_REGISTRYINDEX);
                 new (lua_newuserdata(L, sizeof(CoreAnchor))) CoreAnchor{router->core_};
                 luaL_setmetatable(L, "tdlua.core");
+                const int anchor = lua_gettop(L);
                 lua_newtable(L);
-                lua_setuservalue(L, -2);
+                // Legacy luaL_unref otherwise allocates its free-list header
+                // during detach, where Lua OOM would skip C++ local owners.
+                const int uservalue = lua_gettop(L);
+                tdlua_lua_prepare_unref(L, uservalue);
+                lua_setuservalue(L, anchor);
                 pushCoreAnchors(L);
-                lua_pushvalue(L, -2);
-                lua_rawsetp(L, -2, router->core_.get());
+                const int anchors = lua_gettop(L);
+                lua_pushvalue(L, anchor);
+                lua_rawsetp(L, anchors, router->core_.get());
                 lua_pop(L, 1);
                 router->anchor_reference_ = luaL_ref(L, LUA_REGISTRYINDEX);
             },
@@ -1887,10 +1901,38 @@ public:
 
     ~RequestRouter()
     {
-        core_->detachTransport();
+        // Covers a factory that throws before publishing its C++ client.
+        // This owner-thread fallback releases Lua storage, never runs work.
+        disposeStorage();
+    }
+
+    // Explicit owner-thread disposal. Protected Lua calls contain Lua errors,
+    // and a secondary error preserves the caller's stack. Future/Task uservalues
+    // may keep the CoreAnchor reachable; this releases only its construction
+    // root. False reports that transport detachment did not complete (typically
+    // because Lua could not allocate); the root is still released best-effort.
+    bool disposeStorage() noexcept
+    {
+        if (storage_disposed_) return true;
+        core_->setPump(nullptr, nullptr);
+        const int top = lua_gettop(lua_owner_);
+        bool complete = false;
+        try {
+            protectedLua(lua_owner_, [](lua_State *, void *context) {
+                auto *router = static_cast<RequestRouter *>(context);
+                router->core_->detachTransport();
+            }, this);
+            complete = true;
+        } catch (...) { /* preserve the original construction/finalization error */ }
+        lua_settop(lua_owner_, top);
         if (anchor_reference_ != LUA_NOREF) {
+            // The constructor prepared free-list headers for both the registry
+            // and anchor uservalue, so these unrefs need no Lua allocation.
             luaL_unref(lua_owner_, LUA_REGISTRYINDEX, anchor_reference_);
+            anchor_reference_ = LUA_NOREF;
         }
+        storage_disposed_ = complete;
+        return complete;
     }
 
     RequestRouter(const RequestRouter &) = delete;
@@ -2290,6 +2332,79 @@ inline int completeManagedTrampoline(lua_State *L)
     return managedWaitContinuation(L, LUA_OK, 1);
 }
 
+// Iterate the first managed result, using the same wait/yield path as :wait().
+// Wait in the iterator: Lua 5.2 cannot yield inside its __pairs/__ipairs call.
+// Lua 5.3+ ignores __ipairs and indexes the handle instead; keep numeric access
+// consistent with iteration without changing string-field lookup on Tasks.
+inline void installManagedIteration(lua_State *L)
+{
+    static const char factory_key = 0;
+    const int metatable = lua_absindex(L, -1);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &factory_key);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        const char source[] = R"lua(
+            local defer_wait_until_iteration = ...
+            local type, error, pairs, ipairs = type, error, pairs, ipairs
+            local function wait_for_table_result(self)
+                local value, message = self:wait()
+                if type(value) ~= 'table' then
+                    error(message or 'tdlua: iteration requires a table result', 3)
+                end
+                return value
+            end
+            local function deferred_iterator(self, iterate)
+                local iterator, value, initial
+                return function(_, key)
+                    if iterator == nil then
+                        iterator, value, initial = iterate(wait_for_table_result(self))
+                        -- Do not keep the handle alive for the whole iteration.
+                        self = nil
+                        key = initial
+                    end
+                    return iterator(value, key)
+                end, nil, nil
+            end
+            return function(index)
+                local function lookup(self, key)
+                    if type(key) == 'number' then
+                        return wait_for_table_result(self)[key]
+                    end
+                    return index(self, key)
+                end
+                if not defer_wait_until_iteration then
+                    return function(self) return pairs(wait_for_table_result(self)) end,
+                        function(self) return ipairs(wait_for_table_result(self)) end, lookup
+                end
+                return function(self) return deferred_iterator(self, pairs) end,
+                    function(self) return deferred_iterator(self, ipairs) end, lookup
+            end
+        )lua";
+        if (luaL_loadbuffer(L, source, sizeof(source) - 1,
+                            "=tdlua managed iteration") != LUA_OK) {
+            const char *message = lua_tostring(L, -1);
+            throw std::runtime_error(message ? message : "tdlua: iteration factory failed");
+        }
+        // Stock 5.1 cannot yield from a generic-for iterator either. Its
+        // builtins ignore these metamethods; direct calls can wait beforehand.
+        lua_pushboolean(L, LUA_VERSION_NUM >= 502);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+            const char *message = lua_tostring(L, -1);
+            throw std::runtime_error(message ? message : "tdlua: iteration factory failed");
+        }
+        lua_pushvalue(L, -1);
+        lua_rawsetp(L, LUA_REGISTRYINDEX, &factory_key);
+    }
+    lua_getfield(L, metatable, "__index");
+    if (lua_pcall(L, 1, 3, 0) != LUA_OK) {
+        const char *message = lua_tostring(L, -1);
+        throw std::runtime_error(message ? message : "tdlua: iteration factory failed");
+    }
+    lua_setfield(L, metatable, "__index");
+    lua_setfield(L, metatable, "__ipairs");
+    lua_setfield(L, metatable, "__pairs");
+}
+
 // Future and Task handles share the same lifetime bookkeeping. Their uservalue
 // keeps the CoreAnchor reachable while the handle remains visible to Lua.
 inline void ensureManagedMetatables(lua_State *L)
@@ -2298,11 +2413,13 @@ inline void ensureManagedMetatables(lua_State *L)
         pushManagedFunction(L, futureIndex, completeManagedTrampoline, true);
         lua_setfield(L, -2, "__index");
         lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
+        installManagedIteration(L);
     }
     lua_pop(L, 1);
     if (luaL_newmetatable(L, "tdlua.task")) {
         lua_pushcfunction(L, taskIndex); lua_setfield(L, -2, "__index");
         lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
+        installManagedIteration(L);
     }
     lua_pop(L, 1);
 }

@@ -93,7 +93,7 @@ static void json_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<TDLua> owned_client(static_cast<TDLua *>(client));
     owned_client->closeInternal();
-    owned_client->dispatcher().drainForFinalizer();
+    owned_client->dispatcher().disposeStorage();
 }
 
 static bool json_closed(tdlua_binding::ClientHandle client)

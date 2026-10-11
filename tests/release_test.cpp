@@ -24,7 +24,7 @@ void require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
 void run(lua_State *L, const char *source) {
-    if (luaL_dostring(L, source)) throw std::runtime_error(lua_tostring(L, -1));
+    if (luaL_dostring(L, source)) throw std::runtime_error(std::string(lua_tostring(L, -1))+"\n"+source);
 }
 struct Fake {
     std::deque<Response> incoming;
@@ -34,7 +34,18 @@ struct Fake {
     bool closed = false;
     Client::Transport transport() {
         static const Client::Transport::Operations ops = {
-            [](void *p, std::uint64_t id, Request) { static_cast<Fake *>(p)->sent.push_back(id); },
+            [](void *p, std::uint64_t id, Request request) {
+                auto &fake = *static_cast<Fake *>(p);
+                fake.sent.push_back(id);
+#ifdef TDLUA_NATIVE_BACKEND
+                const bool shutdown = request && (request->get_id() == td::td_api::close::ID ||
+                                                   request->get_id() == td::td_api::destroy::ID);
+#else
+                const std::string type = request.value("@type", std::string());
+                const bool shutdown = type == "close" || type == "destroy";
+#endif
+                if (shutdown) fake.shutdown(id);
+            },
             [](void *p, double wait) {
                 auto &f = *static_cast<Fake *>(p);
                 f.waits.push_back(wait);
@@ -48,6 +59,27 @@ struct Fake {
             [](void *p) { return static_cast<Fake *>(p)->closed; }
         };
         return {this, &ops};
+    }
+    void shutdown(std::uint64_t id) {
+#ifdef TDLUA_NATIVE_BACKEND
+        Response ok;
+        ok.request_id = id;
+        ok.object = td::td_api::make_object<td::td_api::ok>();
+        incoming.push_back(std::move(ok));
+        for (bool terminal : {false, true}) {
+            Response update;
+            td::td_api::object_ptr<td::td_api::AuthorizationState> state;
+            if (terminal) state = td::td_api::make_object<td::td_api::authorizationStateClosed>();
+            else state = td::td_api::make_object<td::td_api::authorizationStateClosing>();
+            update.object = td::td_api::make_object<td::td_api::updateAuthorizationState>(std::move(state));
+            incoming.push_back(std::move(update));
+        }
+#else
+        incoming.push_back({{"@type", "ok"}, {"@extra", {{"__tdlua_request_id", id}}}});
+        for (const char *state : {"authorizationStateClosing", "authorizationStateClosed"})
+            incoming.push_back({{"@type", "updateAuthorizationState"},
+                                {"authorization_state", {{"@type", state}}}});
+#endif
     }
     void object(std::uint64_t id, int value) {
 #ifdef TDLUA_NATIVE_BACKEND
@@ -251,7 +283,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         collectgarbage('collect')
         assert(selected_weak[1]~=nil)
         z:close()
-        assert(z:poll(0)==nil)
+        assert(z:poll(0).name=='21')
     )lua");
     require(!recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
             "selected update remained after close");
@@ -272,7 +304,9 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
             end,0)
         end
         assert(not teardown:ready())
-        d:close(); d=nil; collectgarbage('collect')
+        d=nil; collectgarbage('collect')
+        assert(not teardown:ready() and coroutine.status(retained_co)=='suspended')
+        c:poll(0) -- Only a normal owner-thread scheduler entry resumes it.
         assert(teardown:ready() and resumes==0 and coroutine.status(retained_co)=='dead')
         local ok,e=pcall(function() teardown:wait() end)
         assert(not ok and e:find('closed'))
@@ -309,7 +343,9 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     f.object(0,8);
     run(L,R"lua(
         assert(not pcall(c.receive,c,0)); c:close()
-        assert(c:receive(0).name=='8' and c:receive(0)==nil)
+        assert(c:receive(0).name=='8')
+        while not c:isClosed() do c:receive(0) end
+        assert(c:receive(0)==nil)
         assert(c:poll()==nil and c:poll(function() end)==nil)
         assert(c:poll(nil,0)==nil and c:poll(function() end,0.1)==nil)
         c=nil; d=nil; task=nil; future=nil; collectgarbage('collect')

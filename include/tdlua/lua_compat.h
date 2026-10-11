@@ -21,6 +21,25 @@
 #include <string>
 #include <stdexcept>
 
+// Lua 5.1-5.3 create the luaL_ref free-list header on the first unref.
+// Prepare that slot before acquiring a construction reference so rollback
+// only updates existing keys. Lua 5.4+ initializes its header in luaL_ref.
+inline void tdlua_lua_prepare_unref(lua_State *L, int table)
+{
+#if LUA_VERSION_NUM < 504
+    lua_rawgeti(L, table, 0);
+    const bool missing = lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (missing) {
+        lua_pushinteger(L, 0);
+        lua_rawseti(L, table, 0);
+    }
+#else
+    (void)L;
+    (void)table;
+#endif
+}
+
 /* Value uservalues are direct values on Lua 5.3+ but must be tables on Lua
  * 5.1 and 5.2. Keep this adapter separate from the reference-table uservalues
  * used by continuations and scheduler storage. */

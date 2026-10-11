@@ -704,4 +704,7 @@ for _ = 1, 20 do
 end
 
 local destroyed = tdlua.new()
-finish_shutdown(destroyed, 'destroy')
+local rejected_destroy = destroyed:destroy():wait()
+assert(rejected_destroy._ == 'error')
+assert(not destroyed:isClosed())
+finish_shutdown(destroyed, 'close')

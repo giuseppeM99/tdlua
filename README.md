@@ -4,6 +4,14 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
+The `vnext-threading` branch contains the unreleased v0.5 work. A C++ worker
+receives TDLib objects into per-client FIFO mailboxes. It never calls Lua;
+callbacks, managed requests and coroutine resumption stay on the thread that
+owns the Lua VM.
+
+The v0.5 build requires Linux x86_64 with glibc and an ELF loader that honors
+`NODELETE`. Dynamic unloading is unsupported.
+
 ## Installation
 You first need to install
 * [tdlib](https://github.com/tdlib/td)
@@ -72,9 +80,11 @@ A timeout does not cancel the underlying TDLib request. With the legacy
 `execute(request, timeout)` form, a late response remains available through
 `receive()` with its `_request_id`. A timed-out Future can be waited on again.
 
-## Supported runtimes
+## Runtime profiles
 
-Both backends support these profiles:
+The implementation targets these profiles for both backends. Build and test
+coverage depends on the Lua development files available in the test
+environment.
 
 | Runtime | API profile |
 | --- | --- |
@@ -121,10 +131,10 @@ while `2^53 + 1` and `INT64_MAX` are native strings. No FFI/cdata representation
 is required. On Lua 5.3+, use Lua integers or decimal strings for int64 inputs;
 explicit floats become JSON floats, which TDLib rejects for these fields.
 
-The complete profile-specific JSON and native suites pass on Linux for all six runtimes.
-LuaJIT was tested as `LuaJIT 2.1.1788856981` on Linux x64 with JIT enabled and
-disabled. The build is intended to support macOS, but macOS was not
-runtime-tested for this release. Windows was not validated.
+The validated v0.5 build target is Linux x86_64 with glibc. The local test
+matrix passed both backends on Lua 5.1, 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1.
+Those results apply to the tested source revision; other platforms and Lua
+builds remain unverified.
 
 ## Stock Lua 5.1 Managed Explicit
 
@@ -200,14 +210,18 @@ constraint permits installation for the 5.1 ABI; it does not certify every 5.1
 patch release or modified VM. An accepted build with either remains unverified
 until its yield implementation and runtime behavior have been checked.
 
-## v0.4 managed API
+## Full Managed API
 
-The v0.4 dynamic method and `execute(request)` forms submit eagerly and
-return a Future. In Full Managed, response field access resolves that Future automatically;
+Dynamic methods and `execute(request)` submit eagerly and return a Future. In
+Full Managed, response field access resolves that Future automatically;
 use `future:wait()` when a plain response table is preferred. Wrapper members
 (`wait`, `ready`, and `_request_id`) take precedence over response fields with
-the same names. Full `rawget`, `rawset`, `next`, and `pairs` transparency is not
-part of the API contract.
+the same names. `pairs()` and `ipairs()` on a Future or Task wait for its first
+result, which must be a table. Numeric indexing also resolves a Future for Lua
+versions whose `ipairs` uses indexed access. Iteration stops at the first array
+hole, as usual. Stock Lua 5.1's built-in `pairs` and `ipairs` ignore these
+metamethods, so use `:wait()` before iterating there. `rawget`, `rawset` and
+`next` do not treat managed handles as transparent response tables.
 
 In a yieldable coroutine, `wait()` without a timeout has no implicit deadline.
 In Full Managed, on the main thread or in another non-yieldable context, it uses the historical
@@ -271,8 +285,11 @@ raises after raw acquisition, the call raises that error and preserves the
 unreturned object at the front of the receive queue. The next receive returns it
 without redispatch, including after closure. Further pending errors can still
 raise before delivery. These recovered objects stay in the original client
-across `save()` and close; they are excluded from disk persistence. Explicit
-`clearBuffer()` discards them.
+across explicit `save()` and close; they are excluded from disk persistence.
+Explicit `save()` writes other eligible buffered updates to `tdlua.json` and
+removes them from the in-memory buffer. Version 0.5 does not save the buffer
+automatically on close or load an old `tdlua.json` buffer at startup. Explicit
+`clearBuffer()` discards in-memory objects.
 
 `poll()` and `loop()` execute a protected Lua checkpoint between driver
 iterations so the standalone interpreter can process its existing SIGINT debug
@@ -307,8 +324,9 @@ through `wait()` prevents a later scheduler report. Failures caused solely by
 client teardown remain observable through a retained Task handle and do not
 become scheduler errors when the Task is discarded.
 
-You can also use one of our precompiled binary from [@tdlua](https://t.me/tdlua)
-Use binaries built for your Lua runtime and API profile.
+Precompiled binaries may be available from [@tdlua](https://t.me/tdlua).
+Check each binary's release, backend and Lua ABI before use. Those artifacts
+are not a v0.5 package announcement.
 
 VoIP bindings are currently not part of the native or JSON backend.
 
@@ -326,8 +344,11 @@ The Lua type alias `_` is accepted alongside `@type` and is emitted together wit
 local client = require("tdlua")()
 local me = client:execute({_ = "getMe"}, 1.0)
 
-client:close()
-assert(client:isClosed())
+local closing = client:close()
+while not client:isClosed() do
+    client:receive(0.1)
+end
+assert(closing:wait()._ == "ok")
 ```
 
 Asynchronous requests keep the raw `send`/`receive` API available while adding

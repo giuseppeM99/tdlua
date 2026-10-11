@@ -12,6 +12,7 @@
 #include <deque>
 #include <map>
 #include <string>
+#include <set>
 
 class NativeTDLua final {
 public:
@@ -43,7 +44,7 @@ public:
     // GC fallback: bounded, callback-free teardown using the existing receiver.
     void closeInternal();
     void finishTerminalCleanup();
-    void drainPump();
+    void observeShutdownResponse(const NativeResponse &response);
     bool closed() const;
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
@@ -83,7 +84,13 @@ private:
     bool ready_;
     bool closing_;
     bool closed_;
+    // Set while a shutdown request is pending/uncertain or was accepted; this
+    // prevents finalizer cleanup from sending a duplicate close request.
     bool shutdown_request_sent_ = false;
+    // Sticky after any correlated non-error response to close/destroy.
+    bool shutdown_accepted_ = false;
+    // Request IDs let a correlated error reject only its own shutdown request.
+    std::set<std::uint64_t> shutdown_requests_;
     bool cleanup_complete_ = false;
     unsigned drain_depth_ = 0;
     NativeDispatcher dispatcher_;

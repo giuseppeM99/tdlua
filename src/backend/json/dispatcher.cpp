@@ -53,9 +53,8 @@ LuaDispatcher::LuaDispatcher(lua_State *owner)
 
 LuaDispatcher::~LuaDispatcher()
 {
-    // Destruction is phase one only. The owning binding performs the protected
-    // drain before this facade is destroyed.
-    router_.detachTransport();
+    // Member destruction performs protected, callback-free owner disposal.
+    // The binding calls disposeStorage explicitly after implicit close.
 }
 
 std::uint64_t LuaDispatcher::registerRequest(lua_State *L, int callback_index,

@@ -52,11 +52,23 @@ local function reject_main_submission(c, fn, message)
     assert(after.waiters == counts.waiters and after.running == counts.running
         and after.continuations == counts.continuations)
 end
+local function finish_shutdown(c)
+    if c:isClosed() then return end
+    c:close()
+    assert(not c:isClosed(), 'shutdown request was treated as terminal')
+    P.update(c, 'updateAuthorizationState', 0)
+    for _ = 1, 100 do
+        if c:isClosed() then break end
+        c:receive(0)
+    end
+    assert(c:isClosed(), 'queued terminal was not consumed')
+end
+
 function cleanup()
     assert(P.counts().factory_compilations == 1)
     gc()
     for _, c in ipairs(clients) do
-        assert(pcall(c.close, c))
+        finish_shutdown(c)
         assert(c:isClosed() and c:pendingCount() == 0)
         assert(P.task_count(c) == 0)
     end
@@ -143,7 +155,7 @@ scenarios.E = function()
     local dep = b:getMe()
     local fail = a:getMe(function() return dep:wait() end)
     respond(a,fail._request_id); state(fail,'RUNNING',0)
-    assert(pcall(b.close,b)); state(fail,'FAILED',0)
+    finish_shutdown(b); state(fail,'FAILED',0)
     error_contains(function() fail:wait() end,'client closed')
     P.tick(a); P.tick(b); clean_waits()
     -- Close B while B is resuming A's canonical callback Task.
@@ -152,7 +164,7 @@ scenarios.E = function()
     local joining=start(function() sibling:wait() end)
     local reentrant=owner:getMe(function()
         dependency:wait()
-        assert(pcall(peer.close,peer))
+        finish_shutdown(peer)
         return 99
     end)
     respond(owner,reentrant._request_id); state(reentrant,'RUNNING',0)
@@ -196,7 +208,7 @@ scenarios.G = function()
             joining=start(function() return t:wait() end)
             suspended(joining); assert(P.counts().waiters==2)
         end
-        assert(pcall(c.close,c)); assert(c:isClosed())
+        finish_shutdown(c); assert(c:isClosed())
         if joining then dead(joining); joining=nil end
         if not abandoned then
             state(t,'FAILED',0); error_contains(function() t:wait() end,'client closed')
@@ -205,12 +217,12 @@ scenarios.G = function()
     end
     -- Pending request-backed callback abandoned before its first response.
     local pending = client(); local t = pending:getMe(function() error('must not run') end)
-    t=nil; gc(); assert(pcall(pending.close,pending)); P.tick(pending); clean_waits()
+    t=nil; gc(); finish_shutdown(pending); P.tick(pending); clean_waits()
     -- Standard pcall can catch terminal failures, but cannot protect a pending
     -- wait. Verify unrelated error ownership after a successful suspension and
     -- then a caught terminal teardown error. Suspended teardown protection is
     -- unsupported on this profile.
-    local a,b = client(),client(); local closed = b:getMe(); b:close()
+    local a,b = client(),client(); local closed = b:getMe(); finish_shutdown(b)
     local dep
     local other = a:getMe(function()
         dep = a:getMe(); dep:wait()
@@ -232,7 +244,7 @@ scenarios.H = function()
     respond(a,t._request_id); state(t,'RUNNING',0)
     respond(b,last(b)); assert(t:wait().id == 42)
     local waiter = a:getMe(function() return b:await{_='getMe'} end)
-    respond(a,waiter._request_id); assert(pcall(b.close,b))
+    respond(a,waiter._request_id); finish_shutdown(b)
     error_contains(function() waiter:wait() end,'client closed'); P.tick(a); clean_waits()
     -- await's production API has no timeout argument/handle; :wait(timeout) is
     -- the retryable timeout API. No new await timeout semantics are invented.
@@ -323,7 +335,7 @@ scenarios.M = function()
         assert(t:wait() == 7 and not orphan:ready())
         assert(P.counts().waiters == 0 and P.counts().running == 0)
         assert(c:pendingCount() == 1) -- standalone Future survives graceful drain
-        c:close(); clean_waits()
+        finish_shutdown(c); clean_waits()
     end
     local c=client(); c:on('updateNewMessage',function() end)
     -- Fake budget gives a deterministic upper bound; use a response callback
@@ -428,13 +440,13 @@ scenarios.T=function()
 end
 
 
--- The binding finalizer drains teardown; handles retain scheduler storage.
+-- GC settles handles without running callbacks or resuming coroutines.
 scenarios.U = function()
     local c = tdlua.new(); P.attach(c)
     local f = c:getMe()
     local co = start(function() f:wait() end)
     suspended(co); c=nil; gc()
-    assert(f:ready()); dead(co)
+    assert(f:ready()); suspended(co)
     error_contains(function() f:wait() end, 'client closed')
     co=nil; f=nil; clean_waits()
 end

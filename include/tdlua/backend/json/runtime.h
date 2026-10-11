@@ -16,6 +16,9 @@ class JsonRuntime {
     void send(std::int32_t client, const nlohmann::json &request);
     nlohmann::json execute(const nlohmann::json &request);
     nlohmann::json receive(std::int32_t client, double timeout);
+    bool retireReserved(std::int32_t client);
+    void rejectShutdown(std::int32_t client);
+    bool shutdownPending(std::int32_t client) const { return lifecycle_->shutdownPending(client); }
     void forget(std::int32_t client, bool timed_out = false);
 #ifdef TDLUA_TESTING
     bool waitForNoOwners()

@@ -32,15 +32,18 @@ inline int invoke(lua_State *L)
 }
 } // namespace lua_protected_detail
 // Only the callback uses fallible Lua APIs. No owning C++ automatic object is
-// placed in that frame. Standard C++ exceptions return to this owner; Lua's
-// longjmp or foreign unwind is handled by Lua, never by a C++ catch-all.
+// placed in that frame. pcall/cpcall contains Lua errors; invoke captures C++
+// exceptions so they can be rethrown after the protected Lua frame returns.
 inline void protectedLua(lua_State *L, void (*function)(lua_State *, void *), void *context)
 {
+#if LUA_VERSION_NUM >= 502
     if (!lua_checkstack(L, 8))
         throw std::bad_alloc();
+#endif
     lua_protected_detail::Call call{function, context, std::exception_ptr()};
 #if LUA_VERSION_NUM < 502
-    // pushcfunction itself allocates on stock 5.1; cpcall protects that too.
+    // Stock 5.1 can longjmp while growing the stack as well as allocating
+    // the C closure. Let cpcall protect both, before any fallible Lua API.
     const int status = lua_cpcall(L, lua_protected_detail::invoke, &call);
 #else
     lua_pushcfunction(L, lua_protected_detail::invoke);

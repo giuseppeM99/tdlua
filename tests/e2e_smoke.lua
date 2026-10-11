@@ -64,8 +64,11 @@ end
 
 local close_future = client:close()
 assert(not client:isClosed())
-for _ = 1, 100 do
-    if client:isClosed() then break end
+-- Initialization may queue many updates. Bound the drain by wall-clock time,
+-- not by item count. os.time() has one-second resolution; each receive waits
+-- for at most 100 ms, so this is a coarse test guard rather than a precise SLA.
+local shutdown_deadline = os.time() + 10
+while not client:isClosed() and os.time() < shutdown_deadline do
     client:receive(0.1)
 end
 assert(client:isClosed(), "close did not deliver authorizationStateClosed")

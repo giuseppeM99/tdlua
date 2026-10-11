@@ -63,6 +63,11 @@ public:
         router_.attachStorage(L, client);
     }
 
+    // Also detaches the transport and releases the router's construction-root
+    // reference. Future/Task handles may retain the CoreAnchor; false reports
+    // an incomplete detach for the caller's best-effort teardown path.
+    bool disposeStorage() noexcept { return router_.disposeStorage(); }
+
     void detachAfterDrain(bool preserve_selected_update = false)
     {
         router_.detachAfterDrain(preserve_selected_update);
@@ -71,7 +76,7 @@ public:
     void detachTransport(const std::string &message = "tdlua: client closed",
                          bool preserve_selected_update = false)
     {
-        router_.core()->detachTransport(message, preserve_selected_update);
+        router_.detachTransport(message, preserve_selected_update);
     }
 
 private:

@@ -92,11 +92,7 @@ void test_json_persistence(lua_State *lua,
     restored.dispatcher().cancel(new_id);
     require(restored.empty(), "failed receive was duplicated in persistence");
     source.closeInternal();
-    require(!source.empty(), "close destroyed undelivered receive object");
-    const auto retained = source.pop();
-    require(retained.delivery_pending && retained.value["value"] == "retained",
-            "save/close changed retained receive object");
-    require(source.empty(), "retained receive object duplicated");
+    require(source.empty(), "GC disposal retained application buffer");
 }
 
 #else
@@ -161,11 +157,7 @@ void test_native_persistence(lua_State *lua,
             "native allocator did not advance past restored request IDs");
     require(restored.empty(), "failed receive was duplicated in persistence");
     source.closeInternal();
-    require(!source.empty(), "close destroyed undelivered receive object");
-    const auto delivered = source.pop();
-    require(delivered.delivery_pending && delivered.request_id == 1000,
-            "save/close changed retained receive object");
-    require(source.empty(), "retained receive object duplicated");
+    require(source.empty(), "GC disposal retained application buffer");
 }
 
 #endif

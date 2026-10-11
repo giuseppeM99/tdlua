@@ -3,6 +3,50 @@
 
 # Changelog
 
+## 0.5 (unreleased)
+
+### Threaded receive and lifecycle
+
+- TDLib receive runs on one C++ worker per backend runtime. The worker stores
+  owned responses and updates in per-client FIFO mailboxes; Lua callbacks and
+  coroutine work remain on the owning Lua thread.
+- Runtime lifecycle now coordinates worker stop/join, client ownership,
+  terminal receiver failures and cleanup accounting.
+- `receive(0)` and `poll(0)` no longer query TDLib directly. They inspect work
+  already available to the client; `poll(0)` can still process local managed
+  work. A TDLib result not yet collected by the worker may appear on a later
+  call.
+
+### Backend and binding changes
+
+- JSON and native use the same receiver and managed pump control flow where
+  their contracts match. Payload conversion, JSON correlation, native
+  `object_ptr` ownership, and documented buffering differences remain specific
+  to each backend.
+- Dispatcher request registration is separate from sending the request to
+  TDLib. Existing Future, Task, callback and coroutine contracts remain in
+  place. Full Managed Future and Task handles can be iterated as response
+  tables through the supported iteration metamethods; stock Lua 5.1 requires
+  explicit `:wait()` before built-in iteration.
+- `client:close()` and `client:destroy()` now submit the matching TDLib
+  request. `isClosed()` becomes true after TDLib's terminal authorization
+  update, not when the request is sent. Garbage collection remains a separate
+  internal cleanup path. Explicit `save()` still writes eligible buffered
+  updates, but close no longer saves them automatically and startup no longer
+  loads a previous `tdlua.json` update buffer.
+- Client and userdata construction now roll back partial registrations when C++
+  or Lua allocation fails.
+
+### Compatibility and limits
+
+- The threaded build currently supports Linux x86_64/glibc with an ELF loader
+  that honors `NODELETE`. Dynamic unloading is unsupported.
+- Stock Lua 5.1.5 uses Managed Explicit. Lua 5.2 through 5.5 and LuaJIT 2.1
+  use Full Managed. The local validation matrix passed both backends on all
+  six profiles; other platforms remain unverified.
+- TDLib upstream findings and `CleanupIncomplete` limits remain unresolved.
+  The v0.5 work does not claim to resolve them.
+
 ## 0.4
 
 TDLua 0.4 introduces the Full Managed API while preserving the low-level

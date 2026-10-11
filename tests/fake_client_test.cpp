@@ -3,6 +3,7 @@
 
 #include "binding/lua_binding.h"
 #include "tdlua/backend/json/client.h"
+#include "tdlua/backend/json/runtime.h"
 
 #include <deque>
 #include <chrono>
@@ -1322,7 +1323,7 @@ void testManagedDrivers(lua_State *L, TestTransports &transports, bool fail_afte
             )lua");
         } else {
             runLua(L, R"lua(
-                e:loop(function() e:close(); close_origin_called=true end)
+                e:loop(function(u) if u._=='m4' then e:close(); close_origin_called=true end end)
             )lua");
         }
         runLua(L, "assert(close_origin_called and e:isClosed()); e=nil; collectgarbage('collect')");
@@ -1427,8 +1428,14 @@ void testTaskCloseOwnership()
             }
             if (!retained) runLua(L, "task=nil; collectgarbage('collect')");
             client->closeInternal();
-            client->dispatcher().drainForFinalizer();
             if (!running) runLua(L, "assert(not callback_started)");
+            if (running) {
+                runLua(L, "assert(not task or not task:ready())");
+                if (unrelated)
+                    runLua(L, "local ok,e=pcall(c.poll,c,0); assert(not ok and e:find('unrelated task close boom'))");
+                else
+                    runLua(L, "c:poll(0)");
+            }
             if (retained) {
                 runLua(L, R"lua(
                     assert(task:ready())
@@ -1516,6 +1523,30 @@ void testHardening()
         }
         lua_close(L);
     }
+}
+
+void testReservedDisposal()
+{
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    try {
+        runLua(L, "tdlua=require'tdlua'; tdlua.setLogLevel(0)");
+        const auto before = JsonRuntime::instance().cleanupStats();
+        runLua(L, "unused=tdlua()");
+        const auto allocated = JsonRuntime::instance().cleanupStats();
+        if (allocated.reserved != before.reserved + 1)
+            throw std::runtime_error("unused identity was not reserved");
+        runLua(L, "unused=nil; collectgarbage('collect')");
+        const auto after = JsonRuntime::instance().cleanupStats();
+        if (after.reserved != before.reserved || after.records != before.records ||
+            after.materialized != before.materialized || after.closes != before.closes ||
+            after.identities != before.identities + 1)
+            throw std::runtime_error("unused GC materialized a TDLib client or lost history");
+    } catch (...) {
+        lua_close(L);
+        throw;
+    }
+    lua_close(L);
 }
 
 void testTerminalShutdownLifecycle()
@@ -1684,6 +1715,7 @@ int main(int argc, char **argv)
             testTaskCloseOwnership();
             testHardening();
         } else if (argc > 1 && std::string(argv[1]) == "--terminal-close-only") {
+            testReservedDisposal();
             testTerminalShutdownLifecycle();
         } else if (argc > 1 && std::string(argv[1]) == "--m5-only") {
             createClients(L);

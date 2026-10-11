@@ -64,7 +64,16 @@ for _=1,200 do
 end
 assert(pending and not pending:ready() and not task:ready())
 assert(pcall(c.close,c))
-assert(coroutine.status(co)=='dead' and c:isClosed())
-local ok,e=pcall(function() task:wait() end)
-assert(not ok and e:find('client closed',1,true))
+assert(not c:isClosed(), 'shutdown request was treated as terminal')
+for _=1,200 do
+    if c:isClosed() then break end
+    c:receive(0.01)
+end
+assert(c:isClosed() and coroutine.status(co)=='dead' and task:ready())
+local ok,result=pcall(function() return task:wait() end)
+if ok then
+    assert(result['@type']=='authorizationStateWaitTdlibParameters')
+else
+    assert(result:find('client closed',1,true) or result:find('500',1,true), result)
+end
 print('real backend close/teardown PASS')

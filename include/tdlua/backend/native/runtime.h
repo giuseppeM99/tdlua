@@ -47,6 +47,10 @@ public:
     NativeResponse receive(td::ClientManager::ClientId client_id, double timeout);
     td::td_api::object_ptr<td::td_api::Object> execute(
         td::td_api::object_ptr<td::td_api::Function> request);
+    bool retireReserved(td::ClientManager::ClientId client);
+    void rejectShutdown(td::ClientManager::ClientId client);
+    bool shutdownPending(td::ClientManager::ClientId client) const
+    { return lifecycle_->shutdownPending(client); }
     void forget(td::ClientManager::ClientId client_id, bool timed_out = false);
     tdlua::receiver::RuntimeStats stats() const
     {

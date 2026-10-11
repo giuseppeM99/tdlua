@@ -11,9 +11,8 @@ NativeDispatcher::NativeDispatcher(lua_State *owner)
 
 NativeDispatcher::~NativeDispatcher()
 {
-    // Destruction is phase one only. The owning binding performs the protected
-    // drain before this facade is destroyed.
-    router_.detachTransport();
+    // Member destruction performs protected, callback-free owner disposal.
+    // The binding calls disposeStorage explicitly after implicit close.
 }
 
 std::uint64_t NativeDispatcher::nextRequestId()

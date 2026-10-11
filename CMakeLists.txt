@@ -425,6 +425,14 @@ install(FILES
 
 if(TDLUA_BUILD_TESTS)
     enable_testing()
+    add_executable(tdlua_core_anchor_ownership_test "tests/core_anchor_ownership_test.cpp")
+    target_include_directories(tdlua_core_anchor_ownership_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(tdlua_core_anchor_ownership_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_core_anchor_ownership_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_core_anchor_ownership_test)
+    add_test(NAME tdlua_core_anchor_ownership COMMAND tdlua_core_anchor_ownership_test)
     add_executable(tdlua_client_pump_test "tests/client_pump_test.cpp")
     target_include_directories(tdlua_client_pump_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -436,6 +444,15 @@ if(TDLUA_BUILD_TESTS)
     add_test(NAME tdlua_client_pump COMMAND tdlua_client_pump_test)
 
     if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
+        add_executable(tdlua_shutdown_admission_test "tests/shutdown_admission_test.cpp")
+        target_include_directories(tdlua_shutdown_admission_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_shutdown_admission_test PRIVATE
+            ${LUA_LIBRARIES} tdlua_lua_runtime ${CMAKE_DL_LIBS})
+        target_compile_features(tdlua_shutdown_admission_test PRIVATE cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_shutdown_admission_test)
+        add_test(NAME tdlua_shutdown_admission COMMAND tdlua_shutdown_admission_test
+            "$<TARGET_FILE_DIR:tdlua>" ${_tdlua_backend})
         add_executable(tdlua_receiver_runtime_test tests/receiver_runtime_test.cpp)
         target_include_directories(tdlua_receiver_runtime_test PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include")

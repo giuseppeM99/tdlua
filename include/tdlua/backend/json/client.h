@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <set>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
 #include "tdlua/common/transport.h"
@@ -39,7 +40,13 @@ private:
     std::string dbpath;
     bool _ready;
     ClientState state;
+    // Set while a shutdown request is pending/uncertain or was accepted; this
+    // prevents finalizer cleanup from sending a duplicate close request.
     bool shutdown_request_sent_ = false;
+    // Sticky after any correlated non-error response to close/destroy.
+    bool shutdown_accepted_ = false;
+    // Request IDs let a correlated error reject only its own shutdown request.
+    std::set<std::uint64_t> shutdown_requests_;
     bool cleanup_complete_ = false;
     unsigned drain_depth_ = 0;
     LuaDispatcher dispatcher_;
@@ -81,6 +88,7 @@ public:
     // GC fallback: bounded, callback-free teardown using the existing receiver.
     void closeInternal();
     void finishTerminalCleanup();
+    void observeShutdownResponse(const nlohmann::json &response);
 
     bool closed() const;
 

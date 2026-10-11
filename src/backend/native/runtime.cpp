@@ -41,6 +41,7 @@ std::condition_variable test_changed;
 bool test_paused = false, test_entered = false, cleanup_paused = false, cleanup_entered = false;
 std::atomic<bool> test_hold_terminal{false};
 std::atomic<int> test_fault_before{0}, test_fault_after{0}, test_fault_create{0};
+std::atomic<int> test_fault_send{0};
 void testNotify()
 {
     std::lock_guard<std::mutex> lock(test_mutex);
@@ -225,6 +226,9 @@ td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner)
 void NativeRuntime::send(td::ClientManager::ClientId id, td::ClientManager::RequestId request_id,
                          td::td_api::object_ptr<td::td_api::Function> request)
 {
+#ifdef TDLUA_TESTING
+    if (test_fault_send.exchange(0)) throw std::bad_alloc();
+#endif
     const bool close = request &&
                        (request->get_id() == td::td_api::close::ID ||
                         request->get_id() == td::td_api::destroy::ID);
@@ -269,6 +273,19 @@ NativeRuntime::execute(td::td_api::object_ptr<td::td_api::Function> request)
 {
     engine_.checkHealthy();
     return td::ClientManager::execute(std::move(request));
+}
+bool NativeRuntime::retireReserved(td::ClientManager::ClientId client)
+{
+    if (!lifecycle_->retireReserved(client))
+        return false;
+    // No actor or receive item can exist for an identity never materialized.
+    engine_.cleanupTerminal(client);
+    forget(client);
+    return true;
+}
+void NativeRuntime::rejectShutdown(td::ClientManager::ClientId client)
+{
+    lifecycle_->rejectShutdown(client);
 }
 void NativeRuntime::forget(td::ClientManager::ClientId id, bool timed_out)
 {
@@ -392,6 +409,9 @@ extern "C" int tdlua_native_test_control(int action)
                    : 0;
     case 11:
         test_fault_create.store(1);
+        break;
+    case 12:
+        test_fault_send.store(1);
         break;
     default:
         return 0;

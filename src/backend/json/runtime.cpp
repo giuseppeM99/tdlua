@@ -15,6 +15,7 @@ bool test_paused = false, test_entered = false;
 bool cleanup_paused = false, cleanup_entered = false;
 std::atomic<bool> test_hold_terminal{false};
 std::atomic<int> test_fault_before{0}, test_fault_after{0};
+std::atomic<int> test_fault_send{0};
 JsonRuntime::Engine::Hooks testHooks()
 {
     JsonRuntime::Engine::Hooks hooks;
@@ -217,6 +218,9 @@ std::int32_t JsonRuntime::createClient(std::uint64_t owner)
 }
 void JsonRuntime::send(std::int32_t client, const json &request)
 {
+#ifdef TDLUA_TESTING
+    if (test_fault_send.exchange(0)) throw std::bad_alloc();
+#endif
     const std::string type = request.value("@type", std::string());
     const bool close = type == "close" || type == "destroy";
     if (close) {
@@ -285,6 +289,19 @@ json JsonRuntime::receive(std::int32_t client, double timeout)
         return std::move(item.value);
     return nullptr;
 }
+bool JsonRuntime::retireReserved(std::int32_t client)
+{
+    if (!lifecycle_->retireReserved(client))
+        return false;
+    // No actor or receive item can exist for an identity never materialized.
+    engine_.cleanupTerminal(client);
+    forget(client);
+    return true;
+}
+void JsonRuntime::rejectShutdown(std::int32_t client)
+{
+    lifecycle_->rejectShutdown(client);
+}
 void JsonRuntime::forget(std::int32_t client, bool timed_out)
 {
     {
@@ -344,6 +361,9 @@ extern "C" int tdlua_json_test_control(int action)
         return test_changed.wait_for(lock, std::chrono::seconds(3), [] { return cleanup_entered; })
                    ? 1
                    : 0;
+    case 12:
+        test_fault_send.store(1);
+        break;
     default:
         return 0;
     }

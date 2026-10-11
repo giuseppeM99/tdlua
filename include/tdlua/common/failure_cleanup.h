@@ -149,11 +149,50 @@ class FailureCleanup {
         refreshWork(r);
         retireIfReady(it);
     }
+    // Retirement is atomic with send accounting. A reserved ID needs no TDLib
+    // request; materialized, uncertain or pinned IDs must await a terminal.
+    bool retireReserved(int id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = records_.find(id);
+        if (it == records_.end())
+            return history_.contains(id);
+        Record &record = it->second;
+        if (record.materialized || record.uncertain || record.active)
+            return false;
+        if (!record.notified) {
+            record.notified = true;
+            ++stats_.unused;
+        }
+        refreshWork(record);
+        retireIfReady(it);
+        return true;
+    }
+    // The owner observed rejection of every outstanding shutdown request.
+    // Failure cleanup owns its own close attempts once failed_ is published.
+    void rejectShutdown(int id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = records_.find(id);
+        if (failed_ || it == records_.end() || it->second.terminal)
+            return;
+        it->second.close_sent = false;
+        it->second.close_uncertain = false;
+        refreshWork(it->second);
+    }
     bool materialized(int id) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = records_.find(id);
         return it != records_.end() && it->second.materialized;
+    }
+    // An uncertain send must not trigger an automatic duplicate shutdown.
+    bool shutdownPending(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = records_.find(id);
+        return it != records_.end() &&
+            (it->second.close_sent || it->second.close_uncertain);
     }
     Stats stats() const
     {

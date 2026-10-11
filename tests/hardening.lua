@@ -57,8 +57,10 @@ for _,mode in ipairs{'await', 'field', 'future'} do
     finish_shutdown(c)
     assert(c:isClosed() and coroutine.status(co) == 'dead')
     if pending then
-        local ok, message = pcall(function() pending:wait() end)
-        assert(not ok and message:find('client closed'))
+        local ok, message, request_error = pcall(function() return pending:wait() end)
+        assert((ok and ((type(message)=='table' and message._=='error') or
+                          (message==nil and request_error~=nil))) or
+               (not ok and message:find('client closed')))
     end
 end
 
@@ -90,7 +92,7 @@ for _,mode in ipairs{'pending', 'running', 'unrelated'} do
     else
         assert(ok, message)
     end
-    if mode == 'pending' then assert(not started) end
+    assert(started) -- Preterminal replies remain eligible for callback dispatch.
     assert(c:isClosed() and c:poll() == nil)
     c:loop()
 end
