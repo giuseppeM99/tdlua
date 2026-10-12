@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <set>
+#include <string>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
 #include "tdlua/common/transport.h"
@@ -57,7 +58,8 @@ public:
 
     QueuedUpdate pop();
 
-    void send(std::uint64_t request_id, nlohmann::json json);
+    void send(std::uint64_t request_id, nlohmann::json json,
+              tdlua::ResponseClass response_class = tdlua::ResponseClass::GenericRaw);
     using Transport = tdlua::Transport<nlohmann::json, nlohmann::json>;
     Transport transport();
     // Test injection is below the normal Lua binding and shared router.
@@ -75,6 +77,11 @@ public:
     using PumpValue = nlohmann::json;
     bool hasUndispatchedPumpItem() const;
     bool hasUndispatchedPumpItem(bool discard_unobserved_raw) const;
+#ifdef TDLUA_TESTING
+    std::size_t queuedPumpItemsForTesting() const { return updates.size(); }
+    tdlua::SchedulerCore::BufferStats schedulerBufferStatsForTesting() const
+    { return dispatcher_.bufferStatsForTesting(); }
+#endif
     PumpValue popPumpItem();
     PumpValue receivePumpItem(double timeout);
     bool isValidPumpItem(const PumpValue &value) const;
@@ -90,6 +97,8 @@ public:
     void observeShutdownResponse(const nlohmann::json &response);
 
     bool closed() const;
+    void setConsumerInterest(bool active, bool generic = true);
+    bool setHandlerRegistered(const std::string &type, bool active);
 
     LuaDispatcher &dispatcher();
 

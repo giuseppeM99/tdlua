@@ -1,6 +1,6 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
-#include "binding/lua_binding_common.h"
+#include "tdlua/binding/lua_binding_common.h"
 #include <iostream>
 
 extern "C" int luaopen_tdlua(lua_State *L);

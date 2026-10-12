@@ -12,6 +12,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <string>
 
 class NativeTDLua final {
 public:
@@ -20,7 +21,8 @@ public:
 
     td::td_api::object_ptr<td::td_api::Function> makeRequest(lua_State *L, int index) const;
     void send(td::td_api::object_ptr<td::td_api::Function> request,
-              std::uint64_t request_id);
+              std::uint64_t request_id,
+              tdlua::ResponseClass response_class = tdlua::ResponseClass::GenericRaw);
     NativeResponse receive(double timeout);
     NativeResponse receiveBackend(double timeout);
     bool pump(double timeout);
@@ -28,6 +30,11 @@ public:
     using PumpValue = NativeResponse;
     bool hasUndispatchedPumpItem() const;
     bool hasUndispatchedPumpItem(bool discard_unobserved_raw) const;
+#ifdef TDLUA_TESTING
+    std::size_t queuedPumpItemsForTesting() const { return updates_.size(); }
+    tdlua::SchedulerCore::BufferStats schedulerBufferStatsForTesting() const
+    { return dispatcher_.bufferStatsForTesting(); }
+#endif
     PumpValue popPumpItem();
     PumpValue receivePumpItem(double timeout);
     bool isValidPumpItem(const PumpValue &response) const;
@@ -50,6 +57,8 @@ public:
     void finishTerminalCleanup();
     void observeShutdownResponse(const NativeResponse &response);
     bool closed() const;
+    void setConsumerInterest(bool active, bool generic = true);
+    bool setHandlerRegistered(const std::string &type, bool active);
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
 

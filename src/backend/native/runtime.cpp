@@ -32,7 +32,6 @@ NativeResponse &NativeResponse::operator=(NativeResponse &&other) noexcept
 }
 
 namespace {
-using Clock = std::chrono::steady_clock;
 using Ledger = tdlua::receiver::FailureCleanup;
 using Envelope = tdlua::receiver::Envelope<NativeResponse>;
 #ifdef TDLUA_TESTING
@@ -113,6 +112,13 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
             return false;
         item.client = response.client_id;
         item.terminal = isTerminal(response);
+        item.request_id = response.request_id;
+        if (response.request_id == 0 && engine &&
+            engine->needsHandlerType(response.client_id)) {
+            const auto description = td::td_api::to_string(response.object);
+            const auto delimiter = description.find_first_of(" {\n");
+            item.event_type = description.substr(0, delimiter);
+        }
         // This public terminal is synthesized after ClientManager retires its
         // actor/callback. Inspect scalars before the sole object_ptr move.
         ledger_->observe(item.client, item.terminal);
@@ -229,7 +235,8 @@ td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner)
     }
 }
 void NativeRuntime::send(td::ClientManager::ClientId id, td::ClientManager::RequestId request_id,
-                         td::td_api::object_ptr<td::td_api::Function> request)
+                         td::td_api::object_ptr<td::td_api::Function> request,
+                         tdlua::ResponseClass response_class)
 {
 #ifdef TDLUA_TESTING
     if (test_fault_send.exchange(0)) throw std::bad_alloc();
@@ -237,15 +244,17 @@ void NativeRuntime::send(td::ClientManager::ClientId id, td::ClientManager::Requ
     const bool close = request &&
                        (request->get_id() == td::td_api::close::ID ||
                         request->get_id() == td::td_api::destroy::ID);
-    if (!engine_.admitSend(*lifecycle_, id, close))
+    if (!engine_.admitSend(*lifecycle_, id, close, request_id, response_class))
         return;
     try {
         manager_->send(id, request_id, std::move(request));
     } catch (...) {
         lifecycle_->endSend(id, close, false);
+        engine_.endSend(id, close, request_id, false);
         throw;
     }
     lifecycle_->endSend(id, close, true);
+    engine_.endSend(id, close, request_id, true);
 }
 NativeResponse NativeRuntime::receive(td::ClientManager::ClientId id, double timeout)
 {
@@ -258,17 +267,7 @@ NativeResponse NativeRuntime::receive(td::ClientManager::ClientId id, double tim
         box = found->second;
     }
     Envelope item;
-    tdlua::receiver::Pop status;
-    if (!(timeout > 0))
-        status = box->tryPop(item);
-    else {
-        auto now = Clock::now();
-        auto max_wait = std::chrono::duration<double>(Clock::time_point::max() - now).count();
-        auto deadline = timeout >= max_wait ? Clock::time_point::max()
-                                            : now + std::chrono::duration_cast<Clock::duration>(
-                                                        std::chrono::duration<double>(timeout));
-        status = box->popUntil(deadline, item);
-    }
+    const auto status = engine_.receiveMailbox(id, *box, timeout, item);
     if (status == tdlua::receiver::Pop::Failed)
         throw std::runtime_error(tdlua::receiver::failureMessage(box->failure()));
     return status == tdlua::receiver::Pop::Item ? std::move(item.value) : NativeResponse();

@@ -1,7 +1,7 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "binding/lua_binding.h"
+#include "tdlua/binding/lua_binding.h"
 #ifdef TDLUA_JSON_BACKEND
 #include "tdlua/backend/json/runtime.h"
 #elif defined(TDLUA_NATIVE_BACKEND)
@@ -24,7 +24,16 @@ static int tdclient_index(lua_State *L);
 static int tdclient_newindex(lua_State *L);
 static int tdclient_new(lua_State *L);
 
-static int tdclient_receive(lua_State *L) { return operations().receive(L); }
+static int tdclient_poll_inner(lua_State *L);
+static int tdclient_loop_inner(lua_State *L);
+
+static int invokeConsumer(lua_State *L)
+{
+    const int kind = static_cast<int>(lua_tointeger(L, lua_upvalueindex(1)));
+    if (kind == 0) return operations().receive(L);
+    if (kind == 1) return tdclient_poll_inner(L);
+    return tdclient_loop_inner(L);
+}
 
 static std::shared_ptr<tdlua::SchedulerCore> clientCore(lua_State *L)
 {
@@ -42,12 +51,40 @@ static std::shared_ptr<tdlua::SchedulerCore> clientCore(lua_State *L)
     return core;
 }
 
-struct UpdateConsumerScope {
+// Run Lua-facing consumer code under a nested Lua protection frame. A callback
+// may raise through Lua's longjmp implementation, so application interest and
+// SchedulerCore's consumer flag are released explicitly after lua_pcall.
+static int runConsumerProtected(lua_State *L, int kind, bool managed)
+{
+    const int arguments = lua_gettop(L);
+    const auto handle = client(L);
+    if (!handle) throw std::runtime_error("tdlua: invalid client");
     std::shared_ptr<tdlua::SchedulerCore> core;
-    explicit UpdateConsumerScope(std::shared_ptr<tdlua::SchedulerCore> value)
-        : core(std::move(value)) { core->beginUpdateConsumer(); }
-    ~UpdateConsumerScope() { core->endUpdateConsumer(); }
-};
+    if (managed) core = clientCore(L);
+
+    lua_pushinteger(L, kind);
+    lua_pushcclosure(L, invokeConsumer, 1);
+    for (int index = 1; index <= arguments; ++index)
+        lua_pushvalue(L, index);
+
+    if (managed) core->beginUpdateConsumer();
+    const bool generic_interest = kind != 2 || lua_isfunction(L, 2);
+    operations().consumer_interest(handle, true, generic_interest);
+    const int status = lua_pcall(L, arguments, LUA_MULTRET, 0);
+    operations().consumer_interest(handle, false, generic_interest);
+    if (managed) core->endUpdateConsumer();
+    if (status != LUA_OK) return -1;
+    return lua_gettop(L) - arguments;
+}
+
+static int tdclient_receive(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        const int results = runConsumerProtected(L, 0, false);
+        if (results < 0) throw TDLuaLuaError();
+        return results;
+    });
+}
 
 struct PollArguments {
     int callback = 0;
@@ -106,13 +143,22 @@ static bool loopConcurrency(lua_State *L, int top)
 static int tdclient_poll(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
+        const int results = runConsumerProtected(L, 1, true);
+        if (results < 0) throw TDLuaLuaError();
+        return results;
+    });
+}
+
+static int tdclient_poll_inner(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
         const int top = lua_gettop(L);
         const auto args = pollArguments(L, top);
-        UpdateConsumerScope consumer(clientCore(L));
-        const auto task = consumer.core->selectPollUpdate(L, args.callback, args.timed, args.timeout);
+        const auto core = clientCore(L);
+        const auto task = core->selectPollUpdate(L, args.callback, args.timed, args.timeout);
         if (task) {
             tdlua::pushManagedHandle(L, task, "tdlua.task");
-            consumer.core->tick();
+            core->tick();
         }
         return 1;
     });
@@ -121,13 +167,22 @@ static int tdclient_poll(lua_State *L)
 static int tdclient_loop(lua_State *L)
 {
     return tdlua_binding::protected_call(L, [&]() -> int {
+        const int results = runConsumerProtected(L, 2, true);
+        if (results < 0) throw TDLuaLuaError();
+        return results;
+    });
+}
+
+static int tdclient_loop_inner(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
         const int top = lua_gettop(L);
         if (top > 3 || (top >= 2 && !lua_isfunction(L, 2)))
             throw std::runtime_error(
                 "tdlua: loop accepts an optional callback function and options table");
         const bool concurrent = loopConcurrency(L, top);
-        UpdateConsumerScope consumer(clientCore(L));
-        consumer.core->runLoop(L, top >= 2 ? 2 : 0, concurrent);
+        const auto core = clientCore(L);
+        core->runLoop(L, top >= 2 ? 2 : 0, concurrent);
         return 0;
     });
 }

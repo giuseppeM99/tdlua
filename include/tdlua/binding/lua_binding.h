@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "binding/lua_binding_common.h"
+#include "tdlua/binding/lua_binding_common.h"
 
 const tdlua_binding::ClientOperations &tdlua_backend_operations();
 

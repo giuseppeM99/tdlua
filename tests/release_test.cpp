@@ -1,6 +1,6 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
-#include "binding/lua_binding.h"
+#include "tdlua/binding/lua_binding.h"
 #ifdef TDLUA_NATIVE_BACKEND
 #include "tdlua/backend/native/client.h"
 using Client = NativeTDLua;
@@ -36,14 +36,17 @@ void run(lua_State *L, const char *source) {
 struct Fake {
     std::deque<Response> incoming;
     std::vector<std::uint64_t> sent;
+    std::vector<tdlua::ResponseClass> sent_classes;
     std::vector<double> waits;
     std::function<void(double)> before;
     bool closed = false;
     Client::Transport transport() {
         static const Client::Transport::Operations ops = {
-            [](void *p, std::uint64_t id, Request request) {
+            [](void *p, std::uint64_t id, Request request,
+               tdlua::ResponseClass response_class) {
                 auto &fake = *static_cast<Fake *>(p);
                 fake.sent.push_back(id);
+                fake.sent_classes.push_back(response_class);
 #ifdef TDLUA_NATIVE_BACKEND
                 const bool shutdown = request && (request->get_id() == td::td_api::close::ID ||
                                                    request->get_id() == td::td_api::destroy::ID);
@@ -131,11 +134,16 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         assert(id2==id1+1 and id3==id2+1)
     )lua");
     require(f.sent.size()==3, "legacy submission count");
+    require(f.sent_classes.size()==3 &&
+                f.sent_classes[0] == tdlua::ResponseClass::GenericRaw &&
+                f.sent_classes[1] == tdlua::ResponseClass::GenericRaw &&
+                f.sent_classes[2] == tdlua::ResponseClass::ManagedProtected,
+            "request nil/raw and legacy callback response classes diverged");
     f.object(f.sent[0],11); f.object(f.sent[1],22); f.object(f.sent[2],33);
     run(L, R"lua(
         assert(c:receive(0)._request_id==id1)
         assert(c:receive(0)._request_id==id2)
-        assert(c:receive(0)._request_id==id3 and count==1)
+        assert(c:receive(0)==nil and count==1)
         assert(c:receive(0)==nil)
     )lua");
     run(L,R"lua(
@@ -146,23 +154,24 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     )lua");
     f.object(f.sent[f.sent.size()-4],90); f.object(f.sent[f.sent.size()-3],91);
     f.object(f.sent[f.sent.size()-2],92); f.object(f.sent.back(),93);
-    run(L,"assert(c:receive(0)._request_id==json1); c:receive(0); c:receive(0); assert(json_called and json_ctx); assert(c:receive(0)._request_id==json4)");
+    run(L,"assert(c:receive(0)._request_id==json1)");
+    run(L,"assert(c:receive(0)._request_id==json4); assert(json_called and json_ctx)");
+    run(L,"assert(c:receive(0)==nil)");
     f.object(0,1); f.object(0,2);
     run(L, R"lua(
         seen={}
         c:on('updateOption',function(u) seen[#seen+1]=u.name; error('current boom') end)
         local ok,e=pcall(c.receive,c,0); assert(not ok and e:find('current boom'))
-        assert(c:receive(0).name=='1' and #seen==1)
+        assert(#seen==1)
         ok,e=pcall(c.receive,c,0); assert(not ok and e:find('current boom'))
         c:off('updateOption')
-        assert(c:receive(0).name=='2' and #seen==2 and c:receive(0)==nil)
+        assert(#seen==2 and c:receive(0)==nil)
         c:request({_='getMe'},function() error('unrelated boom') end)
         raw=c:send{_='getMe'}
     )lua");
     f.object(f.sent[f.sent.size()-2],44); f.object(f.sent.back(),55);
     run(L, R"lua(
         local ok,e=pcall(c.receive,c,0); assert(not ok and e:find('unrelated boom'))
-        assert(c:receive(0).code==44)
         assert(c:receive(0)._request_id==raw and c:receive(0)==nil)
     )lua");
     run(L,"c:request({_='getMe'},function() error('previous ready boom') end)");
@@ -200,7 +209,8 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     require(other.waits.back()==0,"zero poll blocked on another client");
     run(L,"raw=c:send{_='getMe'}; future=c:getMe()");
     f.object(f.sent[f.sent.size()-2],77); f.object(f.sent.back(),88); f.object(0,7);
-    run(L,"assert(c:poll(0.1).name=='7' and future:ready()); assert(c:receive(0)._request_id==raw)");
+    run(L,"assert(c:poll(0.1)._request_id==raw); "
+          "assert(c:poll(0.1).name=='7' and future:ready())");
     f.object(0,15);
     run(L,"cross=c:poll(function() return d:getMe():wait().code end,0)");
     double cross_budget=0.0;
@@ -223,7 +233,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         end)
         local ok,e=pcall(c.poll,c,0)
         assert(not ok and e:find('poll handler boom'))
-        assert(c:poll(0).name=='16' and poll_handler_calls==1)
+        assert(c:poll(0)==nil and poll_handler_calls==1)
         c:off('updateOption')
     )lua");
     recovery.object(0, 17);
@@ -238,39 +248,46 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     )lua");
     recovery.object(0, 18);
     run(L, R"lua(
-        recovered_loop_seen={}
-        z:loop(function(u)
-            recovered_loop_seen[#recovered_loop_seen+1]=u.name
-            return u.name~='18'
-        end)
-        assert(table.concat(recovered_loop_seen,',')=='17,18')
-        assert(recovered_loop_handler_calls==2)
+        assert(z:poll(0)==nil and recovered_loop_handler_calls==2)
         z:off('updateOption')
     )lua");
     recovery.object(0, 19);
+    run(L, R"lua(
+        recovered_loop_seen={}
+        z:loop(function(u)
+            recovered_loop_seen[#recovered_loop_seen+1]=u.name
+            return false
+        end)
+        assert(table.concat(recovered_loop_seen,',')=='19')
+        assert(recovered_loop_handler_calls==2)
+    )lua");
+    recovery.object(0, 20);
     run(L, R"lua(
         z:on('updateOption',function() error('recovered task handler boom') end)
         local ok,e=pcall(z.poll,z,0)
         assert(not ok and e:find('recovered task handler boom'))
         z:off('updateOption')
+    )lua");
+    recovery.object(0, 21);
+    run(L, R"lua(
         poll_callback_calls=0
         local recovered_task=z:poll(function(u)
             poll_callback_calls=poll_callback_calls+1
             return u.name
         end,0)
         assert(recovered_task._request_id==nil)
-        assert(recovered_task:wait()=='19' and poll_callback_calls==1)
+        assert(recovered_task:wait()=='21' and poll_callback_calls==1)
     )lua");
-    recovery.object(0, 20);
+    recovery.object(0, 22);
     run(L, R"lua(
         z:on('updateOption',function() error('clear buffer handler boom') end)
         local ok,e=pcall(z.poll,z,0)
         assert(not ok and e:find('clear buffer handler boom'))
         z:off('updateOption')
-        assert(z:poll(0).name=='20')
+        assert(z:poll(0)==nil)
         assert(z:poll(0)==nil)
     )lua");
-    recovery.object(0, 21);
+    recovery.object(0, 23);
     run(L, R"lua(
         selected_weak=setmetatable({}, {__mode='v'})
         z:on('updateOption',function()
@@ -280,16 +297,13 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         assert(not ok and e:find('close selected handler boom'))
         z:off('updateOption')
     )lua");
-    lua_getglobal(L, "selected_weak");
-    require(recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
-            "selected update missing before close");
-    lua_rawseti(L, -2, 1);
-    lua_pop(L, 1);
+    require(!recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
+            "handler-failed update was queued for generic redelivery");
     run(L, R"lua(
         collectgarbage('collect')
-        assert(selected_weak[1]~=nil)
+        assert(selected_weak[1]==nil)
         z:close()
-        assert(z:poll(0).name=='21')
+        assert(z:poll(0)==nil)
     )lua");
     require(!recovery_client->dispatcher().pushSelectedUpdateForTesting(L),
             "selected update remained after close");
@@ -334,22 +348,24 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     f.before={};
     run(L,"raw=c:send{_='getMe'}; future=c:getMe()");
     f.object(f.sent[f.sent.size()-2],101); f.object(f.sent.back(),102);
+    run(L,"assert(c:poll(0.04)._request_id==raw)");
     std::vector<double> budget_waits;
     f.before=[&](double wait) {
         budget_waits.push_back(wait);
         std::this_thread::sleep_for(std::chrono::duration<double>(std::min(wait,0.015)));
     };
     const auto budget_start=std::chrono::steady_clock::now();
-    run(L,"assert(c:poll(0.04)==nil and future:ready()); assert(c:receive(0)._request_id==raw)");
+    run(L,"assert(c:poll(0.04)==nil and future:ready())");
     const double budget_elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-budget_start).count();
-    require(budget_elapsed<0.08 && budget_waits.size()>=3 && budget_waits[2]<0.02,
+    require(budget_elapsed<0.08 && budget_waits.size()>=2 &&
+                budget_waits[1] < budget_waits[0],
             "managed responses restarted poll deadline");
     f.before={};
-    run(L,"c:on('updateOption',function() error('close pending') end)");
+    run(L,"close_handler_calls=0; c:on('updateOption',function() "
+          "close_handler_calls=close_handler_calls+1; error('close pending') end)");
     f.object(0,8);
     run(L,R"lua(
-        assert(not pcall(c.receive,c,0)); c:close()
-        assert(c:receive(0).name=='8')
+        assert(not pcall(c.receive,c,0) and close_handler_calls==1); c:close()
         while not c:isClosed() do c:receive(0) end
         assert(c:receive(0)==nil)
         assert(c:poll()==nil and c:poll(function() end)==nil)
@@ -373,14 +389,13 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
             : "real=t(); real_id=real:request({_='getAuthorizationState'},function() error('real request boom') end)");
         bool failed=false;
         for(int i=0;i<100 && !failed;++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            run(L,"real_ok,real_error=pcall(real.receive,real,0)");
+            run(L,"real_ok,real_error=pcall(real.receive,real,0.05)");
             lua_getglobal(L,"real_ok"); failed=!lua_toboolean(L,-1); lua_pop(L,1);
         }
         require(failed,"real scheduler error was not surfaced");
         run(L,event_failure
-            ? "assert(real_error:find('real event boom')); real:close(); assert(real:receive(0)._=='updateAuthorizationState' and real_calls==1)"
-            : "assert(real_error:find('real request boom')); real:close(); assert(real:receive(0)._request_id==real_id)");
+            ? "assert(real_error:find('real event boom')); real:close(); assert(real_calls==1)"
+            : "assert(real_error:find('real request boom')); real:close(); assert(real:receive(0)==nil)");
         run(L,"real=nil; collectgarbage('collect')");
     }
 
@@ -555,8 +570,8 @@ void test_receive_transient_deadline(lua_State *L)
     fake.object(0, 79);
     run(L, "assert(receive_test_client:receive(0).name=='79')");
 
-    // Explicit Future handles remain observable after a timed-out wait. The
-    // receive result and the Future both refer to the same routed response.
+    // Explicit Future handles remain observable after a timed-out wait; their
+    // response is managed and is not duplicated through receive().
     run(L, R"lua(
         explicit_future=receive_test_client:execute({_='getMe'})
         local waiter=coroutine.create(function()
@@ -569,7 +584,7 @@ void test_receive_transient_deadline(lua_State *L)
     fake.object(fake.sent.back(), 80);
     run(L, R"lua(
         local raw_result=receive_test_client:receive(0)
-        assert(raw_result and raw_result.code==80)
+        assert(raw_result==nil)
         local waiter=coroutine.create(function()
             local result=explicit_future:wait(0)
             assert(result.code==80)

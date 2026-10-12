@@ -465,8 +465,9 @@ if(TDLUA_BUILD_TESTS)
     target_include_directories(tdlua_lua_protected_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
     target_link_libraries(tdlua_lua_protected_test PRIVATE
-        ${LUA_LIBRARIES} tdlua_lua_runtime)
+        ${LUA_LIBRARIES} tdlua_lua_runtime Threads::Threads)
     target_compile_features(tdlua_lua_protected_test PRIVATE cxx_std_11)
+    target_compile_definitions(tdlua_lua_protected_test PRIVATE TDLUA_TESTING)
     tdlua_enable_sanitizers(tdlua_lua_protected_test)
     add_test(NAME tdlua_lua_protected COMMAND tdlua_lua_protected_test)
 
@@ -490,6 +491,27 @@ if(TDLUA_BUILD_TESTS)
             CXX_STANDARD_REQUIRED YES)
         tdlua_enable_sanitizers(tdlua_receiver_runtime_test)
         add_test(NAME tdlua_receiver_runtime COMMAND tdlua_receiver_runtime_test)
+
+        add_executable(tdlua_buffering_accounting_test
+            tests/buffering_accounting_test.cpp)
+        target_include_directories(tdlua_buffering_accounting_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_buffering_accounting_test PRIVATE
+            ${LUA_LIBRARIES} Threads::Threads)
+        target_compile_definitions(tdlua_buffering_accounting_test PRIVATE
+            TDLUA_TESTING)
+        target_compile_features(tdlua_buffering_accounting_test PRIVATE cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_buffering_accounting_test)
+        add_test(NAME tdlua_buffering_accounting
+            COMMAND tdlua_buffering_accounting_test 10000)
+        set_tests_properties(tdlua_buffering_accounting PROPERTIES TIMEOUT 120)
+
+        add_executable(tdlua_retention_policy_poc_test
+            tests/retention_policy_poc_test.cpp)
+        target_compile_features(tdlua_retention_policy_poc_test PRIVATE cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_retention_policy_poc_test)
+        add_test(NAME tdlua_retention_policy_poc
+            COMMAND tdlua_retention_policy_poc_test)
     endif()
     target_compile_definitions(tdlua PRIVATE TDLUA_TESTING)
     add_executable(tdlua_codec_test

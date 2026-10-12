@@ -1,6 +1,6 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
-#include "binding/lua_binding.h"
+#include "tdlua/binding/lua_binding.h"
 #ifdef TDLUA_NATIVE_BACKEND
 #include "tdlua/backend/native/client.h"
 using Client = NativeTDLua;
@@ -46,7 +46,7 @@ struct Fake {
     Client::Transport transport()
     {
         static const Client::Transport::Operations ops = {
-            [](void *p, std::uint64_t id, Request request) {
+            [](void *p, std::uint64_t id, Request request, tdlua::ResponseClass) {
                 auto &f = *static_cast<Fake *>(p);
                 if (f.closed) throw std::runtime_error("fake closed");
                 f.sent.emplace_back(id, std::move(request));

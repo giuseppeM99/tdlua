@@ -35,7 +35,7 @@ struct Fake {
     Transport transport()
     {
         static const Transport::Operations operations = {
-            [](void *context, std::uint64_t id, int request) {
+            [](void *context, std::uint64_t id, int request, tdlua::ResponseClass) {
                 auto &fake = *static_cast<Fake *>(context);
                 if (fake.closed || fake.fail) {
                     throw std::runtime_error("local send failure");

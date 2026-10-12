@@ -17,9 +17,9 @@ TDLua *client_with_injected_drain_failure = nullptr;
 #endif
 
 void json_transport_send(void *context, std::uint64_t request_id,
-                         json request)
+                         json request, tdlua::ResponseClass response_class)
 {
-    static_cast<TDLua *>(context)->send(request_id, std::move(request));
+    static_cast<TDLua *>(context)->send(request_id, std::move(request), response_class);
 }
 
 json json_transport_receive(void *context, double timeout)
@@ -96,7 +96,8 @@ TDLua::QueuedUpdate TDLua::pop()
     return res;
 }
 
-void TDLua::send(std::uint64_t request_id, nlohmann::json json)
+void TDLua::send(std::uint64_t request_id, nlohmann::json json,
+                 tdlua::ResponseClass response_class)
 {
     const std::string type = json.value("@type", std::string());
     const bool shutdown = type == "close" || type == "destroy";
@@ -108,7 +109,7 @@ void TDLua::send(std::uint64_t request_id, nlohmann::json json)
         shutdown_requests_.insert(request_id);
     }
     try {
-        JsonRuntime::instance().send(client_id, json);
+        JsonRuntime::instance().send(client_id, json, response_class);
     } catch (...) {
         if (shutdown) {
             if (JsonRuntime::instance().shutdownPending(client_id)) {
@@ -153,7 +154,24 @@ bool TDLua::pump(const double timeout)
 
 bool TDLua::pumpWithPolicy(const double timeout, bool discard_unobserved_raw)
 {
+    if (closed())
+        return false;
+    // Runtime::receiveMailbox scopes driver demand only around its blocking
+    // wait. Do not keep a lease across pumpClient: dispatch/drain can enter Lua,
+    // whose longjmp must never bypass a C++ lease destructor.
     return tdlua::pumpClient(*this, timeout, discard_unobserved_raw);
+}
+
+void TDLua::setConsumerInterest(bool active, bool generic)
+{
+    JsonRuntime::instance().setConsumerInterest(client_id, active, generic);
+}
+
+bool TDLua::setHandlerRegistered(const std::string &type, bool active)
+{
+    if (injected_transport_.operations)
+        return true;
+    return JsonRuntime::instance().setHandlerRegistered(client_id, type, active);
 }
 
 bool TDLua::hasUndispatchedPumpItem() const

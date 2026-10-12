@@ -7,7 +7,19 @@
 
 namespace {
 using json = nlohmann::json;
-using Clock = std::chrono::steady_clock;
+std::uint64_t requestId(const json &value)
+{
+    const auto extra = value.find("@extra");
+    if (extra == value.end() || !extra->is_object()) return 0;
+    const auto request = extra->find("__tdlua_request_id");
+    if (request == extra->end()) return 0;
+    if (request->is_number_unsigned()) return request->get<std::uint64_t>();
+    if (request->is_number_integer()) {
+        const auto id = request->get<std::int64_t>();
+        if (id > 0) return static_cast<std::uint64_t>(id);
+    }
+    return 0;
+}
 #ifdef TDLUA_TESTING
 std::mutex test_mutex;
 std::condition_variable test_changed;
@@ -106,6 +118,8 @@ class JsonSource final : public tdlua::receiver::Source<json>,
         }
         item.client = item.value.at("@client_id").get<int>();
         item.value.erase("@client_id");
+        item.request_id = requestId(item.value);
+        item.event_type = item.value.value("@type", std::string());
         const auto type = item.value.find("@type");
         if (type != item.value.end() && *type == "updateAuthorizationState") {
             const auto &auth = item.value.at("authorization_state");
@@ -222,13 +236,15 @@ std::int32_t JsonRuntime::createClient(std::uint64_t owner)
         throw;
     }
 }
-void JsonRuntime::send(std::int32_t client, const json &request)
+void JsonRuntime::send(std::int32_t client, const json &request,
+                      tdlua::ResponseClass response_class)
 {
 #ifdef TDLUA_TESTING
     if (test_fault_send.exchange(0)) throw std::bad_alloc();
 #endif
     const std::string type = request.value("@type", std::string());
     const bool close = type == "close" || type == "destroy";
+    const std::uint64_t request_id = requestId(request);
     if (close) {
         try {
             engine_.checkHealthy();
@@ -238,15 +254,17 @@ void JsonRuntime::send(std::int32_t client, const json &request)
     } else
         engine_.checkHealthy();
     const std::string data = request.dump();
-    if (!engine_.admitSend(*lifecycle_, client, close))
+    if (!engine_.admitSend(*lifecycle_, client, close, request_id, response_class))
         return;
     try {
         td_send(client, data.c_str());
     } catch (...) {
         lifecycle_->endSend(client, close, false);
+        engine_.endSend(client, close, request_id, false);
         throw;
     }
     lifecycle_->endSend(client, close, true);
+    engine_.endSend(client, close, request_id, true);
 }
 json JsonRuntime::execute(const json &request)
 {
@@ -275,19 +293,7 @@ json JsonRuntime::receive(std::int32_t client, double timeout)
         box = found->second;
     }
     tdlua::receiver::Envelope<json> item;
-    tdlua::receiver::Pop status;
-    if (!(timeout > 0))
-        status = box->tryPop(item);
-    else {
-        const auto now = Clock::now();
-        const double max_wait =
-            std::chrono::duration<double>(Clock::time_point::max() - now).count();
-        const auto deadline = timeout >= max_wait
-                                  ? Clock::time_point::max()
-                                  : now + std::chrono::duration_cast<Clock::duration>(
-                                              std::chrono::duration<double>(timeout));
-        status = box->popUntil(deadline, item);
-    }
+    const auto status = engine_.receiveMailbox(client, *box, timeout, item);
     // Zero timeout never coordinates a join or calls the source.
     if (status == tdlua::receiver::Pop::Failed)
         throw std::runtime_error(tdlua::receiver::failureMessage(box->failure()));

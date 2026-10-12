@@ -73,4 +73,29 @@ end)
 client:loop()
 assert(called and future:ready())
 finish_shutdown(client)
+
+-- Exercise a recoverable handler error while lifecycle demand keeps the
+-- receiver alive; registration alone must not retain unsolicited updates.
+client = tdlua()
+local handler_calls = 0
+client:on('updateAuthorizationState', function()
+    handler_calls = handler_calls + 1
+    if handler_calls == 1 then error('recoverable handler failure') end
+end)
+local close = client:close()
+local ok, message
+for _ = 1, 100 do
+    ok, message = pcall(client.receive, client, 0.05)
+    if not ok or client:isClosed() then break end
+end
+assert(not ok and message:find('recoverable handler failure'))
+for _ = 1, 100 do
+    local pumped, pump_error = pcall(client.receive, client, 0.05)
+    assert(pumped, pump_error)
+    if client:isClosed() then break end
+end
+assert(client:isClosed(), 'receiver did not resume pumping after handler error')
+assert(handler_calls >= 2, 'later lifecycle updates were not dispatched')
+assert(close:ready() and close:wait()._ == 'ok')
+
 print('managed driver backend smoke passed')

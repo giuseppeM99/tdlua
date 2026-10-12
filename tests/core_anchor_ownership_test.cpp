@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
-#include "binding/lua_binding_common.h"
+#include "tdlua/binding/lua_binding_common.h"
 #include <cstdlib>
 #include <iostream>
 #include <memory>

@@ -4,6 +4,7 @@
 
 #include "tdlua/common/failure_cleanup.h"
 #include "tdlua/common/identity_history.h"
+#include "tdlua/common/transport.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -41,7 +42,10 @@ enum class Pop { Item, Timeout, Closed, Failed };
 template <class Value> struct Envelope {
     int client = 0;
     bool terminal = false;
+    std::uint64_t request_id = 0;
     std::uint64_t sequence = 0;
+    ResponseClass response_class = ResponseClass::GenericRaw;
+    std::string event_type;
     Value value;
 };
 
@@ -165,11 +169,20 @@ struct RuntimeStats {
     State state = State::Stopped;
     std::uint64_t generation = 0, received = 0, published = 0;
     std::uint64_t abandoned = 0, close_timeouts = 0, failures = 0, receive_calls = 0;
+    std::uint64_t dropped_unsolicited = 0;
+    std::uint64_t generic_raw = 0, managed_protected = 0, lifecycle_objects = 0;
+    std::uint64_t unknown_correlated = 0, dropped_by_handler_filter = 0;
     std::uint64_t enqueued = 0, dequeued = 0;
     std::size_t depth = 0, high_water = 0;
     std::size_t owners = 0, clients = 0, tombstones = 0;
     std::size_t identities = 0, identity_blocks = 0;
     bool joinable = false;
+    bool idle = false;
+    std::size_t active_demands = 0, pending_one_shots = 0;
+    std::size_t driver_demands = 0, request_demands = 0;
+    std::size_t lifecycle_demands = 0, one_shot_demands = 0;
+    std::size_t consumer_interests = 0;
+    std::size_t handler_only_consumers = 0;
 };
 
 // Payload and Source have no Lua dependency. Registry -> mailbox is the
@@ -178,6 +191,42 @@ struct RuntimeStats {
 template <class Value> class Runtime {
   public:
     using Box = Mailbox<Value>;
+    class DemandLease {
+      public:
+        DemandLease() noexcept : runtime_(nullptr), token_(0) {}
+        DemandLease(Runtime *runtime, std::uint64_t token) noexcept
+            : runtime_(runtime), token_(token) {}
+        DemandLease(DemandLease &&other) noexcept
+            : runtime_(other.runtime_), token_(other.token_)
+        {
+            other.runtime_ = nullptr;
+            other.token_ = 0;
+        }
+        DemandLease &operator=(DemandLease &&other) noexcept
+        {
+            if (this != &other) {
+                release();
+                runtime_ = other.runtime_;
+                token_ = other.token_;
+                other.runtime_ = nullptr;
+                other.token_ = 0;
+            }
+            return *this;
+        }
+        ~DemandLease() { release(); }
+        DemandLease(const DemandLease &) = delete;
+        DemandLease &operator=(const DemandLease &) = delete;
+        explicit operator bool() const noexcept { return runtime_ != nullptr; }
+        void release() noexcept
+        {
+            if (runtime_) runtime_->releaseDriver(token_);
+            runtime_ = nullptr;
+            token_ = 0;
+        }
+      private:
+        Runtime *runtime_;
+        std::uint64_t token_;
+    };
     struct Hooks {
         std::function<void(const Envelope<Value> &)> before_publish;
         std::function<void()> after_publish;
@@ -207,13 +256,6 @@ template <class Value> class Runtime {
             throw std::runtime_error(failureMessage(failure_));
         const auto owner = ++next_owner_;
         owners_.insert(owner);
-        try {
-            if (hasLeasesLocked())
-                startLocked();
-        } catch (...) {
-            owners_.erase(owner);
-            throw;
-        }
         return owner;
     }
     // Cleanup observes TDLib termination independently of public dispatch.
@@ -224,6 +266,7 @@ template <class Value> class Runtime {
         if (it == entries_.end())
             return;
         it->second.terminal = true;
+        clearDemandLocked(id, it->second);
         it->second.box->terminal();
         if (it->second.orphan) {
             accumulateRetiredLocked(it->second.box);
@@ -234,10 +277,35 @@ template <class Value> class Runtime {
     {
         std::unique_lock<std::mutex> lock(mutex_);
         owners_.erase(owner);
+        const bool another_owner_can_finish_lifecycle =
+            !owners_.empty() && state_ != State::Failed;
         for (auto it = entries_.begin(); it != entries_.end();) {
             Entry &entry = it->second;
             if (entry.owner == owner && !entry.orphan) {
                 entry.orphan = true;
+                if (another_owner_can_finish_lifecycle) {
+                    // No Lua driver or ordinary reply consumer survives this
+                    // owner. Keep only accepted close/destroy lifecycle work
+                    // alive so the shared receiver can observe its terminal.
+                    clearDriverDemandLocked(it->first, entry);
+                    entry.consumer_interests = 0;
+                    entry.handler_only_consumers = 0;
+                    entry.handler_types.clear();
+                    entry.pending_requests.clear();
+                    for (auto request = entry.protected_requests.begin();
+                         request != entry.protected_requests.end();) {
+                        if (request->second != ResponseClass::Lifecycle)
+                            request = entry.protected_requests.erase(request);
+                        else
+                            ++request;
+                    }
+                    ++generation_;
+                    changed_.notify_all();
+                } else {
+                    // The last owner retains the established stop/join and
+                    // bounded cleanup contract; no demand may prevent stop.
+                    clearDemandLocked(it->first, entry);
+                }
                 entry.box->abandon();
             }
             if (entry.owner == owner && entry.terminal) {
@@ -272,12 +340,6 @@ template <class Value> class Runtime {
         entry.owner = owner;
         entry.box = box;
         entries_.emplace(id, std::move(entry));
-        try {
-            startLocked();
-        } catch (...) {
-            entries_.erase(id);
-            throw;
-        }
         return {id, box};
     }
     void forget(int id, bool timed_out = false)
@@ -287,6 +349,14 @@ template <class Value> class Runtime {
         if (found != entries_.end() && !found->second.orphan) {
             Entry &entry = found->second;
             entry.orphan = true;
+            if (entry.terminal) {
+                clearDemandLocked(id, entry);
+            } else {
+                clearDriverDemandLocked(id, entry);
+                entry.consumer_interests = 0;
+                entry.handler_only_consumers = 0;
+                entry.handler_types.clear();
+            }
             entry.box->abandon();
             if (timed_out && !entry.terminal)
                 ++stats_.close_timeouts;
@@ -295,8 +365,6 @@ template <class Value> class Runtime {
                 entries_.erase(found);
             }
         }
-        if (!hasLeasesLocked())
-            requestStopLocked();
         // Failed cleanup is runtime work, not a per-client close operation.
         // Keep it asynchronous while VM owners exist; last-owner detach joins.
         if (state_ != State::Failed || owners_.empty())
@@ -324,13 +392,152 @@ template <class Value> class Runtime {
     // hooks or user callbacks execute inside this critical section.
     bool admitSend(FailureCleanup &ledger, int id, bool close)
     {
+        return admitSend(ledger, id, close, 0);
+    }
+    bool admitSend(FailureCleanup &ledger, int id, bool close, std::uint64_t request_id,
+                   ResponseClass response_class = ResponseClass::GenericRaw)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failure_ != Failure::None) {
             if (close)
                 return false;
             throw std::runtime_error(failureMessage(failure_));
         }
-        return ledger.beginSend(id, close);
+        if (!ledger.beginSend(id, close))
+            return false;
+        auto found = entries_.find(id);
+        bool pending_added = false;
+        bool lifecycle_added = false;
+        try {
+            if (found != entries_.end()) {
+                startLocked();
+                if (request_id) {
+                    ++found->second.pending_requests[request_id];
+                    pending_added = true;
+                }
+                if (request_id && (close || response_class != ResponseClass::GenericRaw))
+                    found->second.protected_requests[request_id] = close
+                        ? ResponseClass::Lifecycle : response_class;
+                if (close) {
+                    ++found->second.lifecycle_demands;
+                    lifecycle_added = true;
+                }
+                ++generation_;
+                changed_.notify_all();
+            }
+        } catch (...) {
+            if (found != entries_.end()) {
+                if (pending_added) erasePendingRequestLocked(found->second, request_id);
+                if (request_id) found->second.protected_requests.erase(request_id);
+                if (lifecycle_added && found->second.lifecycle_demands)
+                    --found->second.lifecycle_demands;
+            }
+            ledger.endSend(id, close, false);
+            throw;
+        }
+        return true;
+    }
+    void endSend(int id, bool close, std::uint64_t request_id, bool sent) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found != entries_.end() && !sent) {
+            if (request_id)
+                erasePendingRequestLocked(found->second, request_id);
+            found->second.protected_requests.erase(request_id);
+            if (close && found->second.lifecycle_demands)
+                --found->second.lifecycle_demands;
+            ++generation_;
+            changed_.notify_all();
+        }
+    }
+    DemandLease acquireDriver(int id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal)
+            return DemandLease();
+        startLocked();
+        const std::uint64_t token = ++next_demand_token_;
+        driver_tokens_.emplace(token, id);
+        ++found->second.active_drivers;
+        ++generation_;
+        changed_.notify_all();
+        return DemandLease(this, token);
+    }
+    // Application interest affects retention only. It deliberately does not
+    // start the shared receiver or count as transport demand.
+    bool setConsumerInterest(int id, bool active)
+    { return setConsumerInterest(id, active, true); }
+    bool setConsumerInterest(int id, bool active, bool generic)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal)
+            return false;
+        std::size_t &count = generic ? found->second.consumer_interests
+                                     : found->second.handler_only_consumers;
+        if (active) {
+            ++count;
+        } else if (count) {
+            --count;
+        }
+        ++generation_;
+        changed_.notify_all();
+        return true;
+    }
+    bool setHandlerRegistered(int id, const std::string &type, bool active)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal) return false;
+        if (active) found->second.handler_types.insert(type);
+        else found->second.handler_types.erase(type);
+        ++generation_;
+        changed_.notify_all();
+        return true;
+    }
+    bool needsHandlerType(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(id);
+        return found != entries_.end() && found->second.handler_only_consumers != 0 &&
+               found->second.consumer_interests == 0;
+    }
+    bool requestOneShot(int id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal)
+            return false;
+        startLocked();
+        found->second.one_shot_pending = true;
+        ++generation_;
+        changed_.notify_all();
+        return true;
+    }
+    Pop receiveMailbox(int id, Box &box, double timeout, Envelope<Value> &item)
+    {
+        if (!(timeout > 0)) {
+            const Pop status = box.tryPop(item);
+            if (status == Pop::Timeout)
+                requestOneShot(id);
+            return status;
+        }
+        // This lease covers only the C++ mailbox wait. Backend dispatch and
+        // scheduler callbacks run after this function returns, outside its
+        // lifetime and outside any Lua longjmp boundary.
+        auto demand = acquireDriver(id);
+        const auto now = std::chrono::steady_clock::now();
+        const double max_wait =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::time_point::max() - now).count();
+        const auto deadline = timeout >= max_wait
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : now + std::chrono::duration_cast<
+                                              std::chrono::steady_clock::duration>(
+                                              std::chrono::duration<double>(timeout));
+        return box.popUntil(deadline, item);
     }
     void checkHealthy() const
     {
@@ -350,8 +557,6 @@ template <class Value> class Runtime {
             accumulateRetiredLocked(found->second.box);
             entries_.erase(found);
         }
-        if (!hasLeasesLocked())
-            requestStopLocked();
         reapLocked(lock);
     }
     bool waitForNoOwners(std::chrono::milliseconds timeout)
@@ -363,6 +568,27 @@ template <class Value> class Runtime {
     {
         std::unique_lock<std::mutex> lock(mutex_);
         return changed_.wait_for(lock, timeout, [&] { return state_ == state; });
+    }
+    bool waitForIdle(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, timeout, [this] {
+            return state_ == State::Running && demandCountLocked() == 0 && !receiving_;
+        });
+    }
+    bool waitForReceived(std::uint64_t count, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, timeout, [this, count] {
+            return stats_.received >= count;
+        });
+    }
+    bool waitForClassified(std::uint64_t count, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, timeout, [this, count] {
+            return stats_.published + stats_.dropped_unsolicited >= count;
+        });
     }
 #endif
     RuntimeStats stats() const
@@ -386,6 +612,20 @@ template <class Value> class Runtime {
         result.identities = known_ids_.identities();
         result.identity_blocks = known_ids_.blocks();
         result.joinable = joining_ || worker_.joinable();
+        result.active_demands = demandCountLocked();
+        result.pending_one_shots = oneShotCountLocked();
+        result.idle = state_ == State::Running && result.active_demands == 0 && !receiving_;
+        for (const auto &pair : entries_) {
+            const Entry &entry = pair.second;
+            result.driver_demands += entry.active_drivers;
+            result.consumer_interests += entry.consumer_interests;
+            result.handler_only_consumers += entry.handler_only_consumers;
+            result.lifecycle_demands += entry.lifecycle_demands;
+            result.one_shot_demands += entry.one_shot_pending ? 1 : 0;
+            result.one_shot_demands += entry.one_shot_in_flight ? 1 : 0;
+            for (const auto &request : entry.pending_requests)
+                result.request_demands += request.second;
+        }
         return result;
     }
 
@@ -394,13 +634,93 @@ template <class Value> class Runtime {
         std::uint64_t owner = 0;
         std::shared_ptr<Box> box;
         bool orphan = false, terminal = false;
+        std::size_t active_drivers = 0, lifecycle_demands = 0;
+        std::size_t consumer_interests = 0;
+        std::size_t handler_only_consumers = 0;
+        std::set<std::string> handler_types;
+        bool one_shot_pending = false, one_shot_in_flight = false;
+        std::map<std::uint64_t, std::size_t> pending_requests;
+        std::map<std::uint64_t, ResponseClass> protected_requests;
     };
-    bool hasLeasesLocked() const
+    static void erasePendingRequestLocked(Entry &entry, std::uint64_t request_id) noexcept
     {
+        auto request = entry.pending_requests.find(request_id);
+        if (request == entry.pending_requests.end()) return;
+        if (--request->second == 0) entry.pending_requests.erase(request);
+    }
+    std::size_t demandCountLocked() const
+    {
+        std::size_t count = 0;
+        for (const auto &pair : entries_) {
+            const Entry &entry = pair.second;
+            count += entry.active_drivers + entry.lifecycle_demands;
+            count += entry.one_shot_pending ? 1 : 0;
+            count += entry.one_shot_in_flight ? 1 : 0;
+            for (const auto &request : entry.pending_requests)
+                count += request.second;
+        }
+        return count;
+    }
+    std::size_t oneShotCountLocked() const
+    {
+        std::size_t count = 0;
         for (const auto &pair : entries_)
-            if (!pair.second.terminal)
+            count += pair.second.one_shot_pending ? 1 : 0;
+        return count;
+    }
+    bool hasContinuousDemandLocked() const
+    {
+        for (const auto &pair : entries_) {
+            const Entry &entry = pair.second;
+            if (entry.active_drivers || entry.lifecycle_demands ||
+                !entry.pending_requests.empty())
                 return true;
+        }
         return false;
+    }
+    void clearDemandLocked(int id, Entry &entry) noexcept
+    {
+        clearDriverDemandLocked(id, entry);
+        entry.lifecycle_demands = 0;
+        entry.pending_requests.clear();
+        entry.protected_requests.clear();
+        entry.consumer_interests = 0;
+        entry.handler_only_consumers = 0;
+        entry.handler_types.clear();
+        ++generation_;
+        changed_.notify_all();
+    }
+    void clearDriverDemandLocked(int id, Entry &entry) noexcept
+    {
+        entry.active_drivers = 0;
+        entry.one_shot_pending = false;
+        entry.one_shot_in_flight = false;
+        for (auto token = driver_tokens_.begin(); token != driver_tokens_.end();) {
+            if (token->second == id) token = driver_tokens_.erase(token);
+            else ++token;
+        }
+        ++generation_;
+        changed_.notify_all();
+    }
+    void completeOneShotLocked(int id) noexcept
+    {
+        auto found = entries_.find(id);
+        if (found != entries_.end())
+            found->second.one_shot_in_flight = false;
+        ++generation_;
+        changed_.notify_all();
+    }
+    void releaseDriver(std::uint64_t token) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto lease = driver_tokens_.find(token);
+        if (lease == driver_tokens_.end()) return;
+        auto entry = entries_.find(lease->second);
+        if (entry != entries_.end() && entry->second.active_drivers)
+            --entry->second.active_drivers;
+        driver_tokens_.erase(lease);
+        ++generation_;
+        changed_.notify_all();
     }
     void accumulateRetiredLocked(const std::shared_ptr<Box> &box)
     {
@@ -410,6 +730,11 @@ template <class Value> class Runtime {
         stats_.dequeued += value.dequeued;
         if (value.high_water > stats_.high_water)
             stats_.high_water = value.high_water;
+    }
+    static Runtime *&activeWorkerRuntime() noexcept
+    {
+        static thread_local Runtime *runtime = nullptr;
+        return runtime;
     }
     void startLocked()
     {
@@ -421,7 +746,6 @@ template <class Value> class Runtime {
             throw std::logic_error("receiver generation not joined");
         stop_.store(false);
         worker_ = std::thread(&Runtime::run, this);
-        worker_id_ = worker_.get_id();
         state_ = State::Running;
         ++stats_.generation;
     }
@@ -436,7 +760,7 @@ template <class Value> class Runtime {
     {
         // Check the cached identity before waiting on another coordinator's
         // ticket. The worker cannot wait for a join that is waiting for it.
-        if (worker_id_ == std::this_thread::get_id())
+        if (activeWorkerRuntime() == this)
             throw std::logic_error("receiver self join forbidden");
         while (joining_)
             changed_.wait(lock, [this] { return !joining_; });
@@ -456,7 +780,6 @@ template <class Value> class Runtime {
         }
         lock.lock();
         joining_ = false;
-        worker_id_ = std::thread::id();
         if (state_ != State::Failed)
             state_ = State::Stopped;
         changed_.notify_all();
@@ -466,6 +789,7 @@ template <class Value> class Runtime {
         std::shared_ptr<Box> box;
         const int id = item.client;
         const bool terminal = item.terminal;
+        const std::uint64_t request_id = item.request_id;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++stats_.received;
@@ -484,28 +808,84 @@ template <class Value> class Runtime {
             }
             box = found->second.box;
         }
-        // Keep the mailbox alive, then publish without the registry lock. Close
-        // or detach may remove the entry while this item is in flight.
+        // Hooks may synchronize or fail, so run them outside the registry lock.
+        // Demand and ownership are revalidated before the mailbox commit below.
         if (hooks_.before_publish)
             hooks_.before_publish(item);
-        box->publish(std::move(item));
+        bool published = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            ++stats_.published;
-            // Re-find the entry: it may have been erased during publication.
+            // Retention linearizes with demand changes under mutex_. Publish
+            // uses the documented registry -> mailbox lock order so a release
+            // cannot slip between this decision and queue ownership transfer.
             auto found = entries_.find(id);
-            if (terminal && found != entries_.end()) {
-                found->second.terminal = true;
-                box->terminal();
-                if (found->second.orphan) {
-                    accumulateRetiredLocked(box);
-                    entries_.erase(found);
+            if (found == entries_.end()) {
+                if (known_ids_.contains(id)) {
+                    ++stats_.abandoned;
+                } else {
+                    throw std::logic_error("unknown receiver client");
                 }
-                if (!hasLeasesLocked())
-                    requestStopLocked();
+            } else if (found->second.terminal) {
+                ++stats_.abandoned;
+            } else {
+                Entry &entry = found->second;
+                const bool driver_active = entry.active_drivers != 0 ||
+                    entry.one_shot_pending || entry.one_shot_in_flight;
+                ResponseClass response_class = ResponseClass::GenericRaw;
+                const auto protected_request = entry.protected_requests.find(request_id);
+                if (terminal || (protected_request != entry.protected_requests.end() &&
+                                 protected_request->second == ResponseClass::Lifecycle)) {
+                    response_class = ResponseClass::Lifecycle;
+                    ++stats_.lifecycle_objects;
+                } else if (protected_request != entry.protected_requests.end()) {
+                    response_class = ResponseClass::ManagedProtected;
+                    ++stats_.managed_protected;
+                } else if (request_id) {
+                    ++stats_.generic_raw;
+                    if (entry.pending_requests.count(request_id) == 0)
+                        ++stats_.unknown_correlated;
+                }
+                item.response_class = response_class;
+                const bool generic_consumer = entry.consumer_interests != 0;
+                const bool handler_consumer = entry.handler_only_consumers != 0;
+                const bool selected_handler_update = handler_consumer &&
+                    entry.handler_types.count(item.event_type) != 0;
+                const bool handler_filter = handler_consumer && !generic_consumer &&
+                    !item.event_type.empty() && !selected_handler_update &&
+                    !request_id && !terminal &&
+                    entry.lifecycle_demands == 0;
+                const bool preserve = request_id != 0 || terminal ||
+                    entry.lifecycle_demands != 0 || driver_active ||
+                    generic_consumer || selected_handler_update;
+                if (handler_filter) {
+                    ++stats_.dropped_unsolicited;
+                    ++stats_.dropped_by_handler_filter;
+                } else if (!preserve) {
+                    ++stats_.dropped_unsolicited;
+                } else {
+                    box = entry.box;
+                    box->publish(std::move(item));
+                    ++stats_.published;
+                    published = true;
+                    if (request_id)
+                        erasePendingRequestLocked(entry, request_id);
+                    if (request_id)
+                        entry.protected_requests.erase(request_id);
+                    if (terminal) {
+                        entry.terminal = true;
+                        clearDemandLocked(id, entry);
+                        box->terminal();
+                        if (entry.orphan) {
+                            accumulateRetiredLocked(box);
+                            entries_.erase(found);
+                        }
+                    }
+                }
             }
+            ++generation_;
+            changed_.notify_all();
         }
-        if (hooks_.after_publish)
+        if (published && hooks_.after_publish)
             hooks_.after_publish();
     }
     void fail(Failure failure) noexcept
@@ -518,32 +898,74 @@ template <class Value> class Runtime {
         }
         state_ = State::Failed;
         stop_.store(true);
+        receiving_ = false;
         for (auto &pair : entries_)
             pair.second.box->fail(failure_);
         changed_.notify_all();
     }
     void run() noexcept
     {
+        activeWorkerRuntime() = this;
         Failure stage = Failure::Source;
         try {
             while (!stop_.load()) {
                 const auto started = std::chrono::steady_clock::now();
                 Envelope<Value> item;
-                stage = Failure::Source;
+                int one_shot_client = 0;
+                bool one_shot_claimed = false;
+                std::chrono::milliseconds receive_timeout = timeout_;
+                std::uint64_t observed_generation = 0;
                 {
-                    std::lock_guard<std::mutex> lock(mutex_);
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    changed_.wait(lock, [this] {
+                        return stop_.load() || demandCountLocked() != 0;
+                    });
+                    if (stop_.load()) break;
+                    observed_generation = generation_;
+                    const bool continuous = hasContinuousDemandLocked();
+                    if (!continuous)
+                        receive_timeout = std::chrono::milliseconds(0);
+                    for (auto &pair : entries_) {
+                        if (pair.second.one_shot_pending) {
+                            one_shot_client = pair.first;
+                            one_shot_claimed = true;
+                            pair.second.one_shot_pending = false;
+                            pair.second.one_shot_in_flight = true;
+                            break;
+                        }
+                    }
+                    receiving_ = true;
                     ++stats_.receive_calls;
                 }
-                if (source_->receive(timeout_, item)) {
+                stage = Failure::Source;
+                const bool received = source_->receive(receive_timeout, item);
+                if (!received) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    receiving_ = false;
+                    if (one_shot_claimed)
+                        completeOneShotLocked(one_shot_client);
+                    changed_.notify_all();
+                }
+                if (received) {
                     stage = Failure::Routing;
                     const int id = item.client;
                     const bool terminal = item.terminal;
                     publish(std::move(item));
                     if (terminal)
                         source_->terminalPublished(id);
-                } else if (std::chrono::steady_clock::now() < started + timeout_) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        receiving_ = false;
+                        if (one_shot_claimed)
+                            completeOneShotLocked(one_shot_client);
+                        changed_.notify_all();
+                    }
+                } else if (receive_timeout.count() > 0 &&
+                           std::chrono::steady_clock::now() < started + receive_timeout) {
                     std::unique_lock<std::mutex> lock(mutex_);
-                    changed_.wait_until(lock, started + timeout_, [this] { return stop_.load(); });
+                    changed_.wait_until(lock, started + receive_timeout, [this, observed_generation] {
+                        return stop_.load() || generation_ != observed_generation;
+                    });
                 }
             }
         } catch (const std::bad_alloc &) {
@@ -553,6 +975,7 @@ template <class Value> class Runtime {
             fail(stage);
             source_->cleanupAfterFailure(timeout_);
         }
+        activeWorkerRuntime() = nullptr;
         changed_.notify_all();
     }
     std::shared_ptr<Source<Value>> source_;
@@ -561,15 +984,16 @@ template <class Value> class Runtime {
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::map<int, Entry> entries_;
+    std::map<std::uint64_t, int> driver_tokens_;
     IdentityHistory known_ids_;
     std::set<std::uint64_t> owners_;
     std::thread worker_;
-    std::thread::id worker_id_;
     std::atomic<bool> stop_{false};
     bool joining_ = false;
     State state_ = State::Stopped;
     Failure failure_ = Failure::None;
-    std::uint64_t next_owner_ = 0, sequence_ = 0;
+    std::uint64_t next_owner_ = 0, sequence_ = 0, generation_ = 0, next_demand_token_ = 0;
+    bool receiving_ = false;
     RuntimeStats stats_;
 };
 

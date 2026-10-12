@@ -5,6 +5,7 @@
 
 #include "tdlua/lua_compat.h"
 #include "tdlua/common/managed_continuation.h"
+#include "tdlua/common/transport.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1459,12 +1460,93 @@ public:
     }
 #endif
 #ifdef TDLUA_TESTING
+    struct BufferStats {
+        std::size_t pending_requests = 0;
+        std::size_t live_states = 0;
+        std::size_t event_states = 0;
+        std::size_t ready_states = 0;
+        std::size_t running_tasks = 0;
+        std::size_t deferred_events = 0;
+        std::size_t selected_updates = 0;
+        std::size_t handler_queued_updates = 0;
+        std::size_t loop_queued_updates = 0;
+        std::size_t lua_registry_refs = 0;
+        std::size_t managed_handles = 0;
+        std::size_t managed_waiters = 0;
+    };
+
     std::size_t liveTaskCount() const
     {
         std::size_t count = event_states_.size();
         for (const auto &entry : live_states_)
             if (isTaskState(entry.second)) ++count;
         return count;
+    }
+
+    BufferStats bufferStats() const
+    {
+        BufferStats result;
+        result.pending_requests = pending_.size();
+        result.live_states = live_states_.size();
+        result.event_states = event_states_.size();
+        result.ready_states = ready_.size();
+        result.running_tasks = running_tasks_.size();
+        result.deferred_events = deferred_events_.size();
+        result.selected_updates = managed_driver_.selected_update != LUA_NOREF ? 1 : 0;
+
+        std::map<const ManagedState *, bool> seen_states;
+        const auto count_state_refs = [&result, &seen_states](const State &state) {
+            if (!state || !seen_states.emplace(state.get(), true).second) return;
+            result.managed_handles += state->handle_count;
+            result.managed_waiters += state->waiter_count;
+            const int refs[] = {state->callback_ref, state->context_ref,
+                                state->thread_ref, state->response_ref,
+                                state->result_ref};
+            for (const int ref : refs)
+                if (ref != LUA_NOREF && ref != LUA_REFNIL)
+                    ++result.lua_registry_refs;
+        };
+        for (const auto &entry : pending_) count_state_refs(entry.second);
+        for (const auto &entry : live_states_) count_state_refs(entry.second);
+        for (const auto &state : event_states_) count_state_refs(state);
+        for (const auto &state : ready_) count_state_refs(state);
+        for (const auto &entry : running_tasks_) count_state_refs(entry.second);
+
+        std::map<const EventRegistration *, bool> seen_registrations;
+        for (const auto &entry : events_) {
+            const auto &registration = entry.second;
+            if (!registration ||
+                !seen_registrations.emplace(registration.get(), true).second)
+                continue;
+            if (registration->handler_ref != LUA_NOREF &&
+                registration->handler_ref != LUA_REFNIL)
+                ++result.lua_registry_refs;
+            result.handler_queued_updates += registration->queued_updates.size();
+            result.lua_registry_refs += registration->queued_updates.size();
+        }
+        if (managed_driver_.loop_observer) {
+            const auto &observer = managed_driver_.loop_observer;
+            if (observer->callback_ref != LUA_NOREF &&
+                observer->callback_ref != LUA_REFNIL)
+                ++result.lua_registry_refs;
+            result.loop_queued_updates = observer->queued_updates.size();
+            result.lua_registry_refs += observer->queued_updates.size();
+        }
+        for (const auto &event : deferred_events_)
+            if (event.update_ref != LUA_NOREF && event.update_ref != LUA_REFNIL)
+                ++result.lua_registry_refs;
+        if (managed_driver_.selected_update != LUA_NOREF &&
+            managed_driver_.selected_update != LUA_REFNIL)
+            ++result.lua_registry_refs;
+        for (const auto &entry : waiters_)
+            if (entry.second.thread_ref != LUA_NOREF &&
+                entry.second.thread_ref != LUA_REFNIL)
+                ++result.lua_registry_refs;
+        for (const auto &entry : notifications_)
+            if (entry.second.thread_ref != LUA_NOREF &&
+                entry.second.thread_ref != LUA_REFNIL)
+                ++result.lua_registry_refs;
+        return result;
     }
 #endif
     using Pump = bool (*)(void *, double);
@@ -1500,6 +1582,13 @@ public:
         if (id >= next_) next_ = id == UINT64_MAX ? id : id + 1;
     }
     std::size_t pendingCount() const { return pending_.size(); }
+    ResponseClass responseClass(std::uint64_t id) const
+    {
+        const auto found = pending_.find(id);
+        return found != pending_.end() && found->second->kind != RequestKind::Raw
+            ? ResponseClass::ManagedProtected
+            : ResponseClass::GenericRaw;
+    }
 
     double deadlineBound(double wait) const
     {
@@ -2445,6 +2534,11 @@ public:
     std::uint64_t nextRequestId() { return core_->nextRequestId(); }
     void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }
     std::size_t pendingCount() const { return core_->pendingCount(); }
+    ResponseClass responseClass(std::uint64_t id) const
+    { return core_->responseClass(id); }
+#ifdef TDLUA_TESTING
+    SchedulerCore::BufferStats bufferStats() const { return core_->bufferStats(); }
+#endif
     std::uint64_t raw() { return core_->raw(); }
     ManagedStatePtr future(bool discard_raw_response = false)
     {

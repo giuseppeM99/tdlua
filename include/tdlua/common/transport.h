@@ -5,20 +5,23 @@
 #include <utility>
 
 namespace tdlua {
+enum class ResponseClass { GenericRaw, ManagedProtected, Lifecycle };
+
 // A non-owning view of one backend. The operation table is static, so sending
 // a request does not allocate a type-erased callable.
 template<class Request, class Response> struct Transport {
     void *context;
     struct Operations {
-        void (*send)(void *, std::uint64_t, Request);
+        void (*send)(void *, std::uint64_t, Request, ResponseClass);
         Response (*receive)(void *, double);
         Response (*executeSync)(void *, Request);
         void (*close)(void *);
         bool (*isClosed)(void *);
     };
     const Operations *operations;
-    void send(std::uint64_t id, Request request) const {
-        operations->send(context, id, std::move(request));
+    void send(std::uint64_t id, Request request,
+              ResponseClass response_class = ResponseClass::GenericRaw) const {
+        operations->send(context, id, std::move(request), response_class);
     }
     Response receive(double timeout) const { return operations->receive(context, timeout); }
     Response executeSync(Request request) const {
@@ -34,7 +37,7 @@ void submit(Router &router, const RequestTransport &transport,
             std::uint64_t id, Request request)
 {
     try {
-        transport.send(id, std::move(request));
+        transport.send(id, std::move(request), router.responseClass(id));
     } catch (...) {
         router.cancel(id);
         throw;

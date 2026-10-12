@@ -13,13 +13,20 @@ class JsonRuntime {
     std::uint64_t attachVm();
     void detachVm(std::uint64_t owner);
     std::int32_t createClient(std::uint64_t owner);
-    void send(std::int32_t client, const nlohmann::json &request);
+    void send(std::int32_t client, const nlohmann::json &request,
+              tdlua::ResponseClass response_class = tdlua::ResponseClass::GenericRaw);
     nlohmann::json execute(const nlohmann::json &request);
     nlohmann::json receive(std::int32_t client, double timeout);
     bool retireReserved(std::int32_t client);
     void rejectShutdown(std::int32_t client);
     bool shutdownPending(std::int32_t client) const { return lifecycle_->shutdownPending(client); }
     void forget(std::int32_t client, bool timed_out = false);
+    bool setConsumerInterest(std::int32_t client, bool active)
+    { return engine_.setConsumerInterest(client, active); }
+    bool setConsumerInterest(std::int32_t client, bool active, bool generic)
+    { return engine_.setConsumerInterest(client, active, generic); }
+    bool setHandlerRegistered(std::int32_t client, const std::string &type, bool active)
+    { return engine_.setHandlerRegistered(client, type, active); }
 #ifdef TDLUA_TESTING
     bool waitForNoOwners()
     {

@@ -19,9 +19,11 @@ NativeTDLua *client_with_injected_drain_failure = nullptr;
 
 void native_transport_send(
     void *context, std::uint64_t request_id,
-    td::td_api::object_ptr<td::td_api::Function> request)
+    td::td_api::object_ptr<td::td_api::Function> request,
+    tdlua::ResponseClass response_class)
 {
-    static_cast<NativeTDLua *>(context)->send(std::move(request), request_id);
+    static_cast<NativeTDLua *>(context)->send(std::move(request), request_id,
+                                              response_class);
 }
 
 NativeResponse native_transport_receive(void *context, double timeout)
@@ -92,7 +94,8 @@ td::td_api::object_ptr<td::td_api::Function> NativeTDLua::makeRequest(
 }
 
 void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
-                       std::uint64_t request_id)
+                       std::uint64_t request_id,
+                       tdlua::ResponseClass response_class)
 {
     const auto request_type = request ? request->get_id() : 0;
     const bool shutdown = request_type == td::td_api::close::ID ||
@@ -104,7 +107,8 @@ void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
         shutdown_requests_.insert(request_id);
     }
     try {
-        NativeRuntime::instance().send(client_id_, request_id, std::move(request));
+        NativeRuntime::instance().send(client_id_, request_id, std::move(request),
+                                        response_class);
     } catch (...) {
         if (shutdown) {
             if (NativeRuntime::instance().shutdownPending(client_id_)) {
@@ -160,7 +164,24 @@ bool NativeTDLua::pump(const double timeout)
 bool NativeTDLua::pumpWithPolicy(const double timeout,
                                  bool discard_unobserved_raw)
 {
+    if (closed())
+        return false;
+    // Runtime::receiveMailbox scopes driver demand only around its blocking
+    // wait. Do not keep a lease across pumpClient: dispatch/drain can enter Lua,
+    // whose longjmp must never bypass a C++ lease destructor.
     return tdlua::pumpClient(*this, timeout, discard_unobserved_raw);
+}
+
+void NativeTDLua::setConsumerInterest(bool active, bool generic)
+{
+    NativeRuntime::instance().setConsumerInterest(client_id_, active, generic);
+}
+
+bool NativeTDLua::setHandlerRegistered(const std::string &type, bool active)
+{
+    if (injected_transport_.operations)
+        return true;
+    return NativeRuntime::instance().setHandlerRegistered(client_id_, type, active);
 }
 
 bool NativeTDLua::hasUndispatchedPumpItem() const

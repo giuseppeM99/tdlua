@@ -1,8 +1,8 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "binding/lua_binding.h"
-#include "binding/lua_binding_common.h"
+#include "tdlua/binding/lua_binding.h"
+#include "tdlua/binding/lua_binding_common.h"
 
 #include "tdlua/common/lua_json.h"
 #include "tdlua/backend/native/client.h"
@@ -71,13 +71,22 @@ static bool native_push_handler(tdlua_binding::ClientHandle client,
 static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
                       const char *type, int callback_index, bool concurrent)
 {
-    static_cast<NativeTDLua *>(client)->dispatcher().on(
-        L, type, callback_index, concurrent);
+    auto *td = static_cast<NativeTDLua *>(client);
+    if (!td->setHandlerRegistered(type, true))
+        throw std::runtime_error("tdlua: client handler registry unavailable");
+    try {
+        td->dispatcher().on(L, type, callback_index, concurrent);
+    } catch (...) {
+        td->setHandlerRegistered(type, false);
+        throw;
+    }
 }
 
 static void native_off(tdlua_binding::ClientHandle client, const char *type)
 {
-    static_cast<NativeTDLua *>(client)->dispatcher().off(type);
+    auto *td = static_cast<NativeTDLua *>(client);
+    td->dispatcher().off(type);
+    td->setHandlerRegistered(type, false);
 }
 
 static void native_unload(tdlua_binding::ClientHandle client)
@@ -90,6 +99,12 @@ static void native_unload(tdlua_binding::ClientHandle client)
 static bool native_closed(tdlua_binding::ClientHandle client)
 {
     return static_cast<NativeTDLua *>(client)->closed();
+}
+
+static void native_consumer_interest(tdlua_binding::ClientHandle client, bool active,
+                                     bool generic)
+{
+    static_cast<NativeTDLua *>(client)->setConsumerInterest(active, generic);
 }
 
 static void reject_reserved_json_fields(const nlohmann::json &request)
@@ -721,6 +736,7 @@ static const tdlua_binding::ClientOperations native_operations = {
     native_off,
     native_unload,
     native_closed,
+    native_consumer_interest,
 #ifdef TDLUA_TESTING
     tdclient_pending_count,
 #endif

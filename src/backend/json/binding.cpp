@@ -1,8 +1,8 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "binding/lua_binding.h"
-#include "binding/lua_binding_common.h"
+#include "tdlua/binding/lua_binding.h"
+#include "tdlua/binding/lua_binding_common.h"
 #include "tdlua/backend/json/client.h"
 #include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/lua_json.h"
@@ -69,13 +69,22 @@ static bool json_push_handler(tdlua_binding::ClientHandle client,
 static void json_on(tdlua_binding::ClientHandle client, lua_State *L,
                     const char *type, int callback_index, bool concurrent)
 {
-    static_cast<TDLua *>(client)->dispatcher().on(
-        L, type, callback_index, concurrent);
+    auto *td = static_cast<TDLua *>(client);
+    if (!td->setHandlerRegistered(type, true))
+        throw std::runtime_error("tdlua: client handler registry unavailable");
+    try {
+        td->dispatcher().on(L, type, callback_index, concurrent);
+    } catch (...) {
+        td->setHandlerRegistered(type, false);
+        throw;
+    }
 }
 
 static void json_off(tdlua_binding::ClientHandle client, const char *type)
 {
-    static_cast<TDLua *>(client)->dispatcher().off(type);
+    auto *td = static_cast<TDLua *>(client);
+    td->dispatcher().off(type);
+    td->setHandlerRegistered(type, false);
 }
 
 static void json_unload(tdlua_binding::ClientHandle client)
@@ -88,6 +97,12 @@ static void json_unload(tdlua_binding::ClientHandle client)
 static bool json_closed(tdlua_binding::ClientHandle client)
 {
     return static_cast<TDLua *>(client)->closed();
+}
+
+static void json_consumer_interest(tdlua_binding::ClientHandle client, bool active,
+                                   bool generic)
+{
+    static_cast<TDLua *>(client)->setConsumerInterest(active, generic);
 }
 
 using json = nlohmann::json;
@@ -574,6 +589,7 @@ static const tdlua_binding::ClientOperations json_operations = {
     json_off,
     json_unload,
     json_closed,
+    json_consumer_interest,
 #ifdef TDLUA_TESTING
     tdclient_pending_count,
 #endif

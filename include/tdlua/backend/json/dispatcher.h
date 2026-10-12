@@ -41,6 +41,8 @@ public:
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
+    tdlua::ResponseClass responseClass(std::uint64_t id) const
+    { return router_.responseClass(id); }
     static bool responseRequestId(const nlohmann::json &response,
                                   std::uint64_t &request_id);
     void on(lua_State *L, const std::string &type, int callback_index,
@@ -64,6 +66,8 @@ public:
     void discardSelectedUpdate();
 #ifdef TDLUA_TESTING
     bool pushSelectedUpdateForTesting(lua_State *L);
+    tdlua::SchedulerCore::BufferStats bufferStatsForTesting() const
+    { return router_.bufferStats(); }
 #endif
     // Storage belongs to the Lua client uservalue. The dispatcher only passes
     // the attachment and transport-detach operations to the common router.

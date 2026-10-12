@@ -1,7 +1,7 @@
 // Copyright (c) 2018-2026 Giuseppe Marino
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "binding/lua_binding.h"
+#include "tdlua/binding/lua_binding.h"
 #include "tdlua/backend/json/client.h"
 
 #include <deque>
@@ -26,7 +26,7 @@ struct Fake {
     TDLua::Transport transport()
     {
         static const TDLua::Transport::Operations operations = {
-            [](void *context, std::uint64_t id, json request) {
+            [](void *context, std::uint64_t id, json request, tdlua::ResponseClass) {
                 auto &fake = *static_cast<Fake *>(context);
                 fake.sent.emplace_back(id, request);
                 if (request["@type"] == "sendMessage") {

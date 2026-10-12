@@ -135,6 +135,7 @@ struct ClientOperations final {
     void (*off)(ClientHandle, const char *);
     void (*unload)(ClientHandle);
     bool (*closed)(ClientHandle);
+    void (*consumer_interest)(ClientHandle, bool, bool);
 #ifdef TDLUA_TESTING
     lua_CFunction pending_count;
 #endif

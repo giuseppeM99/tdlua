@@ -318,6 +318,16 @@ scenarios.L = function()
     assert(type(t)=='userdata'); state(t,'RUNNING',0); state(dep,'PENDING',1)
     assert(P.receives(c) == 1) -- poll selects update, never joins callback
     respond(c,dep._request_id); state(t,'DONE',0); assert(t:wait() == 42); clean_waits()
+
+    local pending = c:getMe(); local before = P.receives(c)
+    assert(c:poll(0) == nil and P.receives(c) == before + 1)
+    local callback_called = false
+    P.wait_empty(c,true)
+    assert(c:poll(function() callback_called=true end,0.01) == nil)
+    P.wait_empty(c,false)
+    assert(not callback_called and not pending:ready())
+    assert(P.receives(c) == before + 2)
+    respond(c,pending._request_id); assert(pending:wait().id == 42); clean_waits()
 end
 scenarios.M = function()
     for _, concurrent in ipairs({true,false}) do

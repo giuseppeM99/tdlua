@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <ctime>
 #include <iostream>
+#include <pthread.h>
+#include <set>
 #include <vector>
 
 using namespace tdlua::receiver;
@@ -22,6 +24,9 @@ class Fake final : public Source<int> {
     {
         std::unique_lock<std::mutex> lock(mutex);
         ++calls;
+        worker_threads.insert(std::this_thread::get_id());
+        worker_thread = pthread_self();
+        have_worker_thread = true;
         changed.notify_all();
         if (paused) {
             entered = true;
@@ -37,13 +42,27 @@ class Fake final : public Source<int> {
         queue.pop_front();
         return true;
     }
-    void push(int id, int value, bool terminal = false)
+    void terminalPublished(int id) override
+    {
+        std::function<void(int)> acknowledge;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            terminal_acks.push_back(id);
+            acknowledge = terminal_acknowledge;
+            changed.notify_all();
+        }
+        if (acknowledge) acknowledge(id);
+    }
+    void push(int id, int value, bool terminal = false, std::uint64_t request_id = 0,
+              std::string event_type = {})
     {
         std::lock_guard<std::mutex> lock(mutex);
         Item item;
         item.client = id;
         item.value = value;
         item.terminal = terminal;
+        item.request_id = request_id;
+        item.event_type = std::move(event_type);
         queue.push_back(std::move(item));
         changed.notify_all();
     }
@@ -53,11 +72,11 @@ class Fake final : public Source<int> {
         paused = true;
         entered = false;
     }
-    void awaitPause()
+    void awaitPause(const char *where)
     {
         std::unique_lock<std::mutex> lock(mutex);
         check(changed.wait_for(lock, Ms(2000), [this] { return entered; }),
-              "worker did not enter source gate");
+              where);
     }
     void release()
     {
@@ -71,6 +90,39 @@ class Fake final : public Source<int> {
         check(changed.wait_for(lock, Ms(2000), [&] { return calls >= count; }),
               "receive did not start");
     }
+    void awaitTerminalAck(int id)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        check(changed.wait_for(lock, Ms(2000), [&] {
+            return std::find(terminal_acks.begin(), terminal_acks.end(), id) !=
+                   terminal_acks.end();
+        }), "terminal acknowledgement did not run");
+    }
+    std::uint64_t callCount()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return calls;
+    }
+    std::size_t workerCount()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return worker_threads.size();
+    }
+    std::uint64_t workerCpuNanoseconds()
+    {
+        pthread_t thread;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!have_worker_thread) return 0;
+            thread = worker_thread;
+        }
+        clockid_t clock_id;
+        if (pthread_getcpuclockid(thread, &clock_id) != 0) return 0;
+        timespec value = {};
+        if (clock_gettime(clock_id, &value) != 0) return 0;
+        return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
+               static_cast<std::uint64_t>(value.tv_nsec);
+    }
     std::size_t pending()
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -79,8 +131,13 @@ class Fake final : public Source<int> {
     std::mutex mutex;
     std::condition_variable changed;
     std::deque<Item> queue;
+    std::vector<int> terminal_acks;
+    std::function<void(int)> terminal_acknowledge;
     bool paused = false, entered = false, error = false;
     std::uint64_t calls = 0;
+    std::set<std::thread::id> worker_threads;
+    pthread_t worker_thread;
+    bool have_worker_thread = false;
 };
 
 static Item pop(const std::shared_ptr<Mailbox<int>> &box)
@@ -96,8 +153,12 @@ static void fifoAndWakeup()
     Engine engine(source, Ms(5));
     const auto owner = engine.attachOwner();
     std::vector<std::shared_ptr<Mailbox<int>>> boxes;
+    std::vector<Engine::DemandLease> demands;
     for (int i = 1; i <= 8; ++i)
+    {
         boxes.push_back(engine.createClient(owner, [i] { return i; }).second);
+        demands.push_back(engine.acquireDriver(i));
+    }
     std::vector<std::thread> producers, consumers;
     std::atomic<bool> failed{false};
     for (int id = 1; id <= 8; ++id) {
@@ -156,7 +217,8 @@ static void tombstoneRestartAndJoin()
     Engine engine(source, Ms(5));
     auto owner = engine.attachOwner();
     auto old = engine.createClient(owner, [] { return 7; }).second;
-    source->awaitPause();
+    auto old_demand = engine.acquireDriver(7);
+    source->awaitPause("old client did not enter source gate");
     Item item;
     source->push(7, 1);
     check(old->tryPop(item) == Pop::Timeout && source->pending() == 1 &&
@@ -175,14 +237,17 @@ static void tombstoneRestartAndJoin()
     source->pause();
     owner = engine.attachOwner();
     auto fresh = engine.createClient(owner, [] { return 8; }).second;
-    source->awaitPause();
+    auto fresh_demand = engine.acquireDriver(8);
+    source->awaitPause("restarted client did not enter source gate");
     check(engine.stats().generation == 2,
           "client registration did not start exactly one new generation");
     source->push(8, 4);
     source->release();
     check(pop(fresh).value == 4, "old response leaked to new identity");
-    check(old->tryPop(item) == Pop::Closed && engine.stats().abandoned >= 3,
-          "orphan not accounted");
+    const auto old_stats = engine.stats();
+    check(old->tryPop(item) == Pop::Closed && old_stats.abandoned >= 1 &&
+              old_stats.dropped_unsolicited >= 2,
+          "orphaned unsolicited items were not accounted");
     source->push(8, 5, true);
     pop(fresh);
     engine.forget(8);
@@ -216,6 +281,7 @@ static void faults(bool after, bool oom)
     Engine engine(source, Ms(5), hooks);
     auto owner = engine.attachOwner();
     auto box = engine.createClient(owner, [] { return 1; }).second;
+    auto demand = engine.acquireDriver(1);
     source->push(1, 1);
     if (!after)
         source->push(1, 2);
@@ -243,7 +309,9 @@ static void independentConsumersAndCreateDuringStop()
     const auto a = engine.attachOwner(), b = engine.attachOwner();
     auto slow = engine.createClient(a, [] { return 1; }).second;
     auto fast = engine.createClient(b, [] { return 2; }).second;
-    source->awaitPause();
+    auto slow_demand = engine.acquireDriver(1);
+    auto fast_demand = engine.acquireDriver(2);
+    source->awaitPause("independent client did not enter source gate");
     for (int i = 0; i < 100; ++i)
         source->push(1, i);
     source->push(2, 101);
@@ -255,7 +323,7 @@ static void independentConsumersAndCreateDuringStop()
     source->push(2, 103);
     check(pop(fast).value == 103, "closing peer stopped worker");
     source->pause();
-    source->awaitPause();
+    source->awaitPause("restart test did not enter source gate");
     // Use a receive gate to keep the join ticket outstanding during new create.
     std::thread stopper([&] { engine.stopAndJoin(); });
     check(engine.waitForState(State::Stopping, Ms(2000)), "stop ticket not claimed");
@@ -264,9 +332,731 @@ static void independentConsumersAndCreateDuringStop()
     source->release();
     stopper.join();
     opener.join();
+    auto next_demand = engine.acquireDriver(3);
     source->push(3, 104);
     check(pop(next).value == 104, "new create failed after stop");
     engine.detachOwner(b);
+}
+
+static void demandIdleAndReactivation()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(20));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    check(engine.stats().state == State::Stopped && source->callCount() == 0,
+          "client registration started reception without demand");
+
+    auto a = engine.acquireDriver(1);
+    source->awaitCalls(1);
+    a.release();
+    check(engine.waitForIdle(Ms(2000)), "receiver did not enter idle after A release");
+    const auto idle_calls = source->callCount();
+    const auto idle_cpu_start = source->workerCpuNanoseconds();
+    std::unique_lock<std::mutex> source_lock(source->mutex);
+    check(!source->changed.wait_for(source_lock, Ms(60), [&] {
+              return source->calls != idle_calls;
+          }), "receiver polled source while idle");
+    source_lock.unlock();
+    const auto idle_cpu_end = source->workerCpuNanoseconds();
+    std::cout << "demand_idle_sample,wall_ms=60,receive_calls=0,cpu_ns="
+              << (idle_cpu_end - idle_cpu_start) << '\n';
+
+    auto b_box = engine.createClient(owner, [] { return 2; }).second;
+    const auto activation_start = Clock::now();
+    auto b = engine.acquireDriver(2);
+    source->push(2, 20);
+    source->awaitCalls(idle_calls + 1);
+    Item item;
+    check(b_box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 20,
+          "client B did not reactivate the shared receiver");
+    std::cout << "demand_reactivation_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     Clock::now() - activation_start).count()
+              << " shared_worker_threads=" << source->workerCount() << '\n';
+    check(source->workerCount() == 1,
+          "reactivation created more than one shared receiver thread");
+    b.release();
+    check(engine.waitForIdle(Ms(2000)), "receiver did not return to idle after B release");
+    check(engine.stats().generation == 1, "ordinary idle/reactivation restarted worker");
+    engine.detachOwner(owner);
+}
+
+static void independentDemandAndReceiveInFlight()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(20));
+    const auto owner = engine.attachOwner();
+    auto a_box = engine.createClient(owner, [] { return 1; }).second;
+    auto b_box = engine.createClient(owner, [] { return 2; }).second;
+    auto a = engine.acquireDriver(1);
+    source->awaitCalls(1);
+    a.release();
+    check(engine.waitForIdle(Ms(2000)), "A did not release demand");
+    auto b = engine.acquireDriver(2);
+    source->push(1, 10);
+    source->push(2, 20);
+    Item item;
+    check(engine.waitForReceived(2, Ms(2000)), "shared receive did not process both clients");
+    check(a_box->stats().depth == 0 && engine.stats().dropped_unsolicited == 1,
+          "inactive A unsolicited update was retained while B was active");
+    check(b_box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 20,
+          "active B did not progress independently");
+
+    // Request responses are retained for their owner even without a Lua driver.
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    check(engine.admitSend(ledger, 1, false, 501), "raw response admission failed");
+    engine.endSend(1, false, 501, true);
+    source->push(1, 11, false, 501);
+    check(engine.waitForReceived(3, Ms(2000)), "raw response was not acquired");
+    check(a_box->stats().depth == 1 && engine.stats().driver_demands == 1,
+          "raw response for inactive A was discarded");
+    auto a_driver = engine.acquireDriver(1);
+    check(engine.receiveMailbox(1, *a_box, 0, item) == Pop::Item && item.value == 11,
+          "inactive A raw response was not consumable");
+    a_driver.release();
+
+    // Managed responses use the same transport correlation metadata but remain
+    // owned by the router after mailbox acquisition.
+    check(engine.admitSend(ledger, 1, false, 502), "managed response admission failed");
+    engine.endSend(1, false, 502, true);
+    source->push(1, 12, false, 502);
+    check(engine.waitForReceived(4, Ms(2000)), "managed response was not acquired");
+    auto managed_driver = engine.acquireDriver(1);
+    check(engine.receiveMailbox(1, *a_box, 0, item) == Pop::Item && item.value == 12,
+          "inactive A managed response was not preserved for owner dispatch");
+    managed_driver.release();
+
+    // A registered Lua handler alone does not create C++ receiver demand or
+    // retention interest. While B drives the shared source, unsolicited A
+    // updates are dropped at mailbox publication.
+    const std::uint64_t before_burst = engine.stats().dropped_unsolicited;
+    const auto classified_before = engine.stats().published + before_burst;
+    const auto start = Clock::now();
+    constexpr int burst = 1000;
+    for (int value = 0; value < burst; ++value)
+        source->push(1, 1000 + value);
+    check(engine.waitForClassified(classified_before + burst, Ms(5000)),
+          "inactive-client unsolicited burst was not fully acquired");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - start).count();
+    const auto burst_stats = engine.stats();
+    check(a_box->stats().depth == 0 && burst_stats.dropped_unsolicited == before_burst + burst,
+          "inactive-client mailbox grew with unsolicited burst");
+    std::cout << "retention_burst,items=" << burst
+              << ",mailbox_depth=" << a_box->stats().depth
+              << ",dropped=" << burst_stats.dropped_unsolicited
+              << ",elapsed_ms=" << elapsed << '\n';
+
+    b.release();
+    check(engine.waitForIdle(Ms(2000)), "B demand did not return to idle");
+
+    source->pause();
+    auto in_flight = engine.acquireDriver(2);
+    source->awaitPause("receive did not enter source during release");
+    const auto calls = engine.stats().receive_calls;
+    const auto received_before_release = engine.stats().received;
+    const auto dropped_before_release = engine.stats().dropped_unsolicited;
+    in_flight.release();
+    source->push(2, 21);
+    source->release();
+    check(engine.waitForReceived(received_before_release + 1, Ms(2000)),
+          "in-flight object was not classified");
+    check(b_box->stats().depth == 0 &&
+              engine.stats().dropped_unsolicited == dropped_before_release + 1,
+          "release during global receive did not make retention decision at publication");
+    check(engine.waitForIdle(Ms(2000)), "released in-flight receive did not idle");
+    check(engine.stats().receive_calls == calls, "idle performed an extra receive");
+    engine.detachOwner(owner);
+}
+
+// A loop's application interest outlives each mailbox driver lease. Client B
+// keeps the shared source active while A's first handler is blocked.
+static void retentionDuringBlockedHandler()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10));
+    const auto owner = engine.attachOwner();
+    auto a_box = engine.createClient(owner, [] { return 1; }).second;
+    engine.createClient(owner, [] { return 2; });
+
+    std::mutex handler_mutex;
+    std::condition_variable handler_changed;
+    bool handler_entered = false;
+    bool release_handler = false;
+    std::exception_ptr loop_error;
+
+    std::thread loop_owner([&] {
+        try {
+            check(engine.setConsumerInterest(1, true),
+                  "could not acquire A's loop consumer interest");
+            auto driver = engine.acquireDriver(1);
+            source->push(1, 101);
+            Item first;
+            check(engine.receiveMailbox(1, *a_box, 1000, first) == Pop::Item &&
+                      first.value == 101,
+                  "loop did not receive the first handler update");
+            driver.release();
+
+            std::unique_lock<std::mutex> lock(handler_mutex);
+            handler_entered = true;
+            handler_changed.notify_all();
+            handler_changed.wait(lock, [&] { return release_handler; });
+        } catch (...) {
+            loop_error = std::current_exception();
+            std::lock_guard<std::mutex> lock(handler_mutex);
+            handler_entered = true;
+            handler_changed.notify_all();
+        }
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(handler_mutex);
+        check(handler_changed.wait_for(lock, Ms(2000), [&] { return handler_entered; }),
+              "first handler did not enter its blocked state");
+    }
+    if (loop_error) {
+        loop_owner.join();
+        std::rethrow_exception(loop_error);
+    }
+
+    auto b_driver = engine.acquireDriver(2);
+    const auto received_before = engine.stats().received;
+    const auto dropped_before = engine.stats().dropped_unsolicited;
+    source->push(1, 102);
+    check(engine.waitForReceived(received_before + 1, Ms(2000)),
+          "shared receiver did not acquire the second A update");
+    const auto stats = engine.stats();
+    check(a_box->stats().depth == 1 &&
+              stats.dropped_unsolicited == dropped_before &&
+              stats.driver_demands == 1 && stats.consumer_interests == 1,
+          "A's active consumer did not preserve its unsolicited update");
+    std::cout << "blocked_handler_retention,client_a_loop=blocked,"
+              << "a_box_depth=" << a_box->stats().depth
+              << ",dropped=" << stats.dropped_unsolicited - dropped_before
+              << ",active_driver_demands=" << stats.driver_demands
+              << ",consumer_interests=" << stats.consumer_interests
+              << ",client_b_driver=active\n";
+
+    b_driver.release();
+    {
+        std::lock_guard<std::mutex> lock(handler_mutex);
+        release_handler = true;
+        handler_changed.notify_all();
+    }
+    loop_owner.join();
+    if (loop_error)
+        std::rethrow_exception(loop_error);
+    Item second;
+    check(a_box->tryPop(second) == Pop::Item && second.value == 102,
+          "A's consumer did not receive the retained second update");
+    check(a_box->tryPop(second) == Pop::Timeout,
+          "A's second update was retained or delivered more than once");
+    check(engine.setConsumerInterest(1, false),
+          "could not release A's loop consumer interest");
+    check(engine.stats().consumer_interests == 0,
+          "consumer interest remained after loop completion");
+    check(engine.waitForIdle(Ms(2000)), "receiver did not idle after handler probe");
+    engine.detachOwner(owner);
+}
+
+static void oneShotAndManagedDemand()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(20));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 1; }).second;
+    Item item;
+    item.value = 7;
+    box->publish(std::move(item));
+    const auto local_start = Clock::now();
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 7,
+          "zero-timeout receive did not inspect the local mailbox");
+    check(source->callCount() == 0 && Clock::now() - local_start < Ms(100),
+          "local zero-timeout receive waited for the worker");
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Timeout,
+          "empty zero-timeout receive did not return immediately");
+    source->awaitCalls(1);
+    check(engine.waitForIdle(Ms(2000)), "one-shot did not complete");
+    check(engine.stats().pending_one_shots == 0 && engine.stats().active_demands == 0,
+          "one-shot demand remained active");
+
+    auto one_shot_box = engine.createClient(owner, [] { return 2; }).second;
+    source->pause();
+    const auto before_one_shot_item = engine.stats().received;
+    check(engine.receiveMailbox(2, *one_shot_box, 0, item) == Pop::Timeout,
+          "one-shot client did not return immediately");
+    source->awaitPause("one-shot did not enter the source gate");
+    source->push(2, 88);
+    source->release();
+    check(engine.waitForReceived(before_one_shot_item + 1, Ms(2000)),
+          "one-shot update was not acquired asynchronously");
+    check(one_shot_box->stats().depth == 1 &&
+              one_shot_box->tryPop(item) == Pop::Item && item.value == 88,
+          "unsolicited update for the one-shot client was not retained");
+    check(engine.waitForIdle(Ms(2000)), "one-shot item did not return receiver to idle");
+
+    // Two in-flight Future/Task requests keep only acquisition active. Their
+    // payloads remain in C++ mailbox after the worker releases that demand.
+    check(engine.admitSend(ledger, 1, false, 101), "first managed request rejected");
+    engine.endSend(1, false, 101, true);
+    check(engine.admitSend(ledger, 1, false, 102), "second managed request rejected");
+    engine.endSend(1, false, 102, true);
+    check(engine.requestOneShot(1), "one-shot under active request demand rejected");
+    auto demand_stats = engine.stats();
+    check(demand_stats.active_demands == 3 && demand_stats.request_demands == 2 &&
+              demand_stats.one_shot_demands == 1,
+          "managed and one-shot demand was not accounted separately");
+    source->push(1, 1010, false, 101);
+    source->push(1, 1020, false, 102);
+    check(engine.waitForIdle(Ms(2000)), "managed response demand outlived mailbox deposit");
+    demand_stats = engine.stats();
+    check(box->stats().depth == 2 && demand_stats.active_demands == 0 &&
+              demand_stats.request_demands == 0,
+          "acquired managed results retained receive demand before owner dispatch");
+    check(box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 1010,
+          "first managed result not deposited");
+    check(box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 1020,
+          "second managed result not deposited");
+
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Timeout,
+          "second one-shot after idle did not return nil-equivalent");
+    source->awaitCalls(4);
+    check(engine.waitForIdle(Ms(2000)), "second one-shot did not complete after idle");
+    const auto response_start = Clock::now();
+    source->push(1, 1030);
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Timeout,
+          "periodic zero-timeout call did not return before async receive");
+    source->awaitCalls(5);
+    check(engine.waitForIdle(Ms(2000)), "async one-shot with an item did not complete");
+    check(box->stats().depth == 1,
+          "asynchronous one-shot result was not deposited before owner dispatch");
+    std::cout << "demand_one_shot_response_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     Clock::now() - response_start).count()
+              << '\n';
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 1030,
+          "later zero-timeout call did not observe the async result");
+    engine.detachOwner(owner);
+}
+
+static void pendingPollTaskDoesNotRetainUnsolicited()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    auto a_box = engine.createClient(owner, [] { return 1; }).second;
+    engine.createClient(owner, [] { return 2; });
+
+    check(engine.admitSend(ledger, 1, false, 701),
+          "pending poll callback dependency was not admitted");
+    engine.endSend(1, false, 701, true);
+
+    // poll(callback) holds consumer interest for its C call. Once it returns a
+    // pending Task, only the callback's managed request remains as demand.
+    check(engine.setConsumerInterest(1, true),
+          "poll consumer interest was not acquired");
+    check(engine.setConsumerInterest(1, false),
+          "poll consumer interest was not released on return");
+    auto b_driver = engine.acquireDriver(2);
+    const auto pending_stats = engine.stats();
+    check(pending_stats.driver_demands == 1 && pending_stats.request_demands == 1 &&
+              pending_stats.consumer_interests == 0,
+          "pending Task was confused with active consumer interest");
+
+    const auto received_before_update = pending_stats.received;
+    const auto dropped_before_update = pending_stats.dropped_unsolicited;
+    const auto depth_before_update = pending_stats.depth;
+    source->push(1, 801);
+    check(engine.waitForReceived(received_before_update + 1, Ms(2000)),
+          "shared receiver did not acquire A's unsolicited update");
+    const auto unsolicited_stats = engine.stats();
+    check(unsolicited_stats.dropped_unsolicited == dropped_before_update + 1 &&
+              unsolicited_stats.depth == depth_before_update && a_box->stats().depth == 0,
+          "pending PollTask incorrectly retained a later unsolicited update");
+
+    source->push(1, 702, false, 701);
+    check(engine.waitForReceived(received_before_update + 2, Ms(2000)),
+          "managed response for pending PollTask was not acquired");
+    const auto response_stats = engine.stats();
+    check(response_stats.dropped_unsolicited == dropped_before_update + 1 &&
+              response_stats.request_demands == 0 && a_box->stats().depth == 1,
+          "managed response did not remain available after Task acquisition");
+
+    auto a_driver = engine.acquireDriver(1);
+    Item item;
+    check(engine.receiveMailbox(1, *a_box, 0, item) == Pop::Item &&
+              item.request_id == 701 && item.value == 702,
+          "owner could not later dispatch the managed response exactly once");
+    check(engine.receiveMailbox(1, *a_box, 0, item) == Pop::Timeout,
+          "managed response was delivered more than once");
+    a_driver.release();
+    b_driver.release();
+    check(engine.waitForIdle(Ms(2000)) &&
+              engine.stats().consumer_interests == 0,
+          "pending poll probe left demand or consumer interest active");
+    std::cout << "pending_poll_task,task=pending_then_dispatched"
+              << ",pending_driver_demands=" << pending_stats.driver_demands
+              << ",pending_request_demands=" << pending_stats.request_demands
+              << ",pending_consumer_interests=" << pending_stats.consumer_interests
+              << ",pending_mailbox_depth=" << pending_stats.depth
+              << ",after_update_mailbox_depth=" << unsolicited_stats.depth
+              << ",after_update_dropped="
+              << unsolicited_stats.dropped_unsolicited - dropped_before_update
+              << ",after_response_request_demands=" << response_stats.request_demands
+              << ",after_response_mailbox_depth=" << response_stats.depth << '\n';
+    engine.detachOwner(owner);
+}
+
+static void handlerOnlyPrefilterAndResponseClassification()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    ledger.registerClient(2);
+    const auto generic_box = engine.createClient(owner, [] { return 2; }).second;
+
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true),
+          "handler metadata registration failed");
+    check(engine.setConsumerInterest(2, true, true),
+          "second client's generic interest was not registered");
+    auto generic_demand = engine.acquireDriver(2);
+    const auto inactive_before = engine.stats();
+    source->push(1, 10, false, 0, "updateNewMessage");
+    source->push(2, 20, false, 0, "updateDeleteMessage");
+    check(engine.waitForReceived(inactive_before.received + 2, Ms(2000)) &&
+              engine.waitForClassified(inactive_before.published +
+                                           inactive_before.dropped_unsolicited + 2,
+                                       Ms(2000)),
+          "shared worker did not classify inactive and generic client updates");
+    auto inactive_stats = engine.stats();
+    Item item;
+    check(box->stats().depth == 0 && generic_box->stats().depth == 1 &&
+              inactive_stats.dropped_by_handler_filter == 0 &&
+              inactive_stats.dropped_unsolicited == 1,
+          "handler registration without a driver retained an inactive client's update");
+    check(generic_box->tryPop(item) == Pop::Item && item.value == 20,
+          "generic client did not retain its unsolicited update independently");
+    check(engine.setConsumerInterest(2, false, true),
+          "second client's generic interest release failed");
+    generic_demand.release();
+
+    check(engine.setConsumerInterest(1, true, false),
+          "handler-only consumer interest was not registered");
+    auto demand = engine.acquireDriver(1);
+    const auto before = engine.stats();
+    source->push(1, 1, false, 0, "updateNewMessage");
+    source->push(1, 2, false, 0, "updateDeleteMessage");
+    check(engine.waitForReceived(before.received + 2, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 2,
+                                       Ms(2000)),
+          "handler-only worker did not classify both updates");
+    auto stats = engine.stats();
+    check(box->stats().depth == 1 && stats.dropped_by_handler_filter == 1,
+          "handler-only prefilter retained an unregistered update");
+    check(box->tryPop(item) == Pop::Item && item.value == 1,
+          "handler-only prefilter lost the selected update");
+
+    check(engine.setConsumerInterest(1, true, true),
+          "concurrent generic interest failed");
+    const auto generic_before = engine.stats();
+    source->push(1, 3, false, 0, "updateDeleteMessage");
+    check(engine.waitForReceived(generic_before.received + 1, Ms(2000)) &&
+              engine.waitForClassified(generic_before.published +
+                                           generic_before.dropped_unsolicited + 1,
+                                       Ms(2000)),
+          "generic consumer update was not acquired");
+    check(box->stats().depth == 1,
+          "generic consumer did not disable destructive handler filtering");
+    check(engine.setConsumerInterest(1, false, true),
+          "generic interest release failed");
+    check(engine.setConsumerInterest(1, false, false),
+          "handler-only interest release failed");
+    demand.release();
+
+    auto submit = [&](std::uint64_t id, bool close,
+                      tdlua::ResponseClass response_class) {
+        check(engine.admitSend(ledger, 1, close, id, response_class),
+              "classified request admission failed");
+        ledger.endSend(1, close, true);
+        engine.endSend(1, close, id, true);
+    };
+    submit(101, false, tdlua::ResponseClass::GenericRaw);
+    submit(102, false, tdlua::ResponseClass::ManagedProtected);
+    submit(103, true, tdlua::ResponseClass::GenericRaw);
+    const auto classified_before = engine.stats();
+    source->push(1, 101, false, 101);
+    source->push(1, 102, false, 102);
+    source->push(1, 103, false, 103);
+    source->push(1, 104, false, 999);
+    check(engine.waitForReceived(classified_before.received + 4, Ms(2000)) &&
+              engine.waitForClassified(classified_before.published +
+                                           classified_before.dropped_unsolicited + 4,
+                                       Ms(2000)),
+          "classified replies did not arrive");
+    stats = engine.stats();
+    check(stats.generic_raw == 2 && stats.managed_protected == 1 &&
+              stats.lifecycle_objects == 1 && stats.unknown_correlated == 1,
+          "raw, managed, lifecycle, or unknown correlation was misclassified");
+    check(box->stats().depth == 5,
+          "classified raw/managed/lifecycle replies were not all preserved");
+    check(box->tryPop(item) == Pop::Item && item.value == 3 &&
+              item.response_class == tdlua::ResponseClass::GenericRaw,
+          "generic update did not retain its generic response class");
+    for (const auto expected : {
+             std::make_pair(101, tdlua::ResponseClass::GenericRaw),
+             std::make_pair(102, tdlua::ResponseClass::ManagedProtected),
+             std::make_pair(103, tdlua::ResponseClass::Lifecycle),
+             std::make_pair(104, tdlua::ResponseClass::GenericRaw)}) {
+        check(box->tryPop(item) == Pop::Item && item.value == expected.first &&
+                  item.response_class == expected.second,
+              "response class was not carried with the mailbox object");
+    }
+    engine.detachOwner(owner);
+}
+
+static void handlerMetadataLinearizesAtPublication()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    unsigned arrivals = 0;
+    unsigned released = 0;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        const unsigned ticket = ++arrivals;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return released >= ticket; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    check(engine.setConsumerInterest(1, true, false),
+          "handler-only consumer was not activated");
+    auto demand = engine.acquireDriver(1);
+    auto waitArrival = [&](unsigned ticket) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return arrivals >= ticket; }),
+              "worker did not reach publication gate");
+    };
+    auto release = [&](unsigned ticket) {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        released = ticket;
+        gate_changed.notify_all();
+    };
+
+    check(engine.setHandlerRegistered(1, "updateExample", true),
+          "handler registration before classification failed");
+    const auto first = engine.stats();
+    source->push(1, 1, false, 0, "updateExample");
+    waitArrival(1);
+    check(engine.setHandlerRegistered(1, "updateExample", false),
+          "handler removal while publishing failed");
+    release(1);
+    check(engine.waitForReceived(first.received + 1, Ms(2000)) &&
+              engine.waitForClassified(first.published + first.dropped_unsolicited + 1,
+                                       Ms(2000)),
+          "first object did not finish publication");
+    check(box->stats().depth == 0,
+          "handler removed before publication still selected the object");
+
+    check(engine.setHandlerRegistered(1, "updateExample", true),
+          "handler re-registration failed");
+    const auto second = engine.stats();
+    source->push(1, 2, false, 0, "updateExample");
+    waitArrival(2);
+    release(2);
+    check(engine.waitForReceived(second.received + 1, Ms(2000)) &&
+              engine.waitForClassified(second.published + second.dropped_unsolicited + 1,
+                                       Ms(2000)),
+          "selected object did not finish publication");
+    check(engine.setHandlerRegistered(1, "updateExample", false),
+          "handler removal after publication failed");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 2,
+          "later off() retroactively removed an already published object");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
+static void lifecycleDemandAndConcurrentLeases()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 1; }).second;
+    check(engine.admitSend(ledger, 1, true, 201), "close request admission failed");
+    engine.endSend(1, true, 201, true);
+    auto demand_stats = engine.stats();
+    check(demand_stats.active_demands == 2 && demand_stats.request_demands == 1 &&
+              demand_stats.lifecycle_demands == 1,
+          "close and response demand were not separated");
+    engine.forget(1, true);
+    check(engine.stats().active_demands == 2, "GC dropped in-flight shutdown demand");
+    source->push(1, 0, true, 0);
+    check(engine.waitForState(State::Running, Ms(1000)), "lifecycle receiver not running");
+    check(engine.waitForIdle(Ms(2000)), "terminal did not release lifecycle demand");
+    Item item;
+    check(box->tryPop(item) == Pop::Closed, "orphan terminal mailbox was not closed");
+
+    auto concurrent_box = engine.createClient(owner, [] { return 2; }).second;
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                for (int n = 0; n < 100; ++n) {
+                    auto lease = engine.acquireDriver(2);
+                    if (!lease) throw std::runtime_error("concurrent lease rejected");
+                    if (((i + n) & 1) == 0) lease.release();
+                }
+            } catch (...) { failed.store(true); }
+        });
+    }
+    for (auto &thread : threads) thread.join();
+    check(!failed.load(), "concurrent lease acquire/release failed");
+    check(engine.waitForIdle(Ms(2000)) && engine.stats().active_demands == 0,
+          "concurrent leases leaked demand");
+    check(engine.stats().generation == 1, "lease contention restarted shared worker");
+    engine.detachOwner(owner);
+}
+
+static void detachedOwnerPreservesCloseLifecycle()
+{
+    auto source = std::make_shared<Fake>();
+    source->pause();
+    Engine engine(source, Ms(10));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner_a = engine.attachOwner();
+    const auto owner_b = engine.attachOwner();
+    engine.createClient(owner_a, [] { return 1; });
+    source->terminal_acknowledge = [&](int id) {
+        ledger.observe(id, true);
+        ledger.acknowledgeTerminal(id);
+    };
+
+    check(engine.admitSend(ledger, 1, false, 301),
+          "ordinary request admission failed before detach");
+    ledger.endSend(1, false, true);
+    engine.endSend(1, false, 301, true);
+    check(engine.admitSend(ledger, 1, true, 302),
+          "close admission failed before detach");
+    ledger.endSend(1, true, true);
+    engine.endSend(1, true, 302, true);
+    source->awaitPause("delayed close did not gate the global receive");
+
+    const auto before = engine.stats();
+    check(before.request_demands == 2 && before.lifecycle_demands == 1 &&
+              before.active_demands == 3,
+          "ordinary and close demand were not represented before detach");
+    engine.detachOwner(owner_a);
+    const auto detached = engine.stats();
+    check(detached.request_demands == 0 && detached.driver_demands == 0 &&
+              detached.lifecycle_demands == 1 && detached.active_demands == 1 &&
+              detached.tombstones == 1,
+          "owner detach discarded required lifecycle demand or retained ordinary demand");
+
+    source->push(1, 900, true);
+    source->release();
+    source->awaitTerminalAck(1);
+    check(engine.waitForIdle(Ms(2000)),
+          "terminal publication did not release the orphan lifecycle demand");
+    const auto after = engine.stats();
+    const auto cleanup = ledger.stats();
+    check(after.lifecycle_demands == 0 && after.active_demands == 0 &&
+              after.tombstones == 0 && after.clients == 0,
+          "terminal did not retire detached-owner tombstone");
+    check(cleanup.remaining == 0 && cleanup.records == 0,
+          "terminal acknowledgement did not retire cleanup ledger record");
+
+    engine.detachOwner(owner_b);
+
+    auto last_source = std::make_shared<Fake>();
+    last_source->pause();
+    Engine last_owner_engine(last_source, Ms(10));
+    FailureCleanup incomplete_cleanup;
+    incomplete_cleanup.registerClient(9);
+    const auto last_owner = last_owner_engine.attachOwner();
+    last_owner_engine.createClient(last_owner, [] { return 9; });
+    check(last_owner_engine.admitSend(incomplete_cleanup, 9, true, 901),
+          "last-owner close admission failed");
+    incomplete_cleanup.endSend(9, true, true);
+    last_owner_engine.endSend(9, true, 901, true);
+    last_source->awaitPause("last-owner close did not enter receive");
+    std::thread detach([&] { last_owner_engine.detachOwner(last_owner); });
+    check(last_owner_engine.waitForState(State::Stopping, Ms(2000)),
+          "last owner did not publish stop while close was pending");
+    check(last_owner_engine.stats().active_demands == 0,
+          "last-owner stop retained lifecycle demand");
+    last_source->release();
+    detach.join();
+    check(last_owner_engine.stats().state == State::Stopped &&
+              !last_owner_engine.stats().joinable,
+          "last-owner close did not retain stop/join behavior");
+    check(incomplete_cleanup.stats().records == 1 &&
+              incomplete_cleanup.stats().remaining == 1,
+          "last-owner detach falsely acknowledged incomplete cleanup");
+}
+
+static void receiveLeaseEndsBeforeDispatch()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10));
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 1; }).second;
+    source->push(1, 77);
+    Item item;
+    check(engine.receiveMailbox(1, *box, 1.0, item) == Pop::Item && item.value == 77,
+          "positive receive did not acquire the queued item");
+    const auto received = engine.stats();
+    check(received.driver_demands == 0 && received.active_demands == 0,
+          "receive driver lease escaped the mailbox wait into owner dispatch");
+    check(engine.waitForIdle(Ms(2000)),
+          "receiver did not return to idle after receive lease release");
+    engine.detachOwner(owner);
+}
+
+static void idleStopJoinAndRestart()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10));
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 1; }).second;
+    auto first = engine.acquireDriver(1);
+    source->awaitCalls(1);
+    first.release();
+    check(engine.waitForIdle(Ms(2000)), "first worker generation did not idle");
+
+    std::vector<std::thread> joiners;
+    for (int i = 0; i < 8; ++i)
+        joiners.emplace_back([&] { engine.stopAndJoin(); });
+    for (auto &thread : joiners) thread.join();
+    check(engine.stats().state == State::Stopped && !engine.stats().joinable,
+          "concurrent idle stop/join did not join once");
+
+    auto restarted = engine.acquireDriver(1);
+    source->awaitCalls(2);
+    check(engine.stats().generation == 2,
+          "new demand after stop/join did not start one worker generation");
+    source->push(1, 99);
+    Item item;
+    check(box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 99,
+          "restarted worker did not deliver response");
+    restarted.release();
+    check(engine.waitForIdle(Ms(2000)), "restarted worker failed to return to idle");
+    engine.detachOwner(owner);
 }
 
 static void metrics()
@@ -279,6 +1069,7 @@ static void metrics()
         const auto calls = engine.stats().receive_calls;
         auto owner = engine.attachOwner();
         engine.createClient(owner, [&] { return ++next; });
+        auto demand = engine.acquireDriver(next);
         source->awaitCalls(calls + 1);
         const auto start = Clock::now();
         engine.detachOwner(owner);
@@ -299,6 +1090,7 @@ static void sourceFailureAndEnqueueStop()
     Engine failed(source, Ms(5));
     const auto owner = failed.attachOwner();
     auto box = failed.createClient(owner, [] { return 1; }).second;
+    auto failed_demand = failed.acquireDriver(1);
     Item item;
     check(box->popUntil(Clock::now() + Ms(2000), item) == Pop::Failed,
           "source failure not notified");
@@ -319,6 +1111,7 @@ static void sourceFailureAndEnqueueStop()
     Engine engine(source, Ms(5), hooks);
     const auto other = engine.attachOwner();
     auto live = engine.createClient(other, [] { return 2; }).second;
+    auto demand = engine.acquireDriver(2);
     source->push(2, 10);
     {
         std::unique_lock<std::mutex> lock(mutex);
@@ -337,8 +1130,9 @@ static void sourceFailureAndEnqueueStop()
     stopper.join();
     closer.join();
     engine.detachOwner(other);
-    check(live->tryPop(item) == Pop::Closed && engine.stats().abandoned == 1,
-          "in-flight item not accounted on close");
+    check(live->tryPop(item) == Pop::Closed &&
+              engine.stats().dropped_unsolicited == 1,
+          "in-flight unsolicited item not accounted on close");
 }
 
 static void spuriousWakeupAndSelfJoin(bool external_join)
@@ -377,6 +1171,7 @@ static void spuriousWakeupAndSelfJoin(bool external_join)
     engine_ptr = &engine;
     const auto owner = engine.attachOwner();
     auto mailbox = engine.createClient(owner, [] { return 1; }).second;
+    auto demand = engine.acquireDriver(1);
     source->push(1, 1);
     std::thread coordinator;
     if (external_join) {
@@ -417,6 +1212,7 @@ static void moveOnlyRuntime()
     Runtime<std::unique_ptr<int>> engine(std::make_shared<MoveSource>(), Ms(5));
     const auto owner = engine.attachOwner();
     auto box = engine.createClient(owner, [] { return 1; }).second;
+    auto demand = engine.acquireDriver(1);
     Envelope<std::unique_ptr<int>> item;
     check(box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && *item.value == 99,
           "runtime did not move exclusive payload ownership");
@@ -470,6 +1266,17 @@ int main(int argc, char **)
         fifoAndWakeup();
         tombstoneRestartAndJoin();
         independentConsumersAndCreateDuringStop();
+        demandIdleAndReactivation();
+        independentDemandAndReceiveInFlight();
+        retentionDuringBlockedHandler();
+        oneShotAndManagedDemand();
+        pendingPollTaskDoesNotRetainUnsolicited();
+        handlerOnlyPrefilterAndResponseClassification();
+        handlerMetadataLinearizesAtPublication();
+        lifecycleDemandAndConcurrentLeases();
+        detachedOwnerPreservesCloseLifecycle();
+        receiveLeaseEndsBeforeDispatch();
+        idleStopJoinAndRestart();
         sourceFailureAndEnqueueStop();
         spuriousWakeupAndSelfJoin(false);
         spuriousWakeupAndSelfJoin(true);
