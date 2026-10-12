@@ -3,7 +3,7 @@
 
 # Changelog
 
-## 0.5 (unreleased)
+## 0.5.0
 
 ### Threaded receive and lifecycle
 
@@ -53,7 +53,7 @@
   use Full Managed. The local validation matrix passed both backends on all
   six profiles; other platforms remain unverified.
 - TDLib upstream findings and `CleanupIncomplete` limits remain unresolved.
-  The v0.5 work does not claim to resolve them.
+  The v0.5.0 work does not claim to resolve them.
 
 ## 0.4
 

@@ -4,12 +4,9 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-The `vnext-threading` branch contains the unreleased v0.5 work. A C++ worker
-receives TDLib objects into per-client FIFO mailboxes. It never calls Lua;
-callbacks, managed requests and coroutine resumption stay on the thread that
-owns the Lua VM.
+TDLua uses a multithreaded architecture with a dedicated C++ receiver worker and per-client FIFO mailboxes. All Lua interactions, including callbacks, managed request handling, and coroutine resumption, are confined to the Lua VM's owning thread.
 
-The v0.5 build requires Linux x86_64 with glibc and an ELF loader that honors
+The v0.5.0 build requires Linux x86_64 with glibc and an ELF loader that honors
 `NODELETE`. Dynamic unloading is unsupported.
 
 ## Installation
@@ -118,7 +115,7 @@ cmake --build build-luajit --target tdlua
 Add `-DTDLUA_BACKEND=native` for the native backend. Non-default installations
 can supply matching `LUA_INCLUDE_DIR` and `LUA_LIBRARY` paths. LuaJIT modules
 install under the Lua 5.1 ABI directory. For LuaRocks, use
-`tdlua-luajit-0.4.0-1.rockspec` or `tdlua-luajit-scm-1.rockspec` with a LuaRocks
+`tdlua-luajit-0.5.0-1.rockspec` or `tdlua-luajit-scm-1.rockspec` with a LuaRocks
 installation configured for LuaJIT. These separate packages require the
 runtime-provided `luajit` dependency as well as the Lua 5.1 ABI; they do not
 claim stock Lua 5.1 support. They install the same `tdlua` module, so choose one
@@ -134,7 +131,7 @@ while `2^53 + 1` and `INT64_MAX` are native strings. No FFI/cdata representation
 is required. On Lua 5.3+, use Lua integers or decimal strings for int64 inputs;
 explicit floats become JSON floats, which TDLib rejects for these fields.
 
-The validated v0.5 build target is Linux x86_64 with glibc. The local test
+The validated v0.5.0 build target is Linux x86_64 with glibc. The local test
 matrix passed both backends on Lua 5.1, 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1.
 Those results apply to the tested source revision; other platforms and Lua
 builds remain unverified.
@@ -336,8 +333,7 @@ client teardown remain observable through a retained Task handle and do not
 become scheduler errors when the Task is discarded.
 
 Precompiled binaries may be available from [@tdlua](https://t.me/tdlua).
-Check each binary's release, backend and Lua ABI before use. Those artifacts
-are not a v0.5 package announcement.
+Check each binary's release, backend and Lua ABI before use.
 
 VoIP bindings are currently not part of the native or JSON backend.
 
