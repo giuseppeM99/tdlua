@@ -39,6 +39,7 @@ using Envelope = tdlua::receiver::Envelope<NativeResponse>;
 std::mutex test_mutex;
 std::condition_variable test_changed;
 bool test_paused = false, test_entered = false, cleanup_paused = false, cleanup_entered = false;
+std::uint64_t test_terminal_acks = 0, test_waited_terminal_acks = 0;
 std::atomic<bool> test_hold_terminal{false};
 std::atomic<int> test_fault_before{0}, test_fault_after{0}, test_fault_create{0};
 std::atomic<int> test_fault_send{0};
@@ -81,7 +82,11 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
     {
         ledger_->acknowledgeTerminal(id);
 #ifdef TDLUA_TESTING
-        testNotify();
+        {
+            std::lock_guard<std::mutex> lock(test_mutex);
+            ++test_terminal_acks;
+            test_changed.notify_all();
+        }
 #endif
     }
     bool receive(std::chrono::milliseconds timeout, Envelope &item) override
@@ -407,6 +412,16 @@ extern "C" int tdlua_native_test_control(int action)
         return test_changed.wait_for(lock, std::chrono::seconds(3), [] { return cleanup_entered; })
                    ? 1
                    : 0;
+    case 13:
+        if (!test_changed.wait_for(lock, std::chrono::seconds(3), [] {
+                return test_terminal_acks > test_waited_terminal_acks;
+            }))
+            return 0;
+        ++test_waited_terminal_acks;
+        return 1;
+    case 14:
+        test_waited_terminal_acks = test_terminal_acks;
+        return 1;
     case 11:
         test_fault_create.store(1);
         break;

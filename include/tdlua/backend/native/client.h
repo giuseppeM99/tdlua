@@ -24,12 +24,16 @@ public:
     NativeResponse receive(double timeout);
     NativeResponse receiveBackend(double timeout);
     bool pump(double timeout);
+    bool pumpWithPolicy(double timeout, bool discard_unobserved_raw);
     using PumpValue = NativeResponse;
     bool hasUndispatchedPumpItem() const;
+    bool hasUndispatchedPumpItem(bool discard_unobserved_raw) const;
     PumpValue popPumpItem();
     PumpValue receivePumpItem(double timeout);
     bool isValidPumpItem(const PumpValue &response) const;
     tdlua::RouteKind dispatchPumpItem(PumpValue &response);
+    tdlua::RouteKind dispatchPumpItem(PumpValue &response,
+                                      bool discard_unobserved_raw);
     void preservePumpItem(PumpValue &response);
     void drainPump();
     using Transport = tdlua::Transport<td::td_api::object_ptr<td::td_api::Function>, NativeResponse>;
@@ -49,7 +53,10 @@ public:
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
 
-    tdlua::RouteKind dispatch(NativeResponse &response, bool managed_receive = false);
+    tdlua::RouteKind dispatch(NativeResponse &response,
+                              bool managed_receive = false);
+    tdlua::RouteKind dispatch(NativeResponse &response, bool managed_receive,
+                              bool discard_unobserved_raw);
     NativeDispatcher &dispatcher();
     void push(NativeResponse response);
     NativeResponse pop();

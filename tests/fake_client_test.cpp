@@ -222,8 +222,6 @@ void testResponses(lua_State *L, Fake &fake)
     fake.incoming.push_back({{"@type", "updateOption"}, {"name", "fake"}});
 
     runLua(L,
-           "c:receive(0); "
-           "c:receive(0); "
            "local update = c:receive(0); "
            "assert(received[1]._request_id == b and "
            "received[2]._request_id == a); "
@@ -290,7 +288,7 @@ void testResponses(lua_State *L, Fake &fake)
     fake.before_receive = {};
     fake.auto_response = false;
     runLua(L,
-           "assert(type(c:receive(0)) == 'table'); "
+           "assert(c:receive(0) == nil); "
            "managed_future = nil; collectgarbage('collect')");
 
     const auto coroutine_sends_before = fake.sent.size();
@@ -655,7 +653,7 @@ void testRollbackAndCallbackErrors(lua_State *L, TDLua *client, Fake &fake)
     fake.response(fake.sent.back().first, 9);
     runLua(L,
            "local ok, error_message = pcall(c.receive, c, 0); "
-           "assert(not ok and error_message:find('fake callback boom')); assert(c:receive(0).value==9)");
+           "assert(not ok and error_message:find('fake callback boom')); assert(c:receive(0)==nil)");
 
     runLua(L,
            "legacy_order_event = false; "
@@ -688,7 +686,7 @@ void testHandlers(lua_State *L, Fake &fake)
     runLua(L,
            "local ok, error_message = pcall(c.receive, c, 0); "
            "assert(not ok and error_message:find('fake handler boom')); "
-           "c.onUpdateOption = nil; assert(c:receive(0).name=='fake')");
+           "c.onUpdateOption = nil; assert(c:receive(0)==nil)");
 
     runLua(L,
            "old_handler_calls = 0; new_handler_calls = 0; "
@@ -711,7 +709,7 @@ void testHandlers(lua_State *L, Fake &fake)
     fake.response(handler_replace_id, 110);
     runLua(L,
            "c:receive(0); assert(handler_replace_task:wait() == 110 and "
-           "old_handler_calls == 0 and new_handler_calls == 1); "
+           "old_handler_calls == 0 and new_handler_calls == 0); "
            "c:off('testInt')");
 
     runLua(L,
@@ -725,7 +723,7 @@ void testHandlers(lua_State *L, Fake &fake)
     fake.response(deferred_rebind_id, 111);
     runLua(L,
            "c:receive(0); assert(deferred_rebind_task:ready()); "
-           "assert(deferred_old == 0 and deferred_new == 1); c:off('testInt')");
+           "assert(deferred_old == 0 and deferred_new == 0); c:off('testInt')");
 
     runLua(L,
            "deferred_drop = 0; "
@@ -844,7 +842,7 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
     runLua(L,
            "local ok, message = pcall(function() c:receive(0) end); "
            "assert(not ok and message:find('m3 handler error 51')); "
-           "assert(m3_after_error == 2); assert(c:receive(0).value==51)");
+           "assert(m3_after_error == 2); assert(c:receive(0)==nil)");
 
     runLua(L,
            "false_result_seen = false; "
@@ -900,7 +898,6 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
     const auto close_dependency_request = second.sent.back().first;
     runLua(L, R"lua(
         close_handle=e:close(); assert(not e:isClosed())
-        assert(e:receive(0)._=='ok')
         assert(e:receive(0).authorization_state._=='authorizationStateClosing')
         assert(e:receive(0)._=='shutdownProgress')
         terminal=e:receive(0)
@@ -920,9 +917,9 @@ void testEventScheduling(lua_State *L, Fake &fake, Fake &second, TestTransports 
            "  f:close(); reentrant_close_called = true end)");
     reentrant_close_transport.update("m3ReentrantClose", 1);
     runLua(L,
-           "f:receive(0); assert(reentrant_close_called and not f:isClosed()); "
-           "assert(f:receive(0)._ == 'ok'); "
-           "assert(f:receive(0).authorization_state._ == 'authorizationStateClosing'); "
+           "local closing=f:receive(0); "
+           "assert(reentrant_close_called and not f:isClosed()); "
+           "assert(closing.authorization_state._ == 'authorizationStateClosing'); "
            "assert(f:receive(0)._ == 'shutdownProgress'); "
            "local terminal=f:receive(0); "
            "assert(terminal.authorization_state._ == 'authorizationStateClosed' "
@@ -1000,7 +997,7 @@ void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second, TestTra
     const auto running_id = second.sent.back().first;
     second.response(running_id, 106);
     runLua(L,
-           "assert(d:receive(0).value == 106); "
+           "d:receive(0); "
            "local first, second = running_task:wait(); "
            "assert(first == 106 and second == 123 and running_task:ready()); "
            "c = nil; d = nil; "
@@ -1121,7 +1118,7 @@ void testLifetimeAndAbandonment()
                "  r = nil; collectgarbage('collect') end); "
                "assert(coroutine.resume(close_waiter)); r:close(); "
                "assert(coroutine.status(close_waiter) == 'suspended'); "
-               "r:receive(0); r:receive(0); r:receive(0); r:receive(0); "
+               "r:receive(0); r:receive(0); r:receive(0); "
                "assert(coroutine.status(close_waiter) == 'dead')");
 
         runLua(L,
@@ -1292,6 +1289,94 @@ void testManagedDrivers(lua_State *L, TestTransports &transports, bool fail_afte
     runLua(L, R"lua(
         assert(wait_future:wait().value==93)
         assert(c:receive(0)._request_id==wait_raw and c:receive(0)==nil)
+    )lua");
+
+    runLua(L, "poll_saved_raw=c:send{_='getMe'}; poll_saved_future=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 94);
+    fake.response(fake.sent.back().first, 95);
+    runLua(L, R"lua(
+        assert(poll_saved_future:wait().value==95)
+        local saved=c:poll()
+        assert(saved._request_id==poll_saved_raw and saved.value==94)
+        assert(c:receive(0)==nil)
+    )lua");
+
+    runLua(L, "loop_saved_raw=c:send{_='getMe'}; loop_saved_future=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 96);
+    fake.response(fake.sent.back().first, 97);
+    runLua(L, R"lua(
+        assert(loop_saved_future:wait().value==97)
+        loop_saved_seen=0
+        c:loop(function(value)
+            assert(value._request_id==loop_saved_raw and value.value==96)
+            loop_saved_seen=loop_saved_seen+1
+            return false
+        end)
+        assert(loop_saved_seen==1 and c:receive(0)==nil)
+    )lua");
+
+    // poll() and loop(callback) share generic visibility with receive(). Raw
+    // replies are delivered once, while managed replies stay on their handle.
+    runLua(L, "poll_raw=c:send{_='getMe'}; poll_managed=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 101);
+    fake.response(fake.sent.back().first, 102);
+    runLua(L, R"lua(
+        local raw=c:poll(); assert(raw._request_id==poll_raw and raw.value==101)
+        assert(poll_managed:wait().value==102 and c:receive(0)==nil)
+    )lua");
+
+    runLua(L, "callback_raw=c:send{_='getMe'}; callback_managed=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 103);
+    fake.response(fake.sent.back().first, 104);
+    runLua(L, R"lua(
+        loop_raw_seen=0
+        c:loop(function(value)
+            assert(value._request_id==callback_raw and value.value==103)
+            loop_raw_seen=loop_raw_seen+1
+            return false
+        end)
+        assert(loop_raw_seen==1 and callback_managed:wait().value==104)
+        assert(c:receive(0)==nil)
+    )lua");
+
+    runLua(L, "drop_raw=c:send{_='getMe'}; drop_managed=c:getMe()");
+    fake.response(fake.sent[fake.sent.size()-2].first, 105);
+    fake.response(fake.sent.back().first, 106);
+    runLua(L, R"lua(
+        c:loop()
+        assert(drop_managed:wait().value==106)
+        assert(c:receive(0)==nil)
+    )lua");
+
+    // A matching specific handler owns an update; generic receive/poll/loop
+    // must not see a second copy.
+    fake.update("owned_update", 107);
+    fake.update("generic_marker", 108);
+    runLua(L, R"lua(
+        owned_count=0
+        c:on('owned_update',function() owned_count=owned_count+1 end)
+        assert(c:poll(0)==nil and owned_count==1)
+        assert(c:receive(0)==nil)
+        c:loop(function(value)
+            assert(value._=='generic_marker' and value.value==108)
+            return false
+        end)
+        assert(owned_count==1)
+        c:off('owned_update')
+    )lua");
+
+    // Handler lookup happens at owner-thread dispatch. Removing the handler
+    // before the queued update is dispatched gives that update to the generic
+    // receive path exactly once.
+    fake.update("removed_update", 109);
+    runLua(L, R"lua(
+        removed_handler_calls=0
+        c:on('removed_update',function() removed_handler_calls=removed_handler_calls+1 end)
+        c:off('removed_update')
+        local removed=c:receive(0)
+        assert(removed._=='removed_update' and removed.value==109)
+        assert(c:receive(0)==nil and c:poll(0)==nil)
+        assert(removed_handler_calls==0)
     )lua");
 
     runLua(L, "raw = c:send{_='getMe'}; pending = c:getMe()");
@@ -1769,7 +1854,6 @@ void testTerminalShutdownLifecycle()
         fake.update("shutdownProgress", 9);
         fake.authorizationState("authorizationStateClosed");
         runLua(L, R"lua(
-            assert(c:receive(0)._=='ok')
             assert(c:receive(0).authorization_state._=='authorizationStateClosing')
             assert(c:receive(0)._=='shutdownProgress')
             local terminal=c:receive(0)

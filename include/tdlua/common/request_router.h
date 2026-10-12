@@ -41,7 +41,10 @@ enum class RequestKind {
 enum class RouteKind {
     Unknown,
     Update,
+    HandledUpdate,
     Raw,
+    GenericDelivered,
+    DroppedRaw,
     Future,
     TransientFuture,
     Task,
@@ -438,6 +441,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     // of the SchedulerCore lifetime.
     void *pump_context_ = nullptr;
     bool (*pump_)(void *, double) = nullptr;
+    bool (*managed_pump_)(void *, double, bool) = nullptr;
     bool draining_ = false;
     bool detach_after_drain_ = false;
     bool detach_after_drain_preserve_selected_ = false;
@@ -1464,6 +1468,7 @@ public:
     }
 #endif
     using Pump = bool (*)(void *, double);
+    using ManagedPump = bool (*)(void *, double, bool);
     explicit SchedulerCore(lua_State *L) : lua_owner_(tdlua_lua_main_thread(L))
     {
         ++liveSchedulerCores();
@@ -1476,7 +1481,19 @@ public:
         for (const auto &entry : notifications_) waitBindings().erase(entry.first);
         --liveSchedulerCores();
     }
-    void setPump(void *context, Pump pump) { pump_context_ = context; pump_ = pump; }
+    void setPump(void *context, Pump pump)
+    {
+        pump_context_ = context;
+        pump_ = pump;
+        managed_pump_ = nullptr;
+    }
+    void setManagedPump(void *context, ManagedPump pump)
+    {
+        pump_context_ = context;
+        managed_pump_ = pump;
+        pump_ = nullptr;
+    }
+    bool hasPump() const { return pump_ || managed_pump_; }
     std::uint64_t nextRequestId() { return next_++; }
     void observeRequestId(std::uint64_t id)
     {
@@ -1526,12 +1543,14 @@ public:
         return requested;
     }
 
-    bool pumpCurrentTransport(double wait)
+    bool pumpCurrentTransport(double wait, bool discard_unobserved_raw)
     {
         const bool previous = managed_driver_.pump_active;
         managed_driver_.pump_active = true;
         try {
-            const bool progressed = pump_(pump_context_, wait);
+            const bool progressed = managed_pump_
+                ? managed_pump_(pump_context_, wait, discard_unobserved_raw)
+                : pump_(pump_context_, wait);
             managed_driver_.pump_active = previous;
             return progressed;
         } catch (...) {
@@ -1563,7 +1582,7 @@ public:
         // A conforming transport blocks. This fallback also bounds a
         // spuriously empty fake/non-blocking transport without a zero-timeout
         // busy loop.
-        if (!progressed && pump_) {
+        if (!progressed && hasPump()) {
             std::this_thread::sleep_for(emptyPumpBackoff());
         }
     }
@@ -1571,7 +1590,8 @@ public:
     // Deadline-aware effect boundary shared by waits, poll and loop. Backend
     // pumps never consume their already-preserved raw response queue again.
     bool driveStep(double wait,
-                   const std::chrono::steady_clock::time_point *deadline = nullptr)
+                   const std::chrono::steady_clock::time_point *deadline = nullptr,
+                   bool discard_unobserved_raw = false)
     {
         if (managed_driver_.drive_active) return false;
         struct DrivingScope {
@@ -1580,18 +1600,19 @@ public:
             ~DrivingScope() { active = false; }
         } driving(managed_driver_.drive_active);
         tick();
-        if (!pump_) return false;
+        if (!hasPump()) return false;
         const auto dependencies = crossClientDependencies();
         wait = receiveBudget(wait, dependencies);
         if (deadline) {
             wait = std::min(wait, std::max(0.0, std::chrono::duration<double>(
                 *deadline - std::chrono::steady_clock::now()).count()));
         }
-        const bool progressed = pumpCurrentTransport(wait);
+        const bool progressed = pumpCurrentTransport(wait,
+                                                      discard_unobserved_raw);
         pumpCrossClientDependencies(dependencies, deadline);
         if (!deadline) {
             backoffAfterEmptyPump(progressed);
-        } else if (!progressed && pump_) {
+        } else if (!progressed && hasPump()) {
             const auto remaining = *deadline - std::chrono::steady_clock::now();
             if (remaining > std::chrono::steady_clock::duration::zero()) {
                 std::this_thread::sleep_for(std::min(remaining,
@@ -1623,7 +1644,26 @@ public:
 
     static bool shouldPreserveManagedPumpObject(RouteKind route)
     {
-        return route == RouteKind::Raw || route == RouteKind::Unknown;
+        return route == RouteKind::Raw;
+    }
+
+    bool hasGenericPumpConsumer() const
+    {
+        return managed_driver_.poll_selecting ||
+            (managed_driver_.loop_observer &&
+             !managed_driver_.loop_observer->stopped);
+    }
+
+    template<class Push> RouteKind dispatchPreservedGeneric(
+        Push push, bool discard_unobserved_raw = false)
+    {
+        if (managed_driver_.pump_active && hasGenericPumpConsumer()) {
+            observeManagedUpdate(push);
+            return RouteKind::GenericDelivered;
+        }
+        if (managed_driver_.pump_active && discard_unobserved_raw)
+            return RouteKind::DroppedRaw;
+        return RouteKind::Raw;
     }
 
     void beginUpdateConsumer()
@@ -1672,7 +1712,7 @@ public:
                                     : std::chrono::steady_clock::time_point::max();
         managed_driver_.poll_selecting = true;
         bool attempted = false;
-        while (managed_driver_.selected_update == LUA_NOREF && pump_) {
+        while (managed_driver_.selected_update == LUA_NOREF && hasPump()) {
             if (timed && attempted && std::chrono::steady_clock::now() >= deadline)
                 break;
             tdlua_lua_vm_checkpoint(L);
@@ -1729,11 +1769,11 @@ public:
         while (true) {
             tdlua_lua_vm_checkpoint(L);
             tick();
-            if (!pump_) return;
+            if (!hasPump()) return;
             // After explicit stop, a standalone Future is not required Task
             // cleanup. It remains pending for the next managed driver.
             if (!hasNormalLoopInterest() && !hasGracefulDrainWork()) return;
-            driveStep(managedReceiveSlice());
+            driveStep(managedReceiveSlice(), nullptr, callback == 0);
         }
     }
     std::uint64_t raw() { return createState(RequestKind::Raw)->request_id; }
@@ -1789,6 +1829,13 @@ public:
             return false;
         }
         return true;
+    }
+
+    bool hasEventHandler(const std::string &type) const
+    {
+        const auto found = events_.find(type);
+        return events_enabled_ && found != events_.end() &&
+            !found->second->removed;
     }
 
     template<class Push>
@@ -1848,9 +1895,12 @@ public:
         live_states_.erase(id);
     }
     template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push,
-                                               bool managed_receive = false)
+                                               bool managed_receive = false,
+                                               bool specific_handler = false,
+                                               bool discard_unobserved_raw = false)
     {
         if (!id) {
+            if (specific_handler) return RouteKind::HandledUpdate;
             if (managed_receive) observeManagedUpdate(push);
             return RouteKind::Update;
         }
@@ -1862,6 +1912,12 @@ public:
         if (state->kind == RequestKind::Raw) {
             state->status = ManagedStatus::Done;
             retireState(state);
+            if (managed_receive && hasGenericPumpConsumer()) {
+                observeManagedUpdate(push);
+                return RouteKind::GenericDelivered;
+            }
+            if (managed_receive && discard_unobserved_raw)
+                return RouteKind::DroppedRaw;
             return RouteKind::Raw;
         }
         try {
@@ -1941,7 +1997,7 @@ public:
                 pushTimeout(L, kind, results);
                 return false;
             }
-            if (!pump_) {
+            if (!hasPump()) {
                 throw std::runtime_error("tdlua: managed scheduler has no pump");
             }
             driveStep(remaining);
@@ -2113,6 +2169,7 @@ public:
         detach_after_drain_ = false;
         detach_after_drain_preserve_selected_ = false;
         pump_ = nullptr;
+        managed_pump_ = nullptr;
         pump_context_ = nullptr;
         events_enabled_ = false;
         if (!preserve_selected_update)
@@ -2286,6 +2343,7 @@ class RequestRouter {
 
 public:
     using Pump = SchedulerCore::Pump;
+    using ManagedPump = SchedulerCore::ManagedPump;
     std::shared_ptr<SchedulerCore> core() const { return core_; }
 
     // ----- CoreAnchor lifetime -----
@@ -2380,6 +2438,10 @@ public:
     // ----- Backend pump and state creation -----
 
     void setPump(void *context, Pump pump) { core_->setPump(context, pump); }
+    void setManagedPump(void *context, ManagedPump pump)
+    {
+        core_->setManagedPump(context, pump);
+    }
     std::uint64_t nextRequestId() { return core_->nextRequestId(); }
     void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }
     std::size_t pendingCount() const { return core_->pendingCount(); }
@@ -2401,6 +2463,14 @@ public:
     {
         return core_->pushEventHandler(L, type);
     }
+    bool hasEventHandler(const std::string &type) const
+    {
+        return core_->hasEventHandler(type);
+    }
+    bool hasGenericPumpConsumer() const
+    {
+        return core_->hasGenericPumpConsumer();
+    }
     template<class Push>
     bool deferEvent(const std::string &type, Push push)
     {
@@ -2417,9 +2487,19 @@ public:
     // ----- Response routing and scheduler progress -----
 
     template<class Push> RouteKind dispatchRoute(std::uint64_t id, Push push,
-                                               bool managed_receive = false)
+                                               bool managed_receive = false,
+                                               bool specific_handler = false,
+                                               bool discard_unobserved_raw = false)
     {
-        return core_->dispatchRoute(id, std::move(push), managed_receive);
+        return core_->dispatchRoute(id, std::move(push), managed_receive,
+                                    specific_handler, discard_unobserved_raw);
+    }
+
+    template<class Push> RouteKind dispatchPreservedGeneric(
+        Push push, bool discard_unobserved_raw = false)
+    {
+        return core_->dispatchPreservedGeneric(std::move(push),
+                                               discard_unobserved_raw);
     }
 
     template<class Push> bool dispatch(std::uint64_t id, Push push)

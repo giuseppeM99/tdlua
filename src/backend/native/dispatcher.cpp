@@ -93,6 +93,12 @@ void NativeDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
     router_.setPump(context, pump);
 }
 
+void NativeDispatcher::setManagedPump(
+    void *context, tdlua::RequestRouter::ManagedPump pump)
+{
+    router_.setManagedPump(context, pump);
+}
+
 void NativeDispatcher::cancel(std::uint64_t id)
 {
     router_.cancel(id);
@@ -137,21 +143,48 @@ std::string nativeEventType(lua_State *L, const NativeDispatcher &dispatcher,
 tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response,
                                            bool managed_receive)
 {
-    const tdlua::RouteKind route = router_.dispatchRoute(response.request_id,
-                                                         [&](lua_State *target) {
-        pushResponse(target, response);
-    }, managed_receive);
-    const bool shouldDefer = route == tdlua::RouteKind::Raw ||
-                             route == tdlua::RouteKind::Task ||
-                             route == tdlua::RouteKind::LegacyRequest ||
-                             route == tdlua::RouteKind::Update;
-    if (shouldDefer) {
-        router_.deferEvent(nativeEventType(L, *this, response),
-                              [&](lua_State *target) {
-                                  pushResponse(target, response);
-                              });
+    return dispatch(L, response, managed_receive, false);
+}
+
+tdlua::RouteKind NativeDispatcher::dispatch(lua_State *L, NativeResponse &response,
+                                           bool managed_receive,
+                                           bool discard_unobserved_raw)
+{
+    const std::string type = response.request_id == 0
+        ? nativeEventType(L, *this, response) : std::string();
+    const bool specific_handler = response.request_id == 0 &&
+        router_.hasEventHandler(type);
+    // The discard policy belongs to this specific worker pump call. Do not
+    // retain it in SchedulerCore across a Lua longjmp.
+    const tdlua::RouteKind routed = router_.dispatchRoute(response.request_id,
+        [&](lua_State *target) { pushResponse(target, response); },
+        managed_receive, specific_handler, discard_unobserved_raw);
+    if (specific_handler && response.request_id == 0) {
+        router_.deferEvent(type, [&](lua_State *target) {
+            pushResponse(target, response);
+        });
     }
-    return route;
+    return routed;
+}
+
+tdlua::RouteKind NativeDispatcher::dispatchPreservedGeneric(
+    lua_State *L, const NativeResponse &response)
+{
+    return dispatchPreservedGeneric(L, response, false);
+}
+
+tdlua::RouteKind NativeDispatcher::dispatchPreservedGeneric(
+    lua_State *L, const NativeResponse &response,
+    bool discard_unobserved_raw)
+{
+    return router_.dispatchPreservedGeneric([&](lua_State *target) {
+        pushResponse(target, response);
+    }, discard_unobserved_raw);
+}
+
+bool NativeDispatcher::hasGenericPumpConsumer() const
+{
+    return router_.hasGenericPumpConsumer();
 }
 
 void NativeDispatcher::drain()

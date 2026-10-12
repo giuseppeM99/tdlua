@@ -32,9 +32,11 @@ json json_transport_execute_sync(void *context, json request)
     return static_cast<TDLua *>(context)->execute(std::move(request));
 }
 
-bool json_transport_pump(void *context, double timeout)
+bool json_transport_pump(void *context, double timeout,
+                         bool discard_unobserved_raw)
 {
-    return static_cast<TDLua *>(context)->pump(timeout);
+    return static_cast<TDLua *>(context)->pumpWithPolicy(
+        timeout, discard_unobserved_raw);
 }
 
 void json_transport_close(void *context)
@@ -68,7 +70,7 @@ TDLua::TDLua(lua_State *lua)
 #endif
       )
 {
-    dispatcher_.setPump(this, json_transport_pump);
+    dispatcher_.setManagedPump(this, json_transport_pump);
 #ifdef TDLUA_TESTING
     tdlua_json_test_creation_stage(6);
 #endif
@@ -146,22 +148,36 @@ nlohmann::json TDLua::receive(const double timeout)
 
 bool TDLua::pump(const double timeout)
 {
-    return tdlua::pumpClient(*this, timeout);
+    return pumpWithPolicy(timeout, false);
+}
+
+bool TDLua::pumpWithPolicy(const double timeout, bool discard_unobserved_raw)
+{
+    return tdlua::pumpClient(*this, timeout, discard_unobserved_raw);
 }
 
 bool TDLua::hasUndispatchedPumpItem() const
 {
-    return !updates.empty() && !updates.front().dispatched;
+    return hasUndispatchedPumpItem(false);
+}
+
+bool TDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw) const
+{
+    return !updates.empty() && (!updates.front().dispatched ||
+        dispatcher_.hasGenericPumpConsumer() ||
+        discard_unobserved_raw);
 }
 
 TDLua::PumpValue TDLua::popPumpItem()
 {
     QueuedUpdate queued = pop();
+    popped_preserved_pump_item_ = queued.dispatched;
     return std::move(queued.value);
 }
 
 TDLua::PumpValue TDLua::receivePumpItem(const double timeout)
 {
+    popped_preserved_pump_item_ = false;
     return transport().receive(timeout);
 }
 
@@ -172,7 +188,18 @@ bool TDLua::isValidPumpItem(const PumpValue &value) const
 
 tdlua::RouteKind TDLua::dispatchPumpItem(PumpValue &value)
 {
-    return dispatch(value, true);
+    return dispatchPumpItem(value, false);
+}
+
+tdlua::RouteKind TDLua::dispatchPumpItem(PumpValue &value,
+                                         bool discard_unobserved_raw)
+{
+    if (popped_preserved_pump_item_) {
+        popped_preserved_pump_item_ = false;
+        return dispatcher_.dispatchPreservedGeneric(value,
+                                                    discard_unobserved_raw);
+    }
+    return dispatch(value, true, discard_unobserved_raw);
 }
 
 void TDLua::preservePumpItem(PumpValue &value)
@@ -339,10 +366,17 @@ void TDLua::observeShutdownResponse(const nlohmann::json &update)
 
 tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive)
 {
+    return dispatch(update, managed_receive, false);
+}
+
+tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive,
+                                 bool discard_unobserved_raw)
+{
     observeShutdownResponse(update);
     checkAuthState(update);
     try {
-        const auto route = dispatcher_.dispatch(update, managed_receive);
+        const auto route = dispatcher_.dispatch(update, managed_receive,
+                                                discard_unobserved_raw);
         if (state == ClientState::Terminal)
             dispatcher_.detachAfterDrain(true);
         return route;

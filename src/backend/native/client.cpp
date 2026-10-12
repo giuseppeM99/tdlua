@@ -38,9 +38,11 @@ NativeResponse native_transport_execute_sync(
     return response;
 }
 
-bool native_transport_pump(void *context, double timeout)
+bool native_transport_pump(void *context, double timeout,
+                           bool discard_unobserved_raw)
 {
-    return static_cast<NativeTDLua *>(context)->pump(timeout);
+    return static_cast<NativeTDLua *>(context)->pumpWithPolicy(
+        timeout, discard_unobserved_raw);
 }
 
 void native_transport_close(void *context)
@@ -69,7 +71,7 @@ NativeTDLua::NativeTDLua(lua_State *lua)
       ready_(false), closing_(false), closed_(false), dispatcher_(lua)
 {
     client_id_ = NativeRuntime::instance().create_client(tdlua_native_vm_owner(lua));
-    dispatcher_.setPump(this, native_transport_pump);
+    dispatcher_.setManagedPump(this, native_transport_pump);
 }
 
 NativeTDLua::~NativeTDLua()
@@ -152,12 +154,25 @@ NativeResponse NativeTDLua::receiveBackend(double timeout)
 
 bool NativeTDLua::pump(const double timeout)
 {
-    return tdlua::pumpClient(*this, timeout);
+    return pumpWithPolicy(timeout, false);
+}
+
+bool NativeTDLua::pumpWithPolicy(const double timeout,
+                                 bool discard_unobserved_raw)
+{
+    return tdlua::pumpClient(*this, timeout, discard_unobserved_raw);
 }
 
 bool NativeTDLua::hasUndispatchedPumpItem() const
 {
-    return !updates_.empty() && !updates_.front().dispatched;
+    return hasUndispatchedPumpItem(false);
+}
+
+bool NativeTDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw) const
+{
+    return !updates_.empty() && (!updates_.front().dispatched ||
+        dispatcher_.hasGenericPumpConsumer() ||
+        discard_unobserved_raw);
 }
 
 NativeTDLua::PumpValue NativeTDLua::popPumpItem()
@@ -177,7 +192,17 @@ bool NativeTDLua::isValidPumpItem(const PumpValue &response) const
 
 tdlua::RouteKind NativeTDLua::dispatchPumpItem(PumpValue &response)
 {
-    return dispatch(response, true);
+    return dispatchPumpItem(response, false);
+}
+
+tdlua::RouteKind NativeTDLua::dispatchPumpItem(PumpValue &response,
+                                               bool discard_unobserved_raw)
+{
+    if (response.dispatched) {
+        return dispatcher_.dispatchPreservedGeneric(lua_, response,
+                                                    discard_unobserved_raw);
+    }
+    return dispatch(response, true, discard_unobserved_raw);
 }
 
 void NativeTDLua::preservePumpItem(PumpValue &response)
@@ -230,7 +255,15 @@ void NativeTDLua::observeShutdownResponse(const NativeResponse &response)
     }
 }
 
-tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response, bool managed_receive)
+tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response,
+                                       bool managed_receive)
+{
+    return dispatch(response, managed_receive, false);
+}
+
+tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response,
+                                       bool managed_receive,
+                                       bool discard_unobserved_raw)
 {
     if (response.dispatched) {
         return tdlua::RouteKind::Unknown;
@@ -238,7 +271,8 @@ tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response, bool managed_re
     observeShutdownResponse(response);
     checkAuthState(response);
     try {
-        const auto route = dispatcher_.dispatch(lua_, response, managed_receive);
+        const auto route = dispatcher_.dispatch(lua_, response, managed_receive,
+                                                discard_unobserved_raw);
         response.dispatched = true;
         if (closed_) dispatcher_.detachAfterDrain(true);
         return route;

@@ -42,7 +42,7 @@ struct FakePumpClient {
     {
         return is_closed;
     }
-    bool hasUndispatchedPumpItem() const
+    bool hasUndispatchedPumpItem(bool) const
     {
         return !local.empty() && !local.front().dispatched;
     }
@@ -66,7 +66,7 @@ struct FakePumpClient {
     {
         return value.valid;
     }
-    tdlua::RouteKind dispatchPumpItem(PumpValue &value)
+    tdlua::RouteKind dispatchPumpItem(PumpValue &value, bool)
     {
         if (throw_dispatch)
             throw std::runtime_error("injected dispatch failure");

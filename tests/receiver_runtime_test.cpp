@@ -171,9 +171,15 @@ static void tombstoneRestartAndJoin()
     source->push(7, 2);
     source->push(7, 3, true);
     check(source->pending() == 2, "stopped source read");
+    check(engine.stats().generation == 1, "stopped runtime generation changed");
+    source->pause();
     owner = engine.attachOwner();
     auto fresh = engine.createClient(owner, [] { return 8; }).second;
+    source->awaitPause();
+    check(engine.stats().generation == 2,
+          "client registration did not start exactly one new generation");
     source->push(8, 4);
+    source->release();
     check(pop(fresh).value == 4, "old response leaked to new identity");
     check(old->tryPop(item) == Pop::Closed && engine.stats().abandoned >= 3,
           "orphan not accounted");

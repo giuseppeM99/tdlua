@@ -13,6 +13,7 @@ std::mutex test_mutex;
 std::condition_variable test_changed;
 bool test_paused = false, test_entered = false;
 bool cleanup_paused = false, cleanup_entered = false;
+std::uint64_t test_terminal_acks = 0, test_waited_terminal_acks = 0;
 std::atomic<bool> test_hold_terminal{false};
 std::atomic<int> test_fault_before{0}, test_fault_after{0};
 std::atomic<int> test_fault_send{0};
@@ -41,6 +42,11 @@ class JsonSource final : public tdlua::receiver::Source<json>,
     void terminalPublished(int id) override
     {
         lifecycle_->acknowledgeTerminal(id);
+#ifdef TDLUA_TESTING
+        std::lock_guard<std::mutex> lock(test_mutex);
+        ++test_terminal_acks;
+        test_changed.notify_all();
+#endif
     }
     void cleanupAfterFailure(std::chrono::milliseconds timeout) noexcept override
     {
@@ -361,6 +367,16 @@ extern "C" int tdlua_json_test_control(int action)
         return test_changed.wait_for(lock, std::chrono::seconds(3), [] { return cleanup_entered; })
                    ? 1
                    : 0;
+    case 13:
+        if (!test_changed.wait_for(lock, std::chrono::seconds(3), [] {
+                return test_terminal_acks > test_waited_terminal_acks;
+            }))
+            return 0;
+        ++test_waited_terminal_acks;
+        return 1;
+    case 14:
+        test_waited_terminal_acks = test_terminal_acks;
+        return 1;
     case 12:
         test_fault_send.store(1);
         break;

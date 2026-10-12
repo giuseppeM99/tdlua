@@ -23,15 +23,6 @@ local raw_request_b = client:getAuthorizationState(true)
 local future = client:getAuthorizationState()
 client:loop()
 assert(future:ready() and future:wait()._request_id == future._request_id)
-local received = {}
-for i=1,20 do
-    local response = client:receive(0.1)
-    if response and response._request_id then
-        received[response._request_id] = true
-    end
-    if received[raw_request_a] and received[raw_request_b] then break end
-end
-assert(received[raw_request_a] and received[raw_request_b])
 finish_shutdown(client)
 assert(client:poll() == nil and client:poll(function() error('closed callback') end) == nil)
 client:loop()

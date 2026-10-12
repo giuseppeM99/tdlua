@@ -21,12 +21,20 @@ struct Driver {
     std::deque<Object> raw;
     std::vector<double> waits;
     bool respond = false;
+    bool throw_from_pump = false;
+    bool last_discard_unobserved_raw = false;
 
     explicit Driver(lua_State *state) : L(state), router(state)
     {
-        router.setPump(this, [](void *context, double timeout) {
+        router.setManagedPump(this, [](void *context, double timeout,
+                                       bool discard_unobserved_raw) {
             auto &driver = *static_cast<Driver *>(context);
             driver.waits.push_back(timeout);
+            driver.last_discard_unobserved_raw = discard_unobserved_raw;
+            if (driver.throw_from_pump) {
+                driver.throw_from_pump = false;
+                throw std::runtime_error("injected pump failure");
+            }
             if (driver.incoming.empty()) {
                 driver.router.detachTransport();
                 return false;
@@ -38,7 +46,8 @@ struct Driver {
                 lua_pushinteger(target, object.value);
                 lua_setfield(target, -2, "value");
             };
-            const auto route = driver.router.dispatchRoute(object.id, push, true);
+            const auto route = driver.router.dispatchRoute(
+                object.id, push, true, false, discard_unobserved_raw);
             if (route == tdlua::RouteKind::Update)
                 driver.router.deferEvent("update", push);
             if (tdlua::SchedulerCore::shouldPreserveManagedPumpObject(route))
@@ -126,13 +135,23 @@ void scenarios(lua_State *L)
     const auto raw_b = value.router.raw();
     value.incoming = {{raw_a, 1}, {future->request_id, 2}, {raw_b, 3}, {0, 4}};
     poll(value);
-    run(L, "assert(selected.value == 4)");
-    require(tdlua::isTerminalState(future), "poll did not route Future");
-    require(value.raw.size() == 2 && value.raw[0].id == raw_a &&
-            value.raw[1].id == raw_b, "raw preservation lost FIFO");
+    run(L, "assert(selected.value == 1)");
+    require(value.raw.empty(), "poll duplicated a consumed raw response");
     const auto count = value.waits.size();
     loop(value);
-    require(value.waits.size() == count, "raw buffer kept loop alive");
+    require(tdlua::isTerminalState(future), "loop did not route Future");
+    require(value.waits.size() > count, "loop did not drain remaining source items");
+    require(value.raw.empty(), "loop without a generic consumer retained raw replies");
+    poll(value);
+    run(L, "assert(selected.value == 3)");
+    poll(value);
+    run(L, "assert(selected.value == 4)");
+
+    const auto loop_raw = value.router.raw();
+    value.incoming = {{loop_raw, 9}};
+    run(L, "function stop_after_raw(u) assert(u.value == 9); return false end");
+    loop(value, "stop_after_raw");
+    require(value.raw.empty(), "loop callback duplicated a raw reply");
 
     value.incoming = {{0, 5}};
     run(L, "function process(u) return request().value, u.value, false end");
@@ -140,8 +159,8 @@ void scenarios(lua_State *L)
     run(L, "assert(not selected:ready() and selected._request_id == nil)");
     const auto response_id = value.router.pendingCount();
     require(response_id == 1, "poll joined its yielded callback");
-    // The single pending request was allocated immediately after raw_b.
-    value.incoming.push_back({raw_b + 1, 6});
+    // The single pending request was allocated immediately after loop_raw.
+    value.incoming.push_back({loop_raw + 1, 6});
     loop(value);
     run(L, "local a,b,c=selected:wait(); assert(a==6 and b==5 and c==false)");
 
@@ -183,6 +202,28 @@ void scenarios(lua_State *L)
     require(value.waits.back() > 0, "idle poll requested a zero transport wait");
 }
 
+void testLoopDiscardModeIsPerPumpCall(lua_State *L)
+{
+    Driver value(L);
+    const std::uint64_t raw_id = value.router.raw();
+    value.router.future();
+    value.throw_from_pump = true;
+    bool caught = false;
+    try {
+        value.router.core()->runLoop(L, 0, true);
+    } catch (const std::runtime_error &error) {
+        caught = std::string(error.what()) == "injected pump failure";
+    }
+    require(caught, "pump failure did not unwind runLoop");
+    require(value.last_discard_unobserved_raw,
+            "loop without a generic consumer did not mark its pump request");
+
+    const auto route = value.router.dispatchRoute(raw_id,
+        [](lua_State *target) { lua_pushinteger(target, 1); }, true);
+    require(route == tdlua::RouteKind::Raw,
+            "loop discard mode survived a failed pump into a later route");
+}
+
 } // namespace
 
 int main()
@@ -190,7 +231,7 @@ int main()
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
     int result = 0;
-    try { scenarios(L); }
+    try { scenarios(L); testLoopDiscardModeIsPerPumpCall(L); }
     catch (const std::exception &error) { std::cerr << error.what() << '\n'; result = 1; }
     lua_close(L);
     if (tdlua::liveSchedulerCores() || tdlua::liveContinuations() ||

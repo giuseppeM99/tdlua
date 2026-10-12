@@ -106,6 +106,12 @@ void LuaDispatcher::setPump(void *context, tdlua::RequestRouter::Pump pump)
     router_.setPump(context, pump);
 }
 
+void LuaDispatcher::setManagedPump(
+    void *context, tdlua::RequestRouter::ManagedPump pump)
+{
+    router_.setManagedPump(context, pump);
+}
+
 bool LuaDispatcher::responseRequestId(const nlohmann::json &response,
                                       std::uint64_t &request_id)
 {
@@ -143,7 +149,15 @@ bool LuaDispatcher::pushHandler(lua_State *L, const std::string &type)
     return router_.pushEventHandler(L, type);
 }
 
-tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event, bool managed_receive)
+tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event,
+                                         bool managed_receive)
+{
+    return dispatch(event, managed_receive, false);
+}
+
+tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event,
+                                         bool managed_receive,
+                                         bool discard_unobserved_raw)
 {
     std::uint64_t id = 0;
     const bool correlated = extractJsonResponseRequestId(event, id);
@@ -151,19 +165,36 @@ tdlua::RouteKind LuaDispatcher::dispatch(nlohmann::json &event, bool managed_rec
     if (correlated) {
         event["_request_id"] = id;
     }
+    const std::string type = eventType(event);
+    const bool specific_handler = router_.hasEventHandler(type);
     const tdlua::RouteKind route = router_.dispatchRoute(id, [&](lua_State *L) {
         lua_pushjson(L, event);
-    }, managed_receive);
-    const bool shouldDefer = route == tdlua::RouteKind::Raw ||
-                             route == tdlua::RouteKind::Task ||
-                             route == tdlua::RouteKind::LegacyRequest ||
-                             route == tdlua::RouteKind::Update;
-    if (shouldDefer) {
-        router_.deferEvent(eventType(event), [&](lua_State *L) {
+    }, managed_receive, specific_handler, discard_unobserved_raw);
+    if (specific_handler && id == 0) {
+        router_.deferEvent(type, [&](lua_State *L) {
             lua_pushjson(L, event);
         });
     }
     return route;
+}
+
+tdlua::RouteKind LuaDispatcher::dispatchPreservedGeneric(
+    const nlohmann::json &event)
+{
+    return dispatchPreservedGeneric(event, false);
+}
+
+tdlua::RouteKind LuaDispatcher::dispatchPreservedGeneric(
+    const nlohmann::json &event, bool discard_unobserved_raw)
+{
+    return router_.dispatchPreservedGeneric([&](lua_State *L) {
+        lua_pushjson(L, event);
+    }, discard_unobserved_raw);
+}
+
+bool LuaDispatcher::hasGenericPumpConsumer() const
+{
+    return router_.hasGenericPumpConsumer();
 }
 
 void LuaDispatcher::drain()

@@ -27,6 +27,8 @@ inline int invoke(lua_State *L)
         has_lua_error = true;
     } catch (const std::exception &) {
         call->exception = std::current_exception();
+    } catch (...) {
+        call->exception = std::current_exception();
     }
     if (has_lua_error)
         return ::lua_error(L);

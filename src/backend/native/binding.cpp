@@ -215,8 +215,10 @@ static int tdclient_receive(lua_State *L)
             if (!response.object) {
                 lua_pushnil(L);
             } else {
+                const bool already_dispatched = response.dispatched;
                 const auto route = td->dispatch(response);
-                if (route == tdlua::RouteKind::TransientFuture) {
+                if (!already_dispatched && route != tdlua::RouteKind::Raw &&
+                    route != tdlua::RouteKind::Update) {
                     // The managed response has already been consumed. If
                     // draining fails, propagate the error without restoring
                     // this response to raw receive().

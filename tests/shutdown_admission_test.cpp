@@ -39,7 +39,9 @@ enum class ControlAction : int {
     WaitForCleanup = 9,
     WaitForNoOwners = 10,
     FailNextClientCreation = 11,
-    FailNextSend = 12
+    FailNextSend = 12,
+    WaitForTerminalAck = 13,
+    MarkTerminalAcks = 14
 };
 
 constexpr int value(CreationStage stage) { return static_cast<int>(stage); }
@@ -133,12 +135,16 @@ int main(int argc, char **argv)
         for (const char *request : {"close", "destroy"}) {
             const auto before = ledger();
             run(L, "client=td(); checkAuthorization()");
+            check(control(value(ControlAction::MarkTerminalAcks)) == 1,
+                  "terminal acknowledgment gate could not be armed");
             check(control(value(ControlAction::FailNextSend)) == 1, "send fault not armed");
             lua_pushstring(L, request); lua_setglobal(L, "shutdown_name");
             run(L, "local ok,err=pcall(function() return client[shutdown_name](client) end); "
                    "assert(not ok and err:find('bad_alloc')); assert(not client:isClosed()); "
                    "checkAuthorization(); "
                    "client=nil; collectgarbage('collect'); collectgarbage('collect')");
+            check(control(value(ControlAction::WaitForTerminalAck)) == 1,
+                  "terminal mailbox publication was not acknowledged");
             const auto after = ledger();
             check(after.records == before.records && after.reserved == before.reserved &&
                   after.remaining == before.remaining && after.active_sends == 0 && after.uncertain == 0,

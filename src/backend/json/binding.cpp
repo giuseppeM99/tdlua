@@ -161,8 +161,11 @@ static int tdclient_receive(lua_State *L)
                 result = td->receive(remaining);
             }
 
+            const auto route = !result.empty() && !dispatched
+                ? td->dispatch(result) : tdlua::RouteKind::Unknown;
             const bool consumed_managed = !result.empty() && !dispatched &&
-                td->dispatch(result) == tdlua::RouteKind::TransientFuture;
+                route != tdlua::RouteKind::Raw &&
+                route != tdlua::RouteKind::Update;
             if (result.empty() || consumed_managed) {
                 if (result.empty()) lua_pushnil(L);
             } else {

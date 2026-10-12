@@ -461,6 +461,15 @@ if(TDLUA_BUILD_TESTS)
     tdlua_enable_sanitizers(tdlua_client_pump_test)
     add_test(NAME tdlua_client_pump COMMAND tdlua_client_pump_test)
 
+    add_executable(tdlua_lua_protected_test "tests/lua_protected_test.cpp")
+    target_include_directories(tdlua_lua_protected_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_lua_protected_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_lua_protected_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_lua_protected_test)
+    add_test(NAME tdlua_lua_protected COMMAND tdlua_lua_protected_test)
+
     if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
         add_executable(tdlua_shutdown_admission_test "tests/shutdown_admission_test.cpp")
         target_include_directories(tdlua_shutdown_admission_test PRIVATE
@@ -736,9 +745,11 @@ if(TDLUA_BUILD_TESTS)
     tdlua_enable_sanitizers(tdlua_model_benchmark)
     set_property(TARGET tdlua_model_benchmark PROPERTY CXX_STANDARD 11)
 
-    if(LUA_EXECUTABLE)
+    # TDLUA_LUA_EXECUTABLE is an explicit test-harness override. Preserve it
+    # when FindLua also reports an interpreter from a different runtime.
+    if(NOT TDLUA_LUA_EXECUTABLE AND LUA_EXECUTABLE)
         set(TDLUA_LUA_EXECUTABLE "${LUA_EXECUTABLE}")
-    else()
+    elseif(NOT TDLUA_LUA_EXECUTABLE)
         find_program(TDLUA_LUA_EXECUTABLE
             NAMES "lua${TDLUA_LUA_VERSION}" lua5.5 lua5.4 lua5.3 lua5.2 lua5.1 luajit lua)
     endif()

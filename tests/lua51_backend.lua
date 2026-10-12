@@ -62,7 +62,9 @@ for _=1,200 do
     if pending then break end
     c:receive(0.01)
 end
-assert(pending and not pending:ready() and not task:ready())
+-- receive() now skips managed replies until it finds a generic object. The
+-- second request and its enclosing Task may finish in the same receive call.
+assert(pending)
 assert(pcall(c.close,c))
 assert(not c:isClosed(), 'shutdown request was treated as terminal')
 for _=1,200 do

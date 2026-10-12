@@ -37,6 +37,7 @@ public:
                   const char *field = nullptr,
                   tdlua::WaitContext context = tdlua::WaitContext::Managed);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
+    void setManagedPump(void *context, tdlua::RequestRouter::ManagedPump pump);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
@@ -45,6 +46,15 @@ public:
     // ordinary receive() keeps the legacy dispatch behavior.
     tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response,
                               bool managed_receive = false);
+    tdlua::RouteKind dispatch(lua_State *L, NativeResponse &response,
+                              bool managed_receive,
+                              bool discard_unobserved_raw);
+    tdlua::RouteKind dispatchPreservedGeneric(lua_State *L,
+                                              const NativeResponse &response);
+    tdlua::RouteKind dispatchPreservedGeneric(
+        lua_State *L, const NativeResponse &response,
+        bool discard_unobserved_raw);
+    bool hasGenericPumpConsumer() const;
     void drain();
     void drainForFinalizer() { router_.drainForFinalizer(); }
     void pushResponse(lua_State *L, const NativeResponse &response) const;
