@@ -7,42 +7,15 @@
 #include "tdlua/backend/native/codec_runtime.h"
 #include "tdlua/backend/native/runtime.h"
 #include "tdlua/common/client_pump.h"
-#include "tdlua/common/lua_json.h"
 
-#include <fstream>
-#include <iostream>
-#include <iterator>
 #include <chrono>
+#include <utility>
 
 namespace {
 
 #ifdef TDLUA_TESTING
 NativeTDLua *client_with_injected_drain_failure = nullptr;
 #endif
-
-bool persistedRequestId(const nlohmann::json &value, std::uint64_t &request_id)
-{
-    if (!value.is_object()) {
-        return false;
-    }
-    const nlohmann::json::const_iterator field = value.find("_request_id");
-    if (field == value.end()) {
-        return false;
-    }
-    if (field->is_number_unsigned()) {
-        request_id = field->get<std::uint64_t>();
-        return request_id != 0;
-    }
-    if (!field->is_number_integer()) {
-        return false;
-    }
-    const std::int64_t signed_id = field->get<std::int64_t>();
-    if (signed_id <= 0) {
-        return false;
-    }
-    request_id = static_cast<std::uint64_t>(signed_id);
-    return true;
-}
 
 void native_transport_send(
     void *context, std::uint64_t request_id,
@@ -93,7 +66,7 @@ const NativeTDLua::Transport::Operations native_transport_operations = {
 
 NativeTDLua::NativeTDLua(lua_State *lua)
     : lua_(tdlua_lua_main_thread(lua)), client_id_((tdlua_native_vm_owner(lua), 0)), updates_(),
-      dbpath_(), ready_(false), closing_(false), closed_(false), dispatcher_(lua)
+      ready_(false), closing_(false), closed_(false), dispatcher_(lua)
 {
     client_id_ = NativeRuntime::instance().create_client(tdlua_native_vm_owner(lua));
     dispatcher_.setPump(this, native_transport_pump);
@@ -308,39 +281,6 @@ std::uint64_t NativeTDLua::nextRequestId()
     return dispatcher_.nextRequestId();
 }
 
-void NativeTDLua::setDB(const std::string &path)
-{
-    dbpath_ = path;
-    if (!dbpath_.empty() && dbpath_.back() != '/') {
-        dbpath_ += "/";
-    }
-    if (!dbpath_.empty()) {
-        dbpath_ += "tdlua.json";
-    }
-}
-
-void NativeTDLua::setDBIfParameters(lua_State *L, int request_index)
-{
-    const int absolute = lua_absindex(L, request_index);
-    lua_getfield(L, absolute, "_");
-    const char *type = lua_tostring(L, -1);
-    if (!type) {
-        lua_pop(L, 1);
-        lua_getfield(L, absolute, "@type");
-        type = lua_tostring(L, -1);
-    }
-    const bool is_parameters = type && std::string(type) == "setTdlibParameters";
-    lua_pop(L, 1);
-    if (!is_parameters) {
-        return;
-    }
-    lua_getfield(L, absolute, "database_directory");
-    if (lua_isstring(L, -1)) {
-        setDB(lua_tostring(L, -1));
-    }
-    lua_pop(L, 1);
-}
-
 void NativeTDLua::checkAuthState(const NativeResponse &response)
 {
     if (!response.object || response.request_id != 0 ||
@@ -450,88 +390,6 @@ bool NativeTDLua::closed() const
 bool NativeTDLua::ready() const
 {
     return ready_;
-}
-
-void NativeTDLua::saveUpdatesBuffer()
-{
-    if (!ready_ || dbpath_.empty() || updates_.empty()) {
-        return;
-    }
-
-    const int stack_top = lua_gettop(lua_);
-    nlohmann::json stored = nlohmann::json::array();
-    for (auto it = updates_.begin(); it != updates_.end();) {
-        if (it->delivery_pending) { ++it; continue; }
-        if (it->object) {
-            pushResponse(lua_, *it);
-            nlohmann::json value;
-            lua_getjson(lua_, value);
-            lua_pop(lua_, 1);
-            stored.push_back(std::move(value));
-        }
-        it = updates_.erase(it);
-    }
-    lua_settop(lua_, stack_top);
-
-    std::ofstream out(dbpath_.c_str());
-    if (out) {
-        out << stored.dump();
-    }
-}
-
-void NativeTDLua::loadUpdatesBuffer()
-{
-    if (dbpath_.empty() || !updates_.empty()) {
-        return;
-    }
-
-    std::ifstream in(dbpath_.c_str());
-    if (!in) {
-        return;
-    }
-    std::string contents((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
-    if (contents.empty()) {
-        return;
-    }
-
-    const int stack_top = lua_gettop(lua_);
-    try {
-        const nlohmann::json stored = nlohmann::json::parse(contents);
-        if (!stored.is_array()) {
-            return;
-        }
-        for (std::size_t i = 0; i < stored.size(); ++i) {
-            lua_pushjson(lua_, stored[i]);
-            const int table_index = lua_gettop(lua_);
-            NativeResponse response;
-            response.client_id = client_id_;
-            persistedRequestId(stored[i], response.request_id);
-            if (response.request_id != 0) {
-                dispatcher_.observeRequestId(response.request_id);
-            }
-            response.object = tdlua_native::from_lua_object(
-                lua_, table_index, "updates[" + std::to_string(i + 1) + "]");
-            updates_.push_back(std::move(response));
-            lua_pop(lua_, 1);
-        }
-        lua_settop(lua_, stack_top);
-    } catch (const std::exception &error) {
-        lua_settop(lua_, stack_top);
-        std::cerr << "[TDCLIENT LOAD BUFFER] JSON parse/codec error "
-                  << error.what() << "\n";
-        emptyUpdatesBuffer();
-    }
-}
-
-void NativeTDLua::emptyUpdatesBuffer(bool preserve_received)
-{
-    for (auto it = updates_.begin(); it != updates_.end();) {
-        if (preserve_received && it->delivery_pending) ++it;
-        else {
-            it = updates_.erase(it);
-        }
-    }
 }
 
 #ifdef TDLUA_TESTING

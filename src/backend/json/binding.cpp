@@ -78,18 +78,6 @@ static void json_off(tdlua_binding::ClientHandle client, const char *type)
     static_cast<TDLua *>(client)->dispatcher().off(type);
 }
 
-static void json_save_updates(tdlua_binding::ClientHandle client)
-{
-    static_cast<TDLua *>(client)->saveUpdatesBuffer();
-}
-
-static void json_clear_updates(tdlua_binding::ClientHandle client)
-{
-    TDLua *td = static_cast<TDLua *>(client);
-    td->dispatcher().discardSelectedUpdate();
-    td->emptyUpdatesBuffer();
-}
-
 static void json_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<TDLua> owned_client(static_cast<TDLua *>(client));
@@ -207,9 +195,6 @@ static int tdclient_send(lua_State *L)
         }
         reject_reserved_json_fields(j);
         if (td->closed()) throw std::runtime_error("tdlua client is closed");
-        if(!td->ready() && j["@type"] == "setTdlibParameters" && j["database_directory"].is_string()) {
-            td->setDB(j["database_directory"]);
-        }
         const std::uint64_t id = td->dispatcher().registerRawRequest();
         tdlua::submit(td->dispatcher(), td->transport(), id, std::move(j));
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
@@ -280,11 +265,6 @@ static int tdclient_execute(lua_State *L)
 
         if (control_type == LUA_TBOOLEAN && !lua_toboolean(L, control_index)) {
             tdlua_lua_require_explicit_submission_context(L);
-        }
-
-        if (!td->ready() && j["@type"] == "setTdlibParameters" &&
-            j["database_directory"].is_string()) {
-            td->setDB(j["database_directory"]);
         }
 
         if (fire_and_forget) {
@@ -375,10 +355,6 @@ static int call(lua_State *L)
         request["@type"] = lua_tostring(L, lua_upvalueindex(1));
 
         if (fire_and_forget) {
-            if (!td->ready() && request["@type"] == "setTdlibParameters" &&
-                request["database_directory"].is_string()) {
-                td->setDB(request["database_directory"]);
-            }
             const std::uint64_t id = td->dispatcher().registerRawRequest();
             tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
             tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
@@ -388,10 +364,6 @@ static int call(lua_State *L)
         if (callback_index != 0) {
             const auto state = td->dispatcher().task(
                 L, callback_index, context_index, arguments.supplied_thread);
-            if (!td->ready() && request["@type"] == "setTdlibParameters" &&
-                request["database_directory"].is_string()) {
-                td->setDB(request["database_directory"]);
-            }
             try {
                 tdlua::submit(td->dispatcher(), td->transport(),
                               state->request_id, std::move(request));
@@ -404,10 +376,6 @@ static int call(lua_State *L)
         }
 
         auto state = td->dispatcher().future();
-        if (!td->ready() && request["@type"] == "setTdlibParameters" &&
-            request["database_directory"].is_string()) {
-            td->setDB(request["database_directory"]);
-        }
         try {
             tdlua::submit(td->dispatcher(), td->transport(),
                           state->request_id, std::move(request));
@@ -488,10 +456,6 @@ static int tdclient_request(lua_State *L)
 
         const std::uint64_t id = td->dispatcher().registerRequest(
             L, callback_index, context_index);
-        if (!td->ready() && request["@type"] == "setTdlibParameters" &&
-            request["database_directory"].is_string()) {
-            td->setDB(request["database_directory"]);
-        }
         tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
         tdlua_lua_push_integer(L, static_cast<std::int64_t>(id));
         return 1;
@@ -520,10 +484,6 @@ static int tdclient_await(lua_State *L)
 
         auto state = td->dispatcher().awaitState(L);
         const std::uint64_t request_id = state->request_id;
-        if (!td->ready() && request["@type"] == "setTdlibParameters" &&
-            request["database_directory"].is_string()) {
-            td->setDB(request["database_directory"]);
-        }
         try {
             tdlua::submit(td->dispatcher(), td->transport(),
                           request_id, std::move(request));
@@ -609,8 +569,6 @@ static const tdlua_binding::ClientOperations json_operations = {
     json_push_handler,
     json_on,
     json_off,
-    json_save_updates,
-    json_clear_updates,
     json_unload,
     json_closed,
 #ifdef TDLUA_TESTING

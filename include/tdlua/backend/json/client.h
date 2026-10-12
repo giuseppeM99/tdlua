@@ -5,7 +5,6 @@
 #pragma once
 #include <cstdint>
 #include <deque>
-#include <string>
 #include <set>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
@@ -36,7 +35,6 @@ private:
 
     std::int32_t client_id;
     std::deque<QueuedUpdate> updates;
-    std::string dbpath;
     bool _ready;
     ClientState state;
     // Set while a shutdown request is pending/uncertain or was accepted; this
@@ -57,8 +55,6 @@ public:
     ~TDLua();
 
     QueuedUpdate pop();
-
-    void setDB(const std::string &path);
 
     void send(std::uint64_t request_id, nlohmann::json json);
     using Transport = tdlua::Transport<nlohmann::json, nlohmann::json>;
@@ -100,12 +96,6 @@ public:
     }
 
     bool empty() const;
-
-    void saveUpdatesBuffer();
-
-    void loadUpdatesBuffer();
-
-    void emptyUpdatesBuffer(bool preserve_received = false);
 
     void checkAuthState(const nlohmann::json &update);
     tdlua::RouteKind dispatch(nlohmann::json &update, bool managed_receive = false);

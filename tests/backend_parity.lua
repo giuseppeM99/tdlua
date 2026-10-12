@@ -14,13 +14,19 @@ assert(tdlua.version == tdlua.api_version .. "-" .. tdlua.tdlib_version)
 local methods = {
     "receive", "poll", "send", "execute", "_execute", "executeSync",
     "request", "await", "on", "off", "close", "destroy", "isClosed",
-    "save", "clearBuffer", "getCall"
+    "getCall"
 }
 
 local client = tdlua.new()
 for _, name in ipairs(methods) do
     assert(type(client[name]) == "function", "missing client method: " .. name)
 end
+local client_methods = debug.getmetatable(client).__methods
+assert(client_methods.save == nil, "legacy save method remains registered")
+assert(client_methods.clearBuffer == nil,
+       "legacy clearBuffer method remains registered")
+assert(client.save == nil and client.clearBuffer == nil,
+       "legacy update-buffer API remains reachable through dynamic lookup")
 assert(client:isClosed() == false)
 
 local function assert_td_object(value, label)

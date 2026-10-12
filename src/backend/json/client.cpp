@@ -5,11 +5,6 @@
 #include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/client_pump.h"
 #include <chrono>
-#include <fstream>
-#include <iostream>
-#include <mutex>
-#include <queue>
-#include <set>
 #include <td/telegram/td_json_client.h>
 #include <utility>
 
@@ -20,30 +15,6 @@ using json = nlohmann::json;
 #ifdef TDLUA_TESTING
 TDLua *client_with_injected_drain_failure = nullptr;
 #endif
-
-bool persistedRequestId(const json &value, std::uint64_t &request_id)
-{
-    if (!value.is_object()) {
-        return false;
-    }
-    const json::const_iterator field = value.find("_request_id");
-    if (field == value.end()) {
-        return false;
-    }
-    if (field->is_number_unsigned()) {
-        request_id = field->get<std::uint64_t>();
-        return request_id != 0;
-    }
-    if (!field->is_number_integer()) {
-        return false;
-    }
-    const std::int64_t signed_id = field->get<std::int64_t>();
-    if (signed_id <= 0) {
-        return false;
-    }
-    request_id = static_cast<std::uint64_t>(signed_id);
-    return true;
-}
 
 void json_transport_send(void *context, std::uint64_t request_id,
                          json request)
@@ -88,7 +59,7 @@ const TDLua::Transport::Operations json_transport_operations = {
 }
 
 TDLua::TDLua(lua_State *lua)
-    : client_id(0), updates(), dbpath(), _ready(false), state(ClientState::Running),
+    : client_id(0), updates(), _ready(false), state(ClientState::Running),
       dispatcher_(
 #ifdef TDLUA_TESTING
           (tdlua_json_test_creation_stage(5), lua)
@@ -121,17 +92,6 @@ TDLua::QueuedUpdate TDLua::pop()
     QueuedUpdate res = updates.front();
     updates.pop_front();
     return res;
-}
-
-void TDLua::setDB(const std::string &path)
-{
-    dbpath = path;
-    if (dbpath.empty()) {
-        return;
-    }
-    if (dbpath.back() != '/')
-        dbpath += "/";
-    dbpath += "tdlua.json";
 }
 
 void TDLua::send(std::uint64_t request_id, nlohmann::json json)
@@ -257,7 +217,7 @@ void TDLua::closeInternal()
     try {
         dispatcher_.detachTransport();
         // Finalizer cleanup cannot deliver buffered objects to Lua callers.
-        emptyUpdatesBuffer();
+        updates.clear();
         if (cleanup_complete_)
             return;
         if (injected_transport_.operations) {
@@ -347,70 +307,6 @@ bool TDLua::empty() const
     return updates.empty();
 }
 
-
-void TDLua::saveUpdatesBuffer()
-{
-    if (!_ready || dbpath.empty()) return;
-    nlohmann::json jupdates = nlohmann::json::array();
-    for (auto it = updates.begin(); it != updates.end();) {
-        // A failed receive still owns public delivery, even across close/save.
-        if (it->delivery_pending) { ++it; continue; }
-        jupdates.push_back(it->value);
-        it = updates.erase(it);
-    }
-    std::ofstream out(dbpath);
-    out << jupdates.dump();
-    out.close();
-}
-
-void TDLua::loadUpdatesBuffer()
-{
-    if (dbpath.empty() || _ready || !updates.empty()) return;
-    std::ifstream in(dbpath);
-    if (in && in.is_open()) {
-        std::string buf;
-        in.seekg(0, std::ios::end);
-        const std::streamoff size = in.tellg();
-        if (size <= 0) {
-            in.close();
-            _ready = true;
-            return;
-        }
-        buf.resize(static_cast<std::size_t>(size));
-        in.seekg(0, std::ios::beg);
-        in.read(&buf[0], buf.size());
-        in.close();
-        try {
-            nlohmann::json j = nlohmann::json::parse(buf);
-            if (j.is_array() && !j.empty()) {
-                for (auto &elem : j) {
-                    std::uint64_t request_id = 0;
-                    if (persistedRequestId(elem, request_id)) {
-                        dispatcher_.observeRequestId(request_id);
-                    }
-                    updates.push_back(QueuedUpdate(elem, false));
-                }
-            }
-        } catch (nlohmann::json::parse_error &e){
-            std::cerr << "[TDCLIENT LOAD BUFFER] JSON Parse error " << e.what() << "\n";
-            _ready = true;
-            emptyUpdatesBuffer();
-            saveUpdatesBuffer();
-            return;
-        }
-    }
-    _ready = true;
-}
-
-void TDLua::emptyUpdatesBuffer(bool preserve_received)
-{
-    for (auto it = updates.begin(); it != updates.end();) {
-        if (preserve_received && it->delivery_pending) ++it;
-        else {
-            it = updates.erase(it);
-        }
-    }
-}
 
 void TDLua::checkAuthState(const nlohmann::json &update)
 {

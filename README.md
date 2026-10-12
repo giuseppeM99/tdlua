@@ -280,8 +280,8 @@ budget; arbitrary Lua execution is not bounded by a wall-clock deadline.
 `loop()` retains its existing continuous behavior and has no timeout argument.
 If an event handler raises during `poll()`, the selected update stays pending
 for the next `poll()` or `loop(callback)` without another event-handler dispatch.
-`clearBuffer()` and closing the client discard a selection still pending in the
-scheduler. A selection already transferred to a Task remains owned by that Task.
+Closing the client discards a selection still pending in the scheduler. A
+selection already transferred to a Task remains owned by that Task.
 
 `receive()` retains its 10-second default. `receive(0)` checks objects already
 available to the client and returns immediately; it does not call TDLib's
@@ -290,12 +290,17 @@ on a later call. Objects already buffered remain FIFO. If scheduler draining
 raises after raw acquisition, the call raises that error and preserves the
 unreturned object at the front of the receive queue. The next receive returns it
 without redispatch, including after closure. Further pending errors can still
-raise before delivery. These recovered objects stay in the original client
-across explicit `save()` and close; they are excluded from disk persistence.
-Explicit `save()` writes other eligible buffered updates to `tdlua.json` and
-removes them from the in-memory buffer. Version 0.5 does not save the buffer
-automatically on close or load an old `tdlua.json` buffer at startup. Explicit
-`clearBuffer()` discards in-memory objects.
+raise before delivery. Updates and recovered objects remain in memory for the
+client lifetime; TDLua no longer saves or restores them through `tdlua.json`.
+The legacy `save()` and `clearBuffer()` methods have been removed. Existing
+`tdlua.json` files are left untouched and are not loaded. TDLib's own databases
+under `database_directory` and `files_directory` remain unchanged.
+Late responses for an abandoned numeric `execute(request, timeout)` are consumed
+by the managed router. `receive(timeout)` continues waiting for a public raw
+object against its original monotonic deadline. Each wait after a transient
+managed response uses the time remaining from that same deadline; it does not
+restart the timeout. Responses for explicitly retained Futures remain governed
+by the Future contract.
 
 `poll()` and `loop()` execute a protected Lua checkpoint between driver
 iterations so the standalone interpreter can process its existing SIGINT debug

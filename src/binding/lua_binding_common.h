@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <new>
 #include <stdexcept>
@@ -132,8 +133,6 @@ struct ClientOperations final {
     bool (*push_handler)(ClientHandle, lua_State *, const char *);
     void (*on)(ClientHandle, lua_State *, const char *, int, bool);
     void (*off)(ClientHandle, const char *);
-    void (*save_updates)(ClientHandle);
-    void (*clear_updates)(ClientHandle);
     void (*unload)(ClientHandle);
     bool (*closed)(ClientHandle);
 #ifdef TDLUA_TESTING
@@ -376,6 +375,11 @@ inline int index(lua_State *L, ClientHandle client,
             throw std::runtime_error("tdlua: client property name must be a string");
         }
         const char *name = lua_tostring(L, 2);
+        if (name && (std::strcmp(name, "save") == 0 ||
+                     std::strcmp(name, "clearBuffer") == 0)) {
+            lua_pushnil(L);
+            return 1;
+        }
         std::string type;
         if (client && handler_property(name, type)) {
             if (operations.push_handler(client, L, type.c_str())) {
@@ -460,24 +464,6 @@ inline int off(lua_State *L, ClientHandle client,
         operations.off(client, lua_tostring(L, 2));
         return 0;
     });
-}
-
-inline int save(lua_State *, ClientHandle client,
-                const ClientOperations &operations)
-{
-    if (client) {
-        operations.save_updates(client);
-    }
-    return 0;
-}
-
-inline int clear(lua_State *, ClientHandle client,
-                 const ClientOperations &operations)
-{
-    if (client) {
-        operations.clear_updates(client);
-    }
-    return 0;
 }
 
 inline int unload(lua_State *L, ClientHandle client,

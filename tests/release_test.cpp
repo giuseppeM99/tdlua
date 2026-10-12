@@ -13,10 +13,17 @@ using Request = nlohmann::json;
 using Response = nlohmann::json;
 #endif
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <string>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -252,7 +259,6 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
             return u.name
         end,0)
         assert(recovered_task._request_id==nil)
-        z:clearBuffer()
         assert(recovered_task:wait()=='19' and poll_callback_calls==1)
     )lua");
     recovery.object(0, 20);
@@ -261,7 +267,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         local ok,e=pcall(z.poll,z,0)
         assert(not ok and e:find('clear buffer handler boom'))
         z:off('updateOption')
-        z:clearBuffer()
+        assert(z:poll(0).name=='20')
         assert(z:poll(0)==nil)
     )lua");
     recovery.object(0, 21);
@@ -379,6 +385,241 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     }
 
 }
+
+void test_legacy_update_persistence(lua_State *L)
+{
+    char directory_template[] = "/tmp/tdlua-legacy-buffer-XXXXXX";
+    char *directory_value = mkdtemp(directory_template);
+    require(directory_value != nullptr,
+            "unable to create legacy persistence test directory");
+    const std::string directory(directory_value);
+    const std::string marker_path = directory + "/tdlua.json";
+    const std::string fresh_directory = directory + "/fresh";
+    const std::string marker_contents =
+        "[{\"@type\":\"updateOption\",\"name\":\"legacy\"}]";
+    {
+        std::ofstream marker(marker_path.c_str());
+        require(static_cast<bool>(marker), "unable to create legacy buffer marker");
+        marker << marker_contents;
+    }
+    require(mkdir(fresh_directory.c_str(), 0700) == 0,
+            "unable to create empty persistence test directory");
+
+    Fake fake;
+    run(L, "legacy_client=t()");
+    attach(L, "legacy_client", fake);
+    lua_pushlstring(L, directory.data(), directory.size());
+    lua_setglobal(L, "legacy_database_directory");
+    lua_pushlstring(L, fresh_directory.data(), fresh_directory.size());
+    lua_setglobal(L, "fresh_database_directory");
+    run(L, R"lua(
+        local methods=debug.getmetatable(legacy_client).__methods
+        assert(methods.save==nil and methods.clearBuffer==nil)
+        assert(legacy_client.save==nil and legacy_client.clearBuffer==nil)
+        legacy_client:send{
+            _='setTdlibParameters',
+            database_directory=legacy_database_directory,
+            files_directory=legacy_database_directory,
+            api_id=1, api_hash='test', system_language_code='en',
+            device_model='test', application_version='test'
+        }
+        assert(legacy_client:receive(0)==nil,
+               'legacy tdlua.json contents were loaded into the update buffer')
+        fresh_client=t()
+        fresh_client:send{
+            _='setTdlibParameters', database_directory=fresh_database_directory,
+            files_directory=fresh_database_directory,
+            api_id=1, api_hash='test', system_language_code='en',
+            device_model='test', application_version='test'
+        }
+    )lua");
+
+    run(L, "legacy_client=nil; fresh_client=nil; collectgarbage('collect')");
+    std::ifstream marker(marker_path.c_str());
+    const std::string after((std::istreambuf_iterator<char>(marker)),
+                            std::istreambuf_iterator<char>());
+    require(after == marker_contents, "legacy tdlua.json contents were modified");
+
+    require(access((fresh_directory + "/tdlua.json").c_str(), F_OK) != 0,
+            "legacy update persistence file was created during GC");
+    std::remove(marker_path.c_str());
+    rmdir(fresh_directory.c_str());
+    rmdir(directory.c_str());
+}
+
+void test_receive_transient_deadline(lua_State *L)
+{
+    Fake fake;
+    run(L, "receive_test_client=t()");
+    Client *client = attach(L, "receive_test_client", fake);
+
+    const std::size_t sent_before = fake.sent.size();
+    run(L, R"lua(
+        for i=1,3 do
+            local result,err=receive_test_client:execute({_='getMe'},0)
+            assert(result==nil and err=='timeout')
+        end
+    )lua");
+    for (std::size_t i = 0; i < 3; ++i) {
+        fake.object(fake.sent[sent_before + i], static_cast<int>(70 + i));
+    }
+    fake.object(0, 73);
+    std::size_t delayed_receives = 0;
+    fake.before = [&](double) {
+        if (delayed_receives++ < 3) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    };
+    const std::size_t wait_start = fake.waits.size();
+    const auto started = std::chrono::steady_clock::now();
+    run(L, "assert(receive_test_client:receive(1).name=='73')");
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    require(elapsed < 1.0, "receive exceeded its original deadline");
+    require(delayed_receives == 4,
+            "receive did not consume three transients before its public update");
+    require(fake.waits.size() == wait_start + 4,
+            "receive performed an unexpected number of source reads");
+    require(fake.waits[wait_start] <= 1.0 && fake.waits[wait_start] > 0.95 &&
+                fake.waits[wait_start + 1] < 0.85 &&
+                fake.waits[wait_start + 2] < 0.65 &&
+                fake.waits[wait_start + 3] > 0.15,
+            "receive did not recompute each wait from the original deadline");
+    require(elapsed > 0.65,
+            "spaced transient responses did not exercise the deadline regression");
+    fake.before = {};
+
+    const std::size_t zero_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[zero_sent], 74);
+    fake.object(0, 75);
+    run(L, "assert(receive_test_client:receive(0).name=='75')");
+
+    const std::size_t only_transient_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[only_transient_sent], 76);
+    run(L, "assert(receive_test_client:receive(0)==nil)");
+
+    // A positive receive timeout expires after consuming a transient when no
+    // public object arrives. The source receives only the remaining budget.
+    const std::size_t timed_transient_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[timed_transient_sent], 77);
+    std::size_t timeout_reads = 0;
+    fake.before = [&](double wait) {
+        if (timeout_reads++ == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        } else {
+            require(wait > 0.0 && wait < 0.24,
+                    "transient receive did not pass the remaining deadline");
+            std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+        }
+    };
+    const auto timeout_started = std::chrono::steady_clock::now();
+    run(L, "assert(receive_test_client:receive(0.25)==nil)");
+    const double timeout_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - timeout_started).count();
+    require(timeout_reads == 2 && timeout_elapsed >= 0.22 && timeout_elapsed < 0.6,
+            "receive did not expire at the original positive deadline");
+    fake.before = {};
+
+    // An update arriving after that receive has timed out remains available
+    // to the next call instead of being discarded with the transient Future.
+    const std::size_t late_transient_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[late_transient_sent], 78);
+    timeout_reads = 0;
+    fake.before = [&](double wait) {
+        if (timeout_reads++ == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        } else {
+            std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+        }
+    };
+    run(L, "assert(receive_test_client:receive(0.25)==nil)");
+    fake.before = {};
+    fake.object(0, 79);
+    run(L, "assert(receive_test_client:receive(0).name=='79')");
+
+    // Explicit Future handles remain observable after a timed-out wait. The
+    // receive result and the Future both refer to the same routed response.
+    run(L, R"lua(
+        explicit_future=receive_test_client:execute({_='getMe'})
+        local waiter=coroutine.create(function()
+            local result,err=explicit_future:wait(0)
+            assert(result==nil and err=='timeout')
+        end)
+        assert(coroutine.resume(waiter))
+        assert(coroutine.status(waiter)=='dead')
+    )lua");
+    fake.object(fake.sent.back(), 80);
+    run(L, R"lua(
+        local raw_result=receive_test_client:receive(0)
+        assert(raw_result and raw_result.code==80)
+        local waiter=coroutine.create(function()
+            local result=explicit_future:wait(0)
+            assert(result.code==80)
+        end)
+        assert(coroutine.resume(waiter))
+        assert(coroutine.status(waiter)=='dead')
+        assert(receive_test_client:receive(0)==nil)
+        explicit_future=nil
+    )lua");
+
+    // Raw requests still return their own response from receive().
+    run(L, "raw_receive_id=receive_test_client:send({_='getMe'})");
+    fake.object(fake.sent.back(), 81);
+    run(L, "local response=receive_test_client:receive(0); "
+           "assert(response.code==81 and response._request_id==raw_receive_id)");
+
+    // A drain error after consuming a transient must not restore that response
+    // to raw receive(). The public update behind it remains available.
+    const std::size_t failed_drain_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[failed_drain_sent], 82);
+    fake.object(0, 83);
+    client->failNextDrainForTesting();
+    run(L, R"lua(
+        local ok,err=pcall(function() receive_test_client:receive(0) end)
+        assert(not ok and tostring(err):find('injected drain failure'))
+        assert(receive_test_client:receive(0).name=='83')
+        assert(receive_test_client:receive(0)==nil)
+    )lua");
+
+    // Clients registered in the same backend runtime keep their own queues.
+    Fake other;
+    run(L, "receive_other_client=t()");
+    attach(L, "receive_other_client", other);
+    const std::size_t isolated_sent = fake.sent.size();
+    run(L, R"lua(
+        local result,err=receive_test_client:execute({_='getMe'},0)
+        assert(result==nil and err=='timeout')
+    )lua");
+    fake.object(fake.sent[isolated_sent], 84);
+    other.object(0, 85);
+    run(L, "assert(receive_test_client:receive(0)==nil); "
+           "assert(receive_other_client:receive(0).name=='85')");
+
+    run(L, "receive_test_client=nil; receive_other_client=nil; "
+           "collectgarbage('collect')");
+}
 }
 int main(int argc, char **argv) {
     Fake f, other;
@@ -390,6 +631,8 @@ int main(int argc, char **argv) {
         (void)argc; (void)argv;
 #endif
         scenarios(L,f,other);
+        test_legacy_update_persistence(L);
+        test_receive_transient_deadline(L);
     } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; result=1; }
     lua_close(L);
     if(tdlua::liveSchedulerCores() || tdlua::liveContinuations() ||

@@ -27,7 +27,10 @@
   timeout semantics. It may yield in a coroutine; after timeout, the eventual
   response is consumed by the managed router instead of becoming visible through
   raw `receive()`. The stock Lua 5.1 main-thread form uses the synchronous
-  SchedulerCore wait path. `executeSync()` remains unchanged.
+  SchedulerCore wait path. `receive(timeout)` continues past such transient
+  responses using the remaining time to its original monotonic deadline; it
+  neither returns the transient response nor restarts the timeout.
+  `executeSync()` remains unchanged.
 - Dispatcher request registration is separate from sending the request to
   TDLib. Existing Future, Task, callback and coroutine contracts remain in
   place. Full Managed Future and Task handles can be iterated as response
@@ -36,9 +39,9 @@
 - `client:close()` and `client:destroy()` now submit the matching TDLib
   request. `isClosed()` becomes true after TDLib's terminal authorization
   update, not when the request is sent. Garbage collection remains a separate
-  internal cleanup path. Explicit `save()` still writes eligible buffered
-  updates, but close no longer saves them automatically and startup no longer
-  loads a previous `tdlua.json` update buffer.
+  internal cleanup path. The legacy `save()` and `clearBuffer()` methods and
+  the `tdlua.json` update-buffer persistence have been removed. Buffered updates
+  remain in memory; TDLib's own database and file storage are unaffected.
 - Client and userdata construction now roll back partial registrations when C++
   or Lua allocation fails.
 

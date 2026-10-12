@@ -80,18 +80,6 @@ static void native_off(tdlua_binding::ClientHandle client, const char *type)
     static_cast<NativeTDLua *>(client)->dispatcher().off(type);
 }
 
-static void native_save_updates(tdlua_binding::ClientHandle client)
-{
-    static_cast<NativeTDLua *>(client)->saveUpdatesBuffer();
-}
-
-static void native_clear_updates(tdlua_binding::ClientHandle client)
-{
-    NativeTDLua *td = static_cast<NativeTDLua *>(client);
-    td->dispatcher().discardSelectedUpdate();
-    td->emptyUpdatesBuffer();
-}
-
 static void native_unload(tdlua_binding::ClientHandle client)
 {
     std::unique_ptr<NativeTDLua> owned_client(static_cast<NativeTDLua *>(client));
@@ -262,7 +250,6 @@ static bool make_request(lua_State *L, NativeTDLua *td, int index,
     // schema conversion so they remain Lua API errors.
     tdlua_binding::reject_reserved_request_fields(L, table_index);
     try {
-        td->setDBIfParameters(L, table_index);
         request = td->makeRequest(L, table_index);
     } catch (const std::exception &exception) {
         codec_error = true;
@@ -730,8 +717,6 @@ static const tdlua_binding::ClientOperations native_operations = {
     native_push_handler,
     native_on,
     native_off,
-    native_save_updates,
-    native_clear_updates,
     native_unload,
     native_closed,
 #ifdef TDLUA_TESTING

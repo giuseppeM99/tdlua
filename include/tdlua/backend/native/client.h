@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <deque>
 #include <map>
-#include <string>
 #include <set>
 
 class NativeTDLua final {
@@ -64,17 +63,11 @@ public:
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
     std::uint64_t nextRequestId();
-    void setDB(const std::string &path);
-    void setDBIfParameters(lua_State *L, int request_index);
-    void saveUpdatesBuffer();
-    void loadUpdatesBuffer();
-    void emptyUpdatesBuffer(bool preserve_received = false);
 
 private:
     lua_State *lua_;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;
-    std::string dbpath_;
     bool ready_;
     bool closing_;
     bool closed_;
