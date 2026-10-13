@@ -3,6 +3,7 @@
 
 
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -58,6 +59,10 @@ private:
     std::shared_ptr<tdlua::receiver::GenericTicket> pump_ticket_;
     LuaDispatcher dispatcher_;
     tdlua::Transport<nlohmann::json, nlohmann::json> injected_transport_ = {nullptr, nullptr};
+#ifdef TDLUA_TESTING
+    std::size_t test_generic_interest_depth_ = 0;
+    std::size_t test_handler_only_interest_depth_ = 0;
+#endif
 public:
 
     explicit TDLua(lua_State *lua);
@@ -75,6 +80,15 @@ public:
 #ifdef TDLUA_TESTING
     void injectTransport(Transport transport);
     void failNextDrainForTesting() noexcept;
+    std::int32_t clientIdForTesting() const { return client_id; }
+    struct ConsumerInterestForTesting {
+        std::size_t generic = 0;
+        std::size_t handler_only = 0;
+    };
+    ConsumerInterestForTesting consumerInterestForTesting() const noexcept
+    {
+        return {test_generic_interest_depth_, test_handler_only_interest_depth_};
+    }
 #endif
     nlohmann::json receiveBackend(double timeout);
 

@@ -59,6 +59,11 @@ static int runConsumerProtected(lua_State *L, int kind, bool managed)
     const int arguments = lua_gettop(L);
     const auto handle = client(L);
     if (!handle) throw std::runtime_error("tdlua: invalid client");
+    // Inspect the caller's original arguments before the protected wrapper
+    // changes the stack. For loop(), argument 2 is the optional fallback
+    // callback; after pushing the closure it may instead refer to that closure.
+    const bool generic_interest = kind != 2 ||
+        (arguments >= 2 && lua_isfunction(L, 2));
     std::shared_ptr<tdlua::SchedulerCore> core;
     if (managed) core = clientCore(L);
 
@@ -68,7 +73,6 @@ static int runConsumerProtected(lua_State *L, int kind, bool managed)
         lua_pushvalue(L, index);
 
     if (managed) core->beginUpdateConsumer();
-    const bool generic_interest = kind != 2 || lua_isfunction(L, 2);
     operations().consumer_interest(handle, true, generic_interest);
     const int status = lua_pcall(L, arguments, LUA_MULTRET, 0);
     operations().consumer_interest(handle, false, generic_interest);

@@ -188,6 +188,15 @@ bool TDLua::pumpWithPolicy(const double timeout, bool discard_unobserved_raw)
 
 void TDLua::setConsumerInterest(bool active, bool generic)
 {
+#ifdef TDLUA_TESTING
+    std::size_t &depth = generic ? test_generic_interest_depth_
+                                 : test_handler_only_interest_depth_;
+    if (active) {
+        ++depth;
+    } else if (depth != 0) {
+        --depth;
+    }
+#endif
     JsonRuntime::instance().setConsumerInterest(client_id, active, generic);
 }
 

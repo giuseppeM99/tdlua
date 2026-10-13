@@ -69,8 +69,10 @@ end
 for _,mode in ipairs{'pending', 'running', 'unrelated'} do
     c = td()
     local started = false
+    local starts = 0
     local task = c:getMe(function()
         started = true
+        starts = starts + 1
         if mode == 'unrelated' then
             pcall(function() c:getMe():wait() end)
             error('offline unrelated task close boom')
@@ -82,18 +84,37 @@ for _,mode in ipairs{'pending', 'running', 'unrelated'} do
             c:receive(0.05)
             if started then break end
         end
-        assert(started and not task:ready())
+        -- The callback may finish before this observer runs. The contract
+        -- guarantees one callback invocation, not an intermediate pending
+        -- state for its Task.
+        assert(started and starts == 1)
     end
-    task = nil
-    collectgarbage('collect')
+    if mode ~= 'running' then
+        task = nil
+        collectgarbage('collect')
+    end
     local ok, message = pcall(finish_shutdown, c)
     if mode == 'unrelated' then
         assert(not ok and message:find('offline unrelated task close boom'))
+    elseif mode == 'pending' and not ok then
+        -- A preterminal reply can start the discarded callback after the
+        -- receiver has published the terminal event but before Lua dispatch
+        -- updates the client state. Lifecycle admission rejects its request.
+        assert(message:find('client closed or unknown'))
     else
         assert(ok, message)
     end
-    assert(started) -- Preterminal replies remain eligible for callback dispatch.
+    assert(started and starts == 1) -- Preterminal replies remain eligible for dispatch.
     assert(c:isClosed() and c:poll() == nil)
+    if mode == 'running' then
+        assert(task:ready())
+        local task_ok, result, request_error = pcall(function() return task:wait() end)
+        assert((task_ok and ((type(result) == 'table' and result._ == 'error') or
+                             (result == nil and request_error ~= nil))) or
+               (not task_ok and tostring(result):find('client closed')))
+        task = nil
+        collectgarbage('collect')
+    end
     c:loop()
 end
 

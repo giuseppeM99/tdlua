@@ -203,6 +203,9 @@ void deferUpdate(tdlua::RequestRouter &router, int sequence)
 
 void testSerialHandlersAndAccounting(std::size_t count)
 {
+    constexpr std::size_t generic_capacity = 1024;
+    require(count > generic_capacity,
+            "the accounting scenario must exceed the generic FIFO capacity");
     auto source = std::make_shared<FakeSource>();
     Receiver receiver(source, Ms(5));
     const std::uint64_t owner = receiver.attachOwner();
@@ -222,12 +225,21 @@ void testSerialHandlersAndAccounting(std::size_t count)
         a_request.router = &a_router;
         a_request.last_id = 0;
         installRequest(L, a_request, "request_a");
+#if defined(TDLUA_USE_LUA51_CONTINUATION)
+        // Stock Lua 5.1 uses Managed Explicit and has no cooperative Future
+        // wait from an event handler. Keep the full bounded-buffer workload;
+        // the serial-suspension backlog is covered by continuation runtimes.
+        run(L, "seen_a={}; seen_b={}; "
+               "function handler_a(u) seen_a[#seen_a+1]=u.seq end; "
+               "function handler_b(u) seen_b[#seen_b+1]=u.seq end");
+#else
         run(L, "seen_a={}; seen_b={}; "
                "function handler_a(u) "
                " if u.seq==1 then request_a():wait() end "
                " seen_a[#seen_a+1]=u.seq "
                "end; "
                "function handler_b(u) seen_b[#seen_b+1]=u.seq end");
+#endif
         setHandler(L, a_router, "handler_a");
         setHandler(L, b_router, "handler_b");
 
@@ -245,8 +257,8 @@ void testSerialHandlersAndAccounting(std::size_t count)
         const auto received_before = receiver.stats().received;
         source->push(11, first);
         source->push(12, first_b);
-        require(receiver.waitForReceived(received_before + 2, Ms(5000)),
-                "receiver did not publish the first updates");
+        require(receiver.waitForClassified(received_before + 2, Ms(5000)),
+                "receiver did not classify the first updates");
         std::deque<Envelope> a_local, b_local;
         std::size_t local_a_peak = 0, local_b_peak = 0;
         Envelope first_a, first_b_received;
@@ -260,12 +272,17 @@ void testSerialHandlersAndAccounting(std::size_t count)
         const int first_sequence = a_local.front().value.at("seq").get<int>();
         a_local.pop_front();
         deferUpdate(a_router, first_sequence);
+#if defined(TDLUA_USE_LUA51_CONTINUATION)
+        charges_a.erase(first_sequence);
+#else
         require(a_request.last_id != 0, "A's first handler did not suspend on a Future");
+#endif
         deferUpdate(b_router, b_local.front().value.at("seq").get<int>());
         b_local.pop_front();
         charges_b.erase(1);
 
         const std::uint64_t remaining = static_cast<std::uint64_t>(count - 1) * 2;
+        const auto overflow_before = receiver.stats().dropped_overflow;
         const std::uint64_t received_before_burst = receiver.stats().received;
         for (std::size_t i = 2; i <= count; ++i) {
             Json a{{"@type", "updateNewMessage"}, {"seq", i}};
@@ -276,49 +293,93 @@ void testSerialHandlersAndAccounting(std::size_t count)
             source->push(12, std::move(b));
         }
         const auto expected_received = received_before_burst + remaining;
-        require(receiver.waitForReceived(expected_received, Ms(30000)),
-                "receiver did not acquire both clients' burst");
+        require(receiver.waitForClassified(expected_received, Ms(30000)),
+                "receiver did not finish classifying both clients' burst");
 
-        const std::size_t mailbox_a = a_box->stats().depth;
-        const std::size_t mailbox_b = b_box->stats().depth;
-        require(mailbox_a == count - 1 && mailbox_b == count - 1,
-                "mailbox depths did not match published client traffic");
+        const std::size_t pending_updates = count - 1;
+        const std::size_t expected_buffered =
+            std::min(pending_updates, generic_capacity);
+        const std::size_t expected_evictions = pending_updates - expected_buffered;
+        const std::size_t first_survivor = count - expected_buffered + 1;
+        const auto mailbox_stats_a = a_box->stats();
+        const auto mailbox_stats_b = b_box->stats();
+        const std::size_t mailbox_a = mailbox_stats_a.depth;
+        const std::size_t mailbox_b = mailbox_stats_b.depth;
+        require(mailbox_a == expected_buffered && mailbox_b == expected_buffered,
+                "generic mailbox depth exceeded or missed its per-client capacity");
+        require(mailbox_stats_a.generic_dropped == expected_evictions &&
+                    mailbox_stats_b.generic_dropped == expected_evictions,
+                "mailbox drop-oldest eviction count is incorrect");
+        const auto receiver_stats = receiver.stats();
+        require(receiver_stats.dropped_overflow - overflow_before ==
+                    expected_evictions * 2 &&
+                    receiver.genericPendingForTesting(11) == expected_buffered &&
+                    receiver.genericPendingForTesting(12) == expected_buffered,
+                "generic ticket accounting did not match bounded mailbox retention");
+
+        // Sequence 1 already moved to the suspended handler. Drop the sidecar
+        // charges for the oldest items evicted from both generic mailboxes.
+        for (std::size_t sequence = 2; sequence < first_survivor; ++sequence) {
+            charges_a.erase(static_cast<int>(sequence));
+            charges_b.erase(static_cast<int>(sequence));
+        }
 
         Envelope item;
         std::size_t a_drained = 0, b_drained = 0;
+        std::size_t expected_a_sequence = first_survivor;
         while (a_box->tryPop(item) == tdlua::receiver::Pop::Item) {
             a_local.push_back(std::move(item));
             local_a_peak = std::max(local_a_peak, a_local.size());
             const int sequence = a_local.front().value.at("seq").get<int>();
+            require(static_cast<std::size_t>(sequence) == expected_a_sequence++,
+                    "A's surviving generic updates were not FIFO after drop-oldest");
             a_local.pop_front();
             deferUpdate(a_router, sequence);
+#if defined(TDLUA_USE_LUA51_CONTINUATION)
+            charges_a.erase(sequence); // handler completed without a cooperative wait
+#endif
             ++a_drained;
         }
+        std::size_t expected_b_sequence = first_survivor;
         while (b_box->tryPop(item) == tdlua::receiver::Pop::Item) {
             b_local.push_back(std::move(item));
             local_b_peak = std::max(local_b_peak, b_local.size());
             const int sequence = b_local.front().value.at("seq").get<int>();
+            require(static_cast<std::size_t>(sequence) == expected_b_sequence++,
+                    "B's surviving generic updates were not FIFO after drop-oldest");
             b_local.pop_front();
             deferUpdate(b_router, sequence);
             charges_b.erase(sequence); // callback completed; ownership released
             ++b_drained;
         }
-        require(a_drained == count - 1 && b_drained == count - 1,
-                "mailbox-to-scheduler transfer count was not exact");
+        require(a_drained == expected_buffered && b_drained == expected_buffered,
+                "mailbox-to-scheduler survivor transfer count was not exact");
+        require(receiver.genericPendingForTesting(11) == 0 &&
+                    receiver.genericPendingForTesting(12) == 0,
+                "generic ticket charges survived transfer out of receiver mailboxes");
 
         const auto a_stats = a_router.bufferStats();
         const auto b_stats = b_router.bufferStats();
-        require(a_stats.handler_queued_updates == count - 1,
-                "A's serial handler queue did not retain every blocked update");
-        require(a_stats.running_tasks == 1,
-                "A should have exactly one suspended event task");
         require(b_stats.handler_queued_updates == 0 && b_stats.running_tasks == 0,
                 "A's blocked handler affected B's scheduler");
-        require(charges_a.size() == count && charges_b.empty(),
+#if defined(TDLUA_USE_LUA51_CONTINUATION)
+        require(a_stats.handler_queued_updates == 0 && a_stats.running_tasks == 0,
+                "Managed Explicit handler left unexpected scheduled work");
+        require(charges_a.empty(),
+                "completed Managed Explicit handlers retained sidecar credits");
+#else
+        require(a_stats.handler_queued_updates == expected_buffered,
+                "A's serial handler queue did not retain every surviving update");
+        require(a_stats.running_tasks == 1,
+                "A should have exactly one suspended event task");
+        require(charges_a.size() == expected_buffered + 1 && charges_b.empty(),
                 "sidecar accounting did not follow per-client object ownership");
+#endif
 
         // Copies of a shared token do not add charges. A real payload copy does.
-        Charge shared = charges_a.begin()->second;
+        Charge shared = charges_a.empty()
+            ? Charge(a_counters, first.dump().size())
+            : charges_a.begin()->second;
         const std::size_t before_copy = a_counters->objects.load();
         Charge shared_reference = shared;
         require(a_counters->objects.load() == before_copy,
@@ -337,6 +398,8 @@ void testSerialHandlersAndAccounting(std::size_t count)
         std::cout << "scenario=serial_blocked count_per_client=" << count
                   << " receiver_mailbox_A=" << mailbox_a
                   << " receiver_mailbox_B=" << mailbox_b
+                  << " dropped_oldest_per_client=" << expected_evictions
+                  << " first_survivor=" << first_survivor
                   << " local_queue_A_peak=" << local_a_peak
                   << " local_queue_B_peak=" << local_b_peak
                   << " scheduler_A_handler_queue=" << a_stats.handler_queued_updates
@@ -351,15 +414,20 @@ void testSerialHandlersAndAccounting(std::size_t count)
                   << " rss_before_kb=" << rss_before << " rss_blocked_kb=" << rssKb()
                   << " cpu_us=" << cpuUs() - cpu_before << '\n';
 
+#if !defined(TDLUA_USE_LUA51_CONTINUATION)
         const auto route = a_router.dispatchRoute(a_request.last_id,
             PushResponse{7}, true);
         require(route == tdlua::RouteKind::Future,
                 "A's unblock response did not route to its managed Future");
         a_router.tick();
-        run(L, "assert(#seen_a==" + std::to_string(count) + "); "
-               "assert(#seen_b==" + std::to_string(count) + "); "
-               "for i=1," + std::to_string(count) + " do "
-               " assert(seen_a[i]==i and seen_b[i]==i) end");
+#endif
+        const std::size_t expected_seen = expected_buffered + 1;
+        run(L, "assert(#seen_a==" + std::to_string(expected_seen) + "); "
+               "assert(#seen_b==" + std::to_string(expected_seen) + "); "
+               "assert(seen_a[1]==1 and seen_b[1]==1); "
+               "for i=1," + std::to_string(expected_buffered) + " do "
+               " local seq=" + std::to_string(first_survivor) + "+i-1; "
+               " assert(seen_a[i+1]==seq and seen_b[i+1]==seq) end");
         charges_a.clear();
         require(a_counters->objects.load() == 0 && b_counters->objects.load() == 0,
                 "accounting credits survived callback completion");
@@ -502,6 +570,18 @@ void testManagedRetention(std::size_t count)
         const std::uint64_t late_id = late->request_id;
         tdlua::pushManagedHandle(L, late, "tdlua.future");
         lua_setglobal(L, "late_future");
+#if defined(TDLUA_USE_LUA51_CONTINUATION)
+        const auto late_pending = router.bufferStats();
+        require(late_pending.pending_requests == 1,
+                "Managed Explicit future was not retained in-flight");
+        router.dispatchRoute(late_id, PushResponse{91}, true);
+        router.tick();
+        run(L, "assert(late_future:ready())");
+        std::cout << "scenario=managed_explicit_late_reply pending_before="
+                  << late_pending.pending_requests
+                  << " ready_after_reply=" << router.bufferStats().ready_states
+                  << '\n';
+#else
         run(L, "late_result='unset'; late_error='unset'; "
                "late_co=coroutine.create(function() "
                " late_result,late_error=late_future:wait(0.001) end); "
@@ -522,6 +602,7 @@ void testManagedRetention(std::size_t count)
                   << " ready_after_late_reply=" << router.bufferStats().ready_states
                   << " refs_after_late_reply=" << router.bufferStats().lua_registry_refs
                   << '\n';
+#endif
         run(L, "late_future=nil; late_co=nil; collectgarbage('collect'); "
                "collectgarbage('collect')");
         router.disposeStorage();

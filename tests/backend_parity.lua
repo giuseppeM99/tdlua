@@ -416,12 +416,13 @@ if missing_type_result ~= nil then
     assert_td_error(missing_type_result, "missing request type")
 end
 
--- send()/receive() exposes the generated request ID and dispatches the
--- response through both the raw receive path and the registered handler.
-local response_handler_called = false
+-- A raw send response has one generic consumer. Receiving it must not cause a
+-- second dispatch to a type handler. Specific update-handler delivery is
+-- exercised separately by the fake-source binding regression.
+local raw_response_handler_calls = 0
 client:on("authorizationStateWaitTdlibParameters", function(event)
-    response_handler_called = true
-    assert_td_object(event, "response handler")
+    raw_response_handler_calls = raw_response_handler_calls + 1
+    assert_td_object(event, "raw response type handler")
 end)
 local sent_id = client:send({_ = "getAuthorizationState"})
 local sent_response
@@ -433,7 +434,8 @@ for _ = 1, 20 do
     end
 end
 assert_td_object(sent_response, "send response")
-assert(response_handler_called == true, "response handler was not dispatched")
+assert(raw_response_handler_calls == 0,
+    "a raw response consumed by receive() was dispatched to a handler")
 client:off("authorizationStateWaitTdlibParameters")
 
 -- A blocking execute must still dispatch unrelated asynchronous work.
@@ -464,11 +466,8 @@ end
 assert_td_object(nested_response, "nested execute from callback")
 assert(callback_called == true,
        "execute did not dispatch an unrelated callback before returning")
-assert(response_handler_count == 1,
-       "execute did not dispatch the unrelated response handler exactly once")
-
-assert(response_handler_count == 1,
-       "managed waiting dispatched the unrelated response handler more than once")
+assert(response_handler_count == 0,
+       "a managed response was also dispatched as a generic type event")
 client:off("authorizationStateWaitTdlibParameters")
 
 -- A timed compact execute uses a managed Future. Its timeout does not cancel
@@ -486,62 +485,6 @@ for _ = 1, 20 do
 end
 assert(client:pendingCount() == pending_before_timed_execute,
        "late compact-execute response was not settled by the managed router")
-
--- An event handler may replace or remove itself while it is running. The
--- dispatcher must keep the callback already copied to the Lua stack valid.
-local mutation_type = "authorizationStateWaitTdlibParameters"
-local self_off_calls = 0
-local self_off_id
-local self_off_handler
-self_off_handler = function(event)
-    if event._request_id == self_off_id then
-        self_off_calls = self_off_calls + 1
-        client:off(mutation_type)
-    end
-end
-client:on(mutation_type, self_off_handler)
-self_off_id = client:send({_ = "getAuthorizationState"})
-local self_off_response
-for _ = 1, 20 do
-    local event = client:receive(0.1)
-    if event and event._request_id == self_off_id then
-        self_off_response = event
-        break
-    end
-end
-assert_td_object(self_off_response, "self-removing handler response")
-assert(self_off_calls == 1, "self-removing handler was not called exactly once")
-
-local replacement_calls = 0
-local replace_id
-local replacement_id
-client:on(mutation_type, function(event)
-    if event._request_id == replace_id then
-        replacement_calls = replacement_calls + 1
-        client:on(mutation_type, function(replacement_event)
-            if replacement_event._request_id == replacement_id then
-                replacement_calls = replacement_calls + 10
-            end
-        end)
-    end
-end)
-replace_id = client:send({_ = "getAuthorizationState"})
-for _ = 1, 20 do
-    local event = client:receive(0.1)
-    if event and event._request_id == replace_id then
-        break
-    end
-end
-replacement_id = client:send({_ = "getAuthorizationState"})
-for _ = 1, 20 do
-    local event = client:receive(0.1)
-    if event and event._request_id == replacement_id then
-        break
-    end
-end
-assert(replacement_calls == 11,
-       "handler replacement during dispatch was not applied safely")
-client:off(mutation_type)
 
 -- Callback context and dynamic helpers must follow the same contract.
 local callback_result
@@ -586,32 +529,50 @@ end
 assert(coroutine.status(codec_thread) == "dead")
 assert_td_error(await_codec_result, "invalid await request")
 
--- Lua failures raised from callbacks, handlers, and resumed awaiters must
--- cross the binding boundary without leaving pending requests behind.
+-- Lua failures raised from callbacks and resumed awaiters must cross the
+-- binding boundary without leaving pending requests behind. Handler errors
+-- are covered by the fake-source binding regression with a distinct update.
+local callback_error_id
 local callback_error_ok = pcall(function()
-    client:request({_ = "getAuthorizationState"},
-                   function()
-                       error("callback failure")
-                   end)
+    callback_error_id = client:request({_ = "getAuthorizationState"},
+                                       function()
+                                           error("callback failure")
+                                       end)
     assert(client:receive(1.0))
 end)
 assert(not callback_error_ok, "callback failure was swallowed")
 assert(client:pendingCount() == 0)
-assert(client:receive(0)) -- already dispatched response survives the error
+local callback_response_leaked = false
+for _ = 1, 5 do
+    local event = client:receive(0)
+    if event and event._request_id == callback_error_id then
+        callback_response_leaked = true
+    end
+end
+assert(not callback_response_leaked,
+       "a callback-managed response leaked into generic receive after callback error")
 
-local handler_error_ok = pcall(function()
-    client:on("authorizationStateWaitTdlibParameters", function()
-        error("handler failure")
-    end)
-    client:send({_ = "getAuthorizationState"})
-    assert(client:receive(1.0))
+local raw_after_handler_registration = 0
+client:on("authorizationStateWaitTdlibParameters", function()
+    raw_after_handler_registration = raw_after_handler_registration + 1
+    error("raw response reached update handler")
 end)
-assert(not handler_error_ok, "handler failure was swallowed")
+local raw_after_handler_id = client:send({_ = "getAuthorizationState"})
+local raw_after_handler_response
+for _ = 1, 20 do
+    local event = client:receive(0.1)
+    if event and event._request_id == raw_after_handler_id then
+        raw_after_handler_response = event
+        break
+    end
+end
+assert_td_object(raw_after_handler_response, "raw response with type handler registered")
+assert(raw_after_handler_registration == 0,
+       "a raw response was delivered to an update handler")
 client:off("authorizationStateWaitTdlibParameters")
-assert(client:receive(0))
 
--- The prior callback and handler failures must not poison a later managed
--- request on the same client.
+-- The prior callback failure and raw-response routing must not poison a later
+-- managed request on the same client.
 local recovered_response = client:execute({_ = "getAuthorizationState"}, 1.0)
 assert_td_object(recovered_response, "execute after handler failure")
 
@@ -632,7 +593,8 @@ for _ = 1, 20 do
 end
 assert(await_error_seen, "await failure was swallowed")
 assert(client:pendingCount() == 0)
-assert(client:receive(0)) -- receive retains the response when a resumed waiter fails
+assert(client:receive(0) == nil,
+       "a response already consumed by a managed await leaked into raw receive")
 
 -- Unknown constructors are rejected by the native schema codec. The JSON
 -- backend may send them to TDLib and return a normal TDLib error object; both

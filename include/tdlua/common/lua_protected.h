@@ -28,7 +28,14 @@ inline int invoke(lua_State *L)
     } catch (const std::exception &) {
         call->exception = std::current_exception();
     } catch (...) {
-        call->exception = std::current_exception();
+        const std::exception_ptr exception = std::current_exception();
+        if (exception) {
+            call->exception = exception;
+        } else {
+            // LuaJIT can use a foreign unwind for lua_error(). Preserve it so
+            // the surrounding lua_cpcall, rather than this catch-all, handles it.
+            throw;
+        }
     }
     if (has_lua_error)
         return ::lua_error(L);

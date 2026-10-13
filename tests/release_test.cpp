@@ -383,19 +383,69 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     }
     require(found,"real receive(0) never read available object");
     run(L,"real:close(); real=nil; collectgarbage('collect')");
+    Fake event_fake;
     for (bool event_failure : {true,false}) {
         run(L,event_failure
-            ? "real=t(); real_calls=0; real:on('updateAuthorizationState',function() real_calls=real_calls+1; error('real event boom') end); real:send{_='getAuthorizationState'}"
-            : "real=t(); real_id=real:request({_='getAuthorizationState'},function() error('real request boom') end)");
+            ? "real=t(); real_calls=0; real_received=0; real_last_kind='nil'; real_last_tag='nil'; real_last_request_id='nil'; real:on('updateOption',function(u) assert(u.name=='73'); real_calls=real_calls+1; error('event scheduler boom') end)"
+            : "real=t(); real_calls=0; real_received=0; real_last_kind='nil'; real_last_tag='nil'; real_last_request_id='nil'; real_id=real:request({_='getAuthorizationState'},function() real_calls=real_calls+1; error('real request boom') end)");
+        if (event_failure) {
+            attach(L, "real", event_fake);
+            event_fake.object(0, 73);
+        }
         bool failed=false;
+        int drive_count=0;
         for(int i=0;i<100 && !failed;++i) {
-            run(L,"real_ok,real_error=pcall(real.receive,real,0.05)");
+            drive_count=i+1;
+            run(L,"real_ok,real_error=pcall(real.receive,real,0.05); "
+                  "if real_ok and real_error~=nil then "
+                  "real_received=real_received+1; real_last_kind=type(real_error); "
+                  "real_last_tag=type(real_error)=='table' and "
+                  "tostring(rawget(real_error,'_') or rawget(real_error,'@type')) "
+                  "or 'non-table'; real_last_request_id=type(real_error)=='table' and "
+                  "tostring(rawget(real_error,'_request_id') or 'nil') "
+                  "or 'non-table' end");
             lua_getglobal(L,"real_ok"); failed=!lua_toboolean(L,-1); lua_pop(L,1);
         }
-        require(failed,"real scheduler error was not surfaced");
+        if (!failed) {
+            run(L,"diag_pending=real:pendingCount(); diag_closed=real:isClosed(); "
+                  "diag_error=tostring(real_error); diag_ok=tostring(real_ok)");
+            const auto string_global = [L](const char *name) {
+                lua_getglobal(L, name);
+                std::size_t size = 0;
+                const char *value = lua_tolstring(L, -1, &size);
+                const std::string result(value ? value : "nil", value ? size : 3);
+                lua_pop(L, 1);
+                return result;
+            };
+            lua_getglobal(L,"real_calls");
+            const lua_Integer callback_calls = lua_tointeger(L,-1);
+            lua_pop(L,1);
+            throw std::runtime_error(
+                std::string("real scheduler error was not surfaced: event_failure=") +
+                (event_failure ? "true" : "false") + " drives=" +
+                std::to_string(drive_count) + " callback_calls=" +
+                std::to_string(callback_calls) + " pending=" +
+                string_global("diag_pending") + " closed=" +
+                string_global("diag_closed") + " last_receive_ok=" +
+                string_global("diag_ok") + " last_error=" +
+                string_global("diag_error") + " receive_values=" +
+                string_global("real_received") + " last_value_kind=" +
+                string_global("real_last_kind") + " last_value_tag=" +
+                string_global("real_last_tag") + " last_value_request_id=" +
+                string_global("real_last_request_id") + " request_id=" +
+                string_global("real_id"));
+        }
         run(L,event_failure
-            ? "assert(real_error:find('real event boom')); real:close(); assert(real_calls==1)"
-            : "assert(real_error:find('real request boom')); real:close(); assert(real:receive(0)==nil)");
+            ? "assert(real_error and real_error:find('event scheduler boom'), "
+              "'unexpected event scheduler error: '..tostring(real_error).."
+              "' calls='..tostring(real_calls)); real:close(); assert(real_calls==1)"
+            : "assert(real_error and real_error:find('real request boom'), "
+              "'unexpected request scheduler error: '..tostring(real_error).."
+              "' calls='..tostring(real_calls)); "
+              "local extra=real:receive(0); "
+              "assert(extra==nil or extra._request_id~=real_id, "
+              "'managed request response leaked to generic receive'); "
+              "assert(real_calls==1); real:close()");
         run(L,"real=nil; collectgarbage('collect')");
     }
 

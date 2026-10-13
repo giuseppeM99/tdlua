@@ -187,6 +187,116 @@ void createClients(lua_State *L)
     runLua(L, "c = tdlua(); d = tdlua()");
 }
 
+void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
+{
+    createClients(L);
+    lua_getglobal(L, "c");
+    auto *client = static_cast<TDLua *>(tdlua_binding::get_client(L));
+    if (!client) throw std::runtime_error("missing JSON runtime test client");
+    const std::int32_t client_id = client->clientIdForTesting();
+    lua_pop(L, 1);
+
+    JsonRuntime &runtime = JsonRuntime::instance();
+    const auto before_registration = runtime.stats();
+    runLua(L,
+           "handler_seen={}; deleted_seen=0; "
+           "c:on('updateNewMessage', function(update) "
+           " handler_seen[#handler_seen+1]=update.value; "
+           " c:off('updateNewMessage') "
+           "end)");
+    const auto registered = runtime.stats();
+    if (registered.consumer_interests != before_registration.consumer_interests ||
+        registered.handler_only_consumers != before_registration.handler_only_consumers ||
+        registered.driver_demands != before_registration.driver_demands)
+        throw std::runtime_error("on() created consumer interest without a driver");
+
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateDeleteMessage"}, {"value", 9}});
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 17}});
+    runLua(L, "c:loop(); assert(#handler_seen==1 and handler_seen[1]==17)");
+
+    const auto handler_only = runtime.stats();
+    if (handler_only.dropped_by_handler_filter - before_registration.dropped_by_handler_filter != 1 ||
+        handler_only.dropped_unsolicited - before_registration.dropped_unsolicited != 1 ||
+        handler_only.dropped_overflow != before_registration.dropped_overflow ||
+        handler_only.published - before_registration.published != 1 ||
+        handler_only.consumer_interests != before_registration.consumer_interests ||
+        handler_only.handler_only_consumers != before_registration.handler_only_consumers)
+        throw std::runtime_error("handler-only loop did not filter and release interest exactly once");
+
+    // Registering and then removing a type before acquisition must update the
+    // worker metadata. Keep a second registration active to make loop() drive
+    // the receiver while the removed type is classified.
+    runLua(L,
+           "c:on('updateNewMessage', function(update) "
+           " handler_seen[#handler_seen+1]=update.value; "
+           " c:off('updateNewMessage') "
+           "end); "
+           "c:on('updateDeleteMessage', function() deleted_seen=deleted_seen+1 end); "
+           "c:off('updateDeleteMessage')");
+    const auto before_on_off = runtime.stats();
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateDeleteMessage"}, {"value", 23}});
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 29}});
+    runLua(L,
+           "c:loop(); assert(deleted_seen==0 and #handler_seen==2 and "
+           "handler_seen[2]==29)");
+    const auto after_on_off = runtime.stats();
+    if (after_on_off.dropped_by_handler_filter - before_on_off.dropped_by_handler_filter != 1 ||
+        after_on_off.published - before_on_off.published != 1)
+        throw std::runtime_error("on()/off() metadata did not govern handler-only acquisition");
+
+    // A generic loop disables the handler-only filter and delivers the same
+    // otherwise-unhandled update to its fallback exactly once.
+    const auto before_generic = runtime.stats();
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateDeleteMessage"}, {"value", 31}});
+    runLua(L,
+           "generic_seen={}; c:loop(function(update) "
+           " generic_seen[#generic_seen+1]=update.value; return false "
+           "end); assert(#generic_seen==1 and generic_seen[1]==31)");
+    const auto after_generic = runtime.stats();
+    if (after_generic.dropped_by_handler_filter != before_generic.dropped_by_handler_filter ||
+        after_generic.published - before_generic.published != 1 ||
+        after_generic.consumer_interests != before_generic.consumer_interests ||
+        after_generic.handler_only_consumers != before_generic.handler_only_consumers)
+        throw std::runtime_error("generic loop did not retain its scoped generic interest");
+
+    // The nested protection frame must release interest when Lua raises.
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateDeleteMessage"}, {"value", 37}});
+    runLua(L,
+           "local ok, err=pcall(function() c:loop(function() "
+           " error('consumer failure probe') end) end); "
+           "assert(not ok and tostring(err):find('consumer failure probe'))");
+    const auto after_error = runtime.stats();
+    if (after_error.consumer_interests != before_generic.consumer_interests ||
+        after_error.handler_only_consumers != before_generic.handler_only_consumers)
+        throw std::runtime_error("Lua consumer error left a persistent interest");
+
+    // Immediate receive/poll calls must also release their interest before
+    // returning. They may request a one-shot receive, but leave no lease.
+    runLua(L, "c:receive(0); c:poll(0)");
+    const auto after_nonblocking = runtime.stats();
+    if (after_nonblocking.consumer_interests != before_generic.consumer_interests ||
+        after_nonblocking.handler_only_consumers != before_generic.handler_only_consumers)
+        throw std::runtime_error("nonblocking receive/poll left consumer interest active");
+
+    std::cout << "scenario=handler_only_binding filtered="
+              << handler_only.dropped_by_handler_filter - before_registration.dropped_by_handler_filter
+              << " published_handler="
+              << handler_only.published - before_registration.published
+              << " filtered_after_off="
+              << after_on_off.dropped_by_handler_filter - before_on_off.dropped_by_handler_filter
+              << " generic_published="
+              << after_generic.published - before_generic.published
+              << " interest_after_error=" << after_error.consumer_interests
+              << " driver_after_error=" << after_error.driver_demands << '\n';
+    runLua(L, "c:close(); d:close(); collectgarbage('collect')");
+}
+
 void testPublicRequests(lua_State *L, Fake &fake)
 {
     runLua(L,
@@ -1942,7 +2052,7 @@ void testHardening()
         luaL_openlibs(L);
         try {
             createClients(L);
-            attachTransport(L, "c", fake);
+            TDLua *client = attachTransport(L, "c", fake);
             attachTransport(L, "d", other);
 
     // The binding's loop interest survives an asynchronous managed wait in a
@@ -1953,8 +2063,8 @@ void testHardening()
     fake.before_receive = [&](double) {
         if (consumer_phase == 0 && fake.incoming.empty()) {
             consumer_phase = 1;
-            const auto stats = JsonRuntime::instance().stats();
-            if (stats.consumer_interests != 1 || stats.driver_demands != 0)
+            const auto interest = client->consumerInterestForTesting();
+            if (interest.generic != 0 || interest.handler_only != 1)
                 throw std::runtime_error(
                     "loop interest did not outlive its mailbox driver lease");
             fake.response(fake.sent.back().first, 119);
@@ -1972,8 +2082,21 @@ void testHardening()
         assert(#lifetime_events==2 and lifetime_events[1]==1 and lifetime_events[2]==2)
     )lua");
     fake.before_receive = {};
-    if (JsonRuntime::instance().stats().consumer_interests != 0)
+    auto interest = client->consumerInterestForTesting();
+    if (interest.generic != 0 || interest.handler_only != 0)
         throw std::runtime_error("Lua loop retained application interest after return");
+
+    // A Lua callback error must release the generic interest as well.
+    fake.update("unhandled", 3);
+    runLua(L, R"lua(
+        local ok, err=pcall(c.loop, c, function()
+            error('generic consumer failure probe')
+        end)
+        assert(not ok and tostring(err):find('generic consumer failure probe'))
+    )lua");
+    interest = client->consumerInterestForTesting();
+    if (interest.generic != 0 || interest.handler_only != 0)
+        throw std::runtime_error("generic Lua error left consumer interest active");
             runLua(L, R"lua(
                 pending=c:getMe()
                 co=coroutine.create(function() return pending.value end)
@@ -2004,8 +2127,12 @@ void testHardening()
             if (mode == 3) {
                 runLua(L, R"lua(
                     close_future=c:close(); assert(not c:isClosed())
-                    assert(c:receive(0).authorization_state._=='authorizationStateClosing')
-                    assert(c:receive(0).authorization_state._=='authorizationStateClosed')
+                    for _=1,8 do
+                        if c:isClosed() then break end
+                        c:receive(0)
+                    end
+                    assert(#states==2 and states[1]=='authorizationStateClosing'
+                           and states[2]=='authorizationStateClosed')
                     assert(c:isClosed())
                 )lua");
             } else {
@@ -2017,6 +2144,10 @@ void testHardening()
                            and states[2]=='authorizationStateClosed')
                 )lua");
             }
+            const auto loop_interest = client->consumerInterestForTesting();
+            if (loop_interest.generic != 0 || loop_interest.handler_only != 0)
+                throw std::runtime_error(
+                    "Lua loop retained consumer interest after lifecycle/error exit");
             runLua(L, R"lua(
                 assert(c:isClosed() and c:poll()==nil)
                 assert(coroutine.status(co)=='dead')
@@ -2030,6 +2161,121 @@ void testHardening()
         }
         lua_close(L);
     }
+}
+
+void testHandlerMutationAndRecoveryThroughBinding(lua_State *L,
+                                                 Fake &fake)
+{
+    const auto cores_before = tdlua::liveSchedulerCores();
+    const auto continuations_before = tdlua::liveContinuations();
+    createClients(L);
+    attachTransport(L, "d", fake);
+    lua_getglobal(L, "c");
+    auto *client = static_cast<TDLua *>(tdlua_binding::get_client(L));
+    if (!client) throw std::runtime_error("missing JSON runtime test client");
+    const std::int32_t client_id = client->clientIdForTesting();
+    lua_pop(L, 1);
+    JsonRuntime &runtime = JsonRuntime::instance();
+    runLua(L, R"lua(
+        mutation_log={}
+        c:on('updateNewMessage', function(update)
+            mutation_log[#mutation_log+1]='old:'..update.value
+            if update.value==1 then
+                c:off('updateNewMessage')
+                c:on('updateNewMessage', function(next_update)
+                    mutation_log[#mutation_log+1]='new:'..next_update.value
+                end)
+            end
+        end)
+    )lua");
+
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 1}});
+    runLua(L, "c:receive(0.2); assert(table.concat(mutation_log, ',')=='old:1')");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 2}});
+    runLua(L,
+           "c:receive(0.2); assert(table.concat(mutation_log, ',')=='old:1,new:2'); "
+           "c:off('updateNewMessage')");
+
+    runLua(L, R"lua(
+        old_started=0; old_completed=0; replacement_seen=0
+        c:on('updateNewMessage', function(update)
+            old_started=old_started+1
+            old_future=d:getMe()
+            local result=old_future:wait()
+            old_completed=old_completed+1
+            old_result=result.value
+        end)
+    )lua");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 3}});
+    runLua(L, "c:receive(0.2); assert(old_started==1 and old_completed==0)");
+
+    runLua(L, R"lua(
+        c:on('updateNewMessage', function(update)
+            replacement_seen=replacement_seen+1
+            replacement_value=update.value
+        end)
+    )lua");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 4}});
+    runLua(L,
+           "c:receive(0.2); assert(old_started==1 and old_completed==0 and "
+           "replacement_seen==1 and replacement_value==4)");
+
+    lua_getglobal(L, "old_future");
+    lua_getfield(L, -1, "_request_id");
+    const auto request_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
+    lua_pop(L, 2);
+    fake.response(request_id, 43);
+    runLua(L,
+           "d:receive(0); c:receive(0); "
+           "assert(old_completed==1 and old_result==43 and "
+           "replacement_seen==1); c:off('updateNewMessage')");
+
+    runLua(L, R"lua(
+        error_calls=0
+        c:on('updateNewMessage', function(update)
+            error_calls=error_calls+1
+            error('handler regression '..update.value)
+        end)
+    )lua");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 5}});
+    runLua(L,
+           "local ok,message=pcall(c.receive,c,0.2); "
+           "assert(not ok and tostring(message):find('handler regression 5') and error_calls==1)");
+    runLua(L,
+           "c:off('updateNewMessage')");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 6}});
+    runLua(L,
+           "local recovered=c:receive(0.2); assert(recovered._=='updateNewMessage' and "
+           "recovered.value==6 and error_calls==1)");
+
+    runLua(L, "recovery_future=d:getMe(); recovery_id=recovery_future._request_id");
+    lua_getglobal(L, "recovery_future");
+    lua_getfield(L, -1, "_request_id");
+    const auto recovery_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
+    lua_pop(L, 2);
+    if (!recovery_id) throw std::runtime_error("managed recovery Future has no request id");
+    fake.response(recovery_id, 47);
+    runLua(L,
+           "d:receive(0); local ok,result=pcall(function() return recovery_future:wait() end); "
+           "assert(ok and recovery_future:ready() and result.value==47); "
+           "c:off('updateNewMessage')");
+    runLua(L,
+           "c:close(); for _=1,8 do if c:isClosed() then break end c:receive(0.1) end; "
+           "assert(c:isClosed()); d:close(); "
+           "for _=1,8 do if d:isClosed() then break end d:receive(0) end; "
+           "assert(d:isClosed()); c=nil; d=nil; old_future=nil; "
+           "recovery_future=nil; collectgarbage('collect'); collectgarbage('collect')");
+    if (tdlua::liveSchedulerCores() != cores_before ||
+        tdlua::liveContinuations() != continuations_before)
+        throw std::runtime_error("handler mutation test retained Lua task references");
+    std::cout << "scenario=handler_mutation old_started=1 old_completed=1 "
+                 "replacement_seen=1 error_calls=1 managed_recovered=1\n";
 }
 
 void testReservedDisposal()
@@ -2226,6 +2472,10 @@ int main(int argc, char **argv)
         if (argc > 1 && std::string(argv[1]) == "--hardening-only") {
             testTaskCloseOwnership();
             testHardening();
+        } else if (argc > 1 && std::string(argv[1]) == "--handler-only-prefilter") {
+            testHandlerOnlyPrefilterThroughBinding(L);
+        } else if (argc > 1 && std::string(argv[1]) == "--handler-mutation-only") {
+            testHandlerMutationAndRecoveryThroughBinding(L, fake);
         } else if (argc > 1 && std::string(argv[1]) == "--terminal-close-only") {
             testReservedDisposal();
             testTerminalShutdownLifecycle();

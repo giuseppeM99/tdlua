@@ -50,6 +50,14 @@ class JsonSource final : public tdlua::receiver::Source<json>,
         : lifecycle_(std::move(lifecycle))
     {
     }
+#ifdef TDLUA_TESTING
+    void inject(tdlua::receiver::Envelope<json> item)
+    {
+        std::lock_guard<std::mutex> lock(test_mutex);
+        injected_.push_back(std::move(item));
+        test_changed.notify_all();
+    }
+#endif
     JsonRuntime::Engine *engine = nullptr;
     void terminalPublished(int id) override
     {
@@ -92,6 +100,13 @@ class JsonSource final : public tdlua::receiver::Source<json>,
                 test_changed.notify_all();
                 test_changed.wait(lock, [] { return !test_paused; });
                 test_entered = false;
+            }
+            if (!injected_.empty()) {
+                item = std::move(injected_.front());
+                injected_.pop_front();
+                lock.unlock();
+                lifecycle_->observe(item.client, item.terminal);
+                return true;
             }
         }
         if (!test_hold_terminal.load() && !held_.empty()) {
@@ -156,6 +171,7 @@ class JsonSource final : public tdlua::receiver::Source<json>,
     std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle_;
 #ifdef TDLUA_TESTING
     std::deque<tdlua::receiver::Envelope<json>> held_;
+    std::deque<tdlua::receiver::Envelope<json>> injected_;
 #endif
 };
 
@@ -409,6 +425,20 @@ void JsonRuntime::replaceWithFake(std::int32_t client)
         send(client, json{{"@type", "close"}});
         engine_.forget(client);
     }
+}
+void JsonRuntime::injectReceivedForTesting(std::int32_t client, json value)
+{
+    tdlua::receiver::Envelope<json> item;
+    item.client = client;
+    item.event_type = value.value("@type", std::string());
+    item.request_id = requestId(value);
+    if (item.event_type == "updateAuthorizationState") {
+        const auto auth = value.find("authorization_state");
+        item.terminal = auth != value.end() && auth->is_object() &&
+            auth->value("@type", std::string()) == "authorizationStateClosed";
+    }
+    item.value = std::move(value);
+    static_cast<JsonSource *>(source_.get())->inject(std::move(item));
 }
 #endif
 

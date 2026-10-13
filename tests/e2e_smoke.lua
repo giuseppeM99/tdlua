@@ -27,7 +27,6 @@ end
 assert(type(initial_state) == "table")
 assert(type(initial_state._) == "string")
 assert(initial_state._ == initial_state["@type"])
-assert(update_count > 0, "authorization update was not received")
 
 -- This exercises the complete Lua -> TDLib -> dispatcher -> Lua path without
 -- requiring Telegram credentials. The dummy values are enough to validate the
@@ -57,6 +56,8 @@ for _ = 1, 10 do
 end
 assert(type(parameter_result) == "table")
 assert(type(parameter_result._) == "string")
+assert(update_count > 0,
+    "authorization update after setTdlibParameters was not received")
 if parameter_result._ == "error" then
     assert(not tostring(parameter_result.message):match("Failed to parse JSON object as TDLib request"),
         "TDLib rejected omitted fields while parsing setTdlibParameters")
