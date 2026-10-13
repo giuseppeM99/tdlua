@@ -243,6 +243,10 @@ void testResponses(lua_State *L, Fake &fake)
            "assert(timed == nil and timed_error == 'timeout')");
 
     const auto late_id = fake.sent.back().first;
+    if (fake.sent_classes.back() != tdlua::ResponseClass::ManagedProtected) {
+        throw std::runtime_error(
+            "timed execute response lost managed protection after waiter timeout");
+    }
     fake.response(late_id, 3);
     runLua(L,
            "local late = c:receive(0); assert(late == nil); "
@@ -1020,6 +1024,77 @@ void testBufferingSerialHandler(lua_State *L, Fake &fake, Fake &second,
               << " B_refs_after_gc=" << b_drained.lua_registry_refs << '\n';
 }
 
+void testBackendGenericTickets(TDLua *client)
+{
+    using Ticket = tdlua::receiver::GenericTicket;
+    using Clock = Ticket::Clock;
+    const auto metrics = std::make_shared<tdlua::receiver::GenericBufferMetrics>();
+    const auto pending = std::make_shared<std::atomic<std::size_t>>(0);
+    std::deque<std::shared_ptr<Ticket>> tickets;
+    constexpr std::size_t capacity = 1024;
+    for (std::size_t value = 0; value < capacity * 2; ++value) {
+        if (tickets.size() == capacity) {
+            tickets.front()->retire(Ticket::DropReason::Overflow);
+            tickets.pop_front();
+        }
+        auto ticket = std::make_shared<Ticket>(
+            Clock::now(), std::chrono::seconds(120), metrics, pending);
+        client->preserveGenericForTesting({{"@type", "raw"}, {"value", value}}, ticket);
+        tickets.push_back(std::move(ticket));
+        if (client->queuedPumpItemsForTesting() > capacity)
+            throw std::runtime_error("backend generic queue exceeded receiver ticket budget");
+    }
+    if (client->queuedPumpItemsForTesting() != capacity ||
+        client->genericPumpItemsForTesting() != capacity ||
+        metrics->dropped_overflow.load() != capacity || pending->load() != capacity) {
+        throw std::runtime_error("backend generic ticket accounting did not remain bounded");
+    }
+    tickets.clear();
+    for (std::size_t expected = capacity; expected < capacity * 2; ++expected) {
+        auto queued = client->pop();
+        if (queued.value.value("value", std::size_t(0)) != expected)
+            throw std::runtime_error("backend eviction changed the remaining FIFO order");
+    }
+    if (pending->load() != 0 || !client->empty())
+        throw std::runtime_error("backend generic tickets survived final consumption");
+}
+
+void testBackendDequeueRaces(TDLua *client)
+{
+    using Ticket = tdlua::receiver::GenericTicket;
+    using Clock = Ticket::Clock;
+    const auto metrics = std::make_shared<tdlua::receiver::GenericBufferMetrics>();
+    const auto pending = std::make_shared<std::atomic<std::size_t>>(0);
+
+    const auto acquired = Clock::now();
+    auto expired = std::make_shared<Ticket>(acquired, std::chrono::seconds(120),
+                                            metrics, pending);
+    client->preserveGenericForTesting({{"@type", "raw"}, {"value", -10}}, expired);
+    if (!client->hasUndispatchedPumpItem(true))
+        throw std::runtime_error("backend item disappeared before deterministic TTL race");
+    if (expired->active(acquired + std::chrono::seconds(121)))
+        throw std::runtime_error("controllable clock did not expire backend ticket");
+    TDLua::PumpValue pump_value;
+    if (client->tryPopPumpItem(true, pump_value) ||
+        client->queuedPumpItemsForTesting() != 0)
+        throw std::runtime_error("pump dequeue exposed an expired item after its prior check");
+
+    auto retired = std::make_shared<Ticket>(Clock::now(), std::chrono::seconds(120),
+                                            metrics, pending);
+    client->preserveGenericForTesting({{"@type", "raw"}, {"value", -11}}, retired);
+    if (client->empty())
+        throw std::runtime_error("backend item disappeared before retirement race");
+    std::thread worker_retirement([retired] {
+        retired->retire(Ticket::DropReason::Overflow);
+    });
+    worker_retirement.join();
+    TDLua::QueuedUpdate queued;
+    if (client->tryPop(queued) || client->queuedPumpItemsForTesting() != 0)
+        throw std::runtime_error("backend receive dequeue exposed a worker-retired item");
+    if (pending->load() != 0)
+        throw std::runtime_error("dequeue-race tickets leaked generic pending accounting");
+}
+
 void testCloseAndClientIsolation(lua_State *L, Fake &fake, Fake &second, TestTransports &transports)
 {
     runLua(L,
@@ -1108,6 +1183,8 @@ void runScenarios(lua_State *L, Fake &fake, Fake &second, TestTransports &transp
     testHandlers(L, fake);
     testEventScheduling(L, fake, second, transports);
     testBufferingSerialHandler(L, fake, second, client, other);
+    testBackendGenericTickets(client);
+    testBackendDequeueRaces(client);
     testCloseAndClientIsolation(L, fake, second, transports);
 }
 

@@ -16,7 +16,9 @@ class JsonRuntime {
     void send(std::int32_t client, const nlohmann::json &request,
               tdlua::ResponseClass response_class = tdlua::ResponseClass::GenericRaw);
     nlohmann::json execute(const nlohmann::json &request);
-    nlohmann::json receive(std::int32_t client, double timeout);
+    nlohmann::json receive(
+        std::int32_t client, double timeout,
+        std::shared_ptr<tdlua::receiver::GenericTicket> *ticket = nullptr);
     bool retireReserved(std::int32_t client);
     void rejectShutdown(std::int32_t client);
     bool shutdownPending(std::int32_t client) const { return lifecycle_->shutdownPending(client); }

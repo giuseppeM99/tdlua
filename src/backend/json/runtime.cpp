@@ -282,7 +282,9 @@ json JsonRuntime::execute(const json &request)
         return nullptr;
     }
 }
-json JsonRuntime::receive(std::int32_t client, double timeout)
+json JsonRuntime::receive(
+    std::int32_t client, double timeout,
+    std::shared_ptr<tdlua::receiver::GenericTicket> *ticket)
 {
     std::shared_ptr<Box> box;
     {
@@ -297,8 +299,10 @@ json JsonRuntime::receive(std::int32_t client, double timeout)
     // Zero timeout never coordinates a join or calls the source.
     if (status == tdlua::receiver::Pop::Failed)
         throw std::runtime_error(tdlua::receiver::failureMessage(box->failure()));
-    if (status == tdlua::receiver::Pop::Item)
+    if (status == tdlua::receiver::Pop::Item) {
+        if (ticket) *ticket = std::move(item.generic_ticket);
         return std::move(item.value);
+    }
     return nullptr;
 }
 bool JsonRuntime::retireReserved(std::int32_t client)

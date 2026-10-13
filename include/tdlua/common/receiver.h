@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,56 @@ inline const char *failureMessage(Failure failure) noexcept
 enum class State { Stopped, Running, Stopping, Failed };
 enum class Pop { Item, Timeout, Closed, Failed };
 
+struct GenericBufferMetrics {
+    std::atomic<std::uint64_t> dropped_overflow{0};
+    std::atomic<std::uint64_t> dropped_expired{0};
+};
+
+class GenericTicket {
+  public:
+    using Clock = std::chrono::steady_clock;
+    enum class DropReason { None, Overflow, Expired };
+
+    GenericTicket(Clock::time_point acquired, std::chrono::seconds ttl,
+                  std::shared_ptr<GenericBufferMetrics> metrics,
+                  std::shared_ptr<std::atomic<std::size_t>> pending)
+        : acquired_(acquired), expires_(acquired + ttl), metrics_(std::move(metrics)),
+          pending_(std::move(pending)),
+          reason_(DropReason::None)
+    {
+        pending_->fetch_add(1, std::memory_order_relaxed);
+    }
+    ~GenericTicket() { retire(DropReason::None); }
+    bool active(Clock::time_point now = Clock::now()) noexcept
+    {
+        if (!active_.load(std::memory_order_acquire)) return false;
+        if (now >= expires_) retire(DropReason::Expired);
+        return active_.load(std::memory_order_acquire);
+    }
+    void retire(DropReason reason) noexcept
+    {
+        bool expected = true;
+        if (!active_.compare_exchange_strong(expected, false,
+                                             std::memory_order_acq_rel)) return;
+        reason_.store(reason, std::memory_order_release);
+        pending_->fetch_sub(1, std::memory_order_relaxed);
+        if (reason == DropReason::Overflow)
+            metrics_->dropped_overflow.fetch_add(1, std::memory_order_relaxed);
+        else if (reason == DropReason::Expired)
+            metrics_->dropped_expired.fetch_add(1, std::memory_order_relaxed);
+    }
+    DropReason reason() const noexcept { return reason_.load(std::memory_order_acquire); }
+    Clock::time_point acquiredAt() const noexcept { return acquired_; }
+
+  private:
+    Clock::time_point acquired_;
+    Clock::time_point expires_;
+    std::shared_ptr<GenericBufferMetrics> metrics_;
+    std::shared_ptr<std::atomic<std::size_t>> pending_;
+    std::atomic<bool> active_{true};
+    std::atomic<DropReason> reason_;
+};
+
 template <class Value> struct Envelope {
     int client = 0;
     bool terminal = false;
@@ -46,6 +97,8 @@ template <class Value> struct Envelope {
     std::uint64_t sequence = 0;
     ResponseClass response_class = ResponseClass::GenericRaw;
     std::string event_type;
+    std::chrono::steady_clock::time_point acquired_at;
+    std::shared_ptr<GenericTicket> generic_ticket;
     Value value;
 };
 
@@ -69,7 +122,7 @@ template <class Value> class Source {
 };
 
 struct MailboxStats {
-    std::uint64_t enqueued = 0, dequeued = 0, abandoned = 0;
+    std::uint64_t enqueued = 0, dequeued = 0, abandoned = 0, generic_dropped = 0;
     std::size_t depth = 0, high_water = 0;
 };
 
@@ -78,10 +131,12 @@ template <class Value> class Mailbox {
     Pop popUntil(std::chrono::steady_clock::time_point deadline, Envelope<Value> &item)
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        changed_.wait_until(lock, deadline, [this] {
-            return !queue_.empty() || failure_ != Failure::None || terminal_ || orphan_;
-        });
-        return popLocked(item);
+        for (;;) {
+            const Pop status = popLocked(item);
+            if (status != Pop::Timeout || std::chrono::steady_clock::now() >= deadline)
+                return status;
+            changed_.wait_until(lock, deadline);
+        }
     }
     Pop tryPop(Envelope<Value> &item)
     {
@@ -111,6 +166,20 @@ template <class Value> class Mailbox {
                 stats_.high_water = stats_.depth;
         }
         changed_.notify_all();
+    }
+    bool eraseGeneric(const std::shared_ptr<GenericTicket> &ticket)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if (it->generic_ticket == ticket) {
+                queue_.erase(it);
+                ++stats_.generic_dropped;
+                stats_.depth = queue_.size();
+                changed_.notify_all();
+                return true;
+            }
+        }
+        return false;
     }
     void terminal()
     {
@@ -144,7 +213,14 @@ template <class Value> class Mailbox {
   private:
     Pop popLocked(Envelope<Value> &item)
     {
-        if (!queue_.empty()) {
+        while (!queue_.empty()) {
+            if (queue_.front().generic_ticket &&
+                !queue_.front().generic_ticket->active()) {
+                queue_.pop_front();
+                ++stats_.generic_dropped;
+                stats_.depth = queue_.size();
+                continue;
+            }
             item = std::move(queue_.front());
             queue_.pop_front();
             ++stats_.dequeued;
@@ -172,6 +248,8 @@ struct RuntimeStats {
     std::uint64_t dropped_unsolicited = 0;
     std::uint64_t generic_raw = 0, managed_protected = 0, lifecycle_objects = 0;
     std::uint64_t unknown_correlated = 0, dropped_by_handler_filter = 0;
+    std::uint64_t dropped_overflow = 0, dropped_expired = 0;
+    std::size_t generic_pending = 0;
     std::uint64_t enqueued = 0, dequeued = 0;
     std::size_t depth = 0, high_water = 0;
     std::size_t owners = 0, clients = 0, tombstones = 0;
@@ -230,13 +308,18 @@ template <class Value> class Runtime {
     struct Hooks {
         std::function<void(const Envelope<Value> &)> before_publish;
         std::function<void()> after_publish;
+        std::function<std::chrono::steady_clock::time_point()> now;
     };
     explicit Runtime(std::shared_ptr<Source<Value>> source,
                      std::chrono::milliseconds timeout = std::chrono::milliseconds(100),
-                     Hooks hooks = Hooks())
-        : source_(std::move(source)), timeout_(timeout), hooks_(std::move(hooks))
+                     Hooks hooks = Hooks(), std::size_t generic_capacity = 1024,
+                     std::chrono::seconds generic_ttl = std::chrono::seconds(120))
+        : source_(std::move(source)), timeout_(timeout), hooks_(std::move(hooks)),
+          generic_capacity_(generic_capacity), generic_ttl_(generic_ttl),
+          generic_metrics_(std::make_shared<GenericBufferMetrics>())
     {
-        if (!source_ || timeout_.count() <= 0)
+        if (!source_ || timeout_.count() <= 0 || generic_capacity_ == 0 ||
+            generic_ttl_.count() <= 0)
             throw std::invalid_argument("invalid receiver source/timeout");
     }
     ~Runtime()
@@ -339,6 +422,7 @@ template <class Value> class Runtime {
         Entry entry;
         entry.owner = owner;
         entry.box = box;
+        entry.generic_pending.reset(new std::atomic<std::size_t>(0));
         entries_.emplace(id, std::move(entry));
         return {id, box};
     }
@@ -408,10 +492,14 @@ template <class Value> class Runtime {
         auto found = entries_.find(id);
         bool pending_added = false;
         bool lifecycle_added = false;
+        const bool requires_receive_demand =
+            close || response_class != ResponseClass::GenericRaw;
         try {
             if (found != entries_.end()) {
-                startLocked();
-                if (request_id) {
+                if (requires_receive_demand) startLocked();
+                // Raw responses are generic payloads. They no longer create
+                // one persistent receiver demand per fire-and-forget send.
+                if (request_id && requires_receive_demand) {
                     ++found->second.pending_requests[request_id];
                     pending_added = true;
                 }
@@ -546,6 +634,20 @@ template <class Value> class Runtime {
             throw std::runtime_error(failureMessage(failure_));
     }
 #ifdef TDLUA_TESTING
+    std::size_t genericPendingForTesting(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(id);
+        return found == entries_.end()
+                   ? 0
+                   : found->second.generic_pending->load(std::memory_order_relaxed);
+    }
+    std::size_t genericTicketMetadataForTesting(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(id);
+        return found == entries_.end() ? 0 : found->second.generic_fifo.size();
+    }
     // Test transport substitution only: the source has not materialized this
     // allocated identity and cannot have any response in flight.
     void discardUnmaterializedClient(int id)
@@ -625,7 +727,12 @@ template <class Value> class Runtime {
             result.one_shot_demands += entry.one_shot_in_flight ? 1 : 0;
             for (const auto &request : entry.pending_requests)
                 result.request_demands += request.second;
+            result.generic_pending += entry.generic_pending->load(std::memory_order_relaxed);
         }
+        result.dropped_overflow = generic_metrics_->dropped_overflow.load(
+            std::memory_order_relaxed);
+        result.dropped_expired = generic_metrics_->dropped_expired.load(
+            std::memory_order_relaxed);
         return result;
     }
 
@@ -641,6 +748,8 @@ template <class Value> class Runtime {
         bool one_shot_pending = false, one_shot_in_flight = false;
         std::map<std::uint64_t, std::size_t> pending_requests;
         std::map<std::uint64_t, ResponseClass> protected_requests;
+        std::deque<std::weak_ptr<GenericTicket>> generic_fifo;
+        std::shared_ptr<std::atomic<std::size_t>> generic_pending;
     };
     static void erasePendingRequestLocked(Entry &entry, std::uint64_t request_id) noexcept
     {
@@ -730,6 +839,64 @@ template <class Value> class Runtime {
         stats_.dequeued += value.dequeued;
         if (value.high_water > stats_.high_water)
             stats_.high_water = value.high_water;
+    }
+    std::chrono::steady_clock::time_point now() const
+    {
+        return hooks_.now ? hooks_.now() : std::chrono::steady_clock::now();
+    }
+    void pruneGenericLocked(Entry &entry, std::chrono::steady_clock::time_point current)
+    {
+        while (!entry.generic_fifo.empty()) {
+            std::shared_ptr<GenericTicket> ticket = entry.generic_fifo.front().lock();
+            if (ticket && ticket->active(current)) break;
+            if (ticket) entry.box->eraseGeneric(ticket);
+            entry.generic_fifo.pop_front();
+        }
+        compactGenericLocked(entry, current);
+    }
+    void compactGenericLocked(Entry &entry, std::chrono::steady_clock::time_point current)
+    {
+        const std::size_t threshold = generic_capacity_ >
+                (std::numeric_limits<std::size_t>::max() - 1) / 2
+            ? std::numeric_limits<std::size_t>::max()
+            : generic_capacity_ * 2;
+        if (entry.generic_fifo.size() <= threshold) return;
+
+        // Consumed tickets may expire behind an older, still-pending ticket.
+        // Compact in place so the metadata queue remains O(N), without a
+        // second unbounded container or per-event vector allocations.
+        auto output = entry.generic_fifo.begin();
+        for (auto input = entry.generic_fifo.begin(); input != entry.generic_fifo.end(); ++input) {
+            std::shared_ptr<GenericTicket> ticket = input->lock();
+            if (ticket && ticket->active(current)) {
+                if (output != input) *output = *input;
+                ++output;
+            } else if (ticket) {
+                entry.box->eraseGeneric(ticket);
+            }
+        }
+        entry.generic_fifo.erase(output, entry.generic_fifo.end());
+    }
+    void addGenericLocked(Entry &entry, Envelope<Value> &item,
+                          std::chrono::steady_clock::time_point current)
+    {
+        pruneGenericLocked(entry, current);
+        if (entry.generic_pending->load(std::memory_order_relaxed) >= generic_capacity_) {
+            while (!entry.generic_fifo.empty()) {
+                std::shared_ptr<GenericTicket> oldest = entry.generic_fifo.front().lock();
+                entry.generic_fifo.pop_front();
+                if (!oldest || !oldest->active(current)) {
+                    if (oldest) entry.box->eraseGeneric(oldest);
+                    continue;
+                }
+                oldest->retire(GenericTicket::DropReason::Overflow);
+                entry.box->eraseGeneric(oldest);
+                break;
+            }
+        }
+        item.generic_ticket = std::make_shared<GenericTicket>(
+            item.acquired_at, generic_ttl_, generic_metrics_, entry.generic_pending);
+        entry.generic_fifo.push_back(item.generic_ticket);
     }
     static Runtime *&activeWorkerRuntime() noexcept
     {
@@ -863,6 +1030,17 @@ template <class Value> class Runtime {
                 } else if (!preserve) {
                     ++stats_.dropped_unsolicited;
                 } else {
+                    const bool generic_update = request_id == 0 && !terminal &&
+                        entry.lifecycle_demands == 0 &&
+                        (generic_consumer || (driver_active && !handler_consumer)) &&
+                        !selected_handler_update;
+                    const bool generic_raw = request_id != 0 &&
+                        response_class == ResponseClass::GenericRaw;
+                    if (generic_update || generic_raw) {
+                        if (item.acquired_at == std::chrono::steady_clock::time_point())
+                            item.acquired_at = now();
+                        addGenericLocked(entry, item, now());
+                    }
                     box = entry.box;
                     box->publish(std::move(item));
                     ++stats_.published;
@@ -948,6 +1126,7 @@ template <class Value> class Runtime {
                 }
                 if (received) {
                     stage = Failure::Routing;
+                    item.acquired_at = now();
                     const int id = item.client;
                     const bool terminal = item.terminal;
                     publish(std::move(item));
@@ -981,6 +1160,9 @@ template <class Value> class Runtime {
     std::shared_ptr<Source<Value>> source_;
     std::chrono::milliseconds timeout_;
     Hooks hooks_;
+    const std::size_t generic_capacity_;
+    const std::chrono::seconds generic_ttl_;
+    std::shared_ptr<GenericBufferMetrics> generic_metrics_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::map<int, Entry> entries_;

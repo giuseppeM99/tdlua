@@ -162,10 +162,12 @@ static int tdclient_receive(lua_State *L)
         for (;;) {
             json result;
             bool dispatched = false;
-            if (!td->empty()) {
-                auto queued = td->pop();
+            std::shared_ptr<tdlua::receiver::GenericTicket> generic_ticket;
+            TDLua::QueuedUpdate queued;
+            if (td->tryPop(queued)) {
                 result = std::move(queued.value);
                 dispatched = queued.dispatched;
+                generic_ticket = std::move(queued.generic_ticket);
             } else if (!td->closed()) {
                 double remaining = timeout;
                 if (std::isfinite(timeout) && timeout > 0) {
@@ -174,6 +176,7 @@ static int tdclient_receive(lua_State *L)
                     remaining = elapsed >= timeout ? 0.0 : timeout - elapsed;
                 }
                 result = td->receive(remaining);
+                generic_ticket = td->takeReceiveTicket();
             }
 
             const auto route = !result.empty() && !dispatched
@@ -193,7 +196,7 @@ static int tdclient_receive(lua_State *L)
                 // even if unrelated draining fails; restoring it would expose
                 // it through raw receive().
                 if (!result.empty() && !consumed_managed)
-                    td->restoreReceived(result);
+                    td->restoreReceived(result, std::move(generic_ticket));
                 throw;
             }
             if (!consumed_managed) return 1;

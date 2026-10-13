@@ -24,6 +24,7 @@ struct NativeResponse {
     td::td_api::object_ptr<td::td_api::Object> object;
     bool dispatched;
     bool delivery_pending;
+    std::shared_ptr<tdlua::receiver::GenericTicket> generic_ticket;
 
     NativeResponse();
     NativeResponse(NativeResponse &&other) noexcept;

@@ -5,10 +5,12 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <set>
 #include <string>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
+#include "tdlua/common/receiver.h"
 #include "tdlua/common/transport.h"
 
 
@@ -18,10 +20,14 @@ public:
         nlohmann::json value;
         bool dispatched;
         bool delivery_pending;
+        std::shared_ptr<tdlua::receiver::GenericTicket> generic_ticket;
 
+        QueuedUpdate() : dispatched(false), delivery_pending(false) {}
         QueuedUpdate(const nlohmann::json &value, const bool dispatched,
-                     bool delivery_pending = false)
-            : value(value), dispatched(dispatched), delivery_pending(delivery_pending)
+                     bool delivery_pending = false,
+                     std::shared_ptr<tdlua::receiver::GenericTicket> generic_ticket = {})
+            : value(value), dispatched(dispatched), delivery_pending(delivery_pending),
+              generic_ticket(std::move(generic_ticket))
         {
         }
     };
@@ -48,6 +54,8 @@ private:
     bool cleanup_complete_ = false;
     unsigned drain_depth_ = 0;
     bool popped_preserved_pump_item_ = false;
+    std::shared_ptr<tdlua::receiver::GenericTicket> receive_ticket_;
+    std::shared_ptr<tdlua::receiver::GenericTicket> pump_ticket_;
     LuaDispatcher dispatcher_;
     tdlua::Transport<nlohmann::json, nlohmann::json> injected_transport_ = {nullptr, nullptr};
 public:
@@ -56,6 +64,7 @@ public:
 
     ~TDLua();
 
+    bool tryPop(QueuedUpdate &result);
     QueuedUpdate pop();
 
     void send(std::uint64_t request_id, nlohmann::json json,
@@ -75,10 +84,26 @@ public:
     bool pump(double timeout);
     bool pumpWithPolicy(double timeout, bool discard_unobserved_raw);
     using PumpValue = nlohmann::json;
-    bool hasUndispatchedPumpItem() const;
-    bool hasUndispatchedPumpItem(bool discard_unobserved_raw) const;
+    bool hasUndispatchedPumpItem();
+    bool hasUndispatchedPumpItem(bool discard_unobserved_raw);
+    bool tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result);
 #ifdef TDLUA_TESTING
     std::size_t queuedPumpItemsForTesting() const { return updates.size(); }
+    std::size_t genericPumpItemsForTesting() const
+    {
+        std::size_t count = 0;
+        for (const auto &item : updates)
+            if (item.generic_ticket && item.generic_ticket->active()) ++count;
+        return count;
+    }
+    void preserveGenericForTesting(
+        const nlohmann::json &value,
+        std::shared_ptr<tdlua::receiver::GenericTicket> ticket)
+    {
+        pump_ticket_ = std::move(ticket);
+        PumpValue copy = value;
+        preservePumpItem(copy);
+    }
     tdlua::SchedulerCore::BufferStats schedulerBufferStatsForTesting() const
     { return dispatcher_.bufferStatsForTesting(); }
 #endif
@@ -89,6 +114,9 @@ public:
     tdlua::RouteKind dispatchPumpItem(PumpValue &value,
                                       bool discard_unobserved_raw);
     void preservePumpItem(PumpValue &value);
+    std::shared_ptr<tdlua::receiver::GenericTicket> takeReceiveTicket() noexcept
+    { return std::move(receive_ticket_); }
+    void releaseReceivedTicket() noexcept { receive_ticket_.reset(); }
     void drainPump();
 
     // GC fallback: bounded, callback-free teardown using the existing receiver.
@@ -104,12 +132,14 @@ public:
 
     void push(const nlohmann::json &update, bool dispatched = false);
 
-    void restoreReceived(const nlohmann::json &value)
+    void restoreReceived(const nlohmann::json &value,
+                         std::shared_ptr<tdlua::receiver::GenericTicket> ticket = {})
     {
-        updates.emplace_front(value, true, true);
+        updates.emplace_front(value, true, true, std::move(ticket));
     }
 
-    bool empty() const;
+    bool empty();
+    void pruneExpiredUpdates();
 
     void checkAuthState(const nlohmann::json &update);
     tdlua::RouteKind dispatch(nlohmann::json &update,

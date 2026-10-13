@@ -28,10 +28,18 @@ public:
     bool pump(double timeout);
     bool pumpWithPolicy(double timeout, bool discard_unobserved_raw);
     using PumpValue = NativeResponse;
-    bool hasUndispatchedPumpItem() const;
-    bool hasUndispatchedPumpItem(bool discard_unobserved_raw) const;
+    bool hasUndispatchedPumpItem();
+    bool hasUndispatchedPumpItem(bool discard_unobserved_raw);
+    bool tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result);
 #ifdef TDLUA_TESTING
     std::size_t queuedPumpItemsForTesting() const { return updates_.size(); }
+    std::size_t genericPumpItemsForTesting() const
+    {
+        std::size_t count = 0;
+        for (const auto &item : updates_)
+            if (item.generic_ticket && item.generic_ticket->active()) ++count;
+        return count;
+    }
     tdlua::SchedulerCore::BufferStats schedulerBufferStatsForTesting() const
     { return dispatcher_.bufferStatsForTesting(); }
 #endif
@@ -68,14 +76,16 @@ public:
                               bool discard_unobserved_raw);
     NativeDispatcher &dispatcher();
     void push(NativeResponse response);
+    bool tryPop(NativeResponse &result);
     NativeResponse pop();
+    void pruneExpiredUpdates();
     void restoreReceived(NativeResponse response) {
         response.dispatched = true;
         response.delivery_pending = true;
         updates_.push_front(std::move(response));
     }
 
-    bool empty() const;
+    bool empty();
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
     std::uint64_t nextRequestId();

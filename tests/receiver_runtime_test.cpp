@@ -150,7 +150,7 @@ static Item pop(const std::shared_ptr<Mailbox<int>> &box)
 static void fifoAndWakeup()
 {
     auto source = std::make_shared<Fake>();
-    Engine engine(source, Ms(5));
+    Engine engine(source, Ms(5), Engine::Hooks(), 2000);
     const auto owner = engine.attachOwner();
     std::vector<std::shared_ptr<Mailbox<int>>> boxes;
     std::vector<Engine::DemandLease> demands;
@@ -397,7 +397,8 @@ static void independentDemandAndReceiveInFlight()
     source->push(1, 10);
     source->push(2, 20);
     Item item;
-    check(engine.waitForReceived(2, Ms(2000)), "shared receive did not process both clients");
+    check(engine.waitForClassified(2, Ms(2000)),
+          "shared receive did not classify both clients");
     check(a_box->stats().depth == 0 && engine.stats().dropped_unsolicited == 1,
           "inactive A unsolicited update was retained while B was active");
     check(b_box->popUntil(Clock::now() + Ms(2000), item) == Pop::Item && item.value == 20,
@@ -409,7 +410,7 @@ static void independentDemandAndReceiveInFlight()
     check(engine.admitSend(ledger, 1, false, 501), "raw response admission failed");
     engine.endSend(1, false, 501, true);
     source->push(1, 11, false, 501);
-    check(engine.waitForReceived(3, Ms(2000)), "raw response was not acquired");
+    check(engine.waitForClassified(3, Ms(2000)), "raw response was not classified");
     check(a_box->stats().depth == 1 && engine.stats().driver_demands == 1,
           "raw response for inactive A was discarded");
     auto a_driver = engine.acquireDriver(1);
@@ -419,10 +420,12 @@ static void independentDemandAndReceiveInFlight()
 
     // Managed responses use the same transport correlation metadata but remain
     // owned by the router after mailbox acquisition.
-    check(engine.admitSend(ledger, 1, false, 502), "managed response admission failed");
+    check(engine.admitSend(ledger, 1, false, 502,
+                           tdlua::ResponseClass::ManagedProtected),
+          "managed response admission failed");
     engine.endSend(1, false, 502, true);
     source->push(1, 12, false, 502);
-    check(engine.waitForReceived(4, Ms(2000)), "managed response was not acquired");
+    check(engine.waitForClassified(4, Ms(2000)), "managed response was not classified");
     auto managed_driver = engine.acquireDriver(1);
     check(engine.receiveMailbox(1, *a_box, 0, item) == Pop::Item && item.value == 12,
           "inactive A managed response was not preserved for owner dispatch");
@@ -458,10 +461,12 @@ static void independentDemandAndReceiveInFlight()
     const auto calls = engine.stats().receive_calls;
     const auto received_before_release = engine.stats().received;
     const auto dropped_before_release = engine.stats().dropped_unsolicited;
+    const auto classified_before_release = engine.stats().published +
+                                           engine.stats().dropped_unsolicited;
     in_flight.release();
     source->push(2, 21);
     source->release();
-    check(engine.waitForReceived(received_before_release + 1, Ms(2000)),
+    check(engine.waitForClassified(classified_before_release + 1, Ms(2000)),
           "in-flight object was not classified");
     check(b_box->stats().depth == 0 &&
               engine.stats().dropped_unsolicited == dropped_before_release + 1,
@@ -524,9 +529,11 @@ static void retentionDuringBlockedHandler()
     auto b_driver = engine.acquireDriver(2);
     const auto received_before = engine.stats().received;
     const auto dropped_before = engine.stats().dropped_unsolicited;
+    const auto classified_before = engine.stats().published +
+                                   engine.stats().dropped_unsolicited;
     source->push(1, 102);
-    check(engine.waitForReceived(received_before + 1, Ms(2000)),
-          "shared receiver did not acquire the second A update");
+    check(engine.waitForClassified(classified_before + 1, Ms(2000)),
+          "shared receiver did not classify the second A update");
     const auto stats = engine.stats();
     check(a_box->stats().depth == 1 &&
               stats.dropped_unsolicited == dropped_before &&
@@ -590,10 +597,12 @@ static void oneShotAndManagedDemand()
     check(engine.receiveMailbox(2, *one_shot_box, 0, item) == Pop::Timeout,
           "one-shot client did not return immediately");
     source->awaitPause("one-shot did not enter the source gate");
+    const auto classified_before = engine.stats().published +
+                                   engine.stats().dropped_unsolicited;
     source->push(2, 88);
     source->release();
-    check(engine.waitForReceived(before_one_shot_item + 1, Ms(2000)),
-          "one-shot update was not acquired asynchronously");
+    check(engine.waitForClassified(classified_before + 1, Ms(2000)),
+          "one-shot update was not classified asynchronously");
     check(one_shot_box->stats().depth == 1 &&
               one_shot_box->tryPop(item) == Pop::Item && item.value == 88,
           "unsolicited update for the one-shot client was not retained");
@@ -601,9 +610,13 @@ static void oneShotAndManagedDemand()
 
     // Two in-flight Future/Task requests keep only acquisition active. Their
     // payloads remain in C++ mailbox after the worker releases that demand.
-    check(engine.admitSend(ledger, 1, false, 101), "first managed request rejected");
+    check(engine.admitSend(ledger, 1, false, 101,
+                           tdlua::ResponseClass::ManagedProtected),
+          "first managed request rejected");
     engine.endSend(1, false, 101, true);
-    check(engine.admitSend(ledger, 1, false, 102), "second managed request rejected");
+    check(engine.admitSend(ledger, 1, false, 102,
+                           tdlua::ResponseClass::ManagedProtected),
+          "second managed request rejected");
     engine.endSend(1, false, 102, true);
     check(engine.requestOneShot(1), "one-shot under active request demand rejected");
     auto demand_stats = engine.stats();
@@ -653,7 +666,8 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
     auto a_box = engine.createClient(owner, [] { return 1; }).second;
     engine.createClient(owner, [] { return 2; });
 
-    check(engine.admitSend(ledger, 1, false, 701),
+    check(engine.admitSend(ledger, 1, false, 701,
+                           tdlua::ResponseClass::ManagedProtected),
           "pending poll callback dependency was not admitted");
     engine.endSend(1, false, 701, true);
 
@@ -669,20 +683,21 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
               pending_stats.consumer_interests == 0,
           "pending Task was confused with active consumer interest");
 
-    const auto received_before_update = pending_stats.received;
+    const auto classified_before_update = pending_stats.published +
+                                          pending_stats.dropped_unsolicited;
     const auto dropped_before_update = pending_stats.dropped_unsolicited;
     const auto depth_before_update = pending_stats.depth;
     source->push(1, 801);
-    check(engine.waitForReceived(received_before_update + 1, Ms(2000)),
-          "shared receiver did not acquire A's unsolicited update");
+    check(engine.waitForClassified(classified_before_update + 1, Ms(2000)),
+          "shared receiver did not classify A's unsolicited update");
     const auto unsolicited_stats = engine.stats();
     check(unsolicited_stats.dropped_unsolicited == dropped_before_update + 1 &&
               unsolicited_stats.depth == depth_before_update && a_box->stats().depth == 0,
           "pending PollTask incorrectly retained a later unsolicited update");
 
     source->push(1, 702, false, 701);
-    check(engine.waitForReceived(received_before_update + 2, Ms(2000)),
-          "managed response for pending PollTask was not acquired");
+    check(engine.waitForClassified(classified_before_update + 2, Ms(2000)),
+          "managed response for pending PollTask was not classified");
     const auto response_stats = engine.stats();
     check(response_stats.dropped_unsolicited == dropped_before_update + 1 &&
               response_stats.request_demands == 0 && a_box->stats().depth == 1,
@@ -804,7 +819,7 @@ static void handlerOnlyPrefilterAndResponseClassification()
           "classified replies did not arrive");
     stats = engine.stats();
     check(stats.generic_raw == 2 && stats.managed_protected == 1 &&
-              stats.lifecycle_objects == 1 && stats.unknown_correlated == 1,
+              stats.lifecycle_objects == 1 && stats.unknown_correlated == 2,
           "raw, managed, lifecycle, or unknown correlation was misclassified");
     check(box->stats().depth == 5,
           "classified raw/managed/lifecycle replies were not all preserved");
@@ -821,6 +836,276 @@ static void handlerOnlyPrefilterAndResponseClassification()
               "response class was not carried with the mailbox object");
     }
     engine.detachOwner(owner);
+}
+
+static void rawSendDoesNotKeepReceiveDemandAndLateManagedStaysProtected()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+
+    for (std::uint64_t id = 1; id <= 5000; ++id) {
+        check(engine.admitSend(ledger, 1, false, id,
+                               tdlua::ResponseClass::GenericRaw),
+              "raw fire-and-forget send was rejected");
+        ledger.endSend(1, false, true);
+        engine.endSend(1, false, id, true);
+    }
+    const auto raw = engine.stats();
+    check(raw.request_demands == 0 && raw.active_demands == 0 &&
+              raw.state == State::Stopped && source->callCount() == 0,
+          "raw fire-and-forget sends left persistent receive demand");
+
+    check(engine.admitSend(ledger, 1, false, 6001,
+                           tdlua::ResponseClass::ManagedProtected),
+          "managed request admission failed");
+    ledger.endSend(1, false, true);
+    engine.endSend(1, false, 6001, true);
+    // The Lua waiter may time out or the Future handle may be collected here.
+    // The reply classification belongs to the request, not to the waiter.
+    const auto classified_before = engine.stats().published +
+                                   engine.stats().dropped_unsolicited;
+    source->push(1, 77, false, 6001);
+    check(engine.waitForClassified(classified_before + 1, Ms(2000)),
+          "late managed reply was not classified");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 77 &&
+              item.response_class == tdlua::ResponseClass::ManagedProtected,
+          "late managed response was reclassified as GenericRaw");
+    check(engine.waitForIdle(Ms(2000)) && engine.stats().request_demands == 0,
+          "managed receive demand did not end after mailbox acquisition");
+    engine.detachOwner(owner);
+    std::cout << "raw_demand_probe,sends=5000,request_demands="
+              << raw.request_demands << ",source_calls=" << source->callCount()
+              << ",late_managed_class=protected\n";
+}
+
+static void boundedGenericBuffer()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10), Engine::Hooks(), 2, std::chrono::seconds(120));
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 1; }).second;
+    auto demand = engine.acquireDriver(1);
+    engine.setConsumerInterest(1, true, true);
+    const auto fifo_classified = engine.stats().published +
+                                 engine.stats().dropped_unsolicited;
+    source->push(1, 1);
+    source->push(1, 2);
+    source->push(1, 3);
+    check(engine.waitForClassified(fifo_classified + 3, Ms(2000)),
+          "bounded FIFO source did not classify burst");
+    auto stats = engine.stats();
+    check(box->stats().depth == 2 && stats.generic_pending == 2 &&
+              stats.dropped_overflow == 1,
+          "generic capacity did not evict exactly the oldest event");
+    Item item;
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 2,
+          "drop-oldest changed remaining generic FIFO order");
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 3,
+          "newest generic event was not retained");
+    item.generic_ticket.reset();
+    check(engine.stats().generic_pending == 0,
+          "generic quota was not released after backend consumption");
+
+    // Raw correlations share the generic budget; a managed response does not.
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    check(engine.admitSend(ledger, 1, false, 91), "raw response admission failed");
+    engine.endSend(1, false, 91, true);
+    check(engine.admitSend(ledger, 1, false, 92), "second raw response admission failed");
+    engine.endSend(1, false, 92, true);
+    check(engine.admitSend(ledger, 1, false, 93), "third raw response admission failed");
+    engine.endSend(1, false, 93, true);
+    check(engine.admitSend(ledger, 1, false, 94,
+                           tdlua::ResponseClass::ManagedProtected),
+          "managed response admission failed");
+    engine.endSend(1, false, 94, true);
+    const auto classified = engine.stats().published + engine.stats().dropped_unsolicited;
+    source->push(1, 91, false, 91);
+    source->push(1, 92, false, 92);
+    source->push(1, 93, false, 93);
+    source->push(1, 94, false, 94);
+    check(engine.waitForClassified(classified + 4, Ms(2000)),
+          "raw/managed overflow burst was not classified");
+    stats = engine.stats();
+    std::cout << "bounded_raw_managed,depth=" << box->stats().depth
+              << ",generic_pending=" << stats.generic_pending
+              << ",overflow=" << stats.dropped_overflow
+              << ",managed=" << stats.managed_protected << '\n';
+    check(stats.generic_pending == 2 && stats.dropped_overflow == 2 &&
+              box->stats().depth == 3,
+          "managed response consumed or escaped the per-client generic budget");
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 92 &&
+              item.generic_ticket,
+          "raw reply did not retain generic FIFO ownership");
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 93,
+          "raw reply order changed after overflow");
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 94 &&
+              item.response_class == tdlua::ResponseClass::ManagedProtected &&
+              !item.generic_ticket,
+          "managed reply was dropped or assigned a generic quota");
+    demand.release();
+    engine.detachOwner(owner);
+
+    std::mutex clock_mutex;
+    Clock::time_point fake_now = Clock::now();
+    Engine::Hooks hooks;
+    hooks.now = [&] {
+        std::lock_guard<std::mutex> lock(clock_mutex);
+        return fake_now;
+    };
+    auto ttl_source = std::make_shared<Fake>();
+    Engine ttl_engine(ttl_source, Ms(10), hooks, 8, std::chrono::seconds(120));
+    const auto ttl_owner = ttl_engine.attachOwner();
+    auto ttl_box = ttl_engine.createClient(ttl_owner, [] { return 7; }).second;
+    auto ttl_demand = ttl_engine.acquireDriver(7);
+    ttl_engine.setConsumerInterest(7, true, true);
+    ttl_source->push(7, 70);
+    ttl_source->push(7, 71);
+    check(ttl_engine.waitForClassified(2, Ms(2000)), "TTL events were not classified");
+    {
+        std::lock_guard<std::mutex> lock(clock_mutex);
+        fake_now += std::chrono::seconds(121);
+    }
+    ttl_source->push(7, 72);
+    check(ttl_engine.waitForClassified(3, Ms(2000)),
+          "post-TTL event was not classified");
+    const auto ttl_stats = ttl_engine.stats();
+    check(ttl_box->stats().depth == 1 && ttl_stats.generic_pending == 1 &&
+              ttl_stats.dropped_expired == 2,
+          "lazy TTL cleanup did not remove expired generic events");
+    check(ttl_engine.receiveMailbox(7, *ttl_box, 0, item) == Pop::Item &&
+              item.value == 72,
+          "expired generic event was delivered instead of the fresh event");
+    ttl_demand.release();
+    ttl_engine.detachOwner(ttl_owner);
+
+    auto multi_source = std::make_shared<Fake>();
+    Engine multi(multi_source, Ms(10), Engine::Hooks(), 2);
+    const auto multi_owner = multi.attachOwner();
+    auto a_box = multi.createClient(multi_owner, [] { return 8; }).second;
+    auto b_box = multi.createClient(multi_owner, [] { return 9; }).second;
+    multi.setConsumerInterest(8, true, true);
+    multi.setConsumerInterest(9, true, true);
+    auto b_demand = multi.acquireDriver(9);
+    const auto multi_classified = multi.stats().published +
+                                  multi.stats().dropped_unsolicited;
+    for (int value = 1; value <= 3; ++value) {
+        multi_source->push(8, value);
+        multi_source->push(9, value + 10);
+    }
+    check(multi.waitForClassified(multi_classified + 6, Ms(2000)),
+          "multi-client bounded burst was not classified");
+    const auto multi_stats = multi.stats();
+    check(a_box->stats().depth == 2 && b_box->stats().depth == 2 &&
+              multi_stats.generic_pending == 4 && multi_stats.dropped_overflow == 2,
+          "one client's overflow changed another client's generic budget");
+    check(multi.genericPendingForTesting(8) == 2 &&
+              multi.genericPendingForTesting(9) == 2,
+          "per-client generic accounting was not isolated");
+    Item a_item, b_item;
+    check(a_box->tryPop(a_item) == Pop::Item && a_item.value == 2 &&
+              b_box->tryPop(b_item) == Pop::Item && b_item.value == 12,
+          "multi-client oldest eviction or per-client FIFO was incorrect");
+    check(a_box->tryPop(a_item) == Pop::Item && a_item.value == 3 &&
+              b_box->tryPop(b_item) == Pop::Item && b_item.value == 13,
+          "healthy client did not progress through its own retained FIFO");
+    b_demand.release();
+    multi.detachOwner(multi_owner);
+
+    auto measure_source = std::make_shared<Fake>();
+    Engine measured(measure_source, Ms(10));
+    const auto measure_owner = measured.attachOwner();
+    auto measure_box = measured.createClient(measure_owner, [] { return 10; }).second;
+    auto measure_demand = measured.acquireDriver(10);
+    measured.setConsumerInterest(10, true, true);
+    const auto measure_classified = measured.stats().published +
+                                    measured.stats().dropped_unsolicited;
+    const auto started = Clock::now();
+    constexpr int measure_count = 5000;
+    for (int value = 0; value < measure_count; ++value)
+        measure_source->push(10, value);
+    check(measured.waitForClassified(measure_classified + measure_count, Ms(5000)),
+          "generic eviction measurement burst was not classified");
+    const auto elapsed = std::chrono::duration_cast<Ms>(Clock::now() - started).count();
+    const auto measured_stats = measured.stats();
+    const auto metadata = measured.genericTicketMetadataForTesting(10);
+    std::cout << "generic_buffer_burst,items=" << measure_count
+              << ",depth=" << measure_box->stats().depth
+              << ",pending=" << measured_stats.generic_pending
+              << ",ticket_metadata=" << metadata
+              << ",overflow=" << measured_stats.dropped_overflow
+              << ",received=" << measured_stats.received
+              << ",published=" << measured_stats.published
+              << ",elapsed_ms=" << elapsed << '\n';
+    check(measure_box->stats().depth == 1024 && measured_stats.generic_pending == 1024 &&
+              measured_stats.dropped_overflow == measure_count - 1024 &&
+              metadata <= 2049,
+          "production-sized generic FIFO did not enforce its event cap");
+    measure_demand.release();
+    measured.detachOwner(measure_owner);
+}
+
+static void boundedGenericTicketMetadata()
+{
+    constexpr std::size_t capacity = 2;
+    constexpr int consumed_count = 100000;
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(10), Engine::Hooks(), capacity,
+                  std::chrono::seconds(120));
+    const auto owner = engine.attachOwner();
+    auto box = engine.createClient(owner, [] { return 61; }).second;
+    auto demand = engine.acquireDriver(61);
+    engine.setConsumerInterest(61, true, true);
+
+    Item item;
+    std::uint64_t classified = engine.stats().published +
+                               engine.stats().dropped_unsolicited;
+    source->push(61, -1);
+    check(engine.waitForClassified(++classified, Ms(2000)),
+          "oldest metadata ticket was not published");
+    check(engine.receiveMailbox(61, *box, 0, item) == Pop::Item &&
+              item.generic_ticket,
+          "could not hold the oldest generic ticket outside the mailbox");
+    auto oldest = std::move(item.generic_ticket);
+
+    std::size_t maximum_metadata = engine.genericTicketMetadataForTesting(61);
+    const auto started = Clock::now();
+    for (int index = 0; index < consumed_count; ++index) {
+        source->push(61, index);
+        check(engine.waitForClassified(++classified, Ms(2000)),
+              "generic event was not classified during metadata stress");
+        check(engine.receiveMailbox(61, *box, 0, item) == Pop::Item &&
+                  item.generic_ticket,
+              "generic event was not dequeued during metadata stress");
+        item.generic_ticket->retire(
+            tdlua::receiver::GenericTicket::DropReason::None);
+        item.generic_ticket.reset();
+        maximum_metadata = std::max(
+            maximum_metadata, engine.genericTicketMetadataForTesting(61));
+        check(engine.genericPendingForTesting(61) == 1,
+              "held oldest ticket lost its per-client quota");
+    }
+    const auto elapsed = std::chrono::duration_cast<Ms>(Clock::now() - started).count();
+    const std::size_t final_metadata = engine.genericTicketMetadataForTesting(61);
+    std::cout << "generic_fifo_metadata_sample,consumed=" << consumed_count
+              << ",capacity=" << capacity
+              << ",max_tracked=" << maximum_metadata
+              << ",final_tracked=" << final_metadata << '\n';
+    check(maximum_metadata <= capacity * 2 + 1 &&
+              final_metadata <= capacity * 2 + 1,
+          "consumed weak tickets grew beyond the bounded compaction window");
+    oldest->retire(tdlua::receiver::GenericTicket::DropReason::None);
+    oldest.reset();
+    check(engine.stats().generic_pending == 0,
+          "generic quota remained after releasing the held ticket");
+    demand.release();
+    engine.detachOwner(owner);
+    std::cout << "generic_fifo_metadata_cost,elapsed_ms=" << elapsed << '\n';
 }
 
 static void handlerMetadataLinearizesAtPublication()
@@ -947,7 +1232,8 @@ static void detachedOwnerPreservesCloseLifecycle()
         ledger.acknowledgeTerminal(id);
     };
 
-    check(engine.admitSend(ledger, 1, false, 301),
+    check(engine.admitSend(ledger, 1, false, 301,
+                           tdlua::ResponseClass::ManagedProtected),
           "ordinary request admission failed before detach");
     ledger.endSend(1, false, true);
     engine.endSend(1, false, 301, true);
@@ -1259,9 +1545,14 @@ void reservedAndRejectedShutdown()
     ledger.acknowledgeTerminal(4);
 }
 
-int main(int argc, char **)
+int main(int argc, char **argv)
 {
     try {
+        if (argc > 1 && std::string(argv[1]) == "--generic-fifo-metadata-only") {
+            boundedGenericTicketMetadata();
+            std::cout << "PASS bounded generic ticket metadata\n";
+            return 0;
+        }
         reservedAndRejectedShutdown();
         fifoAndWakeup();
         tombstoneRestartAndJoin();
@@ -1272,6 +1563,8 @@ int main(int argc, char **)
         oneShotAndManagedDemand();
         pendingPollTaskDoesNotRetainUnsolicited();
         handlerOnlyPrefilterAndResponseClassification();
+        rawSendDoesNotKeepReceiveDemandAndLateManagedStaysProtected();
+        boundedGenericBuffer();
         handlerMetadataLinearizesAtPublication();
         lifecycleDemandAndConcurrentLeases();
         detachedOwnerPreservesCloseLifecycle();

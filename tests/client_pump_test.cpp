@@ -52,6 +52,15 @@ struct FakePumpClient {
         local.pop_front();
         return value;
     }
+    bool tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result)
+    {
+        if (local.empty() ||
+            (local.front().dispatched && !discard_unobserved_raw))
+            return false;
+        result = std::move(local.front());
+        local.pop_front();
+        return true;
+    }
     PumpValue receivePumpItem(double timeout)
     {
         ++transport_reads;

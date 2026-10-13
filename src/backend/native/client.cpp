@@ -132,13 +132,10 @@ void NativeTDLua::send(td::td_api::object_ptr<td::td_api::Function> request,
 
 NativeResponse NativeTDLua::receive(double timeout)
 {
-    if (!updates_.empty()) {
-        NativeResponse response(std::move(updates_.front()));
-        updates_.pop_front();
-        return response;
-    }
+    NativeResponse response;
+    if (tryPop(response)) return response;
     if (closed_) return NativeResponse();
-    NativeResponse response = transport().receive(timeout);
+    response = transport().receive(timeout);
     return response;
 }
 
@@ -184,21 +181,42 @@ bool NativeTDLua::setHandlerRegistered(const std::string &type, bool active)
     return NativeRuntime::instance().setHandlerRegistered(client_id_, type, active);
 }
 
-bool NativeTDLua::hasUndispatchedPumpItem() const
+bool NativeTDLua::hasUndispatchedPumpItem()
 {
     return hasUndispatchedPumpItem(false);
 }
 
-bool NativeTDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw) const
+bool NativeTDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw)
 {
+    pruneExpiredUpdates();
     return !updates_.empty() && (!updates_.front().dispatched ||
         dispatcher_.hasGenericPumpConsumer() ||
         discard_unobserved_raw);
 }
 
+bool NativeTDLua::tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result)
+{
+    for (;;) {
+        pruneExpiredUpdates();
+        if (updates_.empty()) return false;
+        const NativeResponse &front = updates_.front();
+        if (front.dispatched && !dispatcher_.hasGenericPumpConsumer() &&
+            !discard_unobserved_raw)
+            return false;
+        NativeResponse popped(std::move(updates_.front()));
+        updates_.pop_front();
+        if (popped.generic_ticket && !popped.generic_ticket->active())
+            continue;
+        result = std::move(popped);
+        return true;
+    }
+}
+
 NativeTDLua::PumpValue NativeTDLua::popPumpItem()
 {
-    return pop();
+    PumpValue result;
+    if (!tryPopPumpItem(false, result)) return PumpValue();
+    return result;
 }
 
 NativeTDLua::PumpValue NativeTDLua::receivePumpItem(const double timeout)
@@ -220,8 +238,10 @@ tdlua::RouteKind NativeTDLua::dispatchPumpItem(PumpValue &response,
                                                bool discard_unobserved_raw)
 {
     if (response.dispatched) {
-        return dispatcher_.dispatchPreservedGeneric(lua_, response,
-                                                    discard_unobserved_raw);
+        const auto route = dispatcher_.dispatchPreservedGeneric(
+            lua_, response, discard_unobserved_raw);
+        if (route != tdlua::RouteKind::Raw) response.generic_ticket.reset();
+        return route;
     }
     return dispatch(response, true, discard_unobserved_raw);
 }
@@ -295,6 +315,7 @@ tdlua::RouteKind NativeTDLua::dispatch(NativeResponse &response,
         const auto route = dispatcher_.dispatch(lua_, response, managed_receive,
                                                 discard_unobserved_raw);
         response.dispatched = true;
+        if (route != tdlua::RouteKind::Raw) response.generic_ticket.reset();
         if (closed_) dispatcher_.detachAfterDrain(true);
         return route;
     } catch (...) {
@@ -311,18 +332,50 @@ NativeDispatcher &NativeTDLua::dispatcher()
 
 void NativeTDLua::push(NativeResponse response)
 {
+    pruneExpiredUpdates();
     updates_.push_back(std::move(response));
 }
 
 NativeResponse NativeTDLua::pop()
 {
-    NativeResponse result(std::move(updates_.front()));
-    updates_.pop_front();
+    NativeResponse result;
+    if (!tryPop(result)) return result;
     return result;
 }
 
-bool NativeTDLua::empty() const
+bool NativeTDLua::tryPop(NativeResponse &result)
 {
+    for (;;) {
+        pruneExpiredUpdates();
+        if (updates_.empty()) return false;
+        if (updates_.front().generic_ticket &&
+            !updates_.front().generic_ticket->active()) {
+            updates_.pop_front();
+            continue;
+        }
+        result = std::move(updates_.front());
+        updates_.pop_front();
+        if (result.generic_ticket && !result.generic_ticket->active()) {
+            result = NativeResponse();
+            continue;
+        }
+        return true;
+    }
+}
+
+void NativeTDLua::pruneExpiredUpdates()
+{
+    for (auto it = updates_.begin(); it != updates_.end();) {
+        if (it->generic_ticket && !it->generic_ticket->active())
+            it = updates_.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool NativeTDLua::empty()
+{
+    pruneExpiredUpdates();
     return updates_.empty();
 }
 

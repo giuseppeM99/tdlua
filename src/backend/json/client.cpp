@@ -91,9 +91,33 @@ TDLua::~TDLua()
 
 TDLua::QueuedUpdate TDLua::pop()
 {
-    QueuedUpdate res = updates.front();
-    updates.pop_front();
-    return res;
+    QueuedUpdate result;
+    if (!tryPop(result))
+        throw std::runtime_error("tdlua: no pending backend update");
+    return result;
+}
+
+bool TDLua::tryPop(QueuedUpdate &result)
+{
+    for (;;) {
+        pruneExpiredUpdates();
+        if (updates.empty()) return false;
+        if (updates.front().generic_ticket &&
+            !updates.front().generic_ticket->active()) {
+            updates.pop_front();
+            continue;
+        }
+        result = std::move(updates.front());
+        updates.pop_front();
+        // The worker can retire a ticket concurrently, but it never mutates
+        // this owner-thread deque. Recheck after moving and skip a retired
+        // item instead of exposing it after a stale empty()/pop() observation.
+        if (result.generic_ticket && !result.generic_ticket->active()) {
+            result = QueuedUpdate();
+            continue;
+        }
+        return true;
+    }
 }
 
 void TDLua::send(std::uint64_t request_id, nlohmann::json json,
@@ -174,29 +198,53 @@ bool TDLua::setHandlerRegistered(const std::string &type, bool active)
     return JsonRuntime::instance().setHandlerRegistered(client_id, type, active);
 }
 
-bool TDLua::hasUndispatchedPumpItem() const
+bool TDLua::hasUndispatchedPumpItem()
 {
     return hasUndispatchedPumpItem(false);
 }
 
-bool TDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw) const
+bool TDLua::hasUndispatchedPumpItem(bool discard_unobserved_raw)
 {
+    pruneExpiredUpdates();
     return !updates.empty() && (!updates.front().dispatched ||
         dispatcher_.hasGenericPumpConsumer() ||
         discard_unobserved_raw);
 }
 
+bool TDLua::tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result)
+{
+    for (;;) {
+        pruneExpiredUpdates();
+        if (updates.empty()) return false;
+        const QueuedUpdate &front = updates.front();
+        if (front.dispatched && !dispatcher_.hasGenericPumpConsumer() &&
+            !discard_unobserved_raw)
+            return false;
+        QueuedUpdate queued = std::move(updates.front());
+        updates.pop_front();
+        if (queued.generic_ticket && !queued.generic_ticket->active())
+            continue;
+        popped_preserved_pump_item_ = queued.dispatched;
+        pump_ticket_ = std::move(queued.generic_ticket);
+        result = std::move(queued.value);
+        return true;
+    }
+}
+
 TDLua::PumpValue TDLua::popPumpItem()
 {
-    QueuedUpdate queued = pop();
-    popped_preserved_pump_item_ = queued.dispatched;
-    return std::move(queued.value);
+    PumpValue result;
+    if (!tryPopPumpItem(false, result)) return PumpValue();
+    return result;
 }
 
 TDLua::PumpValue TDLua::receivePumpItem(const double timeout)
 {
     popped_preserved_pump_item_ = false;
-    return transport().receive(timeout);
+    receive_ticket_.reset();
+    PumpValue value = transport().receive(timeout);
+    pump_ticket_ = std::move(receive_ticket_);
+    return value;
 }
 
 bool TDLua::isValidPumpItem(const PumpValue &value) const
@@ -214,15 +262,20 @@ tdlua::RouteKind TDLua::dispatchPumpItem(PumpValue &value,
 {
     if (popped_preserved_pump_item_) {
         popped_preserved_pump_item_ = false;
-        return dispatcher_.dispatchPreservedGeneric(value,
-                                                    discard_unobserved_raw);
+        const auto route = dispatcher_.dispatchPreservedGeneric(
+            value, discard_unobserved_raw);
+        if (route != tdlua::RouteKind::Raw) pump_ticket_.reset();
+        return route;
     }
-    return dispatch(value, true, discard_unobserved_raw);
+    const auto route = dispatch(value, true, discard_unobserved_raw);
+    if (route != tdlua::RouteKind::Raw) pump_ticket_.reset();
+    return route;
 }
 
 void TDLua::preservePumpItem(PumpValue &value)
 {
-    push(value, true);
+    pruneExpiredUpdates();
+    updates.push_back(QueuedUpdate(value, true, false, std::move(pump_ticket_)));
 }
 
 void TDLua::drainPump()
@@ -248,7 +301,8 @@ void TDLua::drainPump()
 nlohmann::json TDLua::receiveBackend(const double timeout)
 {
     try {
-        return JsonRuntime::instance().receive(client_id, timeout);
+        receive_ticket_.reset();
+        return JsonRuntime::instance().receive(client_id, timeout, &receive_ticket_);
     } catch (...) {
         // Fail pending work once on the Lua owner after the published prefix.
         dispatcher_.detachTransport("tdlua: receiver failed");
@@ -347,8 +401,19 @@ void TDLua::push(const nlohmann::json &update, const bool dispatched)
     updates.push_back(QueuedUpdate(update, dispatched));
 }
 
-bool TDLua::empty() const
+void TDLua::pruneExpiredUpdates()
 {
+    for (auto it = updates.begin(); it != updates.end();) {
+        if (it->generic_ticket && !it->generic_ticket->active())
+            it = updates.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool TDLua::empty()
+{
+    pruneExpiredUpdates();
     return updates.empty();
 }
 

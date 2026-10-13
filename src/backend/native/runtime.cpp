@@ -8,14 +8,15 @@
 #include <utility>
 
 NativeResponse::NativeResponse()
-    : client_id(0), request_id(0), object(nullptr), dispatched(false), delivery_pending(false)
+    : client_id(0), request_id(0), object(nullptr), dispatched(false), delivery_pending(false),
+      generic_ticket()
 {
 }
 
 NativeResponse::NativeResponse(NativeResponse &&other) noexcept
     : client_id(other.client_id), request_id(other.request_id),
       object(std::move(other.object)), dispatched(other.dispatched),
-      delivery_pending(other.delivery_pending)
+      delivery_pending(other.delivery_pending), generic_ticket(std::move(other.generic_ticket))
 {
 }
 
@@ -27,6 +28,7 @@ NativeResponse &NativeResponse::operator=(NativeResponse &&other) noexcept
         object = std::move(other.object);
         dispatched = other.dispatched;
         delivery_pending = other.delivery_pending;
+        generic_ticket = std::move(other.generic_ticket);
     }
     return *this;
 }
@@ -270,7 +272,9 @@ NativeResponse NativeRuntime::receive(td::ClientManager::ClientId id, double tim
     const auto status = engine_.receiveMailbox(id, *box, timeout, item);
     if (status == tdlua::receiver::Pop::Failed)
         throw std::runtime_error(tdlua::receiver::failureMessage(box->failure()));
-    return status == tdlua::receiver::Pop::Item ? std::move(item.value) : NativeResponse();
+    if (status != tdlua::receiver::Pop::Item) return NativeResponse();
+    item.value.generic_ticket = std::move(item.generic_ticket);
+    return std::move(item.value);
 }
 td::td_api::object_ptr<td::td_api::Object>
 NativeRuntime::execute(td::td_api::object_ptr<td::td_api::Function> request)
