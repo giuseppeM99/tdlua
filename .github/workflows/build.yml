@@ -160,7 +160,18 @@ jobs:
 
       - name: Verify installation
         run: |
-          cmake --install build --prefix "$RUNNER_TEMP/tdlua-install"
+          lua_library="$(find /usr/lib /lib -name "liblua${{ matrix.lua }}.so" -print -quit)"
+          cmake -S . -B build-install -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DLUA_EXECUTABLE="$(command -v lua${{ matrix.lua }})" \
+            -DLUA_INCLUDE_DIR="/usr/include/lua${{ matrix.lua }}" \
+            -DLUA_LIBRARY="$lua_library"
+          cmake --build build-install --target tdlua
+          cmake --install build-install --prefix "$RUNNER_TEMP/tdlua-install"
           test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
 
       - name: Prepare static Lua artifact
