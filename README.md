@@ -15,11 +15,15 @@ You first need to install
 * [Lua](https://lua.org)
 
 ```
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build .
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTDLUA_BUILD_TESTS=OFF
+cmake --build build
 ```
+
+Test builds include diagnostic Lua methods and cannot be installed. Keep
+`TDLUA_BUILD_TESTS=ON` for development and regression runs; use `OFF` for an
+installable module.
 
 The JSON backend is the default. The native backend can be selected with:
 
@@ -27,16 +31,18 @@ The JSON backend is the default. The native backend can be selected with:
 cmake -S . -B build-native \
   -G Ninja \
   -DTDLUA_BACKEND=native \
-  -DTDLUA_BUNDLED_TDLIB=ON
+  -DTDLUA_BUNDLED_TDLIB=ON \
+  -DTDLUA_BUILD_TESTS=OFF
 cmake --build build-native
 ```
 
 The generated native codec uses 16 translation units by default. This can be
 adjusted with `-DTDLUA_NATIVE_SHARDS=<count>` when tuning build parallelism.
 
-The native backend currently requires the bundled TDLib source because its
-codec is generated from TDLib's schema. It requires a C++23-capable compiler;
-the JSON backend can still be built with its existing C++11-compatible code.
+The native backend requires a C++23-capable compiler. Its codec is generated
+from the pinned TDLib schema; the default bundled build provides the schema
+tools automatically. The JSON backend can still be built with its existing
+C++11-compatible code.
 
 By default the repository builds its bundled TDLib copy. To use an installed
 TDLib instead, configure with:
@@ -44,6 +50,7 @@ TDLib instead, configure with:
 ```bash
 cmake -S . -B build \
   -DTDLUA_BUNDLED_TDLIB=OFF \
+  -DTDLUA_BUILD_TESTS=OFF \
   -DCMAKE_PREFIX_PATH=/path/to/tdlib
 cmake --build build
 ```
@@ -68,10 +75,29 @@ objects. Omitted scalar, string, bytes, and vector fields use the same zero,
 empty, or false defaults as the JSON interface. For portable code, use explicit
 Lua strings for TDLib string fields and numeric values for numeric fields.
 
-The native codec is generated from the bundled TDLib schema, so native builds
-currently require `TDLUA_BUNDLED_TDLIB=ON`. The JSON backend can instead link
-against an installed TDLib with `TDLUA_BUNDLED_TDLIB=OFF`; its C JSON ABI is
-the replaceable backend boundary.
+Native builds can reuse an installed TDLib package and the code-generation
+tools from an existing bundled native build of this checkout:
+
+```bash
+cmake -S . -B build-native-external \
+  -DTDLUA_BACKEND=native \
+  -DTDLUA_BUNDLED_TDLIB=OFF \
+  -DTDLUA_BUILD_TESTS=OFF \
+  -DCMAKE_PREFIX_PATH=/path/to/tdlib-install \
+  -DTDLUA_TDLIB_CODEGEN_BUILD_DIR=/path/to/existing-bundled-native-build
+cmake --build build-native-external
+```
+
+The external package version must match the pinned `td` submodule. The
+code-generation build directory must use this same source checkout and C++
+compiler; TDLua reuses its `tdtl` and `tl-parser` artifacts and generates the
+schema file in its own build directory. This mode does not rebuild TDLib's
+runtime libraries. The default bundled build path remains unchanged. The JSON
+backend can also link against an installed TDLib with
+`TDLUA_BUNDLED_TDLIB=OFF`; its C JSON ABI remains the replaceable backend
+boundary. External JSON installations need the TDLib library directory in the
+system loader configuration or `LD_LIBRARY_PATH`. Bundled dynamic JSON builds
+install a relative runtime path for the adjacent TDLib library.
 
 A timeout does not cancel the underlying TDLib request. The compact
 `execute(request, timeout)` form uses the managed Future router and returns the
@@ -244,23 +270,25 @@ local me = client:getMe(false) -- managed wait, returns the response
 local request_id = client:getMe(true) -- raw send, observe with receive()
 ```
 
-`receive(timeout)` is low-level raw transport observation. Managed `poll()`
-waits for an unsolicited update while routing managed work; `poll(callback)`
-returns a one-shot Task, and `loop(callback)` is the continuous managed driver.
-Managed driving may consume unobserved unsolicited updates, while raw responses
-remain available to `receive()` in FIFO order. Native versus JSON selects the
-backend; callbacks versus Futures selects the control-flow style. Async calls
-do not make an individual TDLib request faster, but allow independent requests
-to overlap while Futures preserve sequential-looking Lua.
+`receive(timeout)` observes generic transport events. `poll()` selects a
+generic event while driving managed work; `poll(callback)` returns a one-shot
+Task, and `loop(callback)` is the continuous managed driver. Raw responses are
+eligible for `receive()`, `poll()` and `loop(callback)` until one path consumes
+them. A consumed raw response is not dispatched to a handler a second time.
+Native versus JSON selects the backend; callbacks versus Futures selects the
+control-flow style. Async calls do not make an individual TDLib request faster,
+but allow independent requests to overlap while Futures preserve
+sequential-looking Lua.
 
 The managed poll forms are `poll()`, `poll(callback)`, `poll(timeout)` and
-`poll(callback, timeout)`. `poll(nil, timeout)` also selects an update directly.
+`poll(callback, timeout)`. `poll(nil, timeout)` also selects a generic event
+directly.
 The optional timeout is a finite, non-negative number of seconds. Omitted or
 `nil` means indefinite selection; positive values use one monotonic deadline,
 including managed responses and cross-client dependencies. Timeout or closure
 returns `nil`. Zero gives one nonblocking progress opportunity, including
-current-client and dependency reads, without an idle sleep. An update behind
-other transport objects may require another zero-timeout call.
+current-client and dependency reads, without an idle sleep. A generic event
+behind other transport objects may require another zero-timeout call.
 
 ```lua
 local future = client:getMe()
@@ -287,8 +315,8 @@ on a later call. Objects already buffered remain FIFO. If scheduler draining
 raises after raw acquisition, the call raises that error and preserves the
 unreturned object at the front of the receive queue. The next receive returns it
 without redispatch, including after closure. Further pending errors can still
-raise before delivery. Updates and recovered objects remain in memory for the
-client lifetime; TDLua no longer saves or restores them through `tdlua.json`.
+raise before delivery, subject to the generic buffer's capacity and expiry
+policy. TDLua no longer saves or restores updates through `tdlua.json`.
 The legacy `save()` and `clearBuffer()` methods have been removed. Existing
 `tdlua.json` files are left untouched and are not loaded. TDLib's own databases
 under `database_directory` and `files_directory` remain unchanged.
@@ -435,6 +463,33 @@ client.onUpdateNewMessage = handle_message
 client.onUpdateNewMessage = nil
 ```
 
+`client:on(type, callback[, opts])` and `client:loop(callback[, opts])` use
+`concurrent = true` by default. Each update can start a managed coroutine while
+an earlier callback is suspended on a Future. This is cooperative concurrency
+on the VM's owner thread, not parallel Lua execution. Set `concurrent = false`
+to serialize callbacks for that registration and keep one active instance at a
+time. The registration queues later updates until its current callback
+finishes. `off(type)` removes the registration and its queued updates; a task
+that already started keeps its own callback and update until it finishes.
+
+`loop()` without a generic callback uses handler-only selection. The receiver
+can discard unsolicited update types that have no registered handler. A
+registered handler alone does not keep receive demand active. If the shared
+receiver is active for another client, it may discard unsolicited updates for
+a client with no active consumer interest. `loop(callback)` also consumes
+generic events. `receive()` and `poll()` express generic interest only while
+their respective operation runs. If a generic consumer and a handler-only
+loop run concurrently, generic interest takes precedence.
+
+The receiver/backend generic buffer keeps at most 1024 pending generic event
+tickets per client and expires tickets after 120 seconds. When full, it drops
+the oldest eligible generic event. The count limits tickets, not bytes or total
+process memory. Managed responses, lifecycle events, and updates already
+assigned to handlers do not use this buffer limit. A slow serial handler, many
+suspended callback tasks, or a Lua callback that blocks without yielding can
+still retain substantial memory. TDLua does not provide a process-wide memory
+cap for handler queues or Lua coroutine state.
+
 ## From receive loops to managed async
 
 The low-level form gives the application each object and runs its callback
@@ -457,11 +512,12 @@ while running do
 end
 ```
 
-`poll(process)` waits for an unsolicited update, starts `process(update)` in a
-managed coroutine Task, and returns its Task handle. It does not join that
-Task. A yielding callback may still be running when the call returns, so this
-is not the same as `process(client:poll())`. The callback may yield on a
-pending Future while later calls continue to drive the client.
+`poll(process)` selects one generic event, starts `process(event)` in a managed
+coroutine Task, and returns its Task handle. Generic events include raw
+responses and unsolicited updates. It does not join that Task. A yielding
+callback may still be running when the call returns, so this is not the same
+as `process(client:poll())`. The callback may yield on a pending Future while
+later calls continue to drive the client.
 
 For a continuous runner, use:
 
@@ -469,8 +525,9 @@ For a continuous runner, use:
 client:loop(process)
 ```
 
-`receive()` is low-level and manual, `poll(process)` handles one update with a
-managed Task, and `loop(process)` owns continuous driving and graceful stop.
+`receive()` is low-level generic event access, `poll(process)` handles one
+generic event with a managed Task, and `loop(process)` owns continuous driving
+and graceful stop.
 Only `loop(process)` gives an exact `false` return from `process` its graceful
 stop meaning. A `poll(process)` callback returning `false` only produces Task
 data.
@@ -513,5 +570,7 @@ the resulting interleaving.
 Run the regression tests with:
 
 ```bash
-ctest --test-dir build -R '^tdlua_' --output-on-failure
+cmake -S . -B build-tests -DTDLUA_BUILD_TESTS=ON
+cmake --build build-tests
+ctest --test-dir build-tests -R '^tdlua_' --output-on-failure
 ```

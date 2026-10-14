@@ -12,6 +12,13 @@
   coroutine work remain on the owning Lua thread.
 - Runtime lifecycle now coordinates worker stop/join, client ownership,
   terminal receiver failures and cleanup accounting.
+- `on(type, callback[, opts])` and `loop(callback[, opts])` default to
+  cooperative concurrent callbacks. Set `concurrent = false` to serialize one
+  registration. Lua callbacks still run only on their VM's owner thread.
+- The receiver/backend generic buffer keeps up to 1024 pending event tickets
+  per client for 120 seconds and drops the oldest eligible ticket at capacity.
+  Managed responses, lifecycle events and updates already assigned to handlers
+  are outside this buffer policy. The ticket count is not a total memory cap.
 - `receive(0)` and `poll(0)` no longer query TDLib directly. They inspect work
   already available to the client; `poll(0)` can still process local managed
   work. A TDLib result not yet collected by the worker may appear on a later
@@ -40,8 +47,14 @@
   request. `isClosed()` becomes true after TDLib's terminal authorization
   update, not when the request is sent. Garbage collection remains a separate
   internal cleanup path. The legacy `save()` and `clearBuffer()` methods and
-  the `tdlua.json` update-buffer persistence have been removed. Buffered updates
-  remain in memory; TDLib's own database and file storage are unaffected.
+  the `tdlua.json` update-buffer persistence have been removed. Generic events
+  follow the v0.5.0 capacity and expiry policy; TDLib's own database and file
+  storage are unaffected.
+- `send(request)`, `request(request)` and `request(request, nil)` expose raw
+  responses to generic consumers. `request(request, callback, context)` keeps
+  its legacy managed callback and request-ID result. `await(request)` keeps
+  cooperative managed waiting, and `execute(request, true)` is raw while
+  `execute(request)` returns a managed Future.
 - Client and userdata construction now roll back partial registrations when C++
   or Lua allocation fails.
 
@@ -54,6 +67,9 @@
   six profiles; other platforms remain unverified.
 - TDLib upstream findings and `CleanupIncomplete` limits remain unresolved.
   The v0.5.0 work does not claim to resolve them.
+- Handler queues and suspended Lua tasks have no global count or memory limit.
+  A slow serial handler or a callback that blocks the owner thread can delay
+  Lua-side progress while the receiver continues to collect eligible traffic.
 
 ## 0.4
 
