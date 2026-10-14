@@ -2,6 +2,7 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 
 local tdlua = require "tdlua"
+io.stdout:setvbuf("line")
 
 local function optional_value(value)
     if value and value ~= "" then
@@ -97,10 +98,17 @@ local function check_auth_error()
     end
 end
 
+local function stop_auth_driver_if_finished()
+    if auth_error or (auth_thread and coroutine.status(auth_thread) == "dead") then
+        client:off("updateAuthorizationState")
+    end
+end
+
 local function request_authentication(operation, request)
     return client:execute(request, function(result, context)
         if result._ == "error" then
             fail_auth(context.operation .. " failed: " .. error_text(result))
+            stop_auth_driver_if_finished()
         end
     end, {operation = operation})
 end
@@ -114,6 +122,7 @@ local function resume_authentication(state)
     if not ok then
         fail_auth(message)
     end
+    stop_auth_driver_if_finished()
 end
 
 client:on("updateAuthorizationState", function(update)
@@ -183,32 +192,58 @@ end)
 client:execute({_ = "getAuthorizationState"}, function(state)
     if state._ == "error" then
         fail_auth("getAuthorizationState failed: " .. error_text(state))
+        stop_auth_driver_if_finished()
     else
         resume_authentication(state)
     end
 end)
 
-while coroutine.status(auth_thread) ~= "dead" do
-    check_auth_error()
-    client:poll()
-end
+-- Keep handler interest active across the whole authorization exchange.
+-- Repeated poll() calls release that interest between calls, allowing an
+-- unsolicited authorization update to be discarded in the gap.
+client:loop()
 check_auth_error()
+if coroutine.status(auth_thread) ~= "dead" then
+    error("authorization driver stopped before reaching authorizationStateReady")
+end
 client:off("updateAuthorizationState")
 
 local upload_error
 local upload_succeeded = false
 local upload_update_waiting = false
+local upload_thread
+
+local function stop_upload_handlers()
+    client:off("updateMessageSendSucceeded")
+    client:off("updateMessageSendFailed")
+end
+
+local function resume_upload_thread()
+    if upload_update_waiting and upload_thread and
+        coroutine.status(upload_thread) == "suspended" then
+        upload_update_waiting = false
+        local ok, message = coroutine.resume(upload_thread)
+        if not ok then
+            upload_error = tostring(message)
+        end
+    end
+    if upload_error or (upload_thread and coroutine.status(upload_thread) == "dead") then
+        stop_upload_handlers()
+    end
+end
 
 client:on("updateMessageSendSucceeded", function(update)
     upload_succeeded = true
     print("Upload succeeded for message " .. tostring(update.message.id))
+    resume_upload_thread()
 end)
 
 client:on("updateMessageSendFailed", function(update)
     upload_error = "sendMessage failed: " .. error_text(update.error or {})
+    resume_upload_thread()
 end)
 
-local upload_thread = coroutine.create(function()
+upload_thread = coroutine.create(function()
     local chat_id = configured_chat
 
     if configured_chat:match("^%-?%d+$") then
@@ -220,6 +255,7 @@ local upload_thread = coroutine.create(function()
         })
         if chat._ == "error" then
             upload_error = "searchPublicChat failed: " .. error_text(chat)
+            stop_upload_handlers()
             return
         end
         chat_id = chat.id
@@ -260,24 +296,30 @@ local upload_thread = coroutine.create(function()
             }
         })
 
+        if upload_error then
+            stop_upload_handlers()
+            return
+        end
         if result._ == "error" then
             upload_error = "sendMessage failed for " .. artifact .. ": " .. error_text(result)
+            stop_upload_handlers()
             return
         end
         print("Message accepted by TDLib for " .. artifact)
 
         while not upload_error and not upload_succeeded do
-            -- The coroutine is resumed by the scheduler from inside poll()
-            -- when the send request completes. Yield explicitly here so the
-            -- outer driver can finish that poll before driving again.
+            -- The coroutine resumes when the active loop dispatches the send
+            -- update. Yield here until that update arrives.
             upload_update_waiting = true
             coroutine.yield()
             upload_update_waiting = false
         end
         if upload_error then
+            stop_upload_handlers()
             return
         end
     end
+    stop_upload_handlers()
 end)
 
 local resumed, message = coroutine.resume(upload_thread)
@@ -285,22 +327,27 @@ if not resumed then
     upload_error = tostring(message)
 end
 
-while coroutine.status(upload_thread) ~= "dead" do
-    if upload_error then
-        break
-    end
-    client:poll()
-    if upload_update_waiting and coroutine.status(upload_thread) == "suspended" then
-        local ok, resume_error = coroutine.resume(upload_thread)
-        if not ok then
-            upload_error = tostring(resume_error)
-        end
-    end
+if upload_error or coroutine.status(upload_thread) == "dead" then
+    stop_upload_handlers()
 end
-
-client:off("updateMessageSendSucceeded")
-client:off("updateMessageSendFailed")
-client:close()
+-- The active loop retains the two update types while managed requests and
+-- upload callbacks make progress; it exits when the coroutine removes them.
+client:loop()
+stop_upload_handlers()
+print("Closing TDLib after upload")
+local close_result = client:close():wait(30)
+if not close_result then
+    error("TDLib close response timed out")
+end
+if close_result._ == "error" then
+    error("TDLib close failed: " .. error_text(close_result))
+end
+-- The close response acknowledges the request; the terminal update completes
+-- client shutdown. Keep driving until that separate update has been acquired.
+for _ = 1, 300 do
+    if client:isClosed() then break end
+    client:receive(0.1)
+end
 
 if upload_error then
     error(upload_error)
@@ -309,5 +356,5 @@ if not upload_succeeded then
     error("upload ended without updateMessageSendSucceeded")
 end
 
-assert(client:isClosed())
+assert(client:isClosed(), "TDLib terminal update did not arrive after close")
 print("DONE")
