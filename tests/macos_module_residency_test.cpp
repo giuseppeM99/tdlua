@@ -3,9 +3,11 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+extern "C" {
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+}
 #include <sys/stat.h>
 
 #include <cstdlib>
