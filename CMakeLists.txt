@@ -376,6 +376,7 @@ else()
       "src/backend/json/dispatcher.cpp"
   )
 endif()
+list(APPEND tdlua_srcs "src/common/module_residency.cpp")
 
 if(_tdlua_backend STREQUAL "native")
   set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
@@ -485,18 +486,38 @@ else()
   target_link_libraries(tdlua PRIVATE Td::TdJson)
 endif()
 if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
-  # The threaded runtime's residency contract is reviewed only on this platform.
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    message(FATAL_ERROR "Threaded TDLua currently requires Linux x86_64/glibc")
-  endif()
-  include(CheckCSourceCompiles)
-  check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
-  if(NOT TDLUA_GLIBC)
-    message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
-  endif()
   find_package(Threads REQUIRED)
   target_link_libraries(tdlua PRIVATE Threads::Threads)
-  target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # CMAKE_SYSTEM_PROCESSOR describes the target, including cross builds.
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64)$")
+      message(FATAL_ERROR
+              "Threaded TDLua requires Linux glibc x86_64 or aarch64")
+    endif()
+    include(CheckCSourceCompiles)
+    check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
+    if(NOT TDLUA_GLIBC)
+      message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
+    endif()
+    target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  elseif(APPLE)
+    if(NOT _tdlua_backend STREQUAL "json")
+      message(FATAL_ERROR "macOS currently supports only the JSON backend")
+    endif()
+    if(CMAKE_OSX_ARCHITECTURES)
+      if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+      endif()
+    elseif(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+      message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+    endif()
+    # Lua searches for .so modules on macOS too. Keep the module name expected
+    # by require() while CMake emits a Mach-O shared library.
+    set_target_properties(tdlua PROPERTIES SUFFIX ".so")
+  else()
+    message(FATAL_ERROR
+            "Threaded TDLua currently supports Linux glibc x86_64/aarch64 and macOS arm64 JSON")
+  endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
    AND NOT _tdlua_json_static)
@@ -1024,6 +1045,19 @@ if(TDLUA_BUILD_TESTS)
                     "$<TARGET_FILE_DIR:tdlua>"
         )
         set_tests_properties(tdlua_managed_driver_backend PROPERTIES TIMEOUT 30)
+        if(APPLE)
+            add_executable(tdlua_macos_residency_test
+                "tests/macos_module_residency_test.cpp")
+            target_include_directories(tdlua_macos_residency_test PRIVATE
+                ${LUA_INCLUDE_DIRS})
+            target_link_libraries(tdlua_macos_residency_test PRIVATE
+                ${LUA_LIBRARIES} ${CMAKE_DL_LIBS})
+            target_compile_features(tdlua_macos_residency_test PRIVATE cxx_std_11)
+            add_dependencies(tdlua_macos_residency_test tdlua)
+            add_test(NAME tdlua_macos_residency
+                COMMAND tdlua_macos_residency_test "$<TARGET_FILE:tdlua>")
+            set_tests_properties(tdlua_macos_residency PROPERTIES TIMEOUT 30)
+        endif()
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle
             tdlua_async
