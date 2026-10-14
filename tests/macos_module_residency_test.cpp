@@ -70,6 +70,21 @@ bool runVmScenario(const std::string& module_directory) {
         "assert(future:ready(), 'managed authorization response was not received')\n"
         "assert(coroutine.status(co) == 'dead', 'managed coroutine did not resume')\n"
         "assert(type(result) == 'table', 'managed result was not returned')\n"
+        "local parameters\n"
+        "client:request({\n"
+        "  _ = 'setTdlibParameters',\n"
+        "  database_directory = '/tmp/tdlua-residency-' .. tostring(os.time()) .. '-' .. "
+        "tostring(math.floor(os.clock() * 1000000)),\n"
+        "  api_id = 1, api_hash = 'tdlua-residency-smoke',\n"
+        "  system_language_code = 'en', device_model = 'tdlua-residency',\n"
+        "  application_version = 'test'\n"
+        "}, function(value) parameters = value end)\n"
+        "for _ = 1, 10 do\n"
+        "  client:execute({_ = 'getAuthorizationState'}, 1.0)\n"
+        "  if parameters then break end\n"
+        "end\n"
+        "assert(type(parameters) == 'table', 'TDLib parameter request did not complete')\n"
+        "assert(updates > 0, 'authorization update handler was not dispatched')\n"
         "local raw_id = client:send({_ = 'getAuthorizationState'})\n"
         "local raw\n"
         "for _ = 1, 100 do\n"
@@ -140,14 +155,15 @@ int main(int argc, char** argv) {
         dlclose(module);
         return 1;
     }
-    std::cout << "first Lua VM: require, managed/raw requests, handler registration, close PASS\n";
+    std::cout << "first Lua VM: require, managed/raw requests, handler dispatch, close PASS\n";
 
     if (!runVmScenario(module_directory)) {
         dlclose(module);
         return 1;
     }
-    std::cout << "second Lua VM: repeated initialization and runtime PASS\n";
+    std::cout << "second Lua VM: repeated initialization, handler dispatch, runtime PASS\n";
 
+#if !defined(TDLUA_NATIVE_BACKEND)
     struct stat tdjson_identity;
     dlerror();
     const void* receive_symbol = dlsym(module, "td_receive");
@@ -161,6 +177,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "TDLib JSON image: " << tdjson_info.dli_fname << '\n';
+#else
+    std::cout << "native backend: TDLib is linked statically; runtime requests verified\n";
+#endif
 
     if (dlclose(module) != 0) {
         std::cerr << "failed to release original module handle: " << dlerror() << '\n';
@@ -171,11 +190,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "TDLua image remains resident after VM and handle release PASS\n";
+#if !defined(TDLUA_NATIVE_BACKEND)
     if (!imageLoaded(tdjson_identity)) {
         std::cerr << "TDLib JSON dependency was not resident after module release\n";
         return 1;
     }
     std::cout << "TDLib JSON dependency remains resident PASS\n";
+#endif
     if (!runVmScenario(module_directory)) {
         return 1;
     }

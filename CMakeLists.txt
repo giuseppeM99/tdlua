@@ -501,9 +501,6 @@ if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
     endif()
     target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
   elseif(APPLE)
-    if(NOT _tdlua_backend STREQUAL "json")
-      message(FATAL_ERROR "macOS currently supports only the JSON backend")
-    endif()
     if(CMAKE_OSX_ARCHITECTURES)
       if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
         message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
@@ -514,9 +511,14 @@ if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
     # Lua searches for .so modules on macOS too. Keep the module name expected
     # by require() while CMake emits a Mach-O shared library.
     set_target_properties(tdlua PROPERTIES SUFFIX ".so")
+    if(_tdlua_backend STREQUAL "native")
+      # Native TDLib links system/Homebrew dylibs such as OpenSSL. Retain their
+      # external link directories in the installed module's run path.
+      set_property(TARGET tdlua PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    endif()
   else()
     message(FATAL_ERROR
-            "Threaded TDLua currently supports Linux glibc x86_64/aarch64 and macOS arm64 JSON")
+            "Threaded TDLua currently supports Linux glibc x86_64/aarch64 and macOS arm64")
   endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
@@ -1048,6 +1050,10 @@ if(TDLUA_BUILD_TESTS)
         if(APPLE)
             add_executable(tdlua_macos_residency_test
                 "tests/macos_module_residency_test.cpp")
+            if(_tdlua_backend STREQUAL "native")
+                target_compile_definitions(tdlua_macos_residency_test PRIVATE
+                    TDLUA_NATIVE_BACKEND)
+            endif()
             target_include_directories(tdlua_macos_residency_test PRIVATE
                 ${LUA_INCLUDE_DIRS})
             target_link_libraries(tdlua_macos_residency_test PRIVATE
