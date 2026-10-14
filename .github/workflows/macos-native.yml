@@ -132,12 +132,15 @@ jobs:
           test -f "$bootstrap/td/tdtl/libtdtl.a"
           test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
           test -f "$bootstrap/td/tdutils/td/utils/config.h"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo" \
+            "$GITHUB_WORKSPACE/td/td/generate/scheme/td_api.tl"
           {
             grep '^TDLib_VERSION' "$bootstrap/td/CMakeCache.txt" || true
             file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
             find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
             shasum -a 256 td/td/generate/scheme/td_api.tl \
-              "$bootstrap/td/td/generate/auto/tlo/td_api.tlo"
+              "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
           } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-static-provenance.log"
 
       - name: Save verified TDLib and codegen cache
@@ -168,13 +171,16 @@ jobs:
           git -C td status --short
           test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
           test -z "$(git -C td status --porcelain)"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo" \
+            "$GITHUB_WORKSPACE/td/td/generate/scheme/td_api.tl"
           {
             grep -E '^(CMAKE_CXX_COMPILER|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|TDLUA_BACKEND|TDLUA_BUNDLED_TDLIB):' \
               "$bootstrap/CMakeCache.txt"
             file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
             find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
             shasum -a 256 td/td/generate/scheme/td_api.tl \
-              "$bootstrap/td/td/generate/auto/tlo/td_api.tlo"
+              "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
           } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-cache-verification.log"
 
       - name: Build and install native TDLua using the external static package
