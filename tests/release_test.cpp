@@ -343,30 +343,61 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     const auto reads=f.waits.size();
     run(L,"assert(c:poll(0.025)==nil)");
     const auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-    require(elapsed>=0.020 && elapsed<0.15,"poll timeout accuracy");
-    require(f.waits.size()-reads<=3,"idle poll spun");
+    std::cout << "idle poll deadline: elapsed=" << elapsed
+              << " receives=" << f.waits.size()-reads << '\n';
+    require(elapsed>=0.020,"poll returned before its timeout");
+    // The fake consumes its entire receive budget. A scheduled thread may
+    // resume later, but the driver must neither reset the timeout nor read again.
+    require(f.waits.size()-reads==1,"idle poll repeated its receive budget");
+    require(f.waits.back()>=0 && f.waits.back()<=0.025+0.000001,
+            "idle poll exceeded its requested receive budget");
     f.before={};
     run(L,"raw=c:send{_='getMe'}; future=c:getMe()");
     f.object(f.sent[f.sent.size()-2],101); f.object(f.sent.back(),102);
     run(L,"assert(c:poll(0.04)._request_id==raw)");
     std::vector<double> budget_waits;
+    std::chrono::steady_clock::time_point transport_deadline;
+    double remaining_after_receive = 0.04;
     f.before=[&](double wait) {
+        if (budget_waits.empty()) {
+            transport_deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait));
+        }
+        // Compare against the budget left at the end of the previous receive.
+        // Sampling only at the next entry could mistake preemption between
+        // calculating a timeout and calling the transport for a reset.
+        if (wait > std::max(0.0, remaining_after_receive) + 0.000001) {
+            std::cerr << "poll budget diagnostic: requested=" << wait
+                      << " previous_remaining=" << remaining_after_receive << '\n';
+            require(false, "managed responses restarted poll deadline");
+        }
         budget_waits.push_back(wait);
         std::this_thread::sleep_for(std::chrono::duration<double>(std::min(wait,0.015)));
+        remaining_after_receive = std::chrono::duration<double>(
+            transport_deadline - std::chrono::steady_clock::now()).count();
     };
     const auto budget_start=std::chrono::steady_clock::now();
     run(L,"assert(c:poll(0.04)==nil and future:ready())");
     const double budget_elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-budget_start).count();
-    if (!(budget_elapsed<0.08 && budget_waits.size()>=2 &&
-          budget_waits[1] < budget_waits[0])) {
-        std::cerr << "poll budget diagnostic: elapsed=" << budget_elapsed
-                  << " transport_waits=";
-        for (double wait : budget_waits) std::cerr << wait << ',';
-        std::cerr << '\n';
-    }
-    require(budget_elapsed<0.08 && budget_waits.size()>=2 &&
-                budget_waits[1] < budget_waits[0],
-            "managed responses restarted poll deadline");
+    require(!budget_waits.empty(), "managed response was not acquired during poll");
+    std::cout << "poll deadline: elapsed=" << budget_elapsed
+              << " receives=" << budget_waits.size() << '\n';
+    // A receive may consume the whole budget before returning the managed
+    // response. Then the correct driver completes it without a second read.
+    run(L,"deadline_future=c:getMe()");
+    f.object(f.sent.back(),103);
+    budget_waits.clear();
+    f.before=[&](double wait) {
+        budget_waits.push_back(wait);
+        std::this_thread::sleep_until(std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(wait)));
+    };
+    run(L,"assert(c:poll(0.04)==nil and deadline_future:ready()); "
+          "assert(deadline_future:wait().code==103); deadline_future=nil");
+    require(budget_waits.size()==1,
+            "poll received again after its managed response consumed the deadline");
     f.before={};
     run(L,"close_handler_calls=0; c:on('updateOption',function() "
           "close_handler_calls=close_handler_calls+1; error('close pending') end)");
