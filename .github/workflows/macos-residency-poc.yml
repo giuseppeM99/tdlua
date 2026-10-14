@@ -1,0 +1,102 @@
+name: macOS module residency PoC
+
+on:
+  push:
+    branches:
+      - vnext-portability
+    paths:
+      - .github/workflows/macos-residency-poc.yml
+      - poc/macos_residency/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-residency-poc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  residency:
+    name: dyld residency / macOS arm64
+    runs-on: macos-26
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v7
+
+      - name: Record runner and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "Runner: $RUNNER_NAME"
+            echo "macOS:"
+            sw_vers
+            echo "Architecture:"
+            uname -a
+            test "$(uname -m)" = arm64
+            echo "Xcode:"
+            xcodebuild -version
+            echo "Xcode path:"
+            xcode-select -p
+            echo "macOS SDK:"
+            xcrun --sdk macosx --show-sdk-version
+            echo "Apple Clang:"
+            xcrun --sdk macosx clang++ --version
+            echo "CMake:"
+            cmake --version
+            echo "Ninja:"
+            ninja --version
+          } 2>&1 | tee artifacts/runner-and-toolchain.log
+
+      - name: Configure PoC
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S poc/macos_residency -B build-macos-residency -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            2>&1 | tee artifacts/configure.log
+          cp build-macos-residency/CMakeCache.txt artifacts/CMakeCache.txt
+
+      - name: Build and inspect Mach-O images
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-macos-residency --parallel 2 \
+            2>&1 | tee artifacts/build.log
+          for image in \
+            build-macos-residency/poc_host \
+            build-macos-residency/tdlua_poc.dylib \
+            build-macos-residency/libpoc_dependency.dylib; do
+            test -f "$image"
+            {
+              echo "=== $image ==="
+              file "$image"
+              lipo -archs "$image"
+              otool -hv "$image"
+              otool -L "$image"
+            } 2>&1 | tee -a artifacts/macho-inspection.log
+            lipo -archs "$image" | grep -qx arm64
+          done
+          cp -R build-macos-residency artifacts/build-macos-residency
+
+      - name: Run loader residency test
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-macos-residency --repeat until-fail:5 \
+            --verbose --output-on-failure \
+            2>&1 | tee artifacts/ctest.log
+
+      - name: Upload logs and PoC artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-26-arm64-residency-poc-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
