@@ -951,7 +951,8 @@ template <class Value> class Runtime {
             state_ = State::Stopped;
         changed_.notify_all();
     }
-    void publish(Envelope<Value> item)
+    void publish(Envelope<Value> item,
+                 const std::set<int> &generic_interests_at_receive_start)
     {
         std::shared_ptr<Box> box;
         const int id = item.client;
@@ -1013,7 +1014,9 @@ template <class Value> class Runtime {
                         ++stats_.unknown_correlated;
                 }
                 item.response_class = response_class;
-                const bool generic_consumer = entry.consumer_interests != 0;
+                const bool generic_consumer = entry.consumer_interests != 0 ||
+                    (!entry.orphan &&
+                     generic_interests_at_receive_start.count(id) != 0);
                 const bool handler_consumer = entry.handler_only_consumers != 0;
                 const bool selected_handler_update = handler_consumer &&
                     entry.handler_types.count(item.event_type) != 0;
@@ -1089,6 +1092,7 @@ template <class Value> class Runtime {
             while (!stop_.load()) {
                 const auto started = std::chrono::steady_clock::now();
                 Envelope<Value> item;
+                std::set<int> generic_interests_at_receive_start;
                 int one_shot_client = 0;
                 bool one_shot_claimed = false;
                 std::chrono::milliseconds receive_timeout = timeout_;
@@ -1103,6 +1107,10 @@ template <class Value> class Runtime {
                     const bool continuous = hasContinuousDemandLocked();
                     if (!continuous)
                         receive_timeout = std::chrono::milliseconds(0);
+                    for (const auto &pair : entries_) {
+                        if (pair.second.consumer_interests != 0)
+                            generic_interests_at_receive_start.insert(pair.first);
+                    }
                     for (auto &pair : entries_) {
                         if (pair.second.one_shot_pending) {
                             one_shot_client = pair.first;
@@ -1129,7 +1137,7 @@ template <class Value> class Runtime {
                     item.acquired_at = now();
                     const int id = item.client;
                     const bool terminal = item.terminal;
-                    publish(std::move(item));
+                    publish(std::move(item), generic_interests_at_receive_start);
                     if (terminal)
                         source_->terminalPublished(id);
                     {

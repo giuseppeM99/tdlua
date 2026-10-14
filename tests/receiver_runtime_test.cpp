@@ -476,6 +476,78 @@ static void independentDemandAndReceiveInFlight()
     engine.detachOwner(owner);
 }
 
+static void genericInterestSurvivesInFlightReceiveCompletion()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool publish_entered = false;
+    bool release_publish = false;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &item) {
+        if (item.value != 31) return;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        publish_entered = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return release_publish; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    check(engine.setConsumerInterest(1, true, true),
+          "generic receive interest was not activated");
+
+    Pop receive_status = Pop::Failed;
+    bool receive_finished = false;
+    std::mutex receive_mutex;
+    std::condition_variable receive_changed;
+    std::thread reader([&] {
+        Item item;
+        receive_status = engine.receiveMailbox(1, *box, 0.05, item);
+        {
+            std::lock_guard<std::mutex> lock(receive_mutex);
+            receive_finished = true;
+        }
+        receive_changed.notify_all();
+    });
+
+    source->awaitCalls(1);
+    source->push(1, 31, false, 0, "updateAuthorizationState");
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return publish_entered; }),
+              "worker did not reach the publication gate");
+    }
+    {
+        std::unique_lock<std::mutex> lock(receive_mutex);
+        check(receive_changed.wait_for(lock, Ms(2000), [&] { return receive_finished; }),
+              "bounded receive did not return while publication was paused");
+    }
+    reader.join();
+    check(receive_status == Pop::Timeout,
+          "bounded receive did not expire before publication completed");
+    check(engine.setConsumerInterest(1, false, true),
+          "generic receive interest was not released");
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_publish = true;
+    }
+    gate_changed.notify_all();
+
+    check(engine.waitForClassified(1, Ms(2000)),
+          "in-flight update was not classified after the receive timeout");
+    check(box->stats().depth == 1 && engine.stats().dropped_unsolicited == 0 &&
+              engine.stats().generic_pending == 1,
+          "generic update was dropped after its receive call timed out");
+    Item item;
+    check(engine.receiveMailbox(1, *box, 0, item) == Pop::Item && item.value == 31,
+          "legacy receive loop could not consume the in-flight update on its next call");
+    item.generic_ticket.reset();
+    check(engine.stats().generic_pending == 0,
+          "consumed in-flight update retained generic quota");
+    engine.detachOwner(owner);
+}
+
 // A loop's application interest outlives each mailbox driver lease. Client B
 // keeps the shared source active while A's first handler is blocked.
 static void retentionDuringBlockedHandler()
@@ -1559,6 +1631,7 @@ int main(int argc, char **argv)
         independentConsumersAndCreateDuringStop();
         demandIdleAndReactivation();
         independentDemandAndReceiveInFlight();
+        genericInterestSurvivesInFlightReceiveCompletion();
         retentionDuringBlockedHandler();
         oneShotAndManagedDemand();
         pendingPollTaskDoesNotRetainUnsolicited();
