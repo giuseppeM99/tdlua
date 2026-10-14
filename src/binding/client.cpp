@@ -317,6 +317,13 @@ static luaL_Reg module_functions[] = {
 
 extern "C" {
 
+#ifdef TDLUA_TESTING
+std::size_t tdlua_test_live_scheduler_cores() noexcept
+{
+    return tdlua::liveSchedulerCores();
+}
+#endif
+
 LUALIB_API int luaopen_tdlua(lua_State *L)
 {
     if (!tdlua::ensureModuleResident()) {
