@@ -35,19 +35,6 @@ bool imageLoaded(const struct stat& expected) {
     return false;
 }
 
-bool findImage(const char* name_fragment, struct stat& identity, std::string& image_path) {
-    const uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; ++i) {
-        const char* path = _dyld_get_image_name(i);
-        if (path != nullptr && std::strstr(path, name_fragment) != nullptr &&
-            stat(path, &identity) == 0) {
-            image_path = path;
-            return true;
-        }
-    }
-    return false;
-}
-
 bool runVmScenario(const std::string& module_directory) {
     lua_State* state = luaL_newstate();
     if (state == nullptr) {
@@ -153,7 +140,7 @@ int main(int argc, char** argv) {
         dlclose(module);
         return 1;
     }
-    std::cout << "first Lua VM: require, managed/raw requests, handler, close PASS\n";
+    std::cout << "first Lua VM: require, managed/raw requests, handler registration, close PASS\n";
 
     if (!runVmScenario(module_directory)) {
         dlclose(module);
@@ -162,13 +149,18 @@ int main(int argc, char** argv) {
     std::cout << "second Lua VM: repeated initialization and runtime PASS\n";
 
     struct stat tdjson_identity;
-    std::string tdjson_path;
-    if (!findImage("libtdjson", tdjson_identity, tdjson_path)) {
-        std::cerr << "TDLib JSON shared library was not found in dyld images\n";
+    dlerror();
+    const void* receive_symbol = dlsym(module, "td_receive");
+    const char* receive_error = dlerror();
+    Dl_info tdjson_info = {};
+    if (receive_error != nullptr || receive_symbol == nullptr ||
+        dladdr(receive_symbol, &tdjson_info) == 0 || tdjson_info.dli_fname == nullptr ||
+        stat(tdjson_info.dli_fname, &tdjson_identity) != 0) {
+        std::cerr << "could not identify TDLua's TDLib JSON dependency\n";
         dlclose(module);
         return 1;
     }
-    std::cout << "TDLib JSON image: " << tdjson_path << '\n';
+    std::cout << "TDLib JSON image: " << tdjson_info.dli_fname << '\n';
 
     if (dlclose(module) != 0) {
         std::cerr << "failed to release original module handle: " << dlerror() << '\n';
@@ -184,5 +176,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "TDLib JSON dependency remains resident PASS\n";
+    if (!runVmScenario(module_directory)) {
+        return 1;
+    }
+    if (!imageLoaded(module_identity) || !imageLoaded(tdjson_identity)) {
+        std::cerr << "module or dependency disappeared after logical reload\n";
+        return 1;
+    }
+    std::cout << "third Lua VM after original handle release: logical reload PASS\n";
     return 0;
 }
