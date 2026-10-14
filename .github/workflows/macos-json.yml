@@ -65,7 +65,10 @@ jobs:
           openssl_prefix="$(brew --prefix openssl@3)"
           lua_header="$(find "$lua_prefix/include" -name lua.h -print -quit)"
           lua_library="$(find "$lua_prefix/lib" -maxdepth 1 -name 'liblua*.dylib' -print -quit)"
-          lua_executable="$(find "$lua_prefix/bin" -maxdepth 1 -name 'lua*' -type f -print -quit)"
+          # Select the interpreter explicitly. A glob can pick luac first (or
+          # because lua is a symlink, skip it), which accepts neither -e nor
+          # script execution.
+          lua_executable="$lua_prefix/bin/lua"
           test -n "$lua_header" && test -n "$lua_library" && test -x "$lua_executable"
           {
             brew list --versions cmake gperf lua@5.4 ninja openssl@3
