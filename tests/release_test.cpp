@@ -357,6 +357,13 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     const auto budget_start=std::chrono::steady_clock::now();
     run(L,"assert(c:poll(0.04)==nil and future:ready())");
     const double budget_elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-budget_start).count();
+    if (!(budget_elapsed<0.08 && budget_waits.size()>=2 &&
+          budget_waits[1] < budget_waits[0])) {
+        std::cerr << "poll budget diagnostic: elapsed=" << budget_elapsed
+                  << " transport_waits=";
+        for (double wait : budget_waits) std::cerr << wait << ',';
+        std::cerr << '\n';
+    }
     require(budget_elapsed<0.08 && budget_waits.size()>=2 &&
                 budget_waits[1] < budget_waits[0],
             "managed responses restarted poll deadline");
