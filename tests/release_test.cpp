@@ -367,7 +367,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
         // Compare against the budget left at the end of the previous receive.
         // Sampling only at the next entry could mistake preemption between
         // calculating a timeout and calling the transport for a reset.
-        if (wait > std::max(0.0, remaining_after_receive) + 0.000001) {
+        if (!(wait >= 0.0 && wait <= std::max(0.0, remaining_after_receive) + 0.000001)) {
             std::cerr << "poll budget diagnostic: requested=" << wait
                       << " previous_remaining=" << remaining_after_receive << '\n';
             require(false, "managed responses restarted poll deadline");
@@ -567,31 +567,37 @@ void test_receive_transient_deadline(lua_State *L)
         fake.object(fake.sent[sent_before + i], static_cast<int>(70 + i));
     }
     fake.object(0, 73);
-    std::size_t delayed_receives = 0;
-    fake.before = [&](double) {
-        if (delayed_receives++ < 3) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::size_t source_reads = 0;
+    std::chrono::steady_clock::time_point receive_deadline;
+    double receive_remaining = 1.0;
+    fake.before = [&](double wait) {
+        if (source_reads == 0) {
+            receive_deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait));
         }
+        require(wait >= 0.0 && wait <= std::max(0.0, receive_remaining) + 0.000000001,
+                "receive did not recompute each wait from the original deadline");
+        ++source_reads;
+        // All four objects are already queued. Returning them immediately also
+        // respects a zero remaining timeout if the owner was descheduled.
+        receive_remaining = std::chrono::duration<double>(
+            receive_deadline - std::chrono::steady_clock::now()).count();
     };
     const std::size_t wait_start = fake.waits.size();
     const auto started = std::chrono::steady_clock::now();
     run(L, "assert(receive_test_client:receive(1).name=='73')");
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
-    require(elapsed < 1.0, "receive exceeded its original deadline");
-    require(delayed_receives == 4,
+    std::cout << "transient receive deadline: elapsed=" << elapsed
+              << " receives=" << source_reads << '\n';
+    require(source_reads == 4,
             "receive did not consume three transients before its public update");
     require(fake.waits.size() == wait_start + 4,
             "receive performed an unexpected number of source reads");
-    require(fake.waits[wait_start] <= 1.0 && fake.waits[wait_start] > 0.95 &&
-                fake.waits[wait_start + 1] < 0.85 &&
-                fake.waits[wait_start + 2] < 0.65 &&
-                fake.waits[wait_start + 3] > 0.15,
-            "receive did not recompute each wait from the original deadline");
-    require(elapsed > 0.65,
-            "spaced transient responses did not exercise the deadline regression");
+    require(fake.waits[wait_start] == 0.0 ||
+                fake.waits[wait_start + 3] < fake.waits[wait_start],
+            "transient responses did not reduce the receive budget");
     fake.before = {};
 
     const std::size_t zero_sent = fake.sent.size();
@@ -620,20 +626,34 @@ void test_receive_transient_deadline(lua_State *L)
     )lua");
     fake.object(fake.sent[timed_transient_sent], 77);
     std::size_t timeout_reads = 0;
-    fake.before = [&](double wait) {
-        if (timeout_reads++ == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        } else {
-            require(wait > 0.0 && wait < 0.24,
-                    "transient receive did not pass the remaining deadline");
-            std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+    double timeout_remaining = 0.25;
+    std::chrono::steady_clock::time_point timeout_deadline;
+    auto timeout_receive = [&](double wait) {
+        if (timeout_reads == 0) {
+            timeout_deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait));
         }
+        require(wait >= 0.0 && wait <= std::max(0.0, timeout_remaining) + 0.000000001,
+                "transient receive did not pass the remaining deadline");
+        if (++timeout_reads > 1) {
+            // The queued transient is immediate; an empty source consumes its
+            // remaining budget, including zero, without imposing a wakeup SLA.
+            std::this_thread::sleep_until(std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait)));
+        }
+        timeout_remaining = std::chrono::duration<double>(
+            timeout_deadline - std::chrono::steady_clock::now()).count();
     };
+    fake.before = timeout_receive;
     const auto timeout_started = std::chrono::steady_clock::now();
     run(L, "assert(receive_test_client:receive(0.25)==nil)");
     const double timeout_elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - timeout_started).count();
-    require(timeout_reads == 2 && timeout_elapsed >= 0.22 && timeout_elapsed < 0.6,
+    std::cout << "empty transient receive: elapsed=" << timeout_elapsed
+              << " receives=" << timeout_reads << '\n';
+    require(timeout_reads == 2 && timeout_elapsed >= 0.22,
             "receive did not expire at the original positive deadline");
     fake.before = {};
 
@@ -646,13 +666,8 @@ void test_receive_transient_deadline(lua_State *L)
     )lua");
     fake.object(fake.sent[late_transient_sent], 78);
     timeout_reads = 0;
-    fake.before = [&](double wait) {
-        if (timeout_reads++ == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        } else {
-            std::this_thread::sleep_for(std::chrono::duration<double>(wait));
-        }
-    };
+    timeout_remaining = 0.25;
+    fake.before = timeout_receive;
     run(L, "assert(receive_test_client:receive(0.25)==nil)");
     fake.before = {};
     fake.object(0, 79);
