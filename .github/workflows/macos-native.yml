@@ -132,6 +132,15 @@ jobs:
           cmake --install "$bootstrap" \
             2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-install.log"
           test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-json-header-generation.log"
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
+          printf 'TD_API_JSON_HEADER=%s\n' "$json_header" \
+            | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-api-json-header.log"
           test -f "$bootstrap/td/tdtl/libtdtl.a"
           test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
           test -f "$bootstrap/td/tdutils/td/utils/config.h"
@@ -142,6 +151,8 @@ jobs:
             grep '^TDLib_VERSION' "$bootstrap/td/CMakeCache.txt" || true
             file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
             find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
+            shasum -a 256 "$stage/include/td/telegram/td_api.h" \
+              "$stage/include/td/telegram/td_api_json.h"
             shasum -a 256 td/td/generate/scheme/td_api.tl \
               "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
           } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-static-provenance.log"
@@ -161,8 +172,18 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/tdlua-native-stage"
           bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-json-header-cache-refresh.log"
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
+          printf 'TD_API_JSON_HEADER=%s\n' "$json_header" \
+            | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-api-json-header.log"
           test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
           test -f "$stage/include/td/telegram/Client.h"
+          test -f "$stage/include/td/telegram/td_api_json.h"
           grep -q 'set(PACKAGE_VERSION "1.8.68")' "$stage/lib/cmake/Td/TdConfigVersion.cmake"
           test -f "$bootstrap/CMakeCache.txt"
           test -f "$bootstrap/td/tdtl/libtdtl.a"
@@ -182,6 +203,8 @@ jobs:
               "$bootstrap/CMakeCache.txt"
             file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
             find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
+            shasum -a 256 "$stage/include/td/telegram/td_api.h" \
+              "$stage/include/td/telegram/td_api_json.h"
             shasum -a 256 td/td/generate/scheme/td_api.tl \
               "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
           } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-cache-verification.log"
