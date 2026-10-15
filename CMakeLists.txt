@@ -13,6 +13,12 @@ endif()
 set(_tdlua_base_version "${CMAKE_MATCH_1}")
 project(tdlua VERSION "${_tdlua_base_version}" LANGUAGES C CXX)
 
+# MSVC otherwise defaults to synchronous exception handling, which disables
+# the C++ unwinding required by TDLua's exception-safe cleanup paths.
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+endif()
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Keep the compilation database enabled for clangd and static analysis. This
 # is a project setting rather than a user-selectable backend option.
