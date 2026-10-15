@@ -87,6 +87,276 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  linux-aarch64:
+    name: Linux AArch64 / JSON and native / Lua 5.4
+    if: github.ref == 'refs/heads/vnext-portability-clean' || (github.event_name == 'pull_request' && github.base_ref == 'vnext-portability-clean')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      CCACHE_DIR: ${{ runner.temp }}/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+
+    steps:
+      - name: Checkout pinned source and submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Record runner and toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/aarch64-validation
+          {
+            date -u
+            uname -a
+            uname -m
+            cat /etc/os-release
+            ldd --version | head -n 1
+            lscpu
+            free -h
+            df -h .
+            gcc --version
+            g++ --version
+            printf 'gcc_version=%s\n' "$(gcc -dumpfullversion -dumpversion)"
+            printf 'gxx_version=%s\n' "$(g++ -dumpfullversion -dumpversion)"
+            cmake --version
+            ninja --version
+            ld --version | head -n 1
+          } | tee .ci/aarch64-validation/provenance.log
+          test "$(uname -m)" = aarch64
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          td_commit="$(git -C td rev-parse HEAD)"
+          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+          {
+            printf 'td_commit=%s\n' "$td_commit"
+            sha256sum td/td/generate/scheme/td_api.tl
+          } | tee .ci/aarch64-validation/tdlib-provenance.log
+
+      - name: Install AArch64 build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache \
+            cmake \
+            gperf \
+            liblua5.4-dev \
+            lua5.4 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+          ccache --version
+          ccache --zero-stats
+
+      - name: Restore AArch64 compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tdlua-ccache
+          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.68-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+
+      - name: Configure native backend with bundled pinned TDLib
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B build-aarch64-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/native-configure.log
+          grep -E 'CMAKE_CXX_COMPILER:|TDLUA_BACKEND:|TDLUA_BUNDLED_TDLIB:|TDLUA_LUA_VERSION:' \
+            build-aarch64-native/CMakeCache.txt | tee .ci/aarch64-validation/native-cache-summary.log
+
+      - name: Build native backend and pinned TDLib once
+        run: |
+          set -euo pipefail
+          cmake --build build-aarch64-native --parallel 2 --target tdlua tdjson_static \
+            2>&1 | tee .ci/aarch64-validation/native-build.log
+          file build-aarch64-native/tdlua.so \
+            build-aarch64-native/tdlua_native_generator \
+            build-aarch64-native/td/td/generate/tl-parser/tl-parser \
+            | tee .ci/aarch64-validation/native-architecture.log
+          readelf -h build-aarch64-native/tdlua.so | grep 'Machine:.*AArch64' \
+            | tee .ci/aarch64-validation/native-elf-header.log
+          readelf -d build-aarch64-native/tdlua.so | grep 'FLAGS_1.*NODELETE' \
+            | tee .ci/aarch64-validation/native-nodelete.log
+          nm -D --defined-only build-aarch64-native/tdlua.so | grep -E '[[:space:]]luaopen_tdlua$' \
+            | tee .ci/aarch64-validation/native-export.log
+          ccache --show-stats | tee .ci/aarch64-validation/ccache-after-native.log
+
+      - name: Record native CTest manifest
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --show-only -V \
+            2>&1 | tee .ci/aarch64-validation/native-ctest-manifest.log
+
+      - name: Run complete native CTest suite
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --output-on-failure --timeout 180 \
+            2>&1 | tee .ci/aarch64-validation/native-ctest.log
+
+      - name: Repeat native lifecycle and receiver tests
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --repeat until-fail:100 \
+            --output-on-failure --timeout 180 \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            2>&1 | tee .ci/aarch64-validation/native-repeat.log
+
+      - name: Install production native module and TDLib package
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          cmake -S . -B build-aarch64-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/native-production-configure.log
+          cmake --build build-aarch64-native --parallel 2 --target tdlua \
+            2>&1 | tee .ci/aarch64-validation/native-production-build.log
+          cmake --install build-aarch64-native \
+            2>&1 | tee .ci/aarch64-validation/native-install.log
+          module="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          readelf -h "$module" | grep 'Machine:.*AArch64'
+          readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
+            echo 'test-only TDLUA_TESTING symbols found in production native module'
+            exit 1
+          fi
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
+            lua5.4 -e 'local t=require("tdlua"); assert(t.version:match("^0%.5%.0")); print("installed native module", t.version)' \
+            2>&1 | tee .ci/aarch64-validation/native-installed-require.log
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
+            lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4" \
+            2>&1 | tee .ci/aarch64-validation/native-installed-e2e.log
+
+      - name: Configure JSON backend against the same pinned TDLib build
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B build-aarch64-json -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-json-install" \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/json-configure.log
+          grep -E 'CMAKE_CXX_COMPILER:|TDLUA_BACKEND:|TDLUA_BUNDLED_TDLIB:|TDLUA_TD_STATIC:|TDLUA_LUA_VERSION:' \
+            build-aarch64-json/CMakeCache.txt | tee .ci/aarch64-validation/json-cache-summary.log
+
+      - name: Build JSON backend using installed TDLib archives
+        run: |
+          set -euo pipefail
+          cmake --build build-aarch64-json --parallel 2 \
+            2>&1 | tee .ci/aarch64-validation/json-build.log
+          file build-aarch64-json/tdlua.so \
+            | tee .ci/aarch64-validation/json-architecture.log
+          readelf -h build-aarch64-json/tdlua.so | grep 'Machine:.*AArch64' \
+            | tee .ci/aarch64-validation/json-elf-header.log
+          readelf -d build-aarch64-json/tdlua.so | grep 'FLAGS_1.*NODELETE' \
+            | tee .ci/aarch64-validation/json-nodelete.log
+          nm -D --defined-only build-aarch64-json/tdlua.so | grep -E '[[:space:]]luaopen_tdlua$' \
+            | tee .ci/aarch64-validation/json-export.log
+          if readelf -d build-aarch64-json/tdlua.so | grep -q 'libtdjson'; then
+            echo 'JSON module unexpectedly links a dynamic TDLib JSON library'
+            exit 1
+          fi
+
+      - name: Record JSON CTest manifest
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --show-only -V \
+            2>&1 | tee .ci/aarch64-validation/json-ctest-manifest.log
+
+      - name: Run complete JSON CTest suite
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --output-on-failure --timeout 180 \
+            2>&1 | tee .ci/aarch64-validation/json-ctest.log
+
+      - name: Repeat JSON lifecycle and receiver tests
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --repeat until-fail:100 \
+            --output-on-failure --timeout 180 \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            2>&1 | tee .ci/aarch64-validation/json-repeat.log
+
+      - name: Install production JSON module and exercise it
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          cmake -S . -B build-aarch64-json-install -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-json-install" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/json-production-configure.log
+          cmake --build build-aarch64-json-install --parallel 2 --target tdlua \
+            2>&1 | tee .ci/aarch64-validation/json-production-build.log
+          cmake --install build-aarch64-json-install \
+            2>&1 | tee .ci/aarch64-validation/json-install.log
+          module="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          readelf -h "$module" | grep 'Machine:.*AArch64'
+          readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
+            echo 'test-only TDLUA_TESTING symbols found in production JSON module'
+            exit 1
+          fi
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
+            lua5.4 -e 'local t=require("tdlua"); assert(t.version:match("^0%.5%.0")); print("installed JSON module", t.version)' \
+            2>&1 | tee .ci/aarch64-validation/json-installed-require.log
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
+            lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4" \
+            2>&1 | tee .ci/aarch64-validation/json-installed-e2e.log
+
+      - name: Upload AArch64 build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-linux-aarch64-validation-${{ github.sha }}
+          path: .ci/aarch64-validation/
+          if-no-files-found: warn
+          retention-days: 30
+
   lua:
     name: Lua ${{ matrix.lua }} / static TDLib
     needs: tdlib
