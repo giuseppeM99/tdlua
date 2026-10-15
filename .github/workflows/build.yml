@@ -872,6 +872,7 @@ jobs:
           merge-multiple: true
 
       - name: Upload static artifacts to Telegram in one session
+        timeout-minutes: 10
         env:
           TG_APP_ID: ${{ secrets.TG_APP_ID }}
           TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
