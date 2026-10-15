@@ -231,7 +231,7 @@ jobs:
               echo 'native module has a dynamic TDLib or temporary-build dependency' >&2
               exit 1
             fi
-            if otool -l "$module" | grep -F "$RUNNER_TEMP"; then
+            if otool -l "$module" | sed '1d' | grep -F "$RUNNER_TEMP"; then
               echo 'installed module run path contains a temporary build directory' >&2
               exit 1
             fi
