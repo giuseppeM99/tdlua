@@ -132,10 +132,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "TDLib configure failed: $LASTEXITCODE" }
           cmake --build $build --target tdjson --config Release --parallel 2 2>&1 | Tee-Object -FilePath .ci\windows-msvc\tdlib-build.log
           if ($LASTEXITCODE -ne 0) { throw "TDLib build failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force -Path '.ci\windows-msvc\tdlib' | Out-Null
           Copy-Item (Join-Path $build 'CMakeCache.txt') (Join-Path $prefix 'tdlib-CMakeCache.txt')
           cmake --install $build --config Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\tdlib-install.log
           if ($LASTEXITCODE -ne 0) { throw "TDLib install failed: $LASTEXITCODE" }
-          New-Item -ItemType Directory -Force -Path '.ci\windows-msvc\tdlib' | Out-Null
           $tdjson = Join-Path $prefix 'bin\tdjson.dll'
           if (-not (Test-Path $tdjson)) { throw "TDLib package missing $tdjson" }
           $tdjsonImportLibrary = Join-Path $prefix 'lib\tdjson.lib'
