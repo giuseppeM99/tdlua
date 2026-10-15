@@ -2,8 +2,17 @@ name: macOS arm64 JSON portability
 
 on:
   push:
+    paths:
+      - .github/workflows/macos-json.yml
+      - CMakeLists.txt
+      - cmake/**
+      - include/**
+      - src/**
+      - tests/**
+      - td
+  pull_request:
     branches:
-      - vnext-portability
+      - master
     paths:
       - .github/workflows/macos-json.yml
       - CMakeLists.txt
