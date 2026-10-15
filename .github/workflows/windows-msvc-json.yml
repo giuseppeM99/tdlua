@@ -106,7 +106,7 @@ jobs:
 
       - name: Restore pinned TDLib MSVC package
         id: tdlib-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: .ci/windows-msvc/tdlib
           key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
@@ -185,6 +185,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'TDLib artifact is not PE x64' }
           dumpbin.exe /dependents $tdjson | Tee-Object -FilePath .ci\windows-msvc\tdjson-dependencies.log
           Get-FileHash -Algorithm SHA256 $tdjson | Tee-Object -FilePath .ci\windows-msvc\tdjson-sha256.log
+
+      - name: Save verified TDLib package cache
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .ci/windows-msvc/tdlib
+          key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
 
       - name: Build Lua 5.4.8 with MSVC
         run: |
