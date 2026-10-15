@@ -336,7 +336,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     luaL_requiref(L, "tdlua", luaopen_tdlua, 0); lua_pop(L, 1);
     run(L, "t=require'tdlua'; t.setLogLevel(0); c=t(); d=t()");
     auto *client = attach(L, "c", f);
-    auto *other_client = attach(L, "d", other);
+    attach(L, "d", other);
     Fake recovery;
     run(L, "z=t()");
     auto *recovery_client = attach(L, "z", recovery);
@@ -604,16 +604,17 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
               << " receives=" << f.waits.size()-reads << '\n';
     f.printReceiveTrace(std::cout, idle_trace_start);
     const auto idle_scheduler=client->schedulerBufferStatsForTesting();
-    const auto idle_other_scheduler=other_client->schedulerBufferStatsForTesting();
+    // The cross-client teardown scenario above intentionally collected d.
+    // Do not use a cached C++ pointer to that Lua-owned client after its GC.
     std::cout << "idle poll scheduler after return: pending="
               << idle_scheduler.pending_requests << " ready=" << idle_scheduler.ready_states
               << " running=" << idle_scheduler.running_tasks
               << " waiters=" << idle_scheduler.managed_waiters
-              << " dependent_pending=" << idle_other_scheduler.pending_requests
-              << " dependent_running=" << idle_other_scheduler.running_tasks
               << " driver_active=" << idle_scheduler.driver_active
               << " consumer_active=" << idle_scheduler.consumer_active
-              << " poll_selecting=" << idle_scheduler.poll_selecting << '\n';
+              << " poll_selecting=" << idle_scheduler.poll_selecting
+              << " live_scheduler_cores_after_dependent_gc="
+              << tdlua::liveSchedulerCores() << '\n';
     require(elapsed>=0.020,"poll returned before its timeout");
     // The fake consumes its entire receive budget. A scheduled thread may
     // resume later, but the driver must neither reset the timeout nor read again.
@@ -630,13 +631,10 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
                   << " running=" << scheduler.running_tasks
                   << " waiters=" << scheduler.managed_waiters
                   << " live=" << scheduler.live_states << '\n';
-        const auto other_scheduler=other_client->schedulerBufferStatsForTesting();
-        std::cerr << "dependent scheduler after idle poll: pending="
-                  << other_scheduler.pending_requests
-                  << " ready=" << other_scheduler.ready_states
-                  << " running=" << other_scheduler.running_tasks
-                  << " waiters=" << other_scheduler.managed_waiters
-                  << " live=" << other_scheduler.live_states << '\n';
+        std::cerr << "dependent client was collected before this poll; live scheduler cores="
+                  << tdlua::liveSchedulerCores()
+                  << " wait bindings=" << tdlua::waitBindings().size()
+                  << " task bindings=" << tdlua::taskBindings().size() << '\n';
         require(false,"idle poll repeated its receive budget");
     }
     require(f.waits.back()>=0 && f.waits.back()<=0.025+0.000001,
