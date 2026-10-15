@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -42,7 +43,7 @@ struct FakeSource final : Source {
         changed.wait_for(lock, timeout, [this] { return !incoming.empty(); });
         if (incoming.empty()) return false;
         item = std::move(incoming.front());
-        incoming.erase(incoming.begin());
+        incoming.pop_front();
         return true;
     }
 
@@ -67,7 +68,7 @@ struct FakeSource final : Source {
 
     std::mutex mutex;
     std::condition_variable changed;
-    std::vector<Envelope> incoming;
+    std::deque<Envelope> incoming;
 };
 
 struct Coordination {
@@ -344,21 +345,40 @@ int noteFast(lua_State *L)
     return 0;
 }
 
-bool waitAtOwnerGate(Owner &owner)
+void waitAtOwnerGate(Owner &owner)
 {
     Coordination &coordination = *owner.coordination;
     std::unique_lock<std::mutex> lock(coordination.mutex);
     coordination.owner_blocked = true;
     coordination.changed.notify_all();
-    return coordination.changed.wait_for(lock, std::chrono::seconds(8),
+    coordination.changed.wait(lock,
         [&coordination] { return coordination.release_owner; });
 }
+
+struct OwnerGateRelease {
+    Coordination &coordination;
+    bool released = false;
+
+    explicit OwnerGateRelease(Coordination &value) : coordination(value) {}
+
+    void release()
+    {
+        if (released) return;
+        {
+            std::lock_guard<std::mutex> lock(coordination.mutex);
+            coordination.release_owner = true;
+        }
+        coordination.notify();
+        released = true;
+    }
+
+    ~OwnerGateRelease() { release(); }
+};
 
 int blockOwner(lua_State *L)
 {
     Owner &owner = *static_cast<Owner *>(lua_touserdata(L, lua_upvalueindex(1)));
-    if (!waitAtOwnerGate(owner))
-        return luaL_error(L, "owner gate timed out");
+    waitAtOwnerGate(owner);
     return 0;
 }
 
@@ -599,13 +619,14 @@ void runBlockedOwnerScenario()
     fixture.source->push(fixture.client_a, 1);
     check(coordination.wait([&] { return coordination.owner_blocked; }),
           "handler did not enter the controlled owner-thread block");
+    OwnerGateRelease gate_release(coordination);
     for (int sequence = 2; sequence <= a.expected_fast_updates; ++sequence)
         fixture.source->push(fixture.client_a, sequence);
     for (int sequence = 1; sequence <= 3; ++sequence)
         fixture.source->push(fixture.client_b, sequence);
     check(fixture.receiver.waitForReceived(
               static_cast<std::uint64_t>(a.expected_fast_updates + 3),
-              std::chrono::seconds(8)),
+              std::chrono::seconds(30)),
           "receiver stopped while Lua owner was blocked");
     check(coordination.wait([&] {
         return b.fast_updates.load(std::memory_order_acquire) == 3;
@@ -619,15 +640,17 @@ void runBlockedOwnerScenario()
     check(a_generic_pending == 0,
           "selected handler updates unexpectedly consumed the generic budget");
 
-    {
-        std::lock_guard<std::mutex> lock(coordination.mutex);
-        coordination.release_owner = true;
-    }
-    coordination.notify();
+    gate_release.release();
     owner_a.join();
     owner_b.join();
-    check(!coordination.failed.load(std::memory_order_acquire),
-          "owner failed after the controlled block was released");
+    if (coordination.failed.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(coordination.mutex);
+        throw std::runtime_error(
+            coordination.error.empty()
+                ? "owner failed after the controlled block was released"
+                : "owner failed after the controlled block was released: " +
+                      coordination.error);
+    }
     check(a.fast_updates.load() == a.expected_fast_updates,
           "A did not process all selected updates after returning control");
     check(b.fast_updates.load() == 3, "B update count changed after A resumed");

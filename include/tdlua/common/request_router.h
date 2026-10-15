@@ -1473,6 +1473,10 @@ public:
         std::size_t lua_registry_refs = 0;
         std::size_t managed_handles = 0;
         std::size_t managed_waiters = 0;
+        bool driver_active = false;
+        bool consumer_active = false;
+        bool poll_selecting = false;
+        bool loop_observer_active = false;
     };
 
     std::size_t liveTaskCount() const
@@ -1493,6 +1497,11 @@ public:
         result.running_tasks = running_tasks_.size();
         result.deferred_events = deferred_events_.size();
         result.selected_updates = managed_driver_.selected_update != LUA_NOREF ? 1 : 0;
+        result.driver_active = managed_driver_.drive_active;
+        result.consumer_active = managed_driver_.consumer_active;
+        result.poll_selecting = managed_driver_.poll_selecting;
+        result.loop_observer_active = managed_driver_.loop_observer &&
+            !managed_driver_.loop_observer->stopped;
 
         std::map<const ManagedState *, bool> seen_states;
         const auto count_state_refs = [&result, &seen_states](const State &state) {
@@ -1696,17 +1705,26 @@ public:
             wait = std::min(wait, std::max(0.0, std::chrono::duration<double>(
                 *deadline - std::chrono::steady_clock::now()).count()));
         }
+        const bool nonblocking_step = wait <= 0.0;
         const bool progressed = pumpCurrentTransport(wait,
                                                       discard_unobserved_raw);
-        pumpCrossClientDependencies(dependencies, deadline);
+        // The current receive may consume the caller's entire budget while
+        // delivering a managed response. Do not start another transport read
+        // on a dependent client after that deadline; tick() below still
+        // routes the response and resumes any work it made ready.
+        if (!deadline || nonblocking_step ||
+            std::chrono::steady_clock::now() < *deadline) {
+            pumpCrossClientDependencies(dependencies, deadline);
+        }
         if (!deadline) {
             backoffAfterEmptyPump(progressed);
         } else if (!progressed && hasPump()) {
             const auto remaining = *deadline - std::chrono::steady_clock::now();
             if (remaining > std::chrono::steady_clock::duration::zero()) {
-                std::this_thread::sleep_for(std::min(remaining,
-                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                        emptyPumpBackoff())));
+                // Keep a full backoff quantum near the deadline. MinGW's
+                // Windows sleep implementation rounds sub-millisecond waits
+                // down to zero, which otherwise spins until the deadline.
+                std::this_thread::sleep_for(emptyPumpBackoff());
             }
         }
         tick();
