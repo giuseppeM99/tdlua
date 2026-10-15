@@ -313,6 +313,17 @@ struct Fake {
         incoming.push_back(std::move(r));
     }
 };
+
+struct ResetReceiveHooks {
+    Fake &first;
+    Fake &second;
+
+    ~ResetReceiveHooks()
+    {
+        first.before = {};
+        second.before = {};
+    }
+};
 Client *attach(lua_State *L, const char *name, Fake &fake) {
     lua_getglobal(L, name);
     auto *client = *static_cast<Client **>(lua_touserdata(L, -1));
@@ -430,6 +441,7 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     const std::size_t f_wait_start = f.waits.size();
     const std::size_t other_wait_start = other.waits.size();
     const auto cross_poll_started = std::chrono::steady_clock::now();
+    ResetReceiveHooks reset_cross_receive_hooks{f, other};
     f.before=consume; other.before=consume;
     run(L,"assert(c:poll(0.025)==nil and not cross:ready())");
     const double cross_poll_elapsed = std::chrono::duration<double>(
@@ -440,12 +452,21 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
               << " transport waits; max wait=" << cross_max_wait
               << "s; poll wall time=" << cross_poll_elapsed << "s\n";
     // Per-client receive budgets can be counted more than once while the
-    // scheduler drives independent client dependencies. Check the largest
-    // individual wait and the actual one-shot wall-clock bound instead.
-    require(cross_max_wait<=0.025001,
-            "cross-client receive exceeded the poll timeout");
-    require(cross_poll_elapsed<=0.050,
-            "cross-client poll exceeded its wall-clock bound");
+    // scheduler drives independent client dependencies. A descheduled owner
+    // may return later than the requested wall-clock timeout, so validate the
+    // deadline passed to each receive rather than imposing a scheduler SLA.
+    require(cross_max_wait <= 0.025001, "cross-client receive exceeded the poll timeout");
+    const auto check_cross_deadline = [&](const std::vector<Fake::ReceiveTrace>& trace) {
+        for (const auto& entry : trace) {
+            const double elapsed_before_receive =
+                std::chrono::duration<double>(entry.started - cross_poll_started).count();
+            const double remaining_budget = std::max(0.0, 0.025 - elapsed_before_receive);
+            require(entry.timeout <= remaining_budget + 0.001,
+                    "cross-client receive exceeded its remaining poll deadline");
+        }
+    };
+    check_cross_deadline(f.receiveTraceFrom(f_wait_start));
+    check_cross_deadline(other.receiveTraceFrom(other_wait_start));
     f.before={}; other.before={};
     other.object(other.sent.back(),103);
     run(L,"assert(c:poll(0)==nil and cross:ready() and cross:wait()==103); cross=nil");
