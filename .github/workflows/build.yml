@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 90
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      CCACHE_DIR: ${{ runner.temp }}/tdlua-ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
       CCACHE_COMPRESS: 1
       CCACHE_COMPRESSLEVEL: 6
 
@@ -156,7 +156,7 @@ jobs:
       - name: Restore AArch64 compiler cache
         uses: actions/cache@v6
         with:
-          path: ${{ runner.temp }}/tdlua-ccache
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
           key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.68-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
 
       - name: Configure native backend with bundled pinned TDLib
