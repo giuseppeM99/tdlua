@@ -124,7 +124,10 @@ jobs:
             -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
             -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
             2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-configure.log"
-          cmake --build "$bootstrap" --target tdlua --parallel 3 \
+          # The native module builds Td::TdStatic, but TDLib's install rules
+          # also install tdjson_static when static libraries are enabled.
+          # Build that archive explicitly so the package install is complete.
+          cmake --build "$bootstrap" --target tdlua tdjson_static --parallel 3 \
             2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-build.log"
           cmake --install "$bootstrap" \
             2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-install.log"
