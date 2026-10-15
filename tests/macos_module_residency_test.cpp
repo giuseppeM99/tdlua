@@ -200,10 +200,16 @@ int main(int argc, char** argv) {
     if (!runVmScenario(module_directory)) {
         return 1;
     }
-    if (!imageLoaded(module_identity) || !imageLoaded(tdjson_identity)) {
+    if (!imageLoaded(module_identity)) {
         std::cerr << "module or dependency disappeared after logical reload\n";
         return 1;
     }
+#if !defined(TDLUA_NATIVE_BACKEND)
+    if (!imageLoaded(tdjson_identity)) {
+        std::cerr << "TDLib JSON dependency disappeared after logical reload\n";
+        return 1;
+    }
+#endif
     std::cout << "third Lua VM after original handle release: logical reload PASS\n";
     return 0;
 }
