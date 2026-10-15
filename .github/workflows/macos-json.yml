@@ -1,0 +1,253 @@
+name: macOS arm64 JSON portability
+
+on:
+  push:
+    branches:
+      - vnext-portability
+    paths:
+      - .github/workflows/macos-json.yml
+      - CMakeLists.txt
+      - cmake/**
+      - include/**
+      - src/**
+      - tests/**
+      - td
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-json-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  json-arm64:
+    name: pinned TDLib, JSON, Lua 5.4
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out pinned TDLib submodule
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Record runner, toolchain, and source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tdlua-artifacts"
+          {
+            sw_vers
+            uname -a
+            test "$(uname -m)" = arm64
+            xcodebuild -version
+            xcode-select -p
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx clang++ --version
+            cmake --version
+            ninja --version
+            git rev-parse HEAD
+            git -C td rev-parse HEAD
+            git -C td status --short
+            git ls-tree HEAD td
+            shasum -a 256 td/td/generate/scheme/td_api.tl
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/provenance.log"
+          test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+
+      - name: Install macOS build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake gperf lua@5.4 ninja openssl@3
+          lua_prefix="$(brew --prefix lua@5.4)"
+          openssl_prefix="$(brew --prefix openssl@3)"
+          lua_header="$(find "$lua_prefix/include" -name lua.h -print -quit)"
+          lua_library="$(find "$lua_prefix/lib" -maxdepth 1 -name 'liblua*.dylib' -print -quit)"
+          # Select the interpreter explicitly. A glob can pick luac first (or
+          # because lua is a symlink, skip it), which accepts neither -e nor
+          # script execution.
+          lua_executable="$lua_prefix/bin/lua"
+          test -n "$lua_header" && test -n "$lua_library" && test -x "$lua_executable"
+          {
+            brew list --versions cmake gperf lua@5.4 ninja openssl@3
+            printf 'LUA_INCLUDE_DIR=%s\nLUA_LIBRARY=%s\nLUA_EXECUTABLE=%s\nOPENSSL_ROOT_DIR=%s\n' \
+              "$(dirname "$lua_header")" "$lua_library" "$lua_executable" "$openssl_prefix"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/dependencies.log"
+          echo "LUA_INCLUDE_DIR=$(dirname "$lua_header")" >> "$GITHUB_ENV"
+          echo "LUA_LIBRARY=$lua_library" >> "$GITHUB_ENV"
+          echo "LUA_EXECUTABLE=$lua_executable" >> "$GITHUB_ENV"
+          echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
+          tdlib_cache_key="$( {
+            git -C td rev-parse HEAD
+            shasum -a 256 td/td/generate/scheme/td_api.tl
+            uname -m
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx clang++ --version
+            cmake --version
+            brew list --versions openssl@3
+            printf '%s\n' 'Release;arm64;JSON;shared;parallel=3'
+          } | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "TDLIB_CACHE_KEY=tdlib-macos-json-v1-$tdlib_cache_key" >> "$GITHUB_ENV"
+
+      - name: Restore the pinned TDLib installation
+        id: tdlib-cache
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ env.TDLIB_CACHE_KEY }}
+          path: |
+            ${{ runner.temp }}/tdlua-stage/include/td
+            ${{ runner.temp }}/tdlua-stage/lib/libtdjson*.dylib
+            ${{ runner.temp }}/tdlua-stage/lib/cmake/Td
+
+      - name: Build and install TDLua with pinned TDLib
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-stage"
+          bundled=ON
+          if [ '${{ steps.tdlib-cache.outputs.cache-hit }}' = true ]; then
+            bundled=OFF
+          fi
+          printf 'TDLib bundled build=%s, dependency cache=%s\n' "$bundled" "$TDLIB_CACHE_KEY" \
+            | tee "$RUNNER_TEMP/tdlua-artifacts/tdlib-cache.log"
+          cmake -S . -B "$RUNNER_TEMP/tdlua-package-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_INSTALL_PREFIX="$stage" \
+            -DCMAKE_INSTALL_RPATH='@loader_path;@loader_path/../..' \
+            -DCMAKE_PREFIX_PATH="$stage" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUNDLED_TDLIB="$bundled" \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_INCLUDE_DIR="$LUA_INCLUDE_DIR" \
+            -DLUA_LIBRARY="$LUA_LIBRARY" \
+            -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/package-configure.log"
+          cmake --build "$RUNNER_TEMP/tdlua-package-build" --target tdlua --parallel 3 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/package-build.log"
+          cmake --install "$RUNNER_TEMP/tdlua-package-build" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/install.log"
+          cp "$RUNNER_TEMP/tdlua-package-build/CMakeCache.txt" \
+            "$RUNNER_TEMP/tdlua-artifacts/package-CMakeCache.txt"
+          cp "$stage/lib/lua/5.4/tdlua.so" "$RUNNER_TEMP/tdlua-artifacts/installed-tdlua.so"
+          cp "$stage/lib/libtdjson.dylib" "$RUNNER_TEMP/tdlua-artifacts/installed-libtdjson.dylib"
+          {
+            file "$stage/lib/lua/5.4/tdlua.so" "$stage/lib/libtdjson.dylib"
+            lipo -archs "$stage/lib/lua/5.4/tdlua.so"
+            lipo -archs "$stage/lib/libtdjson.dylib"
+            otool -L "$stage/lib/lua/5.4/tdlua.so"
+            otool -l "$stage/lib/lua/5.4/tdlua.so"
+            otool -L "$stage/lib/libtdjson.dylib"
+            nm -gU "$stage/lib/lua/5.4/tdlua.so" \
+              > "$RUNNER_TEMP/tdlua-artifacts/installed-exports.log"
+            grep '_luaopen_tdlua$' "$RUNNER_TEMP/tdlua-artifacts/installed-exports.log"
+            if grep -q '_tdlua_test_live_scheduler_cores$' "$RUNNER_TEMP/tdlua-artifacts/installed-exports.log"; then
+              echo 'test instrumentation leaked into the installed module' >&2
+              exit 1
+            fi
+            shasum -a 256 "$stage/lib/lua/5.4/tdlua.so" "$stage/lib/libtdjson.dylib"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/installed-linking.log"
+
+      - name: Save the verified TDLib installation
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ env.TDLIB_CACHE_KEY }}
+          path: |
+            ${{ runner.temp }}/tdlua-stage/include/td
+            ${{ runner.temp }}/tdlua-stage/lib/libtdjson*.dylib
+            ${{ runner.temp }}/tdlua-stage/lib/cmake/Td
+
+      - name: Load installed module and exercise real TDLib client
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-stage"
+          export LUA_CPATH="$stage/lib/lua/5.4/?.so;;"
+          "$LUA_EXECUTABLE" -e 'local t = require("tdlua"); assert(type(t.version) == "string"); print("installed require and version PASS", t.version)'
+          "$LUA_EXECUTABLE" tests/e2e_smoke.lua "$stage/lib/lua/5.4" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/installed-e2e.log"
+
+      - name: Configure CTest build against the staged TDLib package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B "$RUNNER_TEMP/tdlua-test-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-stage" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_INCLUDE_DIR="$LUA_INCLUDE_DIR" \
+            -DLUA_LIBRARY="$LUA_LIBRARY" \
+            -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/test-configure.log"
+          cmake -LA -N "$RUNNER_TEMP/tdlua-test-build" \
+            > "$RUNNER_TEMP/tdlua-artifacts/test-CMakeCache-summary.log"
+          ctest --test-dir "$RUNNER_TEMP/tdlua-test-build" -N -V \
+            > "$RUNNER_TEMP/tdlua-artifacts/ctest-list.log" 2>&1
+
+      - name: Build TDLua and tests without rebuilding TDLib
+        id: test-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/tdlua-test-build" --parallel 3 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/test-build.log"
+          module="$RUNNER_TEMP/tdlua-test-build/tdlua.so"
+          test -f "$module"
+          {
+            file "$module"
+            lipo -archs "$module"
+            otool -L "$module"
+            shasum -a 256 "$module"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/test-module-linking.log"
+          lipo -archs "$module" | grep -qx arm64
+
+      - name: Run complete JSON CTest suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/tdlua-test-build" --output-on-failure -j2 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/ctest.log"
+
+      - name: Repeat receiver, lifecycle, and module residency
+        if: always() && steps.test-build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/tdlua-test-build" --output-on-failure \
+            -R '^tdlua_receiver_runtime$' --repeat until-fail:100 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/receiver-repeat.log"
+          ctest --test-dir "$RUNNER_TEMP/tdlua-test-build" --output-on-failure -j2 \
+            -R '^(tdlua_lifecycle|tdlua_shutdown_admission|tdlua_vm_threads|tdlua_macos_residency|tdlua_release)$' \
+            --repeat until-fail:20 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/lifetime-repeat.log"
+
+      - name: Preserve detailed CTest output
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/tdlua-test-build/Testing/Temporary/LastTest.log" ]; then
+            cp "$RUNNER_TEMP/tdlua-test-build/Testing/Temporary/LastTest.log" \
+              "$RUNNER_TEMP/tdlua-artifacts/LastTest.log"
+          fi
+
+      - name: Upload build, install, and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-json-${{ github.run_id }}
+          path: ${{ runner.temp }}/tdlua-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
