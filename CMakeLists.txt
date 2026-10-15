@@ -415,7 +415,16 @@ if(_tdlua_backend STREQUAL "native")
   if(TDLUA_BUNDLED_TDLIB)
     set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
     set(_tdlua_native_codegen_library_target tdtl)
-    set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    if(TARGET tl_generate_tlo)
+      set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    elseif(EXISTS "${TDLUA_TD_API_TLO}")
+      # TDLib omits its executable schema-generation targets while
+      # cross-compiling. Reuse the pinned host-generated TLO when available.
+      set(_tdlua_native_tlo_dependency)
+    else()
+      message(FATAL_ERROR
+              "Native cross-build requires the pinned TDLib schema file '${TDLUA_TD_API_TLO}'. Generate TDLib sources with a host build first.")
+    endif()
   else()
     set(TDLUA_TD_API_TLO "${TDLUA_NATIVE_GENERATED_DIR}/td_api.tlo")
     add_library(tdlua_external_tdtl STATIC IMPORTED GLOBAL)
