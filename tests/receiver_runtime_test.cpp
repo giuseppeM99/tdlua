@@ -759,14 +759,18 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
                            tdlua::ResponseClass::ManagedProtected),
           "pending poll callback dependency was not admitted");
     engine.endSend(1, false, 701, true);
+    source->awaitCalls(1);
 
     // poll(callback) holds consumer interest for its C call. Once it returns a
     // pending Task, only the callback's managed request remains as demand.
+    // The first global receive began before the temporary poll interest, so
+    // wait for a second receive after release before publishing the probe.
     check(engine.setConsumerInterest(1, true),
           "poll consumer interest was not acquired");
     check(engine.setConsumerInterest(1, false),
           "poll consumer interest was not released on return");
     auto b_driver = engine.acquireDriver(2);
+    source->awaitCalls(2);
     const auto pending_stats = engine.stats();
     check(pending_stats.driver_demands == 1 && pending_stats.request_demands == 1 &&
               pending_stats.consumer_interests == 0,
@@ -780,9 +784,17 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
     check(engine.waitForClassified(classified_before_update + 1, Ms(2000)),
           "shared receiver did not classify A's unsolicited update");
     const auto unsolicited_stats = engine.stats();
-    check(unsolicited_stats.dropped_unsolicited == dropped_before_update + 1 &&
-              unsolicited_stats.depth == depth_before_update && a_box->stats().depth == 0,
-          "pending PollTask incorrectly retained a later unsolicited update");
+    if (unsolicited_stats.dropped_unsolicited != dropped_before_update + 1 ||
+        unsolicited_stats.depth != depth_before_update || a_box->stats().depth != 0) {
+        throw std::runtime_error(
+            "pending PollTask retention counters: dropped=" +
+            std::to_string(unsolicited_stats.dropped_unsolicited - dropped_before_update) +
+            ", runtime_depth_delta=" +
+            std::to_string(unsolicited_stats.depth - depth_before_update) +
+            ", client_depth=" + std::to_string(a_box->stats().depth) +
+            ", published_delta=" +
+            std::to_string(unsolicited_stats.published - pending_stats.published));
+    }
 
     source->push(1, 702, false, 701);
     check(engine.waitForClassified(classified_before_update + 2, Ms(2000)),

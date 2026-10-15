@@ -36,6 +36,9 @@ class JsonRuntime {
     }
     void replaceWithFake(std::int32_t client);
     void injectReceivedForTesting(std::int32_t client, nlohmann::json value);
+    bool waitForClassifiedForTesting(
+        std::uint64_t count, std::chrono::milliseconds timeout)
+    { return engine_.waitForClassified(count, timeout); }
     std::size_t testClientRegistrySize()
     {
         std::lock_guard<std::mutex> lock(mutex_);
