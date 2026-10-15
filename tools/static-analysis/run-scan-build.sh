@@ -28,5 +28,5 @@ fi
 # The guard above prevents this diagnostic workflow from cleaning or rebuilding TDLib.
 cmake --build "$build_dir" --target clean
 scan-build --use-cc=clang --use-c++=clang++ \
-    --output "$build_dir/scan-build-reports" \
+    -o "$build_dir/scan-build-reports" \
     cmake --build "$build_dir" --target tdlua
