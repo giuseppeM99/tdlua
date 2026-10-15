@@ -180,10 +180,10 @@ jobs:
           grep -E 'CMAKE_CXX_COMPILER:|TDLUA_BACKEND:|TDLUA_BUNDLED_TDLIB:|TDLUA_LUA_VERSION:' \
             build-aarch64-native/CMakeCache.txt | tee .ci/aarch64-validation/native-cache-summary.log
 
-      - name: Build native backend and pinned TDLib once
+      - name: Build native backend, TDLib, and regression tests
         run: |
           set -euo pipefail
-          cmake --build build-aarch64-native --parallel 2 --target tdlua tdjson_static \
+          cmake --build build-aarch64-native --parallel 2 \
             2>&1 | tee .ci/aarch64-validation/native-build.log
           file build-aarch64-native/tdlua.so \
             build-aarch64-native/tdlua_native_generator \
