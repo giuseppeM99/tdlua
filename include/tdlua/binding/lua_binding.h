@@ -7,6 +7,16 @@
 
 const tdlua_binding::ClientOperations &tdlua_backend_operations();
 
+#if defined(_WIN32)
+#if defined(TDLUA_BUILDING_DLL)
+#define TDLUA_MODULE_API __declspec(dllexport)
+#else
+#define TDLUA_MODULE_API __declspec(dllimport)
+#endif
+#else
+#define TDLUA_MODULE_API LUALIB_API
+#endif
+
 extern "C" {
-    LUALIB_API int luaopen_tdlua(lua_State *L);
+TDLUA_MODULE_API int luaopen_tdlua(lua_State *L);
 }

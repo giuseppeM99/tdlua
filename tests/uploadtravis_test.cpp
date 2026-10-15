@@ -21,13 +21,51 @@ using Response = nlohmann::json;
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace {
 void check(bool condition, const char *message)
 {
     if (!condition) throw std::runtime_error(message);
+}
+
+std::string make_temp_directory()
+{
+#ifdef _WIN32
+    char temp_path[MAX_PATH + 1] = {};
+    const DWORD length = GetTempPathA(MAX_PATH, temp_path);
+    check(length != 0 && length < MAX_PATH,
+          "unable to locate uploader test temporary directory");
+
+    char unique_path[MAX_PATH + 1] = {};
+    check(GetTempFileNameA(temp_path, "tdu", 0, unique_path) != 0,
+          "unable to allocate uploader test directory name");
+    check(DeleteFileA(unique_path) != 0 && CreateDirectoryA(unique_path, nullptr) != 0,
+          "could not create test artifacts");
+    return unique_path;
+#else
+    char directory_template[] = "/tmp/tdlua-uploader-test-XXXXXX";
+    const char *created = mkdtemp(directory_template);
+    check(created != nullptr, "could not create test artifacts");
+    return created;
+#endif
+}
+
+void remove_temp_directory(const std::string &directory)
+{
+#ifdef _WIN32
+    RemoveDirectoryA(directory.c_str());
+#else
+    rmdir(directory.c_str());
+#endif
 }
 
 // Every upload confirmation belongs to a specific handler. No unrelated
@@ -229,10 +267,7 @@ void run(lua_State *L, const char *source)
 
 void scenario(const char *script, int failure_kind)
 {
-    char directory_template[] = "/tmp/tdlua-uploader-test-XXXXXX";
-    const char *created = mkdtemp(directory_template);
-    check(created != nullptr, "could not create test artifacts");
-    const std::string directory(created);
+    const std::string directory = make_temp_directory();
     std::vector<std::string> artifacts;
     for (int i = 1; i <= 3; ++i) {
         artifacts.push_back(directory + "/up" + std::to_string(i) + ".bin");
@@ -298,7 +333,7 @@ void scenario(const char *script, int failure_kind)
     } catch (const std::exception &error) { failure = error.what(); }
     lua_close(L);
     for (const auto &path : artifacts) std::remove(path.c_str());
-    rmdir(directory.c_str());
+    remove_temp_directory(directory);
     if (!failure.empty()) throw std::runtime_error(failure);
     std::cout << "PASS uploader " << (failure_kind == 1 ? "managed rejection" :
         failure_kind == 2 ? "failed confirmation" : "three files / confirmation ordering")
