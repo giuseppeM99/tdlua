@@ -306,7 +306,9 @@ else()
     foreach(_tdlua_codegen_artifact
             "td/tdtl/libtdtl.a"
             "td/td/generate/tl-parser/tl-parser"
-            "td/tdutils/td/utils/config.h")
+            "td/tdutils/td/utils/config.h"
+            "td/td/generate/auto/td/telegram/td_api.h"
+            "td/td/generate/auto/td/telegram/td_api_json.h")
       if(NOT EXISTS "${_tdlua_codegen_build_dir}/${_tdlua_codegen_artifact}")
         message(FATAL_ERROR
                 "Missing TDLib codec tool artifact '${_tdlua_codegen_artifact}' in ${_tdlua_codegen_build_dir}; build the bundled native codec tools once first")
@@ -316,6 +318,8 @@ else()
         "${_tdlua_codegen_build_dir}/td/tdtl/libtdtl.a")
     set(_tdlua_native_tl_parser
         "${_tdlua_codegen_build_dir}/td/td/generate/tl-parser/tl-parser")
+    set(_tdlua_native_td_auto_include_dir
+        "${_tdlua_codegen_build_dir}/td/td/generate/auto")
     set(_tdlua_tdjson_private_target Td::tdjson_private)
   else()
     find_package(Td CONFIG REQUIRED)
@@ -379,6 +383,10 @@ endif()
 list(APPEND tdlua_srcs "src/common/module_residency.cpp")
 
 if(_tdlua_backend STREQUAL "native")
+  if(NOT _tdlua_native_td_auto_include_dir)
+    set(_tdlua_native_td_auto_include_dir
+        "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+  endif()
   set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
   set(TDLUA_NATIVE_GENERATED_HEADER "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.h")
   set(TDLUA_NATIVE_SHARD_COUNT "${TDLUA_NATIVE_SHARDS}")
@@ -451,7 +459,9 @@ target_include_directories(tdlua PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 if(_tdlua_backend STREQUAL "native")
-  target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
+  target_include_directories(tdlua PRIVATE
+      "${TDLUA_NATIVE_GENERATED_DIR}"
+      "${_tdlua_native_td_auto_include_dir}")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
@@ -847,7 +857,8 @@ if(TDLUA_BUILD_TESTS)
         if(_tdlua_backend STREQUAL "native")
             target_compile_definitions(tdlua_lua51_managed_test PRIVATE TDLUA_NATIVE_BACKEND)
             target_include_directories(tdlua_lua51_managed_test PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/td" "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+                "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                "${_tdlua_native_td_auto_include_dir}")
             target_compile_features(tdlua_lua51_managed_test PRIVATE cxx_std_23)
         endif()
         tdlua_enable_sanitizers(tdlua_lua51_managed_test)
@@ -875,7 +886,7 @@ if(TDLUA_BUILD_TESTS)
     if(_tdlua_backend STREQUAL "native")
         target_compile_definitions(tdlua_release_test PRIVATE TDLUA_NATIVE_BACKEND)
         target_include_directories(tdlua_release_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+            "${_tdlua_native_td_auto_include_dir}")
         target_compile_features(tdlua_release_test PRIVATE cxx_std_23)
     endif()
     tdlua_enable_sanitizers(tdlua_release_test)
@@ -895,7 +906,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_auto_include_dir}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         if(NOT TDLUA_BUNDLED_TDLIB)
@@ -921,7 +932,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_auto_include_dir}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         target_link_libraries(tdlua_native_decoder_safety_test PRIVATE
@@ -942,7 +953,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_auto_include_dir}"
             "${TDLUA_NATIVE_GENERATED_DIR}")
         if(NOT TDLUA_BUNDLED_TDLIB)
             target_include_directories(tdlua_native_generic_ticket_test PRIVATE
