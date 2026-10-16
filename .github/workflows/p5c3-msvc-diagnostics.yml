@@ -1,0 +1,46 @@
+name: P5C.3 MSVC EH-model diagnostics
+
+# Diagnostic-only scratch workflow for P5C.3 forensics. It exists solely to run
+# the exception-model matrix and capture allocation provenance on GitHub
+# Actions windows-2022; it is not part of the product build.
+
+on:
+  push:
+    branches: [p5c3-msvc-diagnostics]
+    paths:
+      - '.github/workflows/p5c3-msvc-diagnostics.yml'
+      - 'tools/windows/p5c3-diagnostics.ps1'
+      - 'tools/windows/compile-lua-msvc.ps1'
+      - 'tests/p5c3_eh_matrix_probe.cpp'
+      - 'tests/p5c3_eh_boundary_probe.cpp'
+      - 'tests/managed_adapter_test.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  p5c3:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Exception-model matrix and allocation provenance
+        run: ./tools/windows/p5c3-diagnostics.ps1
+      - name: Preserve text diagnostics and symbols, exclude process dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p5c3-msvc-${{ github.run_id }}
+          path: |
+            .ci/p5c3/**/*.log
+            .ci/p5c3/**/*.txt
+            .ci/p5c3/**/*.asm
+            .ci/p5c3/**/*.pdb
+          retention-days: 7
+          if-no-files-found: error
