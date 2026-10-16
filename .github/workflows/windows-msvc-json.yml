@@ -287,13 +287,42 @@ jobs:
           & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from the build directory' }
           ctest --test-dir $build --output-on-failure -C Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-full.log
-          if ($LASTEXITCODE -ne 0) { throw "full CTest failed: $LASTEXITCODE" }
+          $ctestExit = $LASTEXITCODE
+          Set-Content -Path .ci\windows-msvc\ctest-full-exit.txt -Value $ctestExit
           $fullLog = Get-Content .ci\windows-msvc\ctest-full.log -Raw
-          if ($fullLog -match 'Not Run|tests failed') { throw 'Full CTest contains failed or not-run tests' }
-          ctest --test-dir $build --output-on-failure --repeat until-fail:100 -R '^tdlua_release$' 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-release-repeat.log
-          if ($LASTEXITCODE -ne 0) { throw "release repeat failed: $LASTEXITCODE" }
-          ctest --test-dir $build --output-on-failure -C Release --repeat until-fail:20 -R '^(tdlua_receiver_runtime|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_managed_driver_backend|tdlua_windows_residency)$' 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-focused-repeat.log
-          if ($LASTEXITCODE -ne 0) { throw "focused repeat failed: $LASTEXITCODE" }
+          if ($fullLog -match 'Not Run|tests failed') {
+            'Full CTest reported failed or not-run tests.' | Add-Content .ci\windows-msvc\ctest-full-diagnostic.txt
+          }
+
+      - name: Repeat Windows managed and lifecycle regressions
+        if: always() && steps.provenance.outcome == 'success' && steps.tdlib-cache.outcome != 'failure'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:GITHUB_WORKSPACE 'build-windows-msvc'
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$build;$env:PATH"
+          $env:LUA_CPATH = "$build\?.dll"
+          $results = @()
+          $tests = @(
+            @{ Name = 'release'; Pattern = '^tdlua_release$'; Count = 100 },
+            @{ Name = 'receiver-runtime'; Pattern = '^tdlua_receiver_runtime$'; Count = 20 },
+            @{ Name = 'shutdown-admission'; Pattern = '^tdlua_shutdown_admission$'; Count = 20 },
+            @{ Name = 'lifecycle'; Pattern = '^tdlua_lifecycle$'; Count = 20 },
+            @{ Name = 'managed-driver-backend'; Pattern = '^tdlua_managed_driver_backend$'; Count = 20 },
+            @{ Name = 'windows-residency'; Pattern = '^tdlua_windows_residency$'; Count = 20 }
+          )
+          foreach ($test in $tests) {
+            $log = ".ci\windows-msvc\repeat-$($test.Name).log"
+            ctest --test-dir $build --output-on-failure -C Release --repeat "until-fail:$($test.Count)" -R $test.Pattern 2>&1 | Tee-Object -FilePath $log
+            $exit = $LASTEXITCODE
+            $summary = Get-Content $log -Raw
+            $completed = [regex]::Matches($summary, '(?m)^\s*\d+/\d+ Test #').Count
+            $passed = $completed -eq $test.Count -and $exit -eq 0
+            $results += [pscustomobject]@{ test = $test.Name; requested = $test.Count; exit_code = $exit; passed = $passed }
+          }
+          $results | ConvertTo-Json | Set-Content .ci\windows-msvc\repeat-summary.json
+          if ($results | Where-Object { -not $_.passed }) {
+            'One or more required stress repeats failed; see repeat-summary.json and per-test logs.' | Set-Content .ci\windows-msvc\repeat-failure.txt
+          }
 
       - name: Verify production install and absence of test hooks
         run: |
@@ -328,6 +357,17 @@ jobs:
           & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
+
+      - name: Enforce all MSVC validation results
+        if: always() && steps.provenance.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ctestExitPath = '.ci\windows-msvc\ctest-full-exit.txt'
+          if (-not (Test-Path $ctestExitPath)) { throw 'Full CTest did not produce an exit record' }
+          $ctestExit = [int](Get-Content $ctestExitPath -Raw)
+          if ($ctestExit -ne 0) { throw "Full CTest failed: $ctestExit" }
+          $repeatFailure = '.ci\windows-msvc\repeat-failure.txt'
+          if (Test-Path $repeatFailure) { throw (Get-Content $repeatFailure -Raw) }
 
       - name: Upload MSVC validation logs and manifests
         if: always()
