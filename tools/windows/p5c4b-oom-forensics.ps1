@@ -72,9 +72,10 @@ function Build-OomBinary {
 }
 
 function Invoke-OomBinary {
-    param([string]$Exe, [int]$MaxOffset, [switch]$All, [string]$Log)
+    param([string]$Exe, [int]$MaxOffset, [switch]$All, [switch]$NoFault, [string]$Log)
     $arguments = @($MaxOffset)
     if ($All) { $arguments += 'all' }
+    if ($NoFault) { $arguments += 'nofault' }
     & $Exe @arguments *> $Log
     "exit=$LASTEXITCODE" | Add-Content $Log
     return $LASTEXITCODE
@@ -133,6 +134,14 @@ $probeFacts = Read-ProbeFacts -Log $probeLog
 $probeFacts.offsets | Add-Content (Join-Path $out 'probe-summary.txt')
 $probeFacts.rejections | Add-Content (Join-Path $out 'probe-summary.txt')
 $probeFacts.rejections | Set-Content (Join-Path $out 'probe-rejections.txt')
+
+# Baseline of the same offset without the injected failure: the difference in
+# the lease count is the product-side cost of the double destruction.
+$baselineLog = Join-Path $out 'probe-baseline.log'
+$baselineCode = Invoke-OomBinary -Exe $probe -MaxOffset 1 -NoFault -Log $baselineLog
+"baseline_exit=$baselineCode" | Add-Content (Join-Path $out 'probe-summary.txt')
+Select-String -Path $baselineLog -Pattern '^P5C4B offset' |
+    ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-summary.txt')
 
 # Sign of the leaked counter: a positive value means the destructor was
 # skipped while the object was alive, a negative one means the cleanup funclet
@@ -254,12 +263,16 @@ function Get-FuncletOffsets {
         }
     }
     $offsets = New-Object System.Collections.Generic.List[string]
+    $entries = New-Object System.Collections.Generic.List[object]
     $label = $null
     foreach ($line in Get-Content $Asm) {
         if ($line -match '^\s*([0-9A-Fa-f]+):') {
             if ($label) {
                 $address = [Convert]::ToInt64($Matches[1], 16)
-                $offsets.Add('0x' + ($address - $imageBase).ToString('x'))
+                $offset = '0x' + ($address - $imageBase).ToString('x')
+                $offsets.Add($offset)
+                $tag = ($label -replace '.*::', '') -replace '[^0-9A-Za-z]', '_'
+                $entries.Add([pscustomobject]@{ offset = $offset; label = $label.Trim(); tag = $tag })
                 $label = $null
             }
             continue
@@ -267,7 +280,29 @@ function Get-FuncletOffsets {
         if ($line -match [regex]::Escape($Name) -and $line -match '::`1''::') { $label = $line }
         else { $label = $null }
     }
-    return [pscustomobject]@{ imageBase = $imageBase; offsets = $offsets }
+    return [pscustomobject]@{ imageBase = $imageBase; offsets = $offsets; entries = $entries }
+}
+
+# Returns the module offsets of the addresses in $Asm's $Name block that call
+# $Target: the exact Lua boundary calls of that function, as mapped by the PDB.
+function Get-CallOffsets {
+    param([string]$Asm, [string]$Name, [string]$Target, [Int64]$ImageBase)
+    $offsets = New-Object System.Collections.Generic.List[string]
+    $inside = $false
+    foreach ($line in Get-Content $Asm) {
+        if ($line -match '^\s*([0-9A-Fa-f]+):') {
+            if ($inside) {
+                $candidate = [Convert]::ToInt64($Matches[1], 16)
+                if ($line -match ('call\s+' + [regex]::Escape($Target))) {
+                    $offsets.Add('0x' + ($candidate - $ImageBase).ToString('x'))
+                }
+            }
+            continue
+        }
+        if ($line -match [regex]::Escape($Name)) { $inside = $true }
+        elseif ($inside) { $inside = $false }
+    }
+    return $offsets
 }
 
 $summary = New-Object System.Collections.Generic.List[string]
@@ -317,12 +352,58 @@ $symbolPath = "srv*$env:RUNNER_TEMP\p5c4b-sym*https://msdl.microsoft.com/downloa
 # therefore runs the plain probe build, the one that shares the control's flags
 # while still printing the guard counters at the end of the offset.
 $traceName = 'probe-ehsc'
+# CDB rewrites '-' to '_' in module names, so the debugger expressions must use
+# the underscored form while the file name keeps the dash.
+$traceModule = 'probe_ehsc'
 $traceExe = $work + '\' + "$traceName.exe"
+$waitedFrame = Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+    -Name 'waitForResponse' -Exe $traceExe
+$continuationFrame = Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+    -Name 'managedWaitContinuation' -Exe $traceExe
+@("image_base=0x$($waitedFrame.imageBase.ToString('x'))",
+  "waitForResponse_funclet_offsets=$($waitedFrame.offsets -join ',')",
+  "managedWaitContinuation_funclet_offsets=$($continuationFrame.offsets -join ',')") |
+    Add-Content (Join-Path $out 'funclet-summary.txt')
+
+# Symbol discovery and PDB mapping: the exact names of the fixture's Guard
+# methods, the nearest symbol and source line of every retained Lua boundary
+# call, and the funclet addresses.
+$symbolScript = Join-Path $out 'symbols-commands.txt'
+$symbolLines = New-Object System.Collections.Generic.List[string]
+$symbolLines.Add('.reload')
+$symbolLines.Add('x ' + $traceModule + '!*Guard*')
+$symbolLines.Add('x ' + $traceModule + '!*waitForResponse*')
+$symbolLines.Add('x ' + $traceModule + '!tdlua::SchedulerCore::~SchedulerCore')
+$symbolLines.Add('x ' + $traceModule + '!tdlua::SchedulerCore::SchedulerCore')
+$symbolLines.Add('x lua54!luaD_throw')
+$symbolLines.Add('x lua54!lua_error')
+foreach ($pair in @(@('waitForResponse', 'lua_error'),
+                    @('managedWaitContinuation', 'lua_error'),
+                    @('managedWaitContinuation', '??0runtime_error@std@@'),
+                    @('managedWait', 'lua_yieldk'),
+                    @('managedWait', 'lua_error'))) {
+    $function = $pair[0]
+    $target = $pair[1]
+    $calls = Get-CallOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+        -Name $function -Target $target -ImageBase $waitedFrame.imageBase
+    foreach ($offset in $calls) {
+        "call_offsets=$function/$target=$offset" | Add-Content (Join-Path $out 'funclet-summary.txt')
+        $symbolLines.Add('ln ' + $traceModule + '+' + $offset)
+        $symbolLines.Add('u ' + $traceModule + '+' + $offset + ' L1')
+    }
+}
+foreach ($offset in $waitedFrame.offsets) {
+    $symbolLines.Add('ln ' + $traceModule + '+' + $offset)
+}
+foreach ($offset in $continuationFrame.offsets) {
+    $symbolLines.Add('ln ' + $traceModule + '+' + $offset)
+}
+$symbolLines.Add('q')
+$symbolLines | Set-Content $symbolScript
 $symbolLog = Join-Path $out 'cdb-symbols.log'
 & "$debuggers\cdb.exe" -o -y $symbolPath `
     -logo (Join-Path $out 'cdb-symbols-debugger.log') `
-    -c "x $traceName!*Guard*; x $traceName!*waitForResponse*; x lua54!luaD_throw; x lua54!lua_error; x $traceName!tdlua::SchedulerCore::~SchedulerCore; q" `
-    $traceExe 1 *> $symbolLog
+    -cf $symbolScript $traceExe 1 *> $symbolLog
 $symbols = @(Get-Content $symbolLog | Where-Object { $_ -match '!' }) |
     Where-Object { $_ -notmatch 'Couldn|error' }
 $symbols | Set-Content (Join-Path $out 'cdb-symbols.txt')
@@ -330,28 +411,30 @@ $symbols | Set-Content (Join-Path $out 'cdb-symbols.txt')
 $extraBreakpoints = New-Object System.Collections.Generic.List[string]
 foreach ($line in Get-Content $symbolLog) {
     if ($line -match '!(\?\?1Guard@[^ \r\n]*)') {
-        $extraBreakpoints.Add('bu ' + $traceName + '!' + $Matches[1] +
+        $extraBreakpoints.Add('bu ' + $traceModule + '!' + $Matches[1] +
             ' ".echo P5C4B-GUARD-DTOR; kb 20; g"')
     }
 }
-$waitedFrame = Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
-    -Name 'waitForResponse' -Exe $traceExe
-@("image_base=0x$($waitedFrame.imageBase.ToString('x'))",
-  "waitForResponse_funclet_offsets=$($waitedFrame.offsets -join ',')") |
-    Add-Content (Join-Path $out 'funclet-summary.txt')
 $funcletIndex = 0
-foreach ($offset in $waitedFrame.offsets) {
+foreach ($entry in $waitedFrame.entries) {
     $funcletIndex++
-    $extraBreakpoints.Add('u ' + $traceName + '+' + $offset + ' L1')
-    $extraBreakpoints.Add('bp ' + $traceName + '+' + $offset +
-        ' ".echo P5C4B-WAITFRAME-FUNCLET-' + $funcletIndex + '; kb 12; g"')
+    $extraBreakpoints.Add('u ' + $traceModule + '+' + $entry.offset + ' L1')
+    $extraBreakpoints.Add('bu ' + $traceModule + '+' + $entry.offset +
+        ' ".echo P5C4B-WAITFRAME-FUNCLET-' + $funcletIndex + '-' + $entry.tag + '; kb 12; g"')
 }
-foreach ($offset in (Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
-        -Name 'managedWaitContinuation' -Exe $traceExe).offsets) {
+foreach ($entry in $continuationFrame.entries) {
     $funcletIndex++
-    $extraBreakpoints.Add('u ' + $traceName + '+' + $offset + ' L1')
-    $extraBreakpoints.Add('bp ' + $traceName + '+' + $offset +
-        ' ".echo P5C4B-CONTINUATION-FUNCLET; kb 12; g"')
+    $extraBreakpoints.Add('u ' + $traceModule + '+' + $entry.offset + ' L1')
+    $extraBreakpoints.Add('bu ' + $traceModule + '+' + $entry.offset +
+        ' ".echo P5C4B-CONTINUATION-FUNCLET-' + $entry.tag + '; kb 12; g"')
+}
+foreach ($entry in $waitedFrame.entries) {
+    "waitForResponse_funclet offset=$($entry.offset) label=$($entry.label)" |
+        Add-Content (Join-Path $out 'funclet-summary.txt')
+}
+foreach ($entry in $continuationFrame.entries) {
+    "managedWaitContinuation_funclet offset=$($entry.offset) label=$($entry.label)" |
+        Add-Content (Join-Path $out 'funclet-summary.txt')
 }
 
 function Invoke-Trace {
@@ -364,8 +447,8 @@ function Invoke-Trace {
     $lines.Add('bu lua54!luaD_throw ".echo P5C4B-RAISE-luaD_throw; kb 40; g"')
     $lines.Add('bu lua54!lua_error ".echo P5C4B-RAISE-lua_error; kb 30; g"')
     $lines.Add('bu lua54!luaL_error ".echo P5C4B-RAISE-luaL_error; kb 30; g"')
-    $lines.Add('bu ' + $traceName + '!tdlua::SchedulerCore::SchedulerCore ".echo P5C4B-CORE-CTOR; r @rcx; kb 12; g"')
-    $lines.Add('bu ' + $traceName + '!tdlua::SchedulerCore::~SchedulerCore ".echo P5C4B-CORE-DTOR; r @rcx; kb 12; g"')
+    $lines.Add('bu ' + $traceModule + '!tdlua::SchedulerCore::SchedulerCore ".echo P5C4B-CORE-CTOR; r @rcx; kb 12; g"')
+    $lines.Add('bu ' + $traceModule + '!tdlua::SchedulerCore::~SchedulerCore ".echo P5C4B-CORE-DTOR; r @rcx; kb 12; g"')
     if ($UnwindDetail) {
         # Every frame the non-local jump walks through passes the C++ frame
         # handler: the stack there is the real sequence of abandoned frames.

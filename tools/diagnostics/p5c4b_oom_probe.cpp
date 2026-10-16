@@ -17,8 +17,13 @@
 //   * P5C4B tracing of every rejected allocation (call index, size, realloc);
 //   * the guard failure is recorded and the sweep stops immediately, so the
 //     isolated process does not go on to use an already released core;
-//   * the guard sweep takes its offset bound from argv[1] (zero skips it) and
-//     "all" as argv[2] runs the remaining sweeps, each reported separately.
+//   * the guard sweep takes its offset bound from argv[1] (zero skips it),
+//     "all" runs the remaining sweeps, each reported separately, and "nofault"
+//     runs the same guard sweep without injecting the allocation failure, so
+//     the failing offset can be compared against a baseline offset;
+//   * the offset line also reports the SchedulerCore lease count observed
+//     after the wait; a stale cleanup funclet that runs a second ~shared_ptr
+//     leaves the control block one owner short of the baseline.
 // Behaviour of the product code and the assertions of the original test are
 // untouched: no runtime fix is implemented here.
 // ---------------------------------------------------------------------------
@@ -267,7 +272,7 @@ int waitForResponse(lua_State *L)
     return failed ? lua_error(L) : results;
 }
 
-int sweep(int max_offset)
+int sweep(int max_offset, bool inject)
 {
     int faults = 0;
     std::size_t rejected_calls = 0;
@@ -288,11 +293,17 @@ int sweep(int max_offset)
             Scenario scenario(L);
             current = &scenario;
             lua_pushcfunction(L, waitForResponse);
-            allocator.fail_at = allocator.calls + offset;
+            if (inject) allocator.fail_at = allocator.calls + offset;
             const int status = lua_pcall(L, 0, 1, 0);
             allocator.fail_at = 0;
             if (allocator.rejected) ++faults;
             rejected_calls += allocator.rejected;
+            // The lease count observed here is the product-side effect of the
+            // wait boundary: a stale cleanup funclet that runs a second
+            // ~shared_ptr leaves the control block one owner short. The
+            // comparison run (argv[3]=nofault) is the baseline.
+            const auto core_owner = scenario.router.core();
+            const long core_use_count = core_owner.use_count();
             if (scenario.guards != 0) {
                 std::cerr << "guard diagnostic: offset=" << offset
                           << " allocator_calls=" << allocator.calls
@@ -306,6 +317,7 @@ int sweep(int max_offset)
                           << " guard_dtors=" << p5c4b_guard_dtors
                           << " live_cores=" << tdlua::liveSchedulerCores()
                           << " pending=" << scenario.router.pendingCount()
+                          << " core_use_count=" << core_use_count
                           << " allocator_calls=" << allocator.calls
                           << " rejected=" << allocator.rejected << '\n';
                 ++guard_failures;
@@ -317,6 +329,7 @@ int sweep(int max_offset)
                 std::cerr << "P5C4B offset=" << offset
                           << " guards=0 allocator_calls=" << allocator.calls
                           << " rejected=" << allocator.rejected
+                          << " core_use_count=" << core_use_count
                           << " status=" << status << '\n';
             }
             require(scenario.router.pendingCount() == 0, "pending request remained");
@@ -753,7 +766,12 @@ void nestedTaskOomSweep()
 int main(int argc, char **argv)
 {
     const int max_offset = argc > 1 ? std::atoi(argv[1]) : 80;
-    const bool run_rest = argc > 2 && std::strcmp(argv[2], "all") == 0;
+    bool run_rest = false;
+    bool no_fault = false;
+    for (int argument = 2; argument < argc; ++argument) {
+        if (std::strcmp(argv[argument], "all") == 0) run_rest = true;
+        if (std::strcmp(argv[argument], "nofault") == 0) no_fault = true;
+    }
     try {
         // The probe is focused: by default only the guard sweep runs, with a
         // bounded offset range, so one isolated process and one debugger
@@ -763,7 +781,7 @@ int main(int argc, char **argv)
         // sweep.
         int guard_failures = 0;
         if (max_offset > 0) {
-            guard_failures = sweep(max_offset);
+            guard_failures = sweep(max_offset, !no_fault);
             std::cout << "P5C4B probe done guard_failures=" << guard_failures << '\n';
         }
         if (run_rest) {
