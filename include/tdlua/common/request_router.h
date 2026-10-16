@@ -2787,37 +2787,76 @@ inline int taskReady(lua_State *L)
     lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
 }
+// The frame that enters Lua's longjmp-based yield or error path must not own
+// any automatic with a destructor. Under /EHc MSVC does not model the state
+// transition out of a lease that was already released before the call, so the
+// non-local jump re-runs the cleanup funclet and over-releases the reference
+// (P5C.3). TDLUA_NOINLINE keeps the lease out of that frame even if the
+// compiler would otherwise fold the preparation back into its caller; the
+// Windows validation workflow asserts that no cleanup funclet is emitted for
+// the yield frame.
+#if defined(_MSC_VER)
+#define TDLUA_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDLUA_NOINLINE __attribute__((noinline))
+#else
+#define TDLUA_NOINLINE
+#endif
+
+// Returned by value into the yield frame, so it must be trivially destructible.
+struct ManagedWaitPreparation
+{
+    int context = 0;
+    int results = 0;
+};
+
+static_assert(std::is_trivially_destructible<ManagedWaitPreparation>::value,
+              "the managed wait yield frame must own no non-trivial automatic");
+
+// Owns the scheduler lease for the whole preparation and releases it before
+// returning, on the success path and on every error path. Only the continuation
+// context and the result count cross back to the caller: no ownership is
+// transferred through a local reference.
+TDLUA_NOINLINE inline ManagedWaitPreparation prepareManagedWait(
+    lua_State *L, ManagedHandle *handle, bool timed, double timeout, WaitKind kind,
+    const char *field)
+{
+    ManagedWaitPreparation preparation;
+    try {
+        const auto core = handle->state->core.lock();
+        if (!core) {
+            throw std::runtime_error("tdlua: scheduler storage unavailable");
+        }
+        preparation.context = core->prepareWait(L, handle->state, timed, timeout, kind,
+                                                field, preparation.results);
+    } catch (const TDLuaLuaError &) {
+        preparation.results = -1;
+    } catch (const std::exception &error) {
+        // The lease is already released by the C++ unwind that delivered the
+        // exception, so no owning automatic is alive at this Lua call.
+        lua_pushstring(L, error.what());
+        preparation.results = -1;
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        preparation.results = -1;
+    }
+    return preparation;
+}
+
 inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char *field)
 {
     ManagedHandle *handle = checkManagedHandle(L, 1, type);
     if (kind == WaitKind::Result && lua_gettop(L) > 2) {
         return luaL_error(L, "tdlua: wait accepts at most one timeout");
     }
-    int results = 0, context = 0;
     const bool timed = kind == WaitKind::Result && !lua_isnoneornil(L, 2);
-    double timeout = 0;
     if (timed && lua_type(L, 2) != LUA_TNUMBER) {
         return luaL_error(L, "tdlua: wait timeout must be a number");
     }
-    if (timed) {
-        timeout = lua_tonumber(L, 2);
-    }
-    try {
-        const auto core = handle->state->core.lock();
-        if (!core) {
-            throw std::runtime_error("tdlua: scheduler storage unavailable");
-        }
-        context = core->prepareWait(L, handle->state, timed, timeout, kind, field, results);
-    } catch (const TDLuaLuaError &) {
-        results = -1;
-    } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
-        results = -1;
-    } catch (...) {
-        lua_pushliteral(L, "tdlua: unknown C++ exception");
-        results = -1;
-    }
-    return yieldManagedWait(L, context, results);
+    const double timeout = timed ? lua_tonumber(L, 2) : 0.0;
+    const ManagedWaitPreparation preparation =
+        prepareManagedWait(L, handle, timed, timeout, kind, field);
+    return yieldManagedWait(L, preparation.context, preparation.results);
 }
 
 inline int futureWait(lua_State *L)
