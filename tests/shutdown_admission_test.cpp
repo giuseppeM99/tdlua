@@ -143,7 +143,10 @@ int main(int argc, char **argv)
                 const auto owners_before = stats().owners;
                 construction_stage = stage;
                 set_creation_hook(failConstruction);
+                lua_pushinteger(L, stage); lua_setglobal(L, "diagnostic_stage");
                 run(L, "local ok,err=pcall(function() return td() end); "
+                       "print('construction fault stage='..diagnostic_stage..' pcall_ok='.."
+                       "tostring(ok)..' error='..tostring(err)); "
                        "assert(not ok and err:find('bad_alloc'))");
                 set_creation_hook(nullptr);
                 lua_gc(L, LUA_GCCOLLECT, 0);
@@ -161,6 +164,8 @@ int main(int argc, char **argv)
             check(control(value(ControlAction::FailNextClientCreation)) == 1,
                   "construction fault not armed");
             run(L, "local ok,err=pcall(function() return td() end); "
+                   "print('native construction fault pcall_ok='..tostring(ok).."
+                   "' error='..tostring(err)); "
                    "assert(not ok and err:find('bad_alloc'))");
             lua_gc(L, LUA_GCCOLLECT, 0);
             lua_gc(L, LUA_GCCOLLECT, 0);
@@ -180,6 +185,9 @@ int main(int argc, char **argv)
             check(control(value(ControlAction::FailNextSend)) == 1, "send fault not armed");
             lua_pushstring(L, request); lua_setglobal(L, "shutdown_name");
             run(L, "local ok,err=pcall(function() return client[shutdown_name](client) end); "
+                   "print('shutdown fault request='..shutdown_name..' pcall_ok='.."
+                   "tostring(ok)..' error='..tostring(err)..' closed='.."
+                   "tostring(client:isClosed())); "
                    "assert(not ok and err:find('bad_alloc')); assert(not client:isClosed()); "
                    "checkAuthorization(); "
                    "client=nil; collectgarbage('collect'); collectgarbage('collect')");

@@ -446,7 +446,45 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     const auto cross_poll_started = std::chrono::steady_clock::now();
     ResetReceiveHooks reset_cross_receive_hooks{f, other};
     f.before=consume; other.before=consume;
-    run(L,"assert(c:poll(0.025)==nil and not cross:ready())");
+    // Keep the semantic assertion intact while preserving enough evidence to
+    // distinguish a selected generic update from a prematurely completed
+    // cross-client PollTask on platforms where this test fails.
+    run(L,"cross_ready_before=cross:ready(); cross_poll_result=c:poll(0.025); "
+          "cross_ready_after=cross:ready(); cross_client_closed=c:isClosed()");
+    lua_getglobal(L, "cross_poll_result");
+    const int cross_poll_type = lua_type(L, -1);
+    std::string cross_poll_description = lua_typename(L, cross_poll_type);
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "name");
+        if (lua_isstring(L, -1))
+            cross_poll_description += std::string(" name=") + lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "_request_id");
+        if (lua_isnumber(L, -1))
+            cross_poll_description += std::string(" request_id=") +
+                std::to_string(static_cast<long long>(lua_tointeger(L, -1)));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    lua_getglobal(L, "cross_ready_before");
+    const bool cross_ready_before = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getglobal(L, "cross_ready_after");
+    const bool cross_ready_after = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getglobal(L, "cross_client_closed");
+    const bool cross_client_closed = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    std::cerr << "cross-poll diagnostic: result=" << cross_poll_description
+              << " cross_ready_before=" << cross_ready_before
+              << " cross_ready_after=" << cross_ready_after
+              << " client_closed=" << cross_client_closed << '\n';
+    std::cerr << "cross-poll receive trace (client c):\n";
+    f.printReceiveTrace(std::cerr, f_wait_start);
+    std::cerr << "cross-poll receive trace (client d):\n";
+    other.printReceiveTrace(std::cerr, other_wait_start);
+    require(cross_poll_type == LUA_TNIL && !cross_ready_after && !cross_client_closed,
+            "cross-client timed poll returned an update or completed its dependency");
     const double cross_poll_elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - cross_poll_started).count();
     std::cout << "cross-client requested wait budget: " << cross_budget
