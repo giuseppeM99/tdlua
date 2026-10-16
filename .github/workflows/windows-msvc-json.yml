@@ -379,9 +379,9 @@ jobs:
             ctest --test-dir $build --output-on-failure -C Release --repeat "until-fail:$($test.Count)" -R $test.Pattern 2>&1 | Tee-Object -FilePath $log
             $exit = $LASTEXITCODE
             $summary = Get-Content $log -Raw
-            $completed = [regex]::Matches($summary, '(?m)^\s*\d+/\d+ Test #').Count
-            $passed = $completed -eq $test.Count -and $exit -eq 0
-            $results += [pscustomobject]@{ test = $test.Name; requested = $test.Count; exit_code = $exit; passed = $passed }
+            $started = [regex]::Matches($summary, "(?m)^\s*Start \d+: tdlua_$([regex]::Escape($test.Name.Replace('-', '_')))$").Count
+            $passed = $started -eq $test.Count -and $exit -eq 0
+            $results += [pscustomobject]@{ test = $test.Name; requested = $test.Count; started = $started; exit_code = $exit; passed = $passed }
           }
           $results | ConvertTo-Json | Set-Content .ci\windows-msvc\repeat-summary.json
           if ($results | Where-Object { -not $_.passed }) {
