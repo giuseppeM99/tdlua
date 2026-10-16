@@ -539,6 +539,9 @@ jobs:
           if ($failed.Count -ne 0) {
             throw "in-scope managed regressions failed: $(($failed | ForEach-Object { $_.test }) -join ', ')"
           }
+          # The non-zero ctest results recorded above are deliberate; they must
+          # not leak into the step status through the runner's $LASTEXITCODE.
+          exit 0
 
       - name: Standalone /O2 /MD /EHsc managed wait unwind evidence
         if: always() && steps.provenance.outcome == 'success'
@@ -548,6 +551,7 @@ jobs:
             -LuaDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
             -OutputDirectory "$env:GITHUB_WORKSPACE\.ci\p5c4"
           if ($LASTEXITCODE -ne 0) { throw "P5C.4a evidence script failed: $LASTEXITCODE" }
+          exit 0
 
       - name: Enforce all MSVC validation results
         if: always() && steps.provenance.outcome == 'success'
