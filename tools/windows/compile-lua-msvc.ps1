@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$WorkDirectory,
     [Parameter(Mandatory = $true)][string]$InstallDirectory,
-    [switch]$AddressSanitizer
+    [switch]$AddressSanitizer,
+    [switch]$DebugSymbols
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,11 +40,13 @@ $coreSources = @(
 $compilerFlags = @('/nologo', '/MD', '/O2')
 $dllLinkFlags = @("/OUT:$dll", "/IMPLIB:$library")
 $exeLinkFlags = @("/OUT:$interpreter")
-if ($AddressSanitizer) {
-    $compilerFlags += @('/Zi', '/fsanitize=address')
+if ($AddressSanitizer -or $DebugSymbols) {
+    $compilerFlags += @('/Zi')
     $dllLinkFlags += @('/DEBUG', '/INCREMENTAL:NO')
     $exeLinkFlags += @('/DEBUG', '/INCREMENTAL:NO')
 }
+
+if ($AddressSanitizer) { $compilerFlags += '/fsanitize=address' }
 
 & cl.exe @compilerFlags /LD /DLUA_BUILD_AS_DLL /DLUA_CORE /DLUA_LIB `
     "/I$includeDirectory" @coreSources "/link" @dllLinkFlags
