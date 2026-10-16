@@ -372,6 +372,7 @@ jobs:
             @{ Name = 'shutdown-admission'; Pattern = '^tdlua_shutdown_admission$'; Count = 20 },
             @{ Name = 'lifecycle'; Pattern = '^tdlua_lifecycle$'; Count = 20 },
             @{ Name = 'managed-driver-backend'; Pattern = '^tdlua_managed_driver_backend$'; Count = 20 },
+            @{ Name = 'managed-adapter'; Pattern = '^tdlua_managed_adapter$'; Count = 20 },
             @{ Name = 'windows-residency'; Pattern = '^tdlua_windows_residency$'; Count = 20 }
           )
           foreach ($test in $tests) {
@@ -442,13 +443,18 @@ jobs:
           $diagnostic = '.ci\windows-msvc\asan'
           New-Item -ItemType Directory -Force -Path $diagnostic | Out-Null
           $asanBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-asan'
+          $asanLua = Join-Path $diagnostic 'lua'
           $tdlib = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib'
           $flags = '/Zi /O2 /Ob1 /DNDEBUG /fsanitize=address'
+          & .\tools\windows\compile-lua-msvc.ps1 `
+            -WorkDirectory "$env:RUNNER_TEMP\lua-msvc-asan" `
+            -InstallDirectory $asanLua -AddressSanitizer 2>&1 |
+            Tee-Object -FilePath (Join-Path $diagnostic 'lua-build.log')
+          if ($LASTEXITCODE -ne 0) { throw "Lua ASan build failed: $LASTEXITCODE" }
           @(
             'Test: tdlua_managed_adapter only'
-            'Compiler: MSVC x64, AddressSanitizer enabled on the test executable'
-            'Lua 5.4.8 and TDLib 1.8.68 are prebuilt /MD DLL dependencies and are not ASan-instrumented'
-            'TDLua module is not linked into this test; the target exercises RequestRouter/managed adapter code'
+            'Compiler: MSVC x64, AddressSanitizer enabled on the test executable and Lua 5.4.8 DLL'
+            'TDLua module is not linked into this test; TDLib is not used by this test'
             "CXX flags: $flags"
             'CMake MSVC runtime: MultiThreadedDLL (/MD)'
           ) | Set-Content (Join-Path $diagnostic 'coverage.txt')
@@ -460,10 +466,10 @@ jobs:
             '-DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO=/DEBUG /INCREMENTAL:NO /fsanitize=address' `
             -DTDLUA_BACKEND=json -DTDLUA_BUNDLED_TDLIB=OFF -DTDLUA_BUILD_TESTS=ON `
             "-DTd_DIR=$tdlib\lib\cmake\Td" `
-            "-DLUA_INCLUDE_DIR=$env:LUA_INCLUDE_DIR" `
-            "-DLUA_LIBRARY=$env:LUA_LIBRARY" `
-            "-DLUA_EXECUTABLE=$env:LUA_EXECUTABLE" `
-            "-DTDLUA_LUA_EXECUTABLE=$env:LUA_EXECUTABLE" 2>&1 |
+            "-DLUA_INCLUDE_DIR=$asanLua" `
+            "-DLUA_LIBRARY=$asanLua\lua54.lib" `
+            "-DLUA_EXECUTABLE=$asanLua\lua.exe" `
+            "-DTDLUA_LUA_EXECUTABLE=$asanLua\lua.exe" 2>&1 |
             Tee-Object -FilePath (Join-Path $diagnostic 'configure.log')
           if ($LASTEXITCODE -ne 0) { throw "ASan configure failed: $LASTEXITCODE" }
           cmake --build $asanBuild --target tdlua_managed_adapter_test --config RelWithDebInfo --parallel 2 2>&1 |
@@ -473,8 +479,11 @@ jobs:
           $pdb = Join-Path $asanBuild 'tdlua_managed_adapter_test.pdb'
           if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $diagnostic 'tdlua_managed_adapter_test.pdb') }
           dumpbin.exe /dependents $testExe | Tee-Object -FilePath (Join-Path $diagnostic 'test-dependencies.log')
+          dumpbin.exe /dependents (Join-Path $asanLua 'lua54.dll') | Tee-Object -FilePath (Join-Path $diagnostic 'lua-dependencies.log')
+          $luaPdb = Join-Path $asanLua 'lua54.pdb'
+          if (Test-Path $luaPdb) { Copy-Item $luaPdb (Join-Path $diagnostic 'lua54.pdb') }
           $env:ASAN_OPTIONS = 'halt_on_error=1'
-          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$env:PATH"
+          $env:PATH = "$asanLua;$env:PATH"
           $codes = @()
           $testLog = Join-Path $diagnostic 'repeat.log'
           for ($iteration = 1; $iteration -le 20; $iteration++) {

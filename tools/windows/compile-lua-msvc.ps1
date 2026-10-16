@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$WorkDirectory,
-    [Parameter(Mandatory = $true)][string]$InstallDirectory
+    [Parameter(Mandatory = $true)][string]$InstallDirectory,
+    [switch]$AddressSanitizer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +26,7 @@ if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
 $includeDirectory = Join-Path $sourceRoot 'src'
 $library = Join-Path $InstallDirectory 'lua54.lib'
 $dll = Join-Path $InstallDirectory 'lua54.dll'
+$interpreter = Join-Path $InstallDirectory 'lua.exe'
 $coreSources = @(
     'lapi.c', 'lcode.c', 'lctype.c', 'ldebug.c', 'ldo.c', 'ldump.c',
     'lfunc.c', 'lgc.c', 'llex.c', 'lmem.c', 'lobject.c', 'lopcodes.c',
@@ -34,13 +36,21 @@ $coreSources = @(
     'ltablib.c', 'lutf8lib.c', 'linit.c'
 ) | ForEach-Object { Join-Path $includeDirectory $_ }
 
-& cl.exe /nologo /MD /O2 /LD /DLUA_BUILD_AS_DLL /DLUA_CORE /DLUA_LIB `
-    "/I$includeDirectory" @coreSources "/link" "/OUT:$dll" "/IMPLIB:$library"
+$compilerFlags = @('/nologo', '/MD', '/O2')
+$dllLinkFlags = @("/OUT:$dll", "/IMPLIB:$library")
+$exeLinkFlags = @("/OUT:$interpreter")
+if ($AddressSanitizer) {
+    $compilerFlags += @('/Zi', '/fsanitize=address')
+    $dllLinkFlags += @('/DEBUG', '/INCREMENTAL:NO')
+    $exeLinkFlags += @('/DEBUG', '/INCREMENTAL:NO')
+}
+
+& cl.exe @compilerFlags /LD /DLUA_BUILD_AS_DLL /DLUA_CORE /DLUA_LIB `
+    "/I$includeDirectory" @coreSources "/link" @dllLinkFlags
 if ($LASTEXITCODE -ne 0) { throw "Lua DLL build failed with exit code $LASTEXITCODE" }
 
-$interpreter = Join-Path $InstallDirectory 'lua.exe'
-& cl.exe /nologo /MD /O2 /DLUA_BUILD_AS_DLL "/I$includeDirectory" `
-    (Join-Path $includeDirectory 'lua.c') "/link" $library "/OUT:$interpreter"
+& cl.exe @compilerFlags /DLUA_BUILD_AS_DLL "/I$includeDirectory" `
+    (Join-Path $includeDirectory 'lua.c') "/link" $library @exeLinkFlags
 if ($LASTEXITCODE -ne 0) { throw "Lua interpreter build failed with exit code $LASTEXITCODE" }
 
 $versionOutput = & $interpreter -v 2>&1
