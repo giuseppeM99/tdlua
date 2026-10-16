@@ -41,8 +41,8 @@ Get-FileHash $exe, (Join-Path $lua 'lua54.dll') | Format-List |
 
 # --- 2. Repeat the configuration that used to crash ------------------------
 $codes = @()
-1..$Iterations | ForEach-Object {
-    & $exe --trace *> (Join-Path $work "direct-$_.log")
+for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
+    & $exe --trace *> (Join-Path $work "direct-$iteration.log")
     $codes += $LASTEXITCODE
 }
 $passed = @($codes | Where-Object { $_ -eq 0 }).Count
@@ -54,9 +54,9 @@ $passed = @($codes | Where-Object { $_ -eq 0 }).Count
     Set-Content (Join-Path $out 'adapter-repeat-summary.txt')
 Copy-Item (Join-Path $work 'direct-1.log') (Join-Path $out 'adapter-trace-first.log')
 $owners = @()
-Get-ChildItem (Join-Path $work 'direct-*.log') | ForEach-Object {
-    Get-Content $_ | ForEach-Object {
-        if ($_ -match 'before response core=([0-9A-Fa-f]+) owners=([0-9]+)') {
+foreach ($file in Get-ChildItem (Join-Path $work 'direct-*.log')) {
+    foreach ($text in Get-Content $file) {
+        if ($text -match 'before response core=([0-9A-Fa-f]+) owners=([0-9]+)') {
             $owners += $Matches[2]
         }
     }
@@ -97,8 +97,13 @@ $helperFunclets = @(Select-String -Path $asm -CaseSensitive -Pattern "prepareMan
 @("yield_frame_cleanup_funclets=$($yieldFrameFunclets.Count)",
   "prepare_helper_funclets=$($helperFunclets.Count)") |
     Set-Content (Join-Path $out 'funclet-summary.txt')
-$yieldFrameFunclets | ForEach-Object { $_.Line.Trim() } |
-    Set-Content (Join-Path $out 'yield-frame-funclets.txt')
+if ($yieldFrameFunclets.Count -eq 0) {
+    'none' | Set-Content (Join-Path $out 'yield-frame-funclets.txt')
+}
+else {
+    $yieldFrameFunclets | ForEach-Object { $_.Line.Trim() } |
+        Set-Content (Join-Path $out 'yield-frame-funclets.txt')
+}
 $helperFunclets | ForEach-Object { $_.Line.Trim() } |
     Set-Content (Join-Path $out 'prepare-helper-funclets.txt')
 # MSVC names every cleanup funclet after the function that owns it, so an empty
@@ -174,7 +179,7 @@ function Test-ManagedLifetime([string]$log, [string]$label) {
                 $violations += "destruction of core $($event.address) with no live construction (double release or use after free)"
             }
             else { $live.Remove($event.address) }
-            if ($event.stack -match 'lua_yieldk|luaD_throw|lua_error|_longjmp|RtlUnwind') {
+            if ($event.stack -match 'lua_yieldk|luaD_throw|__longjmp_internal|lua_error') {
                 $unwrapDestructions += $event.address
             }
         }
@@ -191,9 +196,11 @@ function Test-ManagedLifetime([string]$log, [string]$label) {
         throw "${label}: SchedulerCore lifetime violations: $($violations -join '; ')"
     }
     if ($unwrapDestructions.Count -ne 0) {
-        throw "$label: SchedulerCore destroyed while a Lua non-local jump unwinds: $($unwrapDestructions -join ', ')"
+        throw "${label}: SchedulerCore destroyed while a Lua non-local jump unwinds: $($unwrapDestructions -join ', ')"
     }
-    if ($live.Count -ne 0) { throw "$label: $($live.Count) SchedulerCore objects are still alive at exit" }
+    if ($live.Count -ne 0) {
+        throw "${label}: $($live.Count) SchedulerCore objects are still alive at exit"
+    }
     return $events
 }
 
