@@ -433,7 +433,22 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     run(L,"assert(c:poll(0.1)._request_id==raw); "
           "assert(c:poll(0.1).name=='7' and future:ready())");
     f.object(0,15);
-    run(L,"cross=c:poll(function() return d:getMe():wait().code end,0)");
+    run(L,"cross=c:poll(function() return d:getMe():wait().code end,0); "
+          "cross_ready_after_creation=cross:ready()");
+    const auto print_cross_state = [&](const char *phase) {
+        lua_getglobal(L, "cross");
+        auto *handle = static_cast<tdlua::ManagedHandle *>(
+            luaL_checkudata(L, -1, "tdlua.task"));
+        const auto &state = handle->state;
+        std::cerr << "cross task " << phase
+                  << ": status=" << static_cast<int>(state->status)
+                  << " request_id=" << state->request_id
+                  << " result_ref=" << state->result_ref
+                  << " result_count=" << state->result_count
+                  << " error=" << state->error << '\n';
+        lua_pop(L, 1);
+    };
+    print_cross_state("after creation");
     double cross_budget=0.0;
     double cross_max_wait=0.0;
     auto consume=[&](double wait) {
@@ -469,6 +484,9 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     lua_getglobal(L, "cross_ready_before");
     const bool cross_ready_before = lua_toboolean(L, -1) != 0;
     lua_pop(L, 1);
+    lua_getglobal(L, "cross_ready_after_creation");
+    const bool cross_ready_after_creation = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
     lua_getglobal(L, "cross_ready_after");
     const bool cross_ready_after = lua_toboolean(L, -1) != 0;
     lua_pop(L, 1);
@@ -476,9 +494,11 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     const bool cross_client_closed = lua_toboolean(L, -1) != 0;
     lua_pop(L, 1);
     std::cerr << "cross-poll diagnostic: result=" << cross_poll_description
+              << " cross_ready_after_creation=" << cross_ready_after_creation
               << " cross_ready_before=" << cross_ready_before
               << " cross_ready_after=" << cross_ready_after
               << " client_closed=" << cross_client_closed << '\n';
+    print_cross_state("after timed poll");
     std::cerr << "cross-poll receive trace (client c):\n";
     f.printReceiveTrace(std::cerr, f_wait_start);
     std::cerr << "cross-poll receive trace (client d):\n";
