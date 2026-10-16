@@ -2,8 +2,17 @@ name: macOS arm64 native portability
 
 on:
   push:
+    paths:
+      - .github/workflows/macos-native.yml
+      - CMakeLists.txt
+      - cmake/**
+      - include/**
+      - src/**
+      - tests/**
+      - td
+  pull_request:
     branches:
-      - vnext-portability
+      - master
     paths:
       - .github/workflows/macos-native.yml
       - CMakeLists.txt
