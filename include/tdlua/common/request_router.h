@@ -1473,6 +1473,10 @@ public:
         std::size_t lua_registry_refs = 0;
         std::size_t managed_handles = 0;
         std::size_t managed_waiters = 0;
+        bool driver_active = false;
+        bool consumer_active = false;
+        bool poll_selecting = false;
+        bool loop_observer_active = false;
     };
 
     std::size_t liveTaskCount() const
@@ -1493,6 +1497,11 @@ public:
         result.running_tasks = running_tasks_.size();
         result.deferred_events = deferred_events_.size();
         result.selected_updates = managed_driver_.selected_update != LUA_NOREF ? 1 : 0;
+        result.driver_active = managed_driver_.drive_active;
+        result.consumer_active = managed_driver_.consumer_active;
+        result.poll_selecting = managed_driver_.poll_selecting;
+        result.loop_observer_active = managed_driver_.loop_observer &&
+            !managed_driver_.loop_observer->stopped;
 
         std::map<const ManagedState *, bool> seen_states;
         const auto count_state_refs = [&result, &seen_states](const State &state) {
@@ -1696,17 +1705,26 @@ public:
             wait = std::min(wait, std::max(0.0, std::chrono::duration<double>(
                 *deadline - std::chrono::steady_clock::now()).count()));
         }
+        const bool nonblocking_step = wait <= 0.0;
         const bool progressed = pumpCurrentTransport(wait,
                                                       discard_unobserved_raw);
-        pumpCrossClientDependencies(dependencies, deadline);
+        // The current receive may consume the caller's entire budget while
+        // delivering a managed response. Do not start another transport read
+        // on a dependent client after that deadline; tick() below still
+        // routes the response and resumes any work it made ready.
+        if (!deadline || nonblocking_step ||
+            std::chrono::steady_clock::now() < *deadline) {
+            pumpCrossClientDependencies(dependencies, deadline);
+        }
         if (!deadline) {
             backoffAfterEmptyPump(progressed);
         } else if (!progressed && hasPump()) {
             const auto remaining = *deadline - std::chrono::steady_clock::now();
             if (remaining > std::chrono::steady_clock::duration::zero()) {
-                std::this_thread::sleep_for(std::min(remaining,
-                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                        emptyPumpBackoff())));
+                // Keep a full backoff quantum near the deadline. MinGW's
+                // Windows sleep implementation rounds sub-millisecond waits
+                // down to zero, which otherwise spins until the deadline.
+                std::this_thread::sleep_for(emptyPumpBackoff());
             }
         }
         tick();
@@ -2405,8 +2423,18 @@ public:
     }
 };
 
+#ifdef TDLUA_TESTING
+inline std::size_t &coreAnchorFinalizerCountForTesting()
+{
+    static thread_local std::size_t finalizers = 0;
+    return finalizers;
+}
+#endif
 inline int coreAnchorGc(lua_State *L)
 {
+#ifdef TDLUA_TESTING
+    ++coreAnchorFinalizerCountForTesting();
+#endif
     static_cast<CoreAnchor *>(lua_touserdata(L, 1))->~CoreAnchor();
     return 0;
 }
@@ -2759,37 +2787,76 @@ inline int taskReady(lua_State *L)
     lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
 }
+// The frame that enters Lua's longjmp-based yield or error path must not own
+// any automatic with a destructor. Under /EHc MSVC does not model the state
+// transition out of a lease that was already released before the call, so the
+// non-local jump re-runs the cleanup funclet and over-releases the reference
+// (P5C.3). TDLUA_NOINLINE keeps the lease out of that frame even if the
+// compiler would otherwise fold the preparation back into its caller; the
+// Windows validation workflow asserts that no cleanup funclet is emitted for
+// the yield frame.
+#if defined(_MSC_VER)
+#define TDLUA_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDLUA_NOINLINE __attribute__((noinline))
+#else
+#define TDLUA_NOINLINE
+#endif
+
+// Returned by value into the yield frame, so it must be trivially destructible.
+struct ManagedWaitPreparation
+{
+    int context = 0;
+    int results = 0;
+};
+
+static_assert(std::is_trivially_destructible<ManagedWaitPreparation>::value,
+              "the managed wait yield frame must own no non-trivial automatic");
+
+// Owns the scheduler lease for the whole preparation and releases it before
+// returning, on the success path and on every error path. Only the continuation
+// context and the result count cross back to the caller: no ownership is
+// transferred through a local reference.
+TDLUA_NOINLINE inline ManagedWaitPreparation prepareManagedWait(
+    lua_State *L, ManagedHandle *handle, bool timed, double timeout, WaitKind kind,
+    const char *field)
+{
+    ManagedWaitPreparation preparation;
+    try {
+        const auto core = handle->state->core.lock();
+        if (!core) {
+            throw std::runtime_error("tdlua: scheduler storage unavailable");
+        }
+        preparation.context = core->prepareWait(L, handle->state, timed, timeout, kind,
+                                                field, preparation.results);
+    } catch (const TDLuaLuaError &) {
+        preparation.results = -1;
+    } catch (const std::exception &error) {
+        // The lease is already released by the C++ unwind that delivered the
+        // exception, so no owning automatic is alive at this Lua call.
+        lua_pushstring(L, error.what());
+        preparation.results = -1;
+    } catch (...) {
+        lua_pushliteral(L, "tdlua: unknown C++ exception");
+        preparation.results = -1;
+    }
+    return preparation;
+}
+
 inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char *field)
 {
     ManagedHandle *handle = checkManagedHandle(L, 1, type);
     if (kind == WaitKind::Result && lua_gettop(L) > 2) {
         return luaL_error(L, "tdlua: wait accepts at most one timeout");
     }
-    int results = 0, context = 0;
     const bool timed = kind == WaitKind::Result && !lua_isnoneornil(L, 2);
-    double timeout = 0;
     if (timed && lua_type(L, 2) != LUA_TNUMBER) {
         return luaL_error(L, "tdlua: wait timeout must be a number");
     }
-    if (timed) {
-        timeout = lua_tonumber(L, 2);
-    }
-    try {
-        const auto core = handle->state->core.lock();
-        if (!core) {
-            throw std::runtime_error("tdlua: scheduler storage unavailable");
-        }
-        context = core->prepareWait(L, handle->state, timed, timeout, kind, field, results);
-    } catch (const TDLuaLuaError &) {
-        results = -1;
-    } catch (const std::exception &error) {
-        lua_pushstring(L, error.what());
-        results = -1;
-    } catch (...) {
-        lua_pushliteral(L, "tdlua: unknown C++ exception");
-        results = -1;
-    }
-    return yieldManagedWait(L, context, results);
+    const double timeout = timed ? lua_tonumber(L, 2) : 0.0;
+    const ManagedWaitPreparation preparation =
+        prepareManagedWait(L, handle, timed, timeout, kind, field);
+    return yieldManagedWait(L, preparation.context, preparation.results);
 }
 
 inline int futureWait(lua_State *L)
