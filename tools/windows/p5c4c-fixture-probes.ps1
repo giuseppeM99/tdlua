@@ -1,7 +1,7 @@
 # P5C.4c diagnostic harness. Temporary: it must be dropped before any merge.
 #
 # It measures, on the original MSVC Release configuration (/O2 /Ob2 /DNDEBUG
-# /MD, Lua 5.4.8 built with debug symbols):
+# /MD /EHsc, Lua 5.4.8 built with debug symbols):
 #   1. the real, uninstrumented fixture tests/managed_routing_oom_test.cpp run in
 #      isolated processes, with its exit code and its summary;
 #   2. the same fixture plus measurement counters (tools/diagnostics/
@@ -92,15 +92,29 @@ Get-FileHash (Join-Path $lua 'lua54.dll'), (Join-Path $lua 'lua54.lib') |
     Format-List | Out-File (Join-Path $out 'lua-hashes.txt')
 
 # --- 1. builds -------------------------------------------------------------
-$realFixture = Build-Binary -Name 'fixture-ehsc' -Source "$root\tests\managed_routing_oom_test.cpp"
-$fixedEhsc = Build-Binary -Name 'probe-ehsc-fixed' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp"
+# /EHsc and /EHs are passed explicitly: cl.exe with no /EH flag is /EHs- (the
+# compiler warns C4530), which is neither the suite's /EHsc Release
+# configuration nor the /EHc control. The no-EH pair below is kept only as a
+# documented third mode.
+$realFixture = Build-Binary -Name 'fixture-ehsc' -Source "$root\tests\managed_routing_oom_test.cpp" -ExtraFlags @('/EHsc')
+$fixedEhsc = Build-Binary -Name 'probe-ehsc-fixed' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/EHsc')
 $fixedEhs = Build-Binary -Name 'probe-ehs-fixed' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/EHs')
-$prefixEhsc = Build-Binary -Name 'probe-ehsc-prefix' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/DP5C4C_PREFIX_INLINE')
+$prefixEhsc = Build-Binary -Name 'probe-ehsc-prefix' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/EHsc', '/DP5C4C_PREFIX_INLINE')
 $prefixEhs = Build-Binary -Name 'probe-ehs-prefix' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/EHs', '/DP5C4C_PREFIX_INLINE')
-$b1Ehsc = Build-Binary -Name 'b1-ehsc' -Source "$root\tools\diagnostics\p5c4c_continuation_probe.cpp"
+$prefixNoEh = Build-Binary -Name 'probe-noeh-prefix' -Source "$root\tools\diagnostics\p5c4c_oom_probe.cpp" -ExtraFlags @('/DP5C4C_PREFIX_INLINE')
+$b1Ehsc = Build-Binary -Name 'b1-ehsc' -Source "$root\tools\diagnostics\p5c4c_continuation_probe.cpp" -ExtraFlags @('/EHsc')
 $b1Ehs = Build-Binary -Name 'b1-ehs' -Source "$root\tools\diagnostics\p5c4c_continuation_probe.cpp" -ExtraFlags @('/EHs')
-$b2Ehsc = Build-Binary -Name 'b2-ehsc' -Source "$root\tools\diagnostics\p5c4c_waitbyid_probe.cpp"
+$b2Ehsc = Build-Binary -Name 'b2-ehsc' -Source "$root\tools\diagnostics\p5c4c_waitbyid_probe.cpp" -ExtraFlags @('/EHsc')
 $b2Ehs = Build-Binary -Name 'b2-ehs' -Source "$root\tools\diagnostics\p5c4c_waitbyid_probe.cpp" -ExtraFlags @('/EHs')
+
+# Integrity of the flags themselves: a build of a source that uses try/catch and
+# that is compiled without /EHsc or /EHs is reported by C4530. If this check
+# fails the /EHsc measurement below is not an /EHsc measurement.
+foreach ($name in @('fixture-ehsc', 'probe-ehsc-fixed', 'probe-ehsc-prefix', 'b1-ehsc', 'b2-ehsc')) {
+    $c4530 = @(Select-String -Path (Join-Path $out "build-$name.log") -Pattern 'C4530')
+    Add-Check -Name "$name-c4530" -Passed ($c4530.Count -eq 0) `
+        -Detail "C4530_lines=$($c4530.Count)"
+}
 
 # --- 2. the real fixture, isolated processes -------------------------------
 $fixtureLog = Join-Path $out 'fixture-ehsc-runs.log'
@@ -122,7 +136,8 @@ $variants = @(
     @{ Name = 'fixed-ehsc'; Exe = $fixedEhsc },
     @{ Name = 'fixed-ehs'; Exe = $fixedEhs },
     @{ Name = 'prefix-ehsc'; Exe = $prefixEhsc },
-    @{ Name = 'prefix-ehs'; Exe = $prefixEhs }
+    @{ Name = 'prefix-ehs'; Exe = $prefixEhs },
+    @{ Name = 'prefix-noeh'; Exe = $prefixNoEh }
 )
 $offsetLines = New-Object System.Collections.Generic.List[string]
 foreach ($variant in $variants) {
@@ -228,16 +243,23 @@ $comparison = New-Object System.Collections.Generic.List[string]
 $comparison.Add("post_fixture=tests/managed_routing_oom_test.cpp (committed, Gate A2 shape)")
 $comparison.Add("prefix_fixture=b2c47d8:tests/managed_routing_oom_test.cpp")
 foreach ($item in @(
-    @{ Name = 'post-ehsc'; Source = $postSource; Flags = @() },
+    @{ Name = 'post-ehsc'; Source = $postSource; Flags = @('/EHsc') },
     @{ Name = 'post-ehs'; Source = $postSource; Flags = @('/EHs') },
-    @{ Name = 'prefix-ehsc'; Source = $prefixSource; Flags = @() },
+    @{ Name = 'post-noeh'; Source = $postSource; Flags = @() },
+    @{ Name = 'prefix-ehsc'; Source = $prefixSource; Flags = @('/EHsc') },
     @{ Name = 'prefix-ehs'; Source = $prefixSource; Flags = @('/EHs') },
-    @{ Name = 'guard-post-ehsc'; Source = $guardPost; Flags = @() },
+    @{ Name = 'prefix-noeh'; Source = $prefixSource; Flags = @() },
+    @{ Name = 'guard-post-ehsc'; Source = $guardPost; Flags = @('/EHsc') },
     @{ Name = 'guard-post-ehs'; Source = $guardPost; Flags = @('/EHs') },
-    @{ Name = 'guard-prefix-ehsc'; Source = $guardPrefix; Flags = @() },
+    @{ Name = 'guard-prefix-ehsc'; Source = $guardPrefix; Flags = @('/EHsc') },
     @{ Name = 'guard-prefix-ehs'; Source = $guardPrefix; Flags = @('/EHs') }
 )) {
     $exe = Build-Binary -Name "fixture-$($item.Name)" -Source $item.Source -ExtraFlags $item.Flags
+    if ($item.Flags -contains '/EHsc') {
+        $c4530 = @(Select-String -Path (Join-Path $out "build-fixture-$($item.Name).log") -Pattern 'C4530')
+        Add-Check -Name "fixture-$($item.Name)-c4530" -Passed ($c4530.Count -eq 0) `
+            -Detail "C4530_lines=$($c4530.Count)"
+    }
     $log = Join-Path $out "fixture-$($item.Name)-runs.log"
     if (Test-Path $log) { Remove-Item $log -Force }
     $codes = @()
