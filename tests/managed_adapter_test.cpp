@@ -39,6 +39,12 @@ void response(tdlua::RequestRouter &router, const tdlua::ManagedStatePtr &state)
     });
     router.tick();
 }
+int tracedAnchorGc(lua_State *L)
+{
+    const auto *anchor = static_cast<tdlua::CoreAnchor *>(lua_touserdata(L, 1));
+    std::cerr << "anchor gc core=" << anchor->core.get() << " owners=" << anchor->core.use_count() << std::endl;
+    return tdlua::coreAnchorGc(L);
+}
 void scenarios(lua_State *L, bool jit_off)
 {
 #ifdef TDLUA_USE_LUAJIT_CONTINUATION
@@ -54,6 +60,10 @@ void scenarios(lua_State *L, bool jit_off)
     tdlua::initializeManagedContinuations(L);
 #endif
     tdlua::RequestRouter owner(L), dependency(L);
+    if (trace) {
+        luaL_getmetatable(L, "tdlua.core");
+        lua_pushcfunction(L, tracedAnchorGc); lua_setfield(L, -2, "__gc"); lua_pop(L, 1);
+    }
     for (const char *body : {
         "local ok,r=pcall(function() return pending:wait() end); assert(ok); value=r.value",
         "local ok,r=xpcall(function() return pending:wait() end,function(e) return 'handled:'..e end); assert(ok); value=r.value",
@@ -66,6 +76,7 @@ void scenarios(lua_State *L, bool jit_off)
                   "assert(coroutine.resume(co)); assert(not done and coroutine.status(co)=='suspended')";
         run(L, source.c_str());
         require(future->waiter_count == 1, "probe did not install a pending wait");
+        if (trace) std::cerr << "before response core=" << dependency.core().get() << " owners=" << dependency.core().use_count() << std::endl;
         response(dependency, future);
         run(L, "assert(done and value==42 and coroutine.status(co)=='dead'); "
                "assert(type(pending.wait)=='function' and type(pending.ready)=='function'); "
