@@ -435,6 +435,61 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
 
+      - name: Diagnose managed adapter heap corruption with MSVC AddressSanitizer
+        if: always() && contains(github.event.head_commit.message, '[msvc-asan-diagnostic]') && steps.tdlua-build.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diagnostic = '.ci\windows-msvc\asan'
+          New-Item -ItemType Directory -Force -Path $diagnostic | Out-Null
+          $asanBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-asan'
+          $tdlib = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib'
+          $flags = '/Zi /O2 /Ob1 /DNDEBUG /fsanitize=address'
+          @(
+            'Test: tdlua_managed_adapter only'
+            'Compiler: MSVC x64, AddressSanitizer enabled on the test executable'
+            'Lua 5.4.8 and TDLib 1.8.68 are prebuilt /MD DLL dependencies and are not ASan-instrumented'
+            'TDLua module is not linked into this test; the target exercises RequestRouter/managed adapter code'
+            "CXX flags: $flags"
+            'CMake MSVC runtime: MultiThreadedDLL (/MD)'
+          ) | Set-Content (Join-Path $diagnostic 'coverage.txt')
+          cmake -S . -B $asanBuild -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=$flags" `
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=$flags" `
+            '-DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO=/DEBUG /INCREMENTAL:NO /fsanitize=address' `
+            -DTDLUA_BACKEND=json -DTDLUA_BUNDLED_TDLIB=OFF -DTDLUA_BUILD_TESTS=ON `
+            "-DTd_DIR=$tdlib\lib\cmake\Td" `
+            "-DLUA_INCLUDE_DIR=$env:LUA_INCLUDE_DIR" `
+            "-DLUA_LIBRARY=$env:LUA_LIBRARY" `
+            "-DLUA_EXECUTABLE=$env:LUA_EXECUTABLE" `
+            "-DTDLUA_LUA_EXECUTABLE=$env:LUA_EXECUTABLE" 2>&1 |
+            Tee-Object -FilePath (Join-Path $diagnostic 'configure.log')
+          if ($LASTEXITCODE -ne 0) { throw "ASan configure failed: $LASTEXITCODE" }
+          cmake --build $asanBuild --target tdlua_managed_adapter_test --config RelWithDebInfo --parallel 2 2>&1 |
+            Tee-Object -FilePath (Join-Path $diagnostic 'build.log')
+          if ($LASTEXITCODE -ne 0) { throw "ASan target build failed: $LASTEXITCODE" }
+          $testExe = Join-Path $asanBuild 'tdlua_managed_adapter_test.exe'
+          $pdb = Join-Path $asanBuild 'tdlua_managed_adapter_test.pdb'
+          if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $diagnostic 'tdlua_managed_adapter_test.pdb') }
+          dumpbin.exe /dependents $testExe | Tee-Object -FilePath (Join-Path $diagnostic 'test-dependencies.log')
+          $env:ASAN_OPTIONS = 'halt_on_error=1'
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$env:PATH"
+          $codes = @()
+          $testLog = Join-Path $diagnostic 'repeat.log'
+          for ($iteration = 1; $iteration -le 20; $iteration++) {
+            "=== managed_adapter ASan iteration $iteration/20 ===" | Add-Content $testLog
+            ctest --test-dir $asanBuild --output-on-failure -C RelWithDebInfo -R '^tdlua_managed_adapter$' 2>&1 |
+              Tee-Object -FilePath $testLog -Append
+            $codes += $LASTEXITCODE
+          }
+          $passed = @($codes | Where-Object { $_ -eq 0 }).Count
+          @("requested=20", "iterations_run=$($codes.Count)", "passed=$passed", "failed=$($codes.Count - $passed)", "exit_codes=$($codes -join ',')") |
+            Set-Content (Join-Path $diagnostic 'summary.txt')
+          Get-FileHash -Algorithm SHA256 $testExe | Out-File (Join-Path $diagnostic 'test-executable-sha256.log')
+          # Keep the diagnostic result in the artifact and raw log. The main MSVC
+          # validation remains governed by its unmodified CTest and stress gates.
+
       - name: Enforce all MSVC validation results
         if: always() && steps.provenance.outcome == 'success'
         run: |
