@@ -744,11 +744,112 @@ jobs:
           LUA_CPATH="$RUNNER_TEMP/rocks/lib/lua/5.3/?.so;$LUA_CPATH" \
             lua5.3 -e 'assert(require("tdlua"))'
 
+  static-analysis:
+    name: Diagnostic static analysis / JSON Lua 5.4
+    needs: tdlib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install analysis and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            clang-format \
+            clang-tidy \
+            clang-tools \
+            cmake \
+            gperf \
+            liblua5.4-dev \
+            lua5.4 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            python3 \
+            zlib1g-dev
+          clang --version
+          clang-tidy --version
+          clang-format --version
+          scan-build --help >/dev/null
+
+      - name: Download pinned static TDLib package
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+          test -f "$RUNNER_TEMP/tdlib/tdlib-version.txt"
+
+      - name: Configure Clang JSON analysis build
+        run: |
+          lua_library="$(find /usr/lib /lib -name 'liblua5.4.so' -print -quit)"
+          test -n "$lua_library"
+          CC=clang CXX=clang++ cmake -S . -B build-analysis -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library"
+
+      - name: Run Clang Static Analyzer
+        run: tools/static-analysis/run-scan-build.sh build-analysis
+
+      - name: Run clang-tidy diagnostics
+        run: |
+          python3 tools/static-analysis/run-clang-tidy.py \
+            --build-dir build-analysis \
+            --expect-backend json \
+            --report build-analysis/clang-tidy-report.txt
+
+      - name: Check changed C++ formatting diagnostically
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base="$PR_BASE_SHA"
+          if [ -z "$base" ]; then base="$PUSH_BEFORE_SHA"; fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          python3 tools/static-analysis/check-clang-format.py \
+            --changed-from "$base" \
+            --diagnostic \
+            --report build-analysis/clang-format-report.txt
+
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-analysis-json-lua54
+          path: |
+            build-analysis/clang-tidy-report.txt
+            build-analysis/clang-format-report.txt
+            build-analysis/scan-build-reports
+          if-no-files-found: warn
+          retention-days: 14
+
   telegram:
     name: Telegram upload
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: [native, native-lua52, native-lua53, native-lua54, native-luajit]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
