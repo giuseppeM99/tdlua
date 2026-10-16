@@ -29,7 +29,7 @@ try {
             $opt = if ($mode -eq 'debug') { @('/Od', '/Ob0') } else { @('/O2', '/Ob2', '/DNDEBUG') }
             $link = @('/DEBUG', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:ICF')
             if ($mode -eq 'noicf') { $link = @('/DEBUG', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:NOICF') }
-            $eh = if ($mode -eq 'ehs') { @('/EHs', '/EHc-') } else { @('/EHsc') }
+            [string[]]$eh = if ($mode -eq 'ehs') { '/EHs', '/EHc-' } else { '/EHsc' }
             & cl.exe /nologo /MD @eh /Zi @opt /DTDLUA_TESTING "/I$root\include" "/I$lua" "$root\tests\managed_adapter_test.cpp" /Fe:tdlua_managed_adapter_test.exe /link "$lua\lua54.lib" @link 2>&1 | Tee-Object build.log
             if ($LASTEXITCODE -ne 0) { throw "Adapter build failed: $mode" }
             dumpbin.exe /dependents tdlua_managed_adapter_test.exe | Out-File dependencies.log
