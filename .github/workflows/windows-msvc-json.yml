@@ -110,13 +110,76 @@ jobs:
         with:
           path: .ci/windows-msvc/tdlib
           key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
+          restore-keys: |
+            tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-
+
+      - name: Validate restored TDLib cache before deciding to build
+        id: tdlib-package-check
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib'
+          $manifest = Join-Path $prefix 'tdlua-tdlib-manifest.txt'
+          $valid = Test-Path $manifest
+          $reasons = @()
+          if ($valid) {
+            $content = Get-Content $manifest -Raw
+            $schema = (Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash
+            $expected = @(
+              "commit=$env:TDLIB_COMMIT",
+              "schema=$schema",
+              'cl=${{ steps.provenance.outputs.cl }}',
+              'sdk=${{ steps.provenance.outputs.sdk }}',
+              'generator=Ninja',
+              'build_type=Release',
+              'triplet=x64-windows',
+              'td_install_shared=ON',
+              'td_install_static=OFF',
+              "vcpkg=$(& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)"
+            )
+            foreach ($entry in $expected) {
+              if ($content -notmatch [regex]::Escape($entry)) {
+                $valid = $false
+                $reasons += "manifest mismatch: $entry"
+              }
+            }
+            $tdjson = Join-Path $prefix 'bin\tdjson.dll'
+            $importLibrary = Join-Path $prefix 'lib\tdjson.lib'
+            if (-not (Test-Path $tdjson) -or -not (Test-Path $importLibrary)) {
+              $valid = $false
+              $reasons += 'TDLib DLL or import library missing'
+            } else {
+              $tdjsonHash = (Get-FileHash -Algorithm SHA256 $tdjson).Hash
+              $importHash = (Get-FileHash -Algorithm SHA256 $importLibrary).Hash
+              if ($content -notmatch [regex]::Escape("tdjson=$tdjsonHash") -or
+                  $content -notmatch [regex]::Escape("tdjson_import=$importHash")) {
+                $valid = $false
+                $reasons += 'TDLib artifact hash mismatch'
+              }
+              $headers = dumpbin.exe /headers $tdjson | Out-String
+              if ($LASTEXITCODE -ne 0 -or $headers -notmatch '8664 machine') {
+                $valid = $false
+                $reasons += 'TDLib DLL is not PE x64'
+              }
+            }
+          } else {
+            $reasons += 'no restored TDLib manifest'
+          }
+          "valid=$($valid.ToString().ToLowerInvariant())" | Add-Content $env:GITHUB_OUTPUT
+          if ($valid) {
+            'Verified cached TDLib package matches pinned source, schema, toolchain, dependencies, and hashes.' |
+              Tee-Object -FilePath .ci\windows-msvc\tdlib-cache-decision.log
+          } else {
+            "Rebuilding TDLib: $($reasons -join '; ')" |
+              Tee-Object -FilePath .ci\windows-msvc\tdlib-cache-decision.log
+          }
 
       - name: Build TDLib 1.8.68 shared JSON package
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        if: steps.tdlib-package-check.outputs.valid != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
           $prefix = (Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib')
           $build = (Join-Path $env:RUNNER_TEMP 'tdlib-msvc-build')
+          if (Test-Path $prefix) { Remove-Item -Recurse -Force $prefix }
           $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
           $gperf = (Get-ChildItem (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\tools') -Filter gperf.exe -Recurse | Select-Object -First 1).DirectoryName
           $env:PATH = "$gperf;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
