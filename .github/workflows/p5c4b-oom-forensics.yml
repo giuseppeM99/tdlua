@@ -73,7 +73,7 @@ jobs:
           foreach ($file in @('notes.txt', 'control-summary.txt', 'probe-summary.txt',
                               'probe-rejections.txt', 'probe-rest-summary.txt',
                               'probe-ehs-summary.txt', 'probe-helper-summary.txt',
-                             'trace-guard-summary.txt',
+                             'probe-outcome-summary.txt', 'trace-guard-summary.txt',
                               'catch-boundary-summary.txt', 'funclet-summary.txt',
                               'result.txt')) {
             $path = Join-Path $out $file

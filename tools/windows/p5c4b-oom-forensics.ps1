@@ -111,6 +111,12 @@ $probeStandard = Build-OomBinary -Name 'probe-ehs-trace' `
 $probeHelper = Build-OomBinary -Name 'probe-ehsc-helper' `
     -Source "$root\tools\diagnostics\p5c4b_oom_probe.cpp" `
     -ExtraFlags @('/EHsc', '/DP5C4B_ERROR_HELPER')
+$probeOutcome = Build-OomBinary -Name 'probe-ehsc-outcome' `
+    -Source "$root\tools\diagnostics\p5c4b_oom_probe.cpp" `
+    -ExtraFlags @('/EHsc', '/DP5C4B_OUTCOME_HELPER')
+$probeBacktrace = Build-OomBinary -Name 'probe-ehsc-bt' `
+    -Source "$root\tools\diagnostics\p5c4b_oom_probe.cpp" `
+    -ExtraFlags @('/EHsc', '/DP5C4B_BACKTRACE')
 
 # --- 1. control: the unmodified test, isolated processes -------------------
 $codes = @()
@@ -176,6 +182,46 @@ $helperCode = Invoke-OomBinary -Exe $probeHelper -MaxOffset 1 -Log $helperLog
 Select-String -Path $helperLog -Pattern '^P5C4B offset|^P5C4B reject|^exit=' |
     ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-helper-summary.txt')
 $notes.Add("candidate helper shape at offset 1: exit=$helperCode")
+
+# Second candidate: the whole protected body moves into a helper, so the frame
+# that crosses the Lua boundary owns no automatic with a destructor.
+$outcomeLog = Join-Path $out 'probe-outcome.log'
+$outcomeCode = Invoke-OomBinary -Exe $probeOutcome -MaxOffset 1 -Log $outcomeLog
+@("variant=/DP5C4B_OUTCOME_HELPER with /EHsc (P5C.4a shape, diagnostic copy)",
+  "exit=$outcomeCode") | Set-Content (Join-Path $out 'probe-outcome-summary.txt')
+Select-String -Path $outcomeLog -Pattern '^P5C4B offset|^P5C4B reject|^exit=' |
+    ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-outcome-summary.txt')
+$notes.Add("candidate outcome shape at offset 1: exit=$outcomeCode")
+
+# Callers of the second destruction, captured in-process, then resolved with
+# the PDB in a separate debugger session (no hardware breakpoints involved).
+$btLog = Join-Path $out 'probe-backtrace.log'
+$btCode = Invoke-OomBinary -Exe $probeBacktrace -MaxOffset 1 -Log $btLog
+"exit=$btCode" | Add-Content $btLog
+$btFrames = New-Object System.Collections.Generic.List[string]
+foreach ($line in Get-Content $btLog) {
+    if ($line -match '^P5C4B dtor-backtrace frames=(\d+)(.*)$') {
+        foreach ($frame in ($Matches[2] -split '\s+' | Where-Object { $_ })) {
+            $btFrames.Add($frame)
+        }
+    }
+}
+$btScript = Join-Path $out 'backtrace-commands.txt'
+$btLines = New-Object System.Collections.Generic.List[string]
+$btLines.Add('.reload')
+$btIndex = 0
+foreach ($frame in $btFrames) {
+    $btIndex++
+    $btLines.Add('.echo P5C4B-BT-' + $btIndex + ' ' + $frame)
+    $btLines.Add('ln ' + $frame)
+    $btLines.Add('u ' + $frame + ' L1')
+}
+$btLines.Add('q')
+$btLines | Set-Content $btScript
+& "$debuggers\cdb.exe" -o -y $symbolPath `
+    -logo (Join-Path $out 'cdb-backtrace-debugger.log') `
+    -cf $btScript $probeBacktrace 1 *> (Join-Path $out 'backtrace-resolved.txt')
+$notes.Add("second-destruction backtrace frames=$($btFrames.Count)")
 
 # --- 3. trace probe and /EHs probe: codegen and /EHc controls -------------
 $traceLog = Join-Path $work 'trace-guard-1.log'

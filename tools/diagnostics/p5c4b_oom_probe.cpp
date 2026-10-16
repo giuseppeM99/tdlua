@@ -7,6 +7,19 @@
 #include <iostream>
 #include <stdexcept>
 
+#if defined(_MSC_VER)
+#define P5C4B_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define P5C4B_NOINLINE __attribute__((noinline))
+#else
+#define P5C4B_NOINLINE
+#endif
+
+#ifdef P5C4B_BACKTRACE
+#include <cstdint>
+#include <windows.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // P5C4B DIAGNOSTIC PROBE.
 //
@@ -25,8 +38,14 @@
 //     after the wait; a stale cleanup funclet that runs a second ~shared_ptr
 //     leaves the control block one owner short of the baseline;
 //   * built with -DP5C4B_ERROR_HELPER it raises the Lua error through a
-//     non-inline helper frame that owns nothing, i.e. the candidate fix shape,
-//     so the same measurement can be repeated on the candidate.
+//     non-inline helper frame that owns nothing (measured: not sufficient);
+//   * built with -DP5C4B_OUTCOME_HELPER it moves the whole protected body,
+//     automatics included, into a non-inline helper returning a trivially
+//     destructible outcome, so the frame crossing the Lua boundary owns
+//     nothing at all (the P5C.4a shape);
+//   * built with -DP5C4B_BACKTRACE it prints the callers of the second
+//     destruction, labelled with the containing image, so the run's PDB can
+//     resolve them without a debugger.
 // Behaviour of the product code and the assertions of the original test are
 // untouched: no runtime fix is implemented here.
 // ---------------------------------------------------------------------------
@@ -42,6 +61,81 @@ void p5c4b_trace(const char *event)
               << " ctors=" << p5c4b_guard_ctors
               << " dtors=" << p5c4b_guard_dtors << '\n';
 }
+
+#ifdef P5C4B_BACKTRACE
+// Reports the callers of a destructor run without a debugger: the walked
+// frames are labelled with the containing image (as the debugger names it) and
+// an offset, so the same run's PDB can resolve them afterwards.
+void p5c4b_dump_backtrace()
+{
+    struct ModuleRange {
+        const char *name;
+        std::uintptr_t base;
+    };
+    const char *names[] = {"probe_ehsc", "ntdll",       "VCRUNTIME140",
+                           "VCRUNTIME140_1", "KERNELBASE", "lua54", "KERNEL32"};
+    HMODULE handles[] = {GetModuleHandleA(nullptr), GetModuleHandleA("ntdll.dll"),
+                         GetModuleHandleA("vcruntime140.dll"),
+                         GetModuleHandleA("vcruntime140_1.dll"),
+                         GetModuleHandleA("kernelbase.dll"),
+                         GetModuleHandleA("lua54.dll"),
+                         GetModuleHandleA("kernel32.dll")};
+    ModuleRange ranges[7];
+    std::size_t modules = 0;
+    for (std::size_t index = 0; index < 7; ++index) {
+        if (handles[index]) {
+            ranges[modules].name = names[index];
+            ranges[modules].base = reinterpret_cast<std::uintptr_t>(handles[index]);
+            ++modules;
+        }
+    }
+    void *frames[24] = {nullptr};
+    const USHORT captured = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+    std::cerr << "P5C4B dtor-backtrace frames=" << captured;
+    for (USHORT index = 0; index < captured; ++index) {
+        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(frames[index]);
+        const char *name = "?";
+        std::uintptr_t base = 0;
+        for (std::size_t m = 0; m < modules; ++m) {
+            if (address >= ranges[m].base && address - ranges[m].base < 0x400000 &&
+                ranges[m].base >= base) {
+                base = ranges[m].base;
+                name = ranges[m].name;
+            }
+        }
+        std::cerr << ' ' << name << "+0x" << std::hex << (address - base) << std::dec;
+    }
+    std::cerr << '\n';
+}
+#endif
+
+// Counting guard shared by every variant: one construction and, on the healthy
+// path, exactly one destruction.
+struct CountingGuard {
+    int &count;
+    int serial;
+    explicit CountingGuard(int &value, int id) : count(value), serial(id)
+    {
+        ++count;
+        ++p5c4b_guard_ctors;
+#ifdef P5C4B_TRACE
+        p5c4b_trace("guard ctor");
+#endif
+    }
+    ~CountingGuard()
+    {
+        --count;
+        ++p5c4b_guard_dtors;
+#ifdef P5C4B_TRACE
+        p5c4b_trace("guard dtor");
+#endif
+#ifdef P5C4B_BACKTRACE
+        if (p5c4b_guard_dtors >= 2) {
+            p5c4b_dump_backtrace();
+        }
+#endif
+    }
+};
 } // namespace
 
 namespace {
@@ -228,43 +322,51 @@ Scenario *current = nullptr;
 // automatic at all, reached through an ordinary C++ call instead of the
 // extern "C" Lua entry point. /EHc assumes the extern "C" call cannot unwind,
 // which is what leaves the caller's stale cleanup live.
-#if defined(_MSC_VER)
-#define P5C4B_NOINLINE __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-#define P5C4B_NOINLINE __attribute__((noinline))
-#else
-#define P5C4B_NOINLINE
-#endif
 P5C4B_NOINLINE int raiseWaitError(lua_State *L)
 {
     return lua_error(L);
 }
 #endif
+
+#ifdef P5C4B_OUTCOME_HELPER
+// Candidate shape (diagnostic): every automatic with a destructor, including
+// the whole protected body, lives in this helper, which returns a trivially
+// destructible outcome by value. The frame that crosses the Lua boundary owns
+// nothing to destroy, exactly like managedWait after the P5C.4a fix.
+struct WaitOutcome {
+    int failed = 0;
+    int results = 0;
+};
+
+P5C4B_NOINLINE WaitOutcome performWait(lua_State *L)
+{
+    WaitOutcome outcome;
+    try {
+        CountingGuard guard(current->guards, ++p5c4b_guard_serial);
+        const auto core = current->router.core();
+        const auto state = current->state;
+        const bool waited = core->waitSynchronously(L, state, true, .01,
+                                                    tdlua::WaitKind::Result,
+                                                    outcome.results);
+        require(waited, "unexpected timeout");
+        outcome.results = core->pushResult(L, state);
+    } catch (const TDLuaLuaError &) {
+        outcome.failed = 1;
+    }
+    return outcome;
+}
+#endif
+
 int waitForResponse(lua_State *L)
 {
+#ifdef P5C4B_OUTCOME_HELPER
+    const WaitOutcome outcome = performWait(L);
+    return outcome.failed ? lua_error(L) : outcome.results;
+#else
     bool failed = false;
     int results = 0;
     try {
-        struct Guard {
-            int &count;
-            int serial;
-            explicit Guard(int &value, int id) : count(value), serial(id)
-            {
-                ++count;
-                ++p5c4b_guard_ctors;
-#ifdef P5C4B_TRACE
-                p5c4b_trace("guard ctor");
-#endif
-            }
-            ~Guard()
-            {
-                --count;
-                ++p5c4b_guard_dtors;
-#ifdef P5C4B_TRACE
-                p5c4b_trace("guard dtor");
-#endif
-            }
-        } guard(current->guards, ++p5c4b_guard_serial);
+        CountingGuard guard(current->guards, ++p5c4b_guard_serial);
         const auto core = current->router.core();
         const auto state = current->state;
 #ifdef P5C4B_TRACE
@@ -294,6 +396,7 @@ int waitForResponse(lua_State *L)
 #else
     return failed ? lua_error(L) : results;
 #endif
+#endif // P5C4B_OUTCOME_HELPER
 }
 
 int sweep(int max_offset, bool inject)
@@ -328,6 +431,8 @@ int sweep(int max_offset, bool inject)
             // comparison run (argv[3]=nofault) is the baseline.
             const auto core_owner = scenario.router.core();
             const long core_use_count = core_owner.use_count();
+            const auto state_owner = scenario.state;
+            const long state_use_count = state_owner.use_count();
             if (scenario.guards != 0) {
                 std::cerr << "guard diagnostic: offset=" << offset
                           << " allocator_calls=" << allocator.calls
@@ -342,6 +447,7 @@ int sweep(int max_offset, bool inject)
                           << " live_cores=" << tdlua::liveSchedulerCores()
                           << " pending=" << scenario.router.pendingCount()
                           << " core_use_count=" << core_use_count
+                          << " state_use_count=" << state_use_count
                           << " allocator_calls=" << allocator.calls
                           << " rejected=" << allocator.rejected << '\n';
                 ++guard_failures;
@@ -354,6 +460,7 @@ int sweep(int max_offset, bool inject)
                           << " guards=0 allocator_calls=" << allocator.calls
                           << " rejected=" << allocator.rejected
                           << " core_use_count=" << core_use_count
+                          << " state_use_count=" << state_use_count
                           << " status=" << status << '\n';
             }
             require(scenario.router.pendingCount() == 0, "pending request remained");
