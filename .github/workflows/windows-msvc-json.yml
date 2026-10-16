@@ -376,15 +376,27 @@ jobs:
           )
           foreach ($test in $tests) {
             $log = ".ci\windows-msvc\repeat-$($test.Name).log"
-            ctest --test-dir $build --output-on-failure -C Release --repeat "until-fail:$($test.Count)" -R $test.Pattern 2>&1 | Tee-Object -FilePath $log
-            $exit = $LASTEXITCODE
-            $summary = Get-Content $log -Raw
-            $started = [regex]::Matches($summary, "(?m)^\s*Start \d+: tdlua_$([regex]::Escape($test.Name.Replace('-', '_')))\r?$").Count
-            $passed = $started -eq $test.Count -and $exit -eq 0
-            $results += [pscustomobject]@{ test = $test.Name; requested = $test.Count; started = $started; exit_code = $exit; passed = $passed }
+            if (Test-Path $log) { Remove-Item $log -Force }
+            $exitCodes = @()
+            for ($iteration = 1; $iteration -le $test.Count; $iteration++) {
+              "=== $($test.Name) iteration $iteration/$($test.Count) ===" | Add-Content $log
+              ctest --test-dir $build --output-on-failure -C Release -R $test.Pattern 2>&1 | Tee-Object -FilePath $log -Append
+              $exitCodes += $LASTEXITCODE
+            }
+            $passedCount = @($exitCodes | Where-Object { $_ -eq 0 }).Count
+            $failedCount = $exitCodes.Count - $passedCount
+            $results += [pscustomobject]@{
+              test = $test.Name
+              requested = $test.Count
+              iterations_run = $exitCodes.Count
+              passed = $passedCount
+              failed = $failedCount
+              exit_codes = $exitCodes
+              all_passed = ($exitCodes.Count -eq $test.Count -and $failedCount -eq 0)
+            }
           }
           $results | ConvertTo-Json | Set-Content .ci\windows-msvc\repeat-summary.json
-          if ($results | Where-Object { -not $_.passed }) {
+          if ($results | Where-Object { -not $_.all_passed }) {
             'One or more required stress repeats failed; see repeat-summary.json and per-test logs.' | Set-Content .ci\windows-msvc\repeat-failure.txt
           }
 
