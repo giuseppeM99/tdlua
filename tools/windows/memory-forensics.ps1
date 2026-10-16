@@ -38,8 +38,14 @@ try {
                 & .\tdlua_managed_adapter_test.exe --trace *> "direct-$_.log"
                 "iteration=$_ exit=$LASTEXITCODE" | Add-Content exits.txt
             }
+            foreach ($source in @('windows_lua_unwind_probe', 'core_anchor_ownership_test', 'managed_routing_oom_test')) {
+                & cl.exe /nologo /MD @eh /Zi @opt /DTDLUA_TESTING "/I$root\include" "/I$lua" "$root\tests\$source.cpp" "/Fe:$source.exe" /link "$lua\lua54.lib" @link *> "$source-build.log"
+                if ($LASTEXITCODE -ne 0) { throw "Diagnostic build failed: $source" }
+                & ".\$source.exe" *> "$source.log"
+                "$source exit=$LASTEXITCODE" | Add-Content exits.txt
+            }
             # Stop at the first AV/heap failure. Do not publish process memory.
-            $commands = 'sxe av; sxe 0xc0000374; g; .exr -1; r; u @rip-10 @rip+20; kv; ~* kv; !heap -p -a @rax; !heap -p -a @rcx; !heap -p -a @rdx; !heap -p -a @r8; !heap -p -a @r9; lm v; q'
+            $commands = 'sxe av; sxe 0xc0000374; g; .exr -1; r; u @rip-10 @rip+20; kv; ~* kv; !ext.heap -p -a @rax; !ext.heap -p -a @rcx; !ext.heap -p -a @rdx; !ext.heap -p -a @r8; !ext.heap -p -a @r9; lm v; q'
             & "$debuggers\cdb.exe" -o -G -logo debugger.log -c $commands .\tdlua_managed_adapter_test.exe --trace *> debugger-console.log
             "cdb_exit=$LASTEXITCODE" | Add-Content exits.txt
             try {
