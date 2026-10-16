@@ -1,8 +1,8 @@
 $ErrorActionPreference = 'Stop'
 # P5C.3 diagnostic driver. Diagnostic-only: it builds the isolated probes and the
 # existing adapter test under a matrix of C++ exception-model flags, then captures
-# Page Heap allocation provenance, a control-block write trace, and the disassembly
-# of the tdlua functions. No TDLua source is modified.
+# the destruction sequence, allocation provenance and the disassembly of the
+# tdlua functions. No TDLua source is modified.
 $root = $env:GITHUB_WORKSPACE
 $out = Join-Path $root '.ci\p5c3'
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -106,7 +106,7 @@ try {
             $keep = $false
             $lines = New-Object System.Collections.Generic.List[string]
             foreach ($line in Get-Content $raw) {
-                if ($line -match '^[0-9A-Fa-f]+:') {
+                if ($line -match '^\s*[0-9A-Fa-f]+:') {
                     if ($keep) { $lines.Add($line) }
                 } else {
                     $keep = $line -match 'managed|Managed|SchedulerCore|RequestRouter|CoreAnchor|tdlua'
@@ -116,7 +116,10 @@ try {
             $lines | Set-Content (Join-Path $disasm "tdlua-$name.asm")
         }
 
-        # --- 4. Allocation provenance and control-block write trace --------
+        # --- 4. Allocation provenance for the first invalid access --------
+        # Full Page Heap plus user stack traces. At the fault, !address shows the
+        # state of the block that ~SchedulerCore dereferences, and !heap -p -a
+        # would show its create/free stack where the extension is available.
         $target = 'tdlua_managed_adapter_test.exe'
         $bindir = Join-Path $out 'adapter-EHsc'
         $faultScript = @(
@@ -126,32 +129,15 @@ try {
             '.exr -1',
             'r',
             '.lastevent',
-            '!analyze -v',
             'kw',
-            '~* kw',
+            '!analyze -v',
+            '!address @rcx',
             '!heap -p -a @rcx',
             '!heap -p -a @rbp',
-            '!heap -p -a @rbx',
-            '!heap -p -t',
-            '!address @rcx',
             'dt -b tdlua_managed_adapter_test!tdlua::SchedulerCore @rcx',
             'q'
         )
         $faultScript | Set-Content (Join-Path $out 'fault-commands.txt')
-        # Watch the MSVC shared_ptr control block of the first SchedulerCore: for
-        # _Ref_count_obj2 the object sits 16 bytes into the allocation, so the
-        # 4-byte _Uses counter is at (object - 8).
-        $traceScript = @(
-            'sxd av',
-            'sxe 0xc0000374',
-            'r $t1 = 0',
-            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::SchedulerCore ".echo ===CTOR core=@rcx===; .if (@$t1 == 0) { r $t1 = 1; r $t0 = @rcx - 8; ba w4 @$t0 4 \".echo ===USES-WRITE===; kb 8; g\" }; g"',
-            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::~SchedulerCore ".echo ===DTOR core=@rcx===; kb 14; g"',
-            'g',
-            '.echo ===END===',
-            'q'
-        )
-        $traceScript | Set-Content (Join-Path $out 'trace-commands.txt')
         try {
             & "$debuggers\gflags.exe" /p /enable $target /full *> (Join-Path $out 'pageheap-enable.log')
             if ($LASTEXITCODE -ne 0) { throw 'page heap enable failed' }
@@ -165,9 +151,6 @@ try {
                 & "$debuggers\cdb.exe" -o -logo (Join-Path $out 'pageheap-debugger.log') `
                     -cf (Join-Path $out 'fault-commands.txt') .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'pageheap-console.log')
                 "pageheap_cdb_exit=$LASTEXITCODE" | Add-Content (Join-Path $out 'adapter-exits.txt')
-                & "$debuggers\cdb.exe" -o -logo (Join-Path $out 'trace-debugger.log') `
-                    -cf (Join-Path $out 'trace-commands.txt') .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'trace-console.log')
-                "trace_cdb_exit=$LASTEXITCODE" | Add-Content (Join-Path $out 'adapter-exits.txt')
             }
             finally { Pop-Location }
         }
@@ -175,6 +158,31 @@ try {
             & "$debuggers\gflags.exe" /i $target -ust *> (Join-Path $out 'ust-disable.log')
             & "$debuggers\gflags.exe" /p /disable $target *> (Join-Path $out 'pageheap-disable.log')
             & "$debuggers\gflags.exe" /p *> (Join-Path $out 'pageheap-after.log')
+        }
+
+        # --- 5. Destruction sequence, per flag set -------------------------
+        # Every SchedulerCore construction and destruction is logged with its
+        # caller stack, so that the same object address appearing twice, and the
+        # frame that runs the destructor, are directly visible.
+        $traceScript = @(
+            'sxd av',
+            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::SchedulerCore "r @rcx; g"',
+            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::~SchedulerCore "r @rcx; kb 12; g"',
+            'g',
+            '.echo ===END-OF-TRACE===',
+            'q'
+        )
+        $traceScript | Set-Content (Join-Path $out 'trace-commands.txt')
+        foreach ($name in @('EHsc', 'EHs', 'EHs_EHc-')) {
+            $dir = Join-Path $out "adapter-$name"
+            if (-not (Test-Path (Join-Path $dir $target))) { continue }
+            Push-Location $dir
+            try {
+                & "$debuggers\cdb.exe" -o -logo (Join-Path $out "trace-$name-debugger.log") `
+                    -cf (Join-Path $out 'trace-commands.txt') ".\$target" --trace *> (Join-Path $out "trace-$name-console.log")
+                "trace $name cdb_exit=$LASTEXITCODE" | Add-Content (Join-Path $out 'adapter-exits.txt')
+            }
+            finally { Pop-Location }
         }
     }
     finally { Pop-Location }
