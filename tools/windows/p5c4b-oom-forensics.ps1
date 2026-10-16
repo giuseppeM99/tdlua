@@ -364,9 +364,11 @@ function Get-FuncletOffsets {
     return [pscustomobject]@{ imageBase = $imageBase; offsets = $offsets; entries = $entries }
 }
 
-# Returns the module offset that the named funclet tail-jumps to: the
-# waitForResponse cleanup funclet of the guard is a `jmp` to that destructor, so
-# this is the address to break on to see which code region runs the cleanup.
+# Returns what the named funclet tail-jumps to. The waitForResponse cleanup
+# funclets are `jmp` instructions that run a destructor, so the jump target is
+# the address to break on to see which code region performs each cleanup. The
+# operand is a module offset when the callee has no name in the disassembly and
+# a decorated symbol otherwise.
 function Get-FuncletJump {
     param([string]$Asm, [string]$Name, [string]$Tag, [Int64]$ImageBase)
     $awaiting = $false
@@ -376,13 +378,19 @@ function Get-FuncletJump {
             $awaiting = $true
             continue
         }
-        if ($awaiting) {
-            if ($line -match '^\s*([0-9A-Fa-f]+):\s+jmp\s+([0-9A-Fa-f]+)') {
-                $target = [Convert]::ToInt64($Matches[2], 16)
-                return '0x' + ($target - $ImageBase).ToString('x')
+        if (-not $awaiting) { continue }
+        if ($line -match '^\s*([0-9A-Fa-f]+):\s+jmp\s+(\S+)\s*$') {
+            $operand = $Matches[2]
+            if ($operand -match '^[0-9A-Fa-f]+$') {
+                $target = [Convert]::ToInt64($operand, 16)
+                return [pscustomobject]@{
+                    offset = '0x' + ($target - $ImageBase).ToString('x'); symbol = $null
+                }
             }
-            $awaiting = $false
+            return [pscustomobject]@{ offset = $null; symbol = $operand }
         }
+        # Stay inside the funclet: the jump is not always the first instruction.
+        if ($line -notmatch '^\s*[0-9A-Fa-f]+:') { $awaiting = $false }
     }
     return $null
 }
@@ -544,18 +552,26 @@ foreach ($entry in $continuationFrame.entries) {
     "managedWaitContinuation_funclet offset=$($entry.offset) label=$($entry.label)" |
         Add-Content (Join-Path $out 'funclet-summary.txt')
 }
-# The cleanup funclet of the guard is a tail jump to the destructor. Breaking on
-# the destructor itself reports which code region runs it: the ordinary
-# destruction and, if the artifact fires, the frame handler pass of the
-# non-local jump. (A first attempt used hardware write breakpoints on the
-# counters; they never trapped in this environment.)
-$guardDtorOffset = Get-FuncletJump -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
-    -Name 'waitForResponse' -Tag 'dtor$0' -ImageBase $waitedFrame.imageBase
-if ($guardDtorOffset) {
-    $extraBreakpoints.Add('u ' + $traceModule + '+' + $guardDtorOffset + ' L1')
-    $extraBreakpoints.Add('bu ' + $traceModule + '+' + $guardDtorOffset +
-        ' ".echo P5C4B-GUARDDTOR-CALL; kb 24; g"')
-    "waitForResponse_guard_dtor offset=$guardDtorOffset" |
+# The cleanup funclets of the guard (`dtor$0`) and of the lease (`dtor$1`) are
+# tail jumps to the destructor they run. Breaking on the destructor itself
+# reports which code region runs each cleanup: the ordinary destruction and, if
+# the artifact fires, the frame handler pass of the non-local jump. (A first
+# attempt used hardware write breakpoints on the counters; they never trapped in
+# this environment.)
+foreach ($cleanup in @(@('dtor$0', 'GUARDDTOR-CALL'), @('dtor$1', 'LEASEDTOR-CALL'))) {
+    $tag = $cleanup[0]
+    $echo = $cleanup[1]
+    $jump = Get-FuncletJump -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+        -Name 'waitForResponse' -Tag $tag -ImageBase $waitedFrame.imageBase
+    if (-not $jump) { continue }
+    if ($jump.offset) {
+        $target = $traceModule + '+' + $jump.offset
+    } else {
+        $target = $traceModule + '!' + $jump.symbol
+    }
+    $extraBreakpoints.Add('u ' + $target + ' L1')
+    $extraBreakpoints.Add('bu ' + $target + ' ".echo P5C4B-' + $echo + '; kb 24; g"')
+    "waitForResponse_cleanup tag=$tag target=$target" |
         Add-Content (Join-Path $out 'funclet-summary.txt')
 }
 
