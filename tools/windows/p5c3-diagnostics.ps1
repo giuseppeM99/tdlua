@@ -119,17 +119,39 @@ try {
         # --- 4. Allocation provenance and control-block write trace --------
         $target = 'tdlua_managed_adapter_test.exe'
         $bindir = Join-Path $out 'adapter-EHsc'
-        $faultCommands = 'sxd av; sxe 0xc0000374; g; .exr -1; r; .lastevent; !analyze -v; kw; ~* kw; ' +
-            '!heap -p -a @rcx; !heap -p -a @rbp; !heap -p -a @rbx; !heap -p -t; ' +
-            '!address @rcx; dt -b tdlua_managed_adapter_test!tdlua::SchedulerCore @rcx; q'
+        $faultScript = @(
+            'sxd av',
+            'sxe 0xc0000374',
+            'g',
+            '.exr -1',
+            'r',
+            '.lastevent',
+            '!analyze -v',
+            'kw',
+            '~* kw',
+            '!heap -p -a @rcx',
+            '!heap -p -a @rbp',
+            '!heap -p -a @rbx',
+            '!heap -p -t',
+            '!address @rcx',
+            'dt -b tdlua_managed_adapter_test!tdlua::SchedulerCore @rcx',
+            'q'
+        )
+        $faultScript | Set-Content (Join-Path $out 'fault-commands.txt')
         # Watch the MSVC shared_ptr control block of the first SchedulerCore: for
         # _Ref_count_obj2 the object sits 16 bytes into the allocation, so the
         # 4-byte _Uses counter is at (object - 8).
-        $traceCommands = 'sxd av; sxe 0xc0000374; r $t1 = 0; ' +
-            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::SchedulerCore ' +
-            '".echo === CTOR core=@rcx ===; .if (@$t1 == 0) { r $t1 = 1; r $t0 = @rcx - 8; ba w4 @$t0 4 \".echo === USES WRITE ===; .echo core=@rcx; kb 8; g\" }; g"; ' +
-            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::~SchedulerCore ".echo === DTOR core=@rcx ===; kb 8; g"; ' +
-            'g; .echo === END ===; q'
+        $traceScript = @(
+            'sxd av',
+            'sxe 0xc0000374',
+            'r $t1 = 0',
+            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::SchedulerCore ".echo ===CTOR core=@rcx===; .if (@$t1 == 0) { r $t1 = 1; r $t0 = @rcx - 8; ba w4 @$t0 4 \".echo ===USES-WRITE===; kb 8; g\" }; g"',
+            'bu tdlua_managed_adapter_test!tdlua::SchedulerCore::~SchedulerCore ".echo ===DTOR core=@rcx===; kb 14; g"',
+            'g',
+            '.echo ===END===',
+            'q'
+        )
+        $traceScript | Set-Content (Join-Path $out 'trace-commands.txt')
         try {
             & "$debuggers\gflags.exe" /p /enable $target /full *> (Join-Path $out 'pageheap-enable.log')
             if ($LASTEXITCODE -ne 0) { throw 'page heap enable failed' }
@@ -140,11 +162,11 @@ try {
             & "$debuggers\gflags.exe" /i $target +ust *> (Join-Path $out 'ust-enable.log')
             Push-Location $bindir
             try {
-                & "$debuggers\cdb.exe" -o -G -logo (Join-Path $out 'pageheap-debugger.log') `
-                    -c $faultCommands .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'pageheap-console.log')
+                & "$debuggers\cdb.exe" -o -logo (Join-Path $out 'pageheap-debugger.log') `
+                    -cf (Join-Path $out 'fault-commands.txt') .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'pageheap-console.log')
                 "pageheap_cdb_exit=$LASTEXITCODE" | Add-Content (Join-Path $out 'adapter-exits.txt')
-                & "$debuggers\cdb.exe" -o -G -logo (Join-Path $out 'trace-debugger.log') `
-                    -c $traceCommands .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'trace-console.log')
+                & "$debuggers\cdb.exe" -o -logo (Join-Path $out 'trace-debugger.log') `
+                    -cf (Join-Path $out 'trace-commands.txt') .\tdlua_managed_adapter_test.exe --trace *> (Join-Path $out 'trace-console.log')
                 "trace_cdb_exit=$LASTEXITCODE" | Add-Content (Join-Path $out 'adapter-exits.txt')
             }
             finally { Pop-Location }
