@@ -1,0 +1,96 @@
+name: P5C.4b managed continuation OOM forensics
+
+# Diagnostic-only workflow for the dedicated p5c4b-oom-forensics branch.
+#
+# It reproduces tdlua_managed_routing_oom in isolated MSVC Release processes
+# (/O2 /Ob2 /DNDEBUG /MD /EHsc, Lua 5.4.8 built with debug symbols), measures
+# the guard canary and the rejected allocation, traces the Lua error path and
+# the SchedulerCore lifetime under CDB, and records the cleanup funclets of
+# waitForResponse and managedWaitContinuation in the disassembly.
+#
+# No product fix and no test change is part of this workflow:
+# tests/managed_routing_oom_test.cpp is compiled byte-identical as the control
+# and tools/diagnostics/p5c4b_oom_probe.cpp is a diagnostic copy. The whole
+# diagnostic apparatus must be dropped before anything is merged.
+on:
+  push:
+    branches: [p5c4b-oom-forensics]
+    paths:
+      - '.github/workflows/p5c4b-oom-forensics.yml'
+      - 'include/**'
+      - 'src/**'
+      - 'tests/managed_routing_oom_test.cpp'
+      - 'tools/diagnostics/**'
+      - 'tools/windows/compile-lua-msvc.ps1'
+      - 'tools/windows/p5c4b-oom-forensics.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  p5c4b-oom-forensics:
+    name: Windows 2022 / MSVC x64 / Lua 5.4.8 / managed routing OOM forensics
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout forensics branch
+        uses: actions/checkout@v7
+
+      - name: Enable MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Lua 5.4.8 with MSVC and debug symbols
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\compile-lua-msvc.ps1 `
+            -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
+            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -DebugSymbols
+          if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+          $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
+          Get-ChildItem $lua | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Run the managed routing OOM forensics harness
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\p5c4b-oom-forensics.ps1 `
+            -LuaDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -OutputDirectory "$env:GITHUB_WORKSPACE\.ci\p5c4b" `
+            -Iterations 3 `
+            -Offsets 8
+          if ($LASTEXITCODE -ne 0) { throw "P5C.4b forensics harness failed: $LASTEXITCODE" }
+          exit 0
+
+      - name: Show forensics summary
+        if: always()
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\.ci\p5c4b"
+          foreach ($file in @('notes.txt', 'control-summary.txt', 'probe-summary.txt',
+                              'probe-rejections.txt', 'funclet-summary.txt', 'result.txt')) {
+            $path = Join-Path $out $file
+            "--- $file ---"
+            if (Test-Path $path) { Get-Content $path } else { '(missing)' }
+          }
+          foreach ($file in @('funclets-control-ehsc-waitForResponse.txt',
+                              'funclets-probe-ehsc-trace-waitForResponse.txt',
+                              'funclets-probe-ehsc-trace-managedWaitContinuation.txt')) {
+            $path = Join-Path $out $file
+            "--- $file ---"
+            if (Test-Path $path) { Get-Content $path } else { '(missing)' }
+          }
+
+      - name: Upload forensics artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msvc-p5c4b-oom-forensics-${{ github.run_id }}
+          path: |
+            .ci/p5c4b/
+            .ci/windows-msvc/lua/lua54.pdb
+          if-no-files-found: warn
+          retention-days: 30
