@@ -209,11 +209,17 @@ $catch = Build-OomBinary -Name 'catch-boundary-ehsc' `
   "flags=/O2 /Ob2 /DNDEBUG /MD /EHsc /DTDLUA_TESTING",
   "mode 0: control, no injected failure",
   "mode 1: lua_pushstring inside the catch, allocation fails",
-  "mode 2: candidate fixed shape, push after the handler returned") |
+  "mode 2: candidate fixed shape, push after the handler returned",
+  "mode 3: prepareManagedWait shape (lease destroyed by the unwind), push in the catch",
+  "mode 3 nofault: same shape without the injected failure",
+  "mode 4: candidate fixed shape with the same lease") |
     Set-Content (Join-Path $out 'catch-boundary-summary.txt')
-foreach ($catchMode in 0, 1, 2) {
-    $log = Join-Path $out "catch-boundary-mode$catchMode.log"
-    & $catch $catchMode *> $log
+foreach ($catchRun in @(@(0), @(1), @(2), @(3), @(3, 'nofault'), @(4))) {
+    $catchMode = $catchRun[0]
+    $suffix = if ($catchRun.Count -gt 1) { "-$($catchRun[1])" } else { '' }
+    $name = "catch-boundary-mode$catchMode$suffix"
+    $log = Join-Path $out "$name.log"
+    & $catch @catchRun *> $log
     "exit=$LASTEXITCODE" | Add-Content $log
     Select-String -Path $log -Pattern '^P5C4B catch' |
         ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'catch-boundary-summary.txt')
@@ -371,6 +377,7 @@ $continuationFrame = Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.
 $symbolScript = Join-Path $out 'symbols-commands.txt'
 $symbolLines = New-Object System.Collections.Generic.List[string]
 $symbolLines.Add('.reload')
+$symbolLines.Add('lm')
 $symbolLines.Add('x ' + $traceModule + '!*Guard*')
 $symbolLines.Add('x ' + $traceModule + '!*waitForResponse*')
 $symbolLines.Add('x ' + $traceModule + '!tdlua::SchedulerCore::~SchedulerCore')
@@ -459,6 +466,7 @@ function Invoke-Trace {
     $lines.Add('bl')
     $lines.Add('g')
     $lines.Add('.echo ===END-OF-TRACE===')
+    $lines.Add('bl')
     $lines.Add('q')
     $lines | Set-Content $script
     $arguments = @($MaxOffset)

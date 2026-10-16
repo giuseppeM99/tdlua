@@ -9,13 +9,19 @@
 // level check of that boundary, and it must not be used to explain the routing
 // OOM failure.
 //
-// Modes (argv[1]):
+// Modes (argv[1]); argv[2] == "nofault" disables the injected failure:
 //   0  control: push the message inside the catch with no injected failure;
 //   1  push the message inside the catch with the Lua allocator rigged to fail
 //      on that allocation;
 //   2  the candidate fixed shape: copy the message into a trivially
 //      destructible buffer inside the catch and push it after the catch has
-//      returned, with the Lua allocator rigged to fail on the push.
+//      returned, with the Lua allocator rigged to fail on the push;
+//   3  the prepareManagedWait shape: an automatic with a destructor (the
+//      scheduler lease) is destroyed by the unwind that delivers the
+//      exception, and the handler then makes the fallible Lua push. The lease
+//      destructor counter is the observable: two runs mean the frame handler
+//      re-ran the already-performed cleanup while leaving the catch;
+//   4  the candidate fixed shape with the same lease.
 #include "tdlua/common/request_router.h"
 
 #include <cstdio>
@@ -54,12 +60,12 @@ struct Outcome {
 };
 
 Allocator *active = nullptr;
+bool rig_failure = true;
 int witness_ctors = 0;
 int witness_dtors = 0;
 int catch_completed = 0;
+int lease_dtors = 0;
 
-// The exception object whose destructor tells whether the C++ exception
-// machinery completed the dispatch.
 struct Witness : std::runtime_error {
     explicit Witness(const char *message) : std::runtime_error(message)
     {
@@ -68,13 +74,72 @@ struct Witness : std::runtime_error {
     ~Witness() { ++witness_dtors; }
 };
 
+// The scheduler lease analogue: an automatic of the try block whose destructor
+// the unwind into the catch handler runs before the handler body starts.
+struct Lease {
+    int &count;
+    explicit Lease(int &value) : count(value) {}
+    ~Lease() { ++count; }
+};
+
+#if defined(_MSC_VER)
+#define P5C4B_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define P5C4B_NOINLINE __attribute__((noinline))
+#else
+#define P5C4B_NOINLINE
+#endif
+
+// Throws from a separate frame so the protected region contains a call, as
+// prepareManagedWait's protected region contains the call to prepareWait.
+P5C4B_NOINLINE void throwWitness()
+{
+    throw Witness("tdlua: replicated wait failure");
+}
+
+// Mode 3: the prepareManagedWait shape with the lease alive when the exception
+// leaves the protected region.
+int pushInsideCatchWithLease(lua_State *L)
+{
+    try {
+        Lease lease(lease_dtors);
+        throwWitness();
+        return 1;
+    } catch (const std::exception &error) {
+        if (rig_failure) active->fail_at = active->calls + 1;
+        lua_pushstring(L, error.what());
+        ++catch_completed;
+        return 1;
+    }
+}
+
+// Mode 4: the candidate fixed shape with the same lease.
+int pushOutsideCatchWithLease(lua_State *L)
+{
+    Outcome outcome;
+    try {
+        Lease lease(lease_dtors);
+        throwWitness();
+        outcome.failed = 1;
+    } catch (const std::exception &error) {
+        std::strncpy(outcome.message, error.what(), sizeof(outcome.message) - 1);
+        outcome.failed = 1;
+        ++catch_completed;
+    }
+    if (outcome.failed) {
+        if (rig_failure) active->fail_at = active->calls + 1;
+        lua_pushstring(L, outcome.message);
+    }
+    return 1;
+}
+
 // Mode 1: the prepareManagedWait shape, with the pushed message failing.
 int pushInsideCatch(lua_State *L)
 {
     try {
         throw Witness("tdlua: replicated wait failure");
     } catch (const std::exception &error) {
-        active->fail_at = active->calls + 1;
+        if (rig_failure) active->fail_at = active->calls + 1;
         lua_pushstring(L, error.what());
         ++catch_completed;
         return 1;
@@ -93,8 +158,10 @@ int pushOutsideCatch(lua_State *L)
         outcome.failed = 1;
         ++catch_completed;
     }
-    if (outcome.failed) active->fail_at = active->calls + 1;
-    lua_pushstring(L, outcome.message);
+    if (outcome.failed) {
+        if (rig_failure) active->fail_at = active->calls + 1;
+        lua_pushstring(L, outcome.message);
+    }
     return 1;
 }
 
@@ -113,6 +180,7 @@ int control(lua_State *L)
 int main(int argc, char **argv)
 {
     const int mode = argc > 1 ? std::atoi(argv[1]) : 1;
+    rig_failure = !(argc > 2 && std::strcmp(argv[2], "nofault") == 0);
     Allocator allocator;
     active = &allocator;
 #if LUA_VERSION_NUM >= 505
@@ -129,6 +197,10 @@ int main(int argc, char **argv)
         lua_pushcfunction(L, pushInsideCatch);
     } else if (mode == 2) {
         lua_pushcfunction(L, pushOutsideCatch);
+    } else if (mode == 3) {
+        lua_pushcfunction(L, pushInsideCatchWithLease);
+    } else if (mode == 4) {
+        lua_pushcfunction(L, pushOutsideCatchWithLease);
     } else {
         lua_pushcfunction(L, control);
     }
@@ -138,13 +210,16 @@ int main(int argc, char **argv)
     const int ctors = witness_ctors;
     const int dtors = witness_dtors;
     const int completed = catch_completed;
+    const int leases = lease_dtors;
     std::cout << "P5C4B catch mode=" << mode
+              << " rig=" << (rig_failure ? 1 : 0)
               << " status=" << status
               << " stack_type=" << (type ? type : "none")
               << " rejected=" << rejected
               << " catch_completed=" << completed
               << " witness_ctors=" << ctors
               << " witness_dtors=" << dtors
+              << " lease_dtors=" << leases
               << " exception_object_alive="
               << (ctors - dtors) << '\n';
     lua_close(L);
