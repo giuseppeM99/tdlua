@@ -229,7 +229,15 @@ void sweep()
             allocator.fail_at = 0;
             if (allocator.rejected) ++faults;
             rejected_calls += allocator.rejected;
-            require(scenario.guards == 0, "Lua error skipped a C++ destructor");
+            if (scenario.guards != 0) {
+                std::cerr << "guard diagnostic: offset=" << offset
+                          << " allocator_calls=" << allocator.calls
+                          << " rejected=" << allocator.rejected
+                          << " status=" << status
+                          << " task_status=" << static_cast<int>(scenario.state->status)
+                          << " stack_type=" << lua_typename(L, lua_type(L, -1)) << '\n';
+                require(false, "Lua error skipped a C++ destructor");
+            }
             require(scenario.router.pendingCount() == 0, "pending request remained");
             require(scenario.state->waiter_count == 0, "waiter remained");
             require(scenario.state->handle_count == 1, "handle count changed");
