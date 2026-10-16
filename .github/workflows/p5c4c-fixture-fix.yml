@@ -1,0 +1,518 @@
+name: P5C.4c OOM fixture fix validation
+
+# Validation-only workflow for the dedicated p5c4c-fixture-fix branch.
+#
+# Job 1 (probes) measures the fixed OOM fixture against the pre-fix frame shape
+# in the same run, with /EHsc and /EHs, plus the Gate B1 (managedWaitContinuation
+# error path) and Gate B2 (waitById yield) boundaries, and the cleanup funclets
+# of the error-raising frame.
+#
+# Job 2 (suite) is the pinned Windows MSVC JSON validation of the fixed fixture:
+# full CTest (36/36, no test excluded or modified), 100 isolated repetitions of
+# tdlua_managed_routing_oom and tdlua_managed_adapter, the managed/lifecycle
+# repeats, the production install check, and a /EHs rebuild of the module as the
+# Gate B2 backend comparison.
+#
+# Everything here (the workflow and tools/diagnostics/**) must be dropped before
+# the branch is merged: the only product change for P5C.4c is the Gate A refactor
+# of tests/managed_routing_oom_test.cpp.
+on:
+  push:
+    branches: [p5c4c-fixture-fix]
+    paths:
+      - '.github/workflows/p5c4c-fixture-fix.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'include/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'tools/**'
+      - 'td'
+
+permissions:
+  contents: read
+
+env:
+  TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+jobs:
+  probes:
+    name: Windows 2022 / MSVC x64 / P5C.4c probes (/EHsc vs /EHs)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout validation branch
+        uses: actions/checkout@v7
+
+      - name: Enable MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Lua 5.4.8 with MSVC and debug symbols
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\compile-lua-msvc.ps1 `
+            -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
+            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -DebugSymbols
+          if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+          Get-ChildItem "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Run the P5C.4c probe harness
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\p5c4c-fixture-probes.ps1 `
+            -LuaDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -OutputDirectory "$env:GITHUB_WORKSPACE\.ci\p5c4c" `
+            -Iterations 3
+          if ($LASTEXITCODE -ne 0) { throw "P5C.4c probe harness failed: $LASTEXITCODE" }
+          exit 0
+
+      - name: Show probe measurements
+        if: always()
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\.ci\p5c4c"
+          foreach ($file in @('result.txt', 'checks.txt', 'fixture-ehsc-summary.txt',
+                              'probe-offset-summary.txt', 'funclet-summary.txt',
+                              'b1-summary.txt', 'b2-summary.txt', 'source.txt',
+                              'branch.txt', 'worktree-status.txt')) {
+            $path = Join-Path $out $file
+            "--- $file ---"
+            if (Test-Path $path) { Get-Content $path } else { '(missing)' }
+          }
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msvc-p5c4c-probes-${{ github.run_id }}
+          path: |
+            .ci/p5c4c/
+          if-no-files-found: warn
+          retention-days: 30
+
+  suite:
+    name: Windows 2022 / MSVC x64 / Lua 5.4.8 / JSON (P5C.4c fixture fix)
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout validation branch and TDLib
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Enable MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Record fixture provenance and assertion preservation
+        id: provenance
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .ci\windows-msvc, .ci\p5c4c | Out-Null
+          $log = '.ci\p5c4c\fixture-provenance.log'
+          @(
+            "head=$(& git rev-parse HEAD)"
+            "branch=$(& git rev-parse --abbrev-ref HEAD)"
+            "baseline=b2c47d8"
+            "fixture_diff:" + (& git diff b2c47d8 --stat -- tests/managed_routing_oom_test.cpp | Out-String)
+          ) | Tee-Object -FilePath $log
+          & git diff b2c47d8 -- tests/managed_routing_oom_test.cpp | Tee-Object -Append -FilePath $log
+          # The refactor must not remove, add or reword an assertion.
+          $baseline = ((& git show b2c47d8:tests/managed_routing_oom_test.cpp) -join "`n")
+          $current = Get-Content tests/managed_routing_oom_test.cpp -Raw
+          $baselineMessages = @([regex]::Matches($baseline, 'require\([^;]*?"([^"]+)"') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+          $currentMessages = @([regex]::Matches($current, 'require\([^;]*?"([^"]+)"') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+          $missing = @($baselineMessages | Where-Object { $currentMessages -notcontains $_ })
+          $added = @($currentMessages | Where-Object { $baselineMessages -notcontains $_ })
+          $baselineCalls = ([regex]::Matches($baseline, 'require\(')).Count
+          $currentCalls = ([regex]::Matches($current, 'require\(')).Count
+          @("baseline_require_calls=$baselineCalls",
+            "current_require_calls=$currentCalls",
+            "baseline_messages=$($baselineMessages.Count)",
+            "current_messages=$($currentMessages.Count)",
+            "missing_messages=$($missing -join ' | ')",
+            "added_messages=$($added -join ' | ')") |
+            Tee-Object -Append -FilePath $log
+          "baseline_require_calls=$baselineCalls" >> $env:GITHUB_OUTPUT
+          "current_require_calls=$currentCalls" >> $env:GITHUB_OUTPUT
+          "missing_messages=$($missing.Count)" >> $env:GITHUB_OUTPUT
+          "added_messages=$($added.Count)" >> $env:GITHUB_OUTPUT
+          if ($missing.Count -ne 0) { throw 'an assertion message of the baseline is missing' }
+          if ($added.Count -ne 0) { throw 'the fixture gained an assertion message' }
+          if ($baselineCalls -ne $currentCalls) { throw 'the number of require() calls changed' }
+          & cl.exe /Bv 2>&1 | Tee-Object -FilePath .ci\windows-msvc\compiler.txt | Out-String | Write-Host
+          "TDLib HEAD: $(& git -C td rev-parse HEAD)"
+          "TDLib worktree: $(& git -C td status --porcelain)"
+          "TDLib gitlink: $(& git ls-tree HEAD td)"
+          "TDLib schema SHA-256: $((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)"
+          if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') { throw 'MSVC environment is not x64' }
+          if ((git -C td rev-parse HEAD).Trim() -ne $env:TDLIB_COMMIT) { throw 'TDLib submodule commit mismatch' }
+          $tdlibStatus = @(& git -C td status --porcelain)
+          if ($tdlibStatus.Count -gt 0) { throw 'TDLib submodule has local modifications' }
+          $clText = (& cl.exe /Bv 2>&1 | Out-String)
+          $clVersion = [regex]::Match($clText, '19\.\d+\.\d+').Value
+          $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $vcpkgCommit = (& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD).Trim()
+          "cl=$clVersion" >> $env:GITHUB_OUTPUT
+          "sdk=$sdk" >> $env:GITHUB_OUTPUT
+          "vcpkg=$vcpkgCommit" >> $env:GITHUB_OUTPUT
+          "schema=$((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)" >> $env:GITHUB_OUTPUT
+
+      - name: Install pinned tool dependencies with vcpkg
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          & $vcpkg install openssl:x64-windows zlib:x64-windows gperf:x64-windows 2>&1 | Tee-Object -FilePath .ci\windows-msvc\vcpkg-install.log
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed: $LASTEXITCODE" }
+          $tools = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\tools'
+          $gperf = Get-ChildItem $tools -Filter gperf.exe -Recurse | Select-Object -First 1
+          if (-not $gperf) { throw 'vcpkg did not install host gperf.exe' }
+          $env:PATH = "$($gperf.DirectoryName);$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Restore pinned TDLib MSVC package
+        id: tdlib-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .ci/windows-msvc/tdlib
+          key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
+          restore-keys: |
+            tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-
+
+      - name: Validate restored TDLib cache before deciding to build
+        id: tdlib-package-check
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib'
+          $manifest = Join-Path $prefix 'tdlua-tdlib-manifest.txt'
+          $valid = Test-Path $manifest
+          if ($valid) {
+            $content = Get-Content $manifest -Raw
+            $schema = (Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash
+            $expected = @(
+              "commit=$env:TDLIB_COMMIT",
+              "schema=$schema",
+              'cl=${{ steps.provenance.outputs.cl }}',
+              'sdk=${{ steps.provenance.outputs.sdk }}',
+              'generator=Ninja',
+              'build_type=Release',
+              'triplet=x64-windows',
+              'td_install_shared=ON',
+              'td_install_static=OFF',
+              "vcpkg=$(& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)"
+            )
+            foreach ($entry in $expected) {
+              if ($content -notmatch [regex]::Escape($entry)) { $valid = $false }
+            }
+            $tdjson = Join-Path $prefix 'bin\tdjson.dll'
+            $importLibrary = Join-Path $prefix 'lib\tdjson.lib'
+            if (-not (Test-Path $tdjson) -or -not (Test-Path $importLibrary)) { $valid = $false }
+          }
+          "valid=$($valid.ToString().ToLowerInvariant())" | Add-Content $env:GITHUB_OUTPUT
+          "Restored TDLib package valid: $valid" | Tee-Object -FilePath .ci\windows-msvc\tdlib-cache-decision.log
+
+      - name: Build TDLib 1.8.68 shared JSON package
+        if: steps.tdlib-package-check.outputs.valid != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = (Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib')
+          $build = (Join-Path $env:RUNNER_TEMP 'tdlib-msvc-build')
+          if (Test-Path $prefix) { Remove-Item -Recurse -Force $prefix }
+          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
+          $gperf = (Get-ChildItem (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\tools') -Filter gperf.exe -Recurse | Select-Object -First 1).DirectoryName
+          $env:PATH = "$gperf;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          cmake -S td -B $build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_INSTALL_PREFIX="$prefix" `
+            -DTD_INSTALL_SHARED_LIBRARIES=ON `
+            -DTD_INSTALL_STATIC_LIBRARIES=OFF `
+            -DTD_ENABLE_JNI=OFF `
+            -DTD_ENABLE_DOTNET=OFF
+          if ($LASTEXITCODE -ne 0) { throw "TDLib configure failed: $LASTEXITCODE" }
+          cmake --build $build --target tdjson --config Release --parallel 2 2>&1 | Tee-Object -FilePath .ci\windows-msvc\tdlib-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLib build failed: $LASTEXITCODE" }
+          cmake --install $build --config Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\tdlib-install.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLib install failed: $LASTEXITCODE" }
+          $tdjson = Join-Path $prefix 'bin\tdjson.dll'
+          $tdjsonImportLibrary = Join-Path $prefix 'lib\tdjson.lib'
+          @(
+            "commit=$env:TDLIB_COMMIT"
+            "schema=$((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)"
+            "cl=${{ steps.provenance.outputs.cl }}"
+            "sdk=${{ steps.provenance.outputs.sdk }}"
+            "generator=Ninja"
+            "build_type=Release"
+            "triplet=x64-windows"
+            "td_install_shared=ON"
+            "td_install_static=OFF"
+            "vcpkg=$(& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)"
+            "tdjson=$((Get-FileHash -Algorithm SHA256 $tdjson).Hash)"
+            "tdjson_import=$((Get-FileHash -Algorithm SHA256 $tdjsonImportLibrary).Hash)"
+          ) | Set-Content (Join-Path $prefix 'tdlua-tdlib-manifest.txt')
+
+      - name: Save verified TDLib package cache
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .ci/windows-msvc/tdlib
+          key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
+
+      - name: Build Lua 5.4.8 with MSVC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\compile-lua-msvc.ps1 `
+            -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
+            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -DebugSymbols
+          if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+          $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
+          "LUA_INCLUDE_DIR=$lua" >> $env:GITHUB_ENV
+          "LUA_LIBRARY=$lua\lua54.lib" >> $env:GITHUB_ENV
+          "LUA_EXECUTABLE=$lua\lua.exe" >> $env:GITHUB_ENV
+          "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Configure and build TDLua JSON MSVC
+        id: tdlua-build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = (Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib')
+          $tdluaBuild = (Join-Path $env:GITHUB_WORKSPACE 'build-windows-msvc')
+          cmake -S . -B $tdluaBuild -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTd_DIR="$prefix\lib\cmake\Td" `
+            -DTDLUA_BACKEND=json `
+            -DTDLUA_BUNDLED_TDLIB=OFF `
+            -DTDLUA_BUILD_TESTS=ON `
+            -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" `
+            -DLUA_LIBRARY="$env:LUA_LIBRARY" `
+            -DLUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DTDLUA_LUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DCMAKE_C_FLAGS=/DLUA_BUILD_AS_DLL `
+            -DCMAKE_CXX_FLAGS=/DLUA_BUILD_AS_DLL
+          if ($LASTEXITCODE -ne 0) { throw "TDLua configure failed: $LASTEXITCODE" }
+          cmake --build $tdluaBuild --config Release --parallel 2 2>&1 | Tee-Object -FilePath .ci\windows-msvc\tdlua-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLua build failed: $LASTEXITCODE" }
+          Copy-Item (Join-Path $tdluaBuild 'CMakeCache.txt') .ci\windows-msvc\tdlua-CMakeCache.txt
+          ctest --test-dir $tdluaBuild -N -V 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-list.log
+
+      - name: Verify module and run full CTest
+        id: full-ctest
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:GITHUB_WORKSPACE 'build-windows-msvc'
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$build;$env:PATH"
+          $env:LUA_CPATH = "$build\?.dll"
+          $testList = ctest --test-dir $build --show-only=json-v1 2>&1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate CTest tests' }
+          $testManifest = ($testList -join "`n") | ConvertFrom-Json
+          $testNames = @($testManifest.tests | ForEach-Object { $_.name })
+          $testNames | Set-Content .ci\windows-msvc\ctest-test-names.txt
+          $expectedTestNames = @(
+            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
+            'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
+            'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
+            'tdlua_buffering_accounting', 'tdlua_scheduler_concurrency',
+            'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
+            'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
+            'tdlua_fake_client', 'tdlua_terminal_shutdown', 'tdlua_harness_cleanup',
+            'tdlua_hardening_fake', 'tdlua_handler_only_prefilter', 'tdlua_handler_mutation',
+            'tdlua_managed_driver', 'tdlua_m5_conformance', 'tdlua_simple_bot_example',
+            'tdlua_async_demo', 'tdlua_vm_threads', 'tdlua_release', 'tdlua_uploadtravis',
+            'tdlua_hardening_backend', 'tdlua_lifecycle', 'tdlua_async',
+            'tdlua_backend_parity', 'tdlua_e2e_smoke', 'tdlua_managed_driver_backend',
+            'tdlua_windows_residency'
+          )
+          $actualSorted = @($testNames | Sort-Object)
+          $expectedSorted = @($expectedTestNames | Sort-Object)
+          if (Compare-Object $expectedSorted $actualSorted) {
+            throw "Registered MSVC test manifest differs from the 36-test baseline; actual=$($testNames.Count)"
+          }
+          "MSVC test manifest matches the 36-test baseline exactly; no test was excluded, added or renamed." |
+            Set-Content .ci\windows-msvc\test-manifest-check.txt
+          $module = Join-Path $build 'tdlua.dll'
+          dumpbin.exe /dependents $module | Tee-Object -FilePath .ci\windows-msvc\tdlua-dependencies-test.log
+          dumpbin.exe /exports $module | Select-String 'luaopen_tdlua' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'luaopen_tdlua export missing' }
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
+          if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from the build directory' }
+          ctest --test-dir $build --output-on-failure -C Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-full.log
+          $ctestExit = $LASTEXITCODE
+          Set-Content -Path .ci\windows-msvc\ctest-full-exit.txt -Value $ctestExit
+          if ($LASTEXITCODE -ne 0) { throw "Full CTest failed: $LASTEXITCODE" }
+          $fullLog = Get-Content .ci\windows-msvc\ctest-full.log -Raw
+          if ($fullLog -notmatch '100% tests passed') { throw 'Full CTest did not report 100% passed' }
+          if ($fullLog -match '\*\*\*Failed|\*\*\*Not Run|The following tests FAILED') {
+            throw 'Full CTest reported failed or not-run tests'
+          }
+          $summary = ($fullLog -split "`n" | Select-String 'tests passed|Test #' | Select-Object -Last 3) -join "`n"
+          "Full CTest summary: $summary" | Tee-Object -FilePath .ci\windows-msvc\ctest-full-summary.txt
+
+      - name: Repeat the managed, lifecycle and backend regressions
+        if: always() && steps.provenance.outcome == 'success' && steps.tdlib-cache.outcome != 'failure'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:GITHUB_WORKSPACE 'build-windows-msvc'
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$build;$env:PATH"
+          $env:LUA_CPATH = "$build\?.dll"
+          $results = @()
+          $tests = @(
+            @{ Name = 'managed-routing-oom'; Pattern = '^tdlua_managed_routing_oom$'; Count = 100 },
+            @{ Name = 'managed-adapter'; Pattern = '^tdlua_managed_adapter$'; Count = 100 },
+            @{ Name = 'backend-parity'; Pattern = '^tdlua_backend_parity$'; Count = 20 },
+            @{ Name = 'release'; Pattern = '^tdlua_release$'; Count = 20 },
+            @{ Name = 'receiver-runtime'; Pattern = '^tdlua_receiver_runtime$'; Count = 20 },
+            @{ Name = 'shutdown-admission'; Pattern = '^tdlua_shutdown_admission$'; Count = 20 },
+            @{ Name = 'lifecycle'; Pattern = '^tdlua_lifecycle$'; Count = 20 },
+            @{ Name = 'managed-driver-backend'; Pattern = '^tdlua_managed_driver_backend$'; Count = 20 },
+            @{ Name = 'windows-residency'; Pattern = '^tdlua_windows_residency$'; Count = 20 }
+          )
+          foreach ($test in $tests) {
+            $log = ".ci\windows-msvc\repeat-$($test.Name).log"
+            if (Test-Path $log) { Remove-Item $log -Force }
+            $exitCodes = @()
+            for ($iteration = 1; $iteration -le $test.Count; $iteration++) {
+              "=== $($test.Name) iteration $iteration/$($test.Count) ===" | Add-Content $log
+              ctest --test-dir $build --output-on-failure -C Release -R $test.Pattern 2>&1 | Tee-Object -FilePath $log -Append
+              $exitCodes += $LASTEXITCODE
+            }
+            $passedCount = @($exitCodes | Where-Object { $_ -eq 0 }).Count
+            $results += [pscustomobject]@{
+              test = $test.Name
+              requested = $test.Count
+              iterations_run = $exitCodes.Count
+              passed = $passedCount
+              failed = $exitCodes.Count - $passedCount
+              exit_codes = $exitCodes
+              all_passed = ($exitCodes.Count -eq $test.Count -and $passedCount -eq $test.Count)
+            }
+          }
+          $results | ConvertTo-Json -Depth 4 | Set-Content .ci\windows-msvc\repeat-summary.json
+          $results | ForEach-Object { "$($_.test) passed=$($_.passed)/$($_.iterations_run)" } |
+            Set-Content .ci\windows-msvc\repeat-summary.txt
+          if ($results | Where-Object { -not $_.all_passed }) {
+            'One or more required repeats failed; see repeat-summary.json and per-test logs.' |
+              Set-Content .ci\windows-msvc\repeat-failure.txt
+          }
+
+      - name: Verify production install and absence of test hooks
+        if: always() && steps.provenance.outcome == 'success' && steps.tdlua-build.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prodBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-production'
+          $install = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-install'
+          cmake -S . -B $prodBuild -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTd_DIR="$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\lib\cmake\Td" `
+            -DTDLUA_BACKEND=json -DTDLUA_BUNDLED_TDLIB=OFF -DTDLUA_BUILD_TESTS=OFF `
+            -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" -DLUA_LIBRARY="$env:LUA_LIBRARY" `
+            -DLUA_EXECUTABLE="$env:LUA_EXECUTABLE" -DTDLUA_LUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DCMAKE_C_FLAGS=/DLUA_BUILD_AS_DLL -DCMAKE_CXX_FLAGS=/DLUA_BUILD_AS_DLL `
+            -DCMAKE_INSTALL_PREFIX="$install"
+          if ($LASTEXITCODE -ne 0) { throw "production configure failed: $LASTEXITCODE" }
+          cmake --build $prodBuild --config Release --parallel 2 2>&1 | Tee-Object -FilePath .ci\windows-msvc\production-build.log
+          if ($LASTEXITCODE -ne 0) { throw "production build failed: $LASTEXITCODE" }
+          cmake --install $prodBuild --config Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\production-install.log
+          if ($LASTEXITCODE -ne 0) { throw "production install failed: $LASTEXITCODE" }
+          $prodModule = Join-Path $install 'lib\lua\5.4\tdlua.dll'
+          if (-not (Test-Path $prodModule)) { throw "installed module missing: $prodModule" }
+          $exports = dumpbin.exe /exports $prodModule
+          $exports | Tee-Object -FilePath .ci\windows-msvc\tdlua-exports-production.log
+          if (($exports | Select-String 'luaopen_tdlua').Count -ne 1) { throw 'production luaopen export missing' }
+          if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') { throw 'test-only accessor leaked into production DLL' }
+          $env:LUA_CPATH = "$install\lib\lua\5.4\?.dll"
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$install\lib\lua\5.4;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$env:PATH"
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
+          if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
+
+      - name: Gate B2 backend comparison with /EHs instead of /EHsc
+        if: always() && steps.provenance.outcome == 'success' && steps.tdlib-cache.outcome != 'failure'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ehsBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-ehs'
+          $prefix = (Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib')
+          # Diagnostic only: /EHs is the MSVC standard-C++ model in which an
+          # extern "C" call is allowed to unwind, so it is the /EHc- control for
+          # the same sources. Result: recorded, not a gate.
+          $flags = '/DWIN32 /D_WINDOWS /W3 /GR /EHs /DLUA_BUILD_AS_DLL'
+          cmake -S . -B $ehsBuild -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTd_DIR="$prefix\lib\cmake\Td" `
+            -DTDLUA_BACKEND=json -DTDLUA_BUNDLED_TDLIB=OFF -DTDLUA_BUILD_TESTS=ON `
+            -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" -DLUA_LIBRARY="$env:LUA_LIBRARY" `
+            -DLUA_EXECUTABLE="$env:LUA_EXECUTABLE" -DTDLUA_LUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            "-DCMAKE_CXX_FLAGS=$flags"
+          if ($LASTEXITCODE -ne 0) { throw "EHs configure failed: $LASTEXITCODE" }
+          cmake --build $ehsBuild --config Release --parallel 2 2>&1 | Tee-Object -FilePath .ci\p5c4c\ehs-build.log
+          if ($LASTEXITCODE -ne 0) { throw "EHs build failed: $LASTEXITCODE" }
+          $env:PATH = "$prefix\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$ehsBuild;$env:PATH"
+          $env:LUA_CPATH = "$ehsBuild\?.dll"
+          $results = @()
+          foreach ($pattern in @('^tdlua_managed_routing_oom$', '^tdlua_managed_adapter$',
+                                '^tdlua_backend_parity$', '^tdlua_release$')) {
+            $codes = @()
+            for ($iteration = 1; $iteration -le 3; $iteration++) {
+              ctest --test-dir $ehsBuild --output-on-failure -C Release -R $pattern 2>&1 |
+                Tee-Object -FilePath .ci\p5c4c\ehs-tests.log -Append
+              $codes += $LASTEXITCODE
+            }
+            $results += [pscustomobject]@{
+              pattern = $pattern
+              iterations = $codes.Count
+              passed = @($codes | Where-Object { $_ -eq 0 }).Count
+              exit_codes = $codes
+            }
+          }
+          $results | ConvertTo-Json -Depth 4 | Set-Content .ci\p5c4c\ehs-summary.json
+          $results | ForEach-Object { "$($_.pattern) passed=$($_.passed)/$($_.iterations)" } |
+            Set-Content .ci\p5c4c\ehs-summary.txt
+
+      - name: Enforce all MSVC validation results
+        if: always() && steps.provenance.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ctestExitPath = '.ci\windows-msvc\ctest-full-exit.txt'
+          if (-not (Test-Path $ctestExitPath)) { throw 'Full CTest did not produce an exit record' }
+          $ctestExit = [int](Get-Content $ctestExitPath -Raw)
+          if ($ctestExit -ne 0) { throw "Full CTest failed: $ctestExit" }
+          $repeatFailure = '.ci\windows-msvc\repeat-failure.txt'
+          if (Test-Path $repeatFailure) { throw (Get-Content $repeatFailure -Raw) }
+          $repeatSummary = Get-Content '.ci\windows-msvc\repeat-summary.json' -Raw | ConvertFrom-Json
+          $oom = $repeatSummary | Where-Object { $_.test -eq 'managed-routing-oom' }
+          $adapter = $repeatSummary | Where-Object { $_.test -eq 'managed-adapter' }
+          if ($null -eq $oom -or $oom.passed -ne 100) { throw 'tdlua_managed_routing_oom did not pass 100/100' }
+          if ($null -eq $adapter -or $adapter.passed -ne 100) { throw 'tdlua_managed_adapter did not pass 100/100' }
+          'MSVC validation complete: full CTest green, 100/100 managed routing OOM, 100/100 managed adapter.' |
+            Tee-Object -FilePath .ci\windows-msvc\p5c4c-enforcement.txt
+
+      - name: Upload MSVC validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msvc-p5c4c-suite-${{ github.run_id }}
+          path: |
+            .ci/windows-msvc/
+            .ci/p5c4c/
+          if-no-files-found: warn
+          retention-days: 30
