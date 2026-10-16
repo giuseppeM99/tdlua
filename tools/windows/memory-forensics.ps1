@@ -45,7 +45,7 @@ try {
                 "$source exit=$LASTEXITCODE" | Add-Content exits.txt
             }
             # Stop at the first AV/heap failure. Do not publish process memory.
-            $commands = 'sxe av; sxe 0xc0000374; g; .exr -1; r; u @rip-10 @rip+20; kv; ~* kv; !ext.heap -p -a @rax; !ext.heap -p -a @rcx; !ext.heap -p -a @rdx; !ext.heap -p -a @r8; !ext.heap -p -a @r9; lm v; q'
+            $commands = 'sxd av; sxe 0xc0000374; g; .exr -1; r; u @rip-10 @rip+20; kv; ~* kv; !ext.heap -p -a @rax; !ext.heap -p -a @rcx; !ext.heap -p -a @rdx; !ext.heap -p -a @r8; !ext.heap -p -a @r9; lm v; q'
             & "$debuggers\cdb.exe" -o -G -logo debugger.log -c $commands .\tdlua_managed_adapter_test.exe --trace *> debugger-console.log
             "cdb_exit=$LASTEXITCODE" | Add-Content exits.txt
             try {
