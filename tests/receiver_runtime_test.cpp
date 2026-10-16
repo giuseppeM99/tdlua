@@ -6,6 +6,10 @@
 #include <set>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
 using namespace tdlua::receiver;
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::milliseconds;
@@ -116,12 +120,25 @@ class Fake final : public Source<int> {
             if (!have_worker_thread) return 0;
             thread = worker_thread;
         }
+#if defined(__APPLE__)
+        thread_basic_info_data_t info = {};
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(pthread_mach_thread_np(thread), THREAD_BASIC_INFO,
+                        reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS)
+            return 0;
+        const auto seconds = static_cast<std::uint64_t>(info.user_time.seconds) +
+                             static_cast<std::uint64_t>(info.system_time.seconds);
+        const auto microseconds = static_cast<std::uint64_t>(info.user_time.microseconds) +
+                                  static_cast<std::uint64_t>(info.system_time.microseconds);
+        return seconds * 1000000000ULL + microseconds * 1000ULL;
+#else
         clockid_t clock_id;
         if (pthread_getcpuclockid(thread, &clock_id) != 0) return 0;
         timespec value = {};
         if (clock_gettime(clock_id, &value) != 0) return 0;
         return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
                static_cast<std::uint64_t>(value.tv_nsec);
+#endif
     }
     std::size_t pending()
     {

@@ -81,8 +81,11 @@ int main(int argc, char **argv)
         const auto ledger = reinterpret_cast<Ledger>(dlsym(dso, ("tdlua_" + backend + "_test_cleanup_stats").c_str()));
         const auto stats = reinterpret_cast<Stats>(dlsym(dso, ("tdlua_" + backend + "_test_stats").c_str()));
         check(control && ledger && stats, "testing hooks unavailable");
-        auto *cores = static_cast<std::size_t *>(dlsym(dso,
-            "_ZZN5tdlua18liveSchedulerCoresEvE5count"));
+        // Query TLS in the module that owns it. Mach-O exposes a TLV descriptor
+        // for a thread_local symbol, not the calling thread's counter storage.
+        using CoreCount = std::size_t (*)();
+        const auto cores = reinterpret_cast<CoreCount>(
+            dlsym(dso, "tdlua_test_live_scheduler_cores"));
         using CreationHook = void (*)(void (*)(int));
         auto set_creation_hook = reinterpret_cast<CreationHook>(
             dlsym(dso, "tdlua_json_test_creation_hook"));
@@ -109,7 +112,7 @@ int main(int argc, char **argv)
                 lua_gc(L, LUA_GCCOLLECT, 0);
                 lua_gc(L, LUA_GCCOLLECT, 0);
                 const auto after = ledger();
-                check(stats().owners == owners_before && *cores == 0 && stats().clients == 0 && stats().tombstones == 0 &&
+                check(stats().owners == owners_before && cores() == 0 && stats().clients == 0 && stats().tombstones == 0 &&
                       after.records == 0 && after.reserved == 0 && after.active_sends == 0 &&
                       after.uncertain == 0 && after.materialized == before.materialized &&
                       after.closes == before.closes, "factory rollback retained core/client or materialized an actor");
@@ -125,7 +128,7 @@ int main(int argc, char **argv)
             lua_gc(L, LUA_GCCOLLECT, 0);
             lua_gc(L, LUA_GCCOLLECT, 0);
             const auto after = ledger();
-            check(stats().owners == owners_before && *cores == 0 && stats().clients == 0 && stats().tombstones == 0 &&
+            check(stats().owners == owners_before && cores() == 0 && stats().clients == 0 && stats().tombstones == 0 &&
                   after.records == 0 && after.reserved == 0 && after.active_sends == 0 &&
                   after.uncertain == 0 && after.materialized == before.materialized &&
                   after.closes == before.closes,
@@ -175,10 +178,10 @@ int main(int argc, char **argv)
                "assert(not ok and err:find('client closed')); "
                "failed_handle=nil; collectgarbage('collect'); collectgarbage('collect')");
         const auto detached = stats();
-        std::cout << "Failed GC counters: cores=" << *cores
+        std::cout << "Failed GC counters: cores=" << cores()
                   << " clients=" << detached.clients << " tombstones=" << detached.tombstones
                   << " owners=" << detached.owners << '\n';
-        check(*cores == 0 && detached.clients == detached.tombstones,
+        check(cores() == 0 && detached.clients == detached.tombstones,
               "Failed GC retained an application client/core");
         std::cout << "Failed GC: callback-free settlement, zero application clients/cores PASS\n";
         lua_close(L); L = nullptr;

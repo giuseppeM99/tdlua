@@ -316,6 +316,24 @@ else()
         "${_tdlua_codegen_build_dir}/td/tdtl/libtdtl.a")
     set(_tdlua_native_tl_parser
         "${_tdlua_codegen_build_dir}/td/td/generate/tl-parser/tl-parser")
+    get_target_property(_tdlua_native_td_include_dirs
+        Td::TdStatic INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT _tdlua_native_td_include_dirs)
+      message(FATAL_ERROR
+              "The imported Td::TdStatic target does not export its include directory")
+    endif()
+    if(TDLUA_BUILD_TESTS)
+      set(_tdlua_external_td_json_header_found FALSE)
+      foreach(_tdlua_td_include_dir IN LISTS _tdlua_native_td_include_dirs)
+        if(EXISTS "${_tdlua_td_include_dir}/td/telegram/td_api_json.h")
+          set(_tdlua_external_td_json_header_found TRUE)
+        endif()
+      endforeach()
+      if(NOT _tdlua_external_td_json_header_found)
+        message(FATAL_ERROR
+                "Native tests with external TDLib require td/telegram/td_api_json.h in the imported TDLib include directory")
+      endif()
+    endif()
     set(_tdlua_tdjson_private_target Td::tdjson_private)
   else()
     find_package(Td CONFIG REQUIRED)
@@ -376,8 +394,13 @@ else()
       "src/backend/json/dispatcher.cpp"
   )
 endif()
+list(APPEND tdlua_srcs "src/common/module_residency.cpp")
 
 if(_tdlua_backend STREQUAL "native")
+  if(NOT _tdlua_native_td_include_dirs)
+    set(_tdlua_native_td_include_dirs
+        "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+  endif()
   set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
   set(TDLUA_NATIVE_GENERATED_HEADER "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.h")
   set(TDLUA_NATIVE_SHARD_COUNT "${TDLUA_NATIVE_SHARDS}")
@@ -392,7 +415,16 @@ if(_tdlua_backend STREQUAL "native")
   if(TDLUA_BUNDLED_TDLIB)
     set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
     set(_tdlua_native_codegen_library_target tdtl)
-    set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    if(TARGET tl_generate_tlo)
+      set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    elseif(EXISTS "${TDLUA_TD_API_TLO}")
+      # TDLib omits its executable schema-generation targets while
+      # cross-compiling. Reuse the pinned host-generated TLO when available.
+      set(_tdlua_native_tlo_dependency)
+    else()
+      message(FATAL_ERROR
+              "Native cross-build requires the pinned TDLib schema file '${TDLUA_TD_API_TLO}'. Generate TDLib sources with a host build first.")
+    endif()
   else()
     set(TDLUA_TD_API_TLO "${TDLUA_NATIVE_GENERATED_DIR}/td_api.tlo")
     add_library(tdlua_external_tdtl STATIC IMPORTED GLOBAL)
@@ -450,7 +482,9 @@ target_include_directories(tdlua PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 if(_tdlua_backend STREQUAL "native")
-  target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
+  target_include_directories(tdlua PRIVATE
+      "${TDLUA_NATIVE_GENERATED_DIR}"
+      "${_tdlua_native_td_include_dirs}")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
@@ -485,18 +519,40 @@ else()
   target_link_libraries(tdlua PRIVATE Td::TdJson)
 endif()
 if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
-  # The threaded runtime's residency contract is reviewed only on this platform.
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    message(FATAL_ERROR "Threaded TDLua currently requires Linux x86_64/glibc")
-  endif()
-  include(CheckCSourceCompiles)
-  check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
-  if(NOT TDLUA_GLIBC)
-    message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
-  endif()
   find_package(Threads REQUIRED)
   target_link_libraries(tdlua PRIVATE Threads::Threads)
-  target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # CMAKE_SYSTEM_PROCESSOR describes the target, including cross builds.
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64)$")
+      message(FATAL_ERROR
+              "Threaded TDLua requires Linux glibc x86_64 or aarch64")
+    endif()
+    include(CheckCSourceCompiles)
+    check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
+    if(NOT TDLUA_GLIBC)
+      message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
+    endif()
+    target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  elseif(APPLE)
+    if(CMAKE_OSX_ARCHITECTURES)
+      if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+      endif()
+    elseif(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+      message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+    endif()
+    # Lua searches for .so modules on macOS too. Keep the module name expected
+    # by require() while CMake emits a Mach-O shared library.
+    set_target_properties(tdlua PROPERTIES SUFFIX ".so")
+    if(_tdlua_backend STREQUAL "native")
+      # Native TDLib links system/Homebrew dylibs such as OpenSSL. Retain their
+      # external link directories in the installed module's run path.
+      set_property(TARGET tdlua PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    endif()
+  else()
+    message(FATAL_ERROR
+            "Threaded TDLua currently supports Linux glibc x86_64/aarch64 and macOS arm64")
+  endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
    AND NOT _tdlua_json_static)
@@ -824,7 +880,8 @@ if(TDLUA_BUILD_TESTS)
         if(_tdlua_backend STREQUAL "native")
             target_compile_definitions(tdlua_lua51_managed_test PRIVATE TDLUA_NATIVE_BACKEND)
             target_include_directories(tdlua_lua51_managed_test PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/td" "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+                "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                "${_tdlua_native_td_include_dirs}")
             target_compile_features(tdlua_lua51_managed_test PRIVATE cxx_std_23)
         endif()
         tdlua_enable_sanitizers(tdlua_lua51_managed_test)
@@ -852,7 +909,7 @@ if(TDLUA_BUILD_TESTS)
     if(_tdlua_backend STREQUAL "native")
         target_compile_definitions(tdlua_release_test PRIVATE TDLUA_NATIVE_BACKEND)
         target_include_directories(tdlua_release_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+            "${_tdlua_native_td_include_dirs}")
         target_compile_features(tdlua_release_test PRIVATE cxx_std_23)
     endif()
     tdlua_enable_sanitizers(tdlua_release_test)
@@ -872,7 +929,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         if(NOT TDLUA_BUNDLED_TDLIB)
@@ -898,7 +955,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         target_link_libraries(tdlua_native_decoder_safety_test PRIVATE
@@ -919,7 +976,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}")
         if(NOT TDLUA_BUNDLED_TDLIB)
             target_include_directories(tdlua_native_generic_ticket_test PRIVATE
@@ -1024,6 +1081,23 @@ if(TDLUA_BUILD_TESTS)
                     "$<TARGET_FILE_DIR:tdlua>"
         )
         set_tests_properties(tdlua_managed_driver_backend PROPERTIES TIMEOUT 30)
+        if(APPLE)
+            add_executable(tdlua_macos_residency_test
+                "tests/macos_module_residency_test.cpp")
+            if(_tdlua_backend STREQUAL "native")
+                target_compile_definitions(tdlua_macos_residency_test PRIVATE
+                    TDLUA_NATIVE_BACKEND)
+            endif()
+            target_include_directories(tdlua_macos_residency_test PRIVATE
+                ${LUA_INCLUDE_DIRS})
+            target_link_libraries(tdlua_macos_residency_test PRIVATE
+                ${LUA_LIBRARIES} ${CMAKE_DL_LIBS})
+            target_compile_features(tdlua_macos_residency_test PRIVATE cxx_std_11)
+            add_dependencies(tdlua_macos_residency_test tdlua)
+            add_test(NAME tdlua_macos_residency
+                COMMAND tdlua_macos_residency_test "$<TARGET_FILE:tdlua>")
+            set_tests_properties(tdlua_macos_residency PROPERTIES TIMEOUT 30)
+        endif()
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle
             tdlua_async
