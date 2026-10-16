@@ -274,6 +274,7 @@ jobs:
           "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
 
       - name: Configure and build TDLua JSON MSVC
+        id: tdlua-build
         run: |
           $ErrorActionPreference = 'Stop'
           $prefix = (Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib')
@@ -388,6 +389,7 @@ jobs:
           }
 
       - name: Verify production install and absence of test hooks
+        if: always() && steps.provenance.outcome == 'success' && steps.tdlua-build.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $prodBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-production'
