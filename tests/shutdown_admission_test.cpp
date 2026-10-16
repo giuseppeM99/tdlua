@@ -147,7 +147,7 @@ int main(int argc, char **argv)
                 run(L, "local ok,err=pcall(function() return td() end); "
                        "print('construction fault stage='..diagnostic_stage..' pcall_ok='.."
                        "tostring(ok)..' error='..tostring(err)); "
-                       "assert(not ok and err:find('bad_alloc'))");
+                       "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true)))");
                 set_creation_hook(nullptr);
                 lua_gc(L, LUA_GCCOLLECT, 0);
                 lua_gc(L, LUA_GCCOLLECT, 0);
@@ -166,7 +166,7 @@ int main(int argc, char **argv)
             run(L, "local ok,err=pcall(function() return td() end); "
                    "print('native construction fault pcall_ok='..tostring(ok).."
                    "' error='..tostring(err)); "
-                   "assert(not ok and err:find('bad_alloc'))");
+                   "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true)))");
             lua_gc(L, LUA_GCCOLLECT, 0);
             lua_gc(L, LUA_GCCOLLECT, 0);
             const auto after = ledger();
@@ -188,7 +188,7 @@ int main(int argc, char **argv)
                    "print('shutdown fault request='..shutdown_name..' pcall_ok='.."
                    "tostring(ok)..' error='..tostring(err)..' closed='.."
                    "tostring(client:isClosed())); "
-                   "assert(not ok and err:find('bad_alloc')); assert(not client:isClosed()); "
+                   "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true))); assert(not client:isClosed()); "
                    "checkAuthorization(); "
                    "client=nil; collectgarbage('collect'); collectgarbage('collect')");
             check(control(value(ControlAction::WaitForTerminalAck)) == 1,
