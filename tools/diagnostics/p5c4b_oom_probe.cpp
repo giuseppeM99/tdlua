@@ -64,6 +64,33 @@ void p5c4b_trace(const char *event)
 }
 
 #ifdef P5C4B_BACKTRACE
+// The debugger renames the module (`-` becomes `_`) and the backtrace build has
+// a different file name, so the label is derived from the running image.
+const char *p5c4b_module_label()
+{
+    static char label[MAX_PATH] = {0};
+    if (label[0] == '\0') {
+        char path[MAX_PATH] = {0};
+        const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        const char *base = path;
+        for (const char *cursor = path; *cursor; ++cursor) {
+            if (*cursor == '\\' || *cursor == '/') {
+                base = cursor + 1;
+            }
+        }
+        std::size_t used = 0;
+        for (const char *cursor = base; *cursor && *cursor != '.' &&
+                                        used + 1 < sizeof(label); ++cursor) {
+            label[used++] = (*cursor == '-') ? '_' : *cursor;
+        }
+        label[used] = '\0';
+        if (length == 0 || used == 0) {
+            std::strcpy(label, "probe_ehsc_bt");
+        }
+    }
+    return label;
+}
+
 // The destructor only walks the stack and stores the frames. Printing happens
 // later, outside the unwinding sequence, from the normal path: an earlier
 // version formatted from inside the destructor and the process died with
@@ -88,7 +115,7 @@ void p5c4b_print_backtrace()
         const char *name;
         std::uintptr_t base;
     };
-    const char *names[] = {"probe_ehsc", "ntdll",       "VCRUNTIME140",
+    const char *names[] = {p5c4b_module_label(), "ntdll", "VCRUNTIME140",
                            "VCRUNTIME140_1", "KERNELBASE", "lua54", "KERNEL32"};
     HMODULE handles[] = {GetModuleHandleA(nullptr), GetModuleHandleA("ntdll.dll"),
                          GetModuleHandleA("vcruntime140.dll"),

@@ -364,6 +364,29 @@ function Get-FuncletOffsets {
     return [pscustomobject]@{ imageBase = $imageBase; offsets = $offsets; entries = $entries }
 }
 
+# Returns the module offset that the named funclet tail-jumps to: the
+# waitForResponse cleanup funclet of the guard is a `jmp` to that destructor, so
+# this is the address to break on to see which code region runs the cleanup.
+function Get-FuncletJump {
+    param([string]$Asm, [string]$Name, [string]$Tag, [Int64]$ImageBase)
+    $awaiting = $false
+    foreach ($line in Get-Content $Asm) {
+        if ($line -match [regex]::Escape($Name) -and $line -match '::`1''::' -and
+            $line -match [regex]::Escape($Tag)) {
+            $awaiting = $true
+            continue
+        }
+        if ($awaiting) {
+            if ($line -match '^\s*([0-9A-Fa-f]+):\s+jmp\s+([0-9A-Fa-f]+)') {
+                $target = [Convert]::ToInt64($Matches[2], 16)
+                return '0x' + ($target - $ImageBase).ToString('x')
+            }
+            $awaiting = $false
+        }
+    }
+    return $null
+}
+
 # Returns the module offsets of the addresses in $Asm's $Name block that call
 # $Target: the exact Lua boundary calls of that function, as mapped by the PDB.
 function Get-CallOffsets {
@@ -519,6 +542,20 @@ foreach ($entry in $waitedFrame.entries) {
 }
 foreach ($entry in $continuationFrame.entries) {
     "managedWaitContinuation_funclet offset=$($entry.offset) label=$($entry.label)" |
+        Add-Content (Join-Path $out 'funclet-summary.txt')
+}
+# The cleanup funclet of the guard is a tail jump to the destructor. Breaking on
+# the destructor itself reports which code region runs it: the ordinary
+# destruction and, if the artifact fires, the frame handler pass of the
+# non-local jump. (A first attempt used hardware write breakpoints on the
+# counters; they never trapped in this environment.)
+$guardDtorOffset = Get-FuncletJump -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+    -Name 'waitForResponse' -Tag 'dtor$0' -ImageBase $waitedFrame.imageBase
+if ($guardDtorOffset) {
+    $extraBreakpoints.Add('u ' + $traceModule + '+' + $guardDtorOffset + ' L1')
+    $extraBreakpoints.Add('bu ' + $traceModule + '+' + $guardDtorOffset +
+        ' ".echo P5C4B-GUARDDTOR-CALL; kb 24; g"')
+    "waitForResponse_guard_dtor offset=$guardDtorOffset" |
         Add-Content (Join-Path $out 'funclet-summary.txt')
 }
 
