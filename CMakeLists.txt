@@ -649,6 +649,7 @@ endif()
 if(TDLUA_BUILD_TESTS)
     enable_testing()
     add_executable(tdlua_core_anchor_ownership_test "tests/core_anchor_ownership_test.cpp")
+    target_compile_definitions(tdlua_core_anchor_ownership_test PRIVATE TDLUA_TESTING)
     target_include_directories(tdlua_core_anchor_ownership_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(tdlua_core_anchor_ownership_test PRIVATE

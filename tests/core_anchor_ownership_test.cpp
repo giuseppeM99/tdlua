@@ -222,6 +222,8 @@ void survivingHandles()
     require(lua_pcall(L, 0, 1, 0) == LUA_OK, "client creation failed");
     auto *router = *static_cast<tdlua::RequestRouter **>(lua_touserdata(L, -1));
     require(constructionRoots(L) == 0, "attachment retained its temporary root");
+    const std::weak_ptr<tdlua::SchedulerCore> expected_core = router->core();
+    const std::size_t finalizers_before = tdlua::coreAnchorFinalizerCountForTesting();
     const auto future = router->future();
     tdlua::pushManagedHandle(L, future, "tdlua.future");
     const int future_index = lua_gettop(L);
@@ -255,6 +257,9 @@ void survivingHandles()
                   << " uservalue_type=" << lua_typename(L, lua_type(L, -1))
                   << " retains_anchor=" << retains_anchor
                   << " live_cores=" << tdlua::liveSchedulerCores()
+                  << " core_expired=" << expected_core.expired()
+                  << " finalizers="
+                  << (tdlua::coreAnchorFinalizerCountForTesting() - finalizers_before)
                   << " anchors=" << coreAnchorCount(L) << '\n';
         lua_pop(L, 2);
     }

@@ -2423,8 +2423,18 @@ public:
     }
 };
 
+#ifdef TDLUA_TESTING
+inline std::size_t &coreAnchorFinalizerCountForTesting()
+{
+    static thread_local std::size_t finalizers = 0;
+    return finalizers;
+}
+#endif
 inline int coreAnchorGc(lua_State *L)
 {
+#ifdef TDLUA_TESTING
+    ++coreAnchorFinalizerCountForTesting();
+#endif
     static_cast<CoreAnchor *>(lua_touserdata(L, 1))->~CoreAnchor();
     return 0;
 }
