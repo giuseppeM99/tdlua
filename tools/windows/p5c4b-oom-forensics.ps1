@@ -434,13 +434,12 @@ $symbols | Set-Content (Join-Path $out 'cdb-symbols.txt')
 
 $extraBreakpoints = New-Object System.Collections.Generic.List[string]
 foreach ($line in Get-Content $symbolLog) {
-    if ($line -match '!' + [regex]::Escape($traceModule) + '!(.+?)\s+=' -and
-        $Matches[1] -match 'p5c4b_guard_(dtors|ctors)') {
+    if ($line -match ([regex]::Escape($traceModule) + '!(\S*p5c4b_guard_(?:dtors|ctors))\s+=')) {
         # The counter is a data symbol: a write breakpoint on it reports the
         # exact stack of every construction and destruction of the fixture
         # guard, which is where the frame handler re-runs the cleanup.
         $symbol = $Matches[1]
-        $tag = if ($Matches[1] -match 'dtors') { 'GUARD-DTOR-WRITE' } else { 'GUARD-CTOR-WRITE' }
+        $tag = if ($symbol -match 'dtors') { 'GUARD-DTOR-WRITE' } else { 'GUARD-CTOR-WRITE' }
         $extraBreakpoints.Add('ba w4 ' + $traceModule + '!' + $symbol +
             ' ".echo P5C4B-' + $tag + '; kb 24; g"')
         "data_breakpoint=$tag symbol=$symbol" |
