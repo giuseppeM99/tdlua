@@ -161,6 +161,102 @@ foreach ($name in @('fixed-ehsc', 'fixed-ehs')) {
     Add-Check -Name "$name-sweep" -Passed ($sweepExit -eq '0') -Detail "exit=$sweepExit"
 }
 
+# --- 3b. the real fixture, b2c47d8 (pre-fix) against the committed file -----
+#
+# The instrumented copy above is a rewrite of the fixture, so its code
+# generation is not the fixture's. These four binaries are the real fixture:
+# the committed file and the byte materialisation of its b2c47d8 baseline, each
+# built with /EHsc and with /EHs. The two guard-counting copies differ from the
+# real file by four textual substitutions only (a ctor counter, a dtor counter,
+# their two globals and one extra field in the existing diagnostic line), so a
+# clustered skip/double destruction can be told apart in the real frame shape.
+function New-GuardCountingFixture {
+    param([string]$Source, [string]$Destination)
+    $text = [System.IO.File]::ReadAllText($Source)
+    $replacements = @(
+        @{ From = 'explicit Guard(int &value) : count(value) { ++count; }'
+           To = 'explicit Guard(int &value) : count(value) { ++count; ++p5c4c_guard_ctors; }' },
+        @{ From = '~Guard() { --count; }'
+           To = '~Guard() { --count; ++p5c4c_guard_dtors; }' },
+        @{ From = 'Scenario *current = nullptr;'
+           To = "int p5c4c_guard_ctors = 0;`nint p5c4c_guard_dtors = 0;`nScenario *current = nullptr;" },
+        @{ From = '<< "guard diagnostic: offset=" << offset'
+           To = '<< "guard diagnostic: ctors=" << p5c4c_guard_ctors << " dtors=" << p5c4c_guard_dtors << " offset=" << offset' }
+    )
+    foreach ($replacement in $replacements) {
+        $hits = ([regex]::Matches($text, [regex]::Escape($replacement.From))).Count
+        if ($hits -ne 1) {
+            throw "guard-counting transform matched $hits times (expected 1): $($replacement.From)"
+        }
+        $text = $text.Replace($replacement.From, $replacement.To)
+    }
+    [System.IO.File]::WriteAllText($Destination, $text)
+    return $Destination
+}
+
+$prefixSource = Join-Path $work 'fixture-b2c47d8.cpp'
+$prefixLines = @(& git -C $root show 'b2c47d8:tests/managed_routing_oom_test.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'could not materialise the b2c47d8 fixture' }
+$prefixText = ($prefixLines -join "`n") + "`n"
+[System.IO.File]::WriteAllText($prefixSource, $prefixText)
+$prefixBlobSize = (& git -C $root cat-file -s 'b2c47d8:tests/managed_routing_oom_test.cpp' | Out-String).Trim()
+$prefixSize = (Get-Item $prefixSource).Length
+$prefixHash = (Get-FileHash -Algorithm SHA256 $prefixSource).Hash
+$expectedPrefixHash = '95D6DD914B224E40EB4E30FD204C19E78FA5C1D69ACFC75337F5C93E7D8E3478'
+@("baseline_commit=b2c47d8",
+  "baseline_blob_bytes=$prefixBlobSize",
+  "materialised_bytes=$prefixSize",
+  "materialised_sha256=$prefixHash",
+  "expected_sha256=$expectedPrefixHash",
+  "materialised_has_pre_fix_shape=$($prefixText -notmatch 'performWait' -and $prefixText -match 'int waitForResponse\(lua_State \*L\)')",
+  "committed_has_post_fix_shape=$(([System.IO.File]::ReadAllText((Join-Path $root 'tests\managed_routing_oom_test.cpp'))) -match 'performWait')",
+  "baseline_guard_message_present=$($prefixText -match 'Lua error skipped a C\+\+ destructor')") |
+    Set-Content (Join-Path $out 'fixture-provenance.txt')
+Add-Check -Name 'baseline-fixture-provenance' `
+    -Passed (($prefixHash -eq $expectedPrefixHash) -and
+             ($prefixText -notmatch 'performWait') -and
+             ($prefixText -match 'Lua error skipped a C\+\+ destructor')) `
+    -Detail "sha256=$prefixHash bytes=$prefixSize blob=$prefixBlobSize"
+
+$postSource = "$root\tests\managed_routing_oom_test.cpp"
+$guardPost = New-GuardCountingFixture -Source $postSource `
+    -Destination (Join-Path $work 'fixture-guard-post.cpp')
+$guardPrefix = New-GuardCountingFixture -Source $prefixSource `
+    -Destination (Join-Path $work 'fixture-guard-prefix.cpp')
+
+$comparison = New-Object System.Collections.Generic.List[string]
+$comparison.Add("post_fixture=tests/managed_routing_oom_test.cpp (committed, Gate A2 shape)")
+$comparison.Add("prefix_fixture=b2c47d8:tests/managed_routing_oom_test.cpp")
+foreach ($item in @(
+    @{ Name = 'post-ehsc'; Source = $postSource; Flags = @() },
+    @{ Name = 'post-ehs'; Source = $postSource; Flags = @('/EHs') },
+    @{ Name = 'prefix-ehsc'; Source = $prefixSource; Flags = @() },
+    @{ Name = 'prefix-ehs'; Source = $prefixSource; Flags = @('/EHs') },
+    @{ Name = 'guard-post-ehsc'; Source = $guardPost; Flags = @() },
+    @{ Name = 'guard-post-ehs'; Source = $guardPost; Flags = @('/EHs') },
+    @{ Name = 'guard-prefix-ehsc'; Source = $guardPrefix; Flags = @() },
+    @{ Name = 'guard-prefix-ehs'; Source = $guardPrefix; Flags = @('/EHs') }
+)) {
+    $exe = Build-Binary -Name "fixture-$($item.Name)" -Source $item.Source -ExtraFlags $item.Flags
+    $log = Join-Path $out "fixture-$($item.Name)-runs.log"
+    if (Test-Path $log) { Remove-Item $log -Force }
+    $codes = @()
+    for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
+        "=== $($item.Name) iteration $iteration/$Iterations ===" | Add-Content $log
+        $codes += Invoke-Binary -Exe $exe -Log $log
+    }
+    $comparison.Add("variant=$($item.Name) exit_codes=$($codes -join ',')")
+    foreach ($line in @(Select-String -Path $log -Pattern 'diagnostic|skipped a C\+\+ destructor|^[0-9]+ offsets passed')) {
+        $comparison.Add("  $($item.Name): $($line.Line.Trim())")
+    }
+    if ($item.Name -in @('post-ehs', 'prefix-ehs', 'guard-post-ehs', 'guard-prefix-ehs')) {
+        $passed = @($codes | Where-Object { $_ -eq 0 }).Count
+        Add-Check -Name "fixture-$($item.Name)-exit" -Passed ($passed -eq $Iterations) `
+            -Detail "codes=$($codes -join ',')"
+    }
+}
+$comparison | Set-Content (Join-Path $out 'fixture-comparison.txt')
+
 # --- 4. cleanup funclets in the disassembly --------------------------------
 function Export-Disassembly {
     param([string]$Name, [string]$Exe)

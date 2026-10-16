@@ -47,6 +47,10 @@ jobs:
     steps:
       - name: Checkout validation branch
         uses: actions/checkout@v7
+        with:
+          # The harness materialises tests/managed_routing_oom_test.cpp at the
+          # b2c47d8 baseline, so the pre-fix commit must be present.
+          fetch-depth: 0
 
       - name: Enable MSVC x64 environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -79,6 +83,7 @@ jobs:
         run: |
           $out = "$env:GITHUB_WORKSPACE\.ci\p5c4c"
           foreach ($file in @('result.txt', 'checks.txt', 'fixture-ehsc-summary.txt',
+                              'fixture-comparison.txt', 'fixture-provenance.txt',
                               'probe-offset-summary.txt', 'funclet-summary.txt',
                               'b1-summary.txt', 'b2-summary.txt', 'source.txt',
                               'branch.txt', 'worktree-status.txt')) {
@@ -109,6 +114,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          # The provenance step diffs against the b2c47d8 baseline.
+          fetch-depth: 0
 
       - name: Enable MSVC x64 environment
         uses: ilammy/msvc-dev-cmd@v1
