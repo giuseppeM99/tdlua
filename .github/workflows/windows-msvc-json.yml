@@ -2,7 +2,7 @@ name: Windows MSVC JSON validation
 
 on:
   push:
-    branches: [vnext-portability-clean]
+    branches: [vnext-portability-clean, v0.5.1-consolidated]
     paths:
       - '.github/workflows/windows-msvc-json.yml'
       - 'CMakeLists.txt'
@@ -13,7 +13,7 @@ on:
       - 'tools/windows/**'
       - 'td'
   pull_request:
-    branches: [vnext-portability-clean]
+    branches: [vnext-portability-clean, v0.5.1-consolidated]
     paths:
       - '.github/workflows/windows-msvc-json.yml'
       - 'CMakeLists.txt'
@@ -384,9 +384,40 @@ jobs:
           $ctestExit = $LASTEXITCODE
           Set-Content -Path .ci\windows-msvc\ctest-full-exit.txt -Value $ctestExit
           $fullLog = Get-Content .ci\windows-msvc\ctest-full.log -Raw
-          if ($fullLog -match 'Not Run|tests failed') {
-            'Full CTest reported failed or not-run tests.' | Add-Content .ci\windows-msvc\ctest-full-diagnostic.txt
+          if ($null -eq $fullLog) { $fullLog = '' }
+          # Classify the full CTest run. The summary line is matched exactly: the
+          # words "tests failed" also occur in the successful line "100% tests
+          # passed, 0 tests failed out of N", so a substring test reports a
+          # passing run as failed or not-run. Recent CTest omits the failed
+          # clause on a clean run ("100% tests passed out of N").
+          $ctestSummary = [regex]::Match(
+            $fullLog,
+            '(?im)^[ \t]*(\d+)% tests passed(?:, (\d+) tests failed)? out of (\d+)[ \t]*\r?$')
+          $notRunCount = [regex]::Matches($fullLog, '\*\*\*Not Run').Count
+          $diagnosis = @()
+          if ($fullLog -match '(?im)No tests were found') {
+            $diagnosis += 'Full CTest discovered no tests to run.'
+          } elseif ($ctestSummary.Success) {
+            $failedCount = if ($ctestSummary.Groups[2].Success) {
+              [int]$ctestSummary.Groups[2].Value
+            } else {
+              0
+            }
+            $testCount = [int]$ctestSummary.Groups[3].Value
+            if ($failedCount -eq 0) {
+              $diagnosis += "Full CTest passed with 0 tests failed out of $testCount."
+            } else {
+              $diagnosis += "Full CTest reported $failedCount tests failed out of $testCount."
+            }
+          } elseif ($ctestExit -ne 0) {
+            $diagnosis += "Full CTest exited with code $ctestExit and no parsable summary."
+          } else {
+            $diagnosis += 'Full CTest produced no parsable summary; inspect ctest-full.log.'
           }
+          if ($notRunCount -gt 0) {
+            $diagnosis += "Full CTest reported $notRunCount not-run tests."
+          }
+          $diagnosis | Add-Content .ci\windows-msvc\ctest-full-diagnostic.txt
 
       - name: Repeat Windows managed and lifecycle regressions
         if: always() && steps.provenance.outcome == 'success' && steps.tdlib-cache.outcome != 'failure'

@@ -1,7 +1,7 @@
 name: Windows isolated memory forensics
 on:
   push:
-    branches: [vnext-portability-clean]
+    branches: [vnext-portability-clean, v0.5.1-consolidated]
     paths:
       - '.github/workflows/windows-memory-forensics.yml'
       - 'tools/windows/memory-forensics.ps1'
