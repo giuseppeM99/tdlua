@@ -253,9 +253,13 @@ jobs:
       - name: Build Lua 5.4.8 with MSVC
         run: |
           $ErrorActionPreference = 'Stop'
+          # Symbol information only: /MD /O2 code generation is unchanged, and
+          # the resulting lua54.dll matches the P5C.3 forensics build so the
+          # debugger traces are directly comparable to the pre-fix baseline.
           & .\tools\windows\compile-lua-msvc.ps1 `
             -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
-            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
+            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua" `
+            -DebugSymbols
           if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
           $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
           dumpbin.exe /headers "$lua\lua54.dll" | Tee-Object -FilePath .ci\windows-msvc\lua-headers.log

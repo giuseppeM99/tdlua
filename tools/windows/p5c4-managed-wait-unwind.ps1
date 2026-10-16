@@ -169,6 +169,7 @@ function Test-ManagedLifetime([string]$log, [string]$label) {
     $live = @{}
     $violations = @()
     $unwrapDestructions = @()
+    $machineryDestructions = @()
     foreach ($event in $events) {
         if ($event.kind -eq 'CTOR') {
             if ($live.ContainsKey($event.address)) { $violations += "second construction of live core $($event.address)" }
@@ -179,8 +180,14 @@ function Test-ManagedLifetime([string]$log, [string]$label) {
                 $violations += "destruction of core $($event.address) with no live construction (double release or use after free)"
             }
             else { $live.Remove($event.address) }
-            if ($event.stack -match 'lua_yieldk|luaD_throw|__longjmp_internal|lua_error') {
+            # Only a Lua non-local jump reaches __longjmp_internal / luaD_throw.
+            # A structured C++ unwinding frame is reported separately: it is a
+            # legal destruction, but it must not appear on the yield path.
+            if ($event.stack -match '__longjmp_internal|luaD_throw') {
                 $unwrapDestructions += $event.address
+            }
+            if ($event.stack -match 'CallSettingFrameEncoded|FrameUnwindToState|_CxxFrameHandler4|RtlUnwind') {
+                $machineryDestructions += $event.address
             }
         }
     }
@@ -189,6 +196,7 @@ function Test-ManagedLifetime([string]$log, [string]$label) {
                  "destructions=$(@($events | Where-Object { $_.kind -eq 'DTOR' }).Count)",
                  "cores_alive_at_end=$($live.Count)",
                  "destructions_inside_lua_jump=$($unwrapDestructions.Count)",
+                 "destructions_in_unwind_machinery=$($machineryDestructions.Count)",
                  "lifetime_violations=$($violations.Count)")
     $summary += ($violations | ForEach-Object { "violation=$_" })
     $summary | Set-Content (Join-Path $out "trace-$label-lifetime.txt")
