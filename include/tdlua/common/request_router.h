@@ -2787,21 +2787,25 @@ inline int taskReady(lua_State *L)
     lua_pushboolean(L, isTerminalState(handle->state));
     return 1;
 }
-// The frame that enters Lua's longjmp-based yield or error path must not own
-// any automatic with a destructor. Under /EHc MSVC does not model the state
-// transition out of a lease that was already released before the call, so the
-// non-local jump re-runs the cleanup funclet and over-releases the reference
-// (P5C.3). TDLUA_NOINLINE keeps the lease out of that frame even if the
-// compiler would otherwise fold the preparation back into its caller; the
-// Windows validation workflow asserts that no cleanup funclet is emitted for
-// the yield frame.
-#if defined(_MSC_VER)
-#define TDLUA_NOINLINE __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-#define TDLUA_NOINLINE __attribute__((noinline))
-#else
-#define TDLUA_NOINLINE
-#endif
+// The frame that enters Lua's longjmp-based yield or error path must not own any
+// automatic with a destructor, so the preparation is kept in a dedicated
+// out-of-line helper: prepareManagedWait() owns the scheduler lease and the
+// ManagedState reference and releases both before it returns, and the caller
+// (managedWait) carries only the trivially destructible ManagedWaitPreparation
+// across the boundary.
+//
+// The helper must stay out of line. Under /EHc MSVC does not model the state
+// transition out of a lease that was already released before the call, so a
+// non-local Lua jump out of a frame the compiler folded the preparation back
+// into re-runs the cleanup funclet and over-releases the reference (P5C.3). The
+// attribute keeps the lease out of the yield frame even when the compiler would
+// otherwise inline the preparation into its caller.
+//
+// The permanent Windows validation workflow does not inspect the generated code
+// for funclet emission. It guards the same failure mode indirectly, by requiring
+// /EHsc and /O2 on every TDLua C++ translation unit with zero C4530 and a /MD
+// module, and by repeating the managed and lifecycle regressions on the Release
+// build.
 
 // Returned by value into the yield frame, so it must be trivially destructible.
 struct ManagedWaitPreparation
@@ -2817,7 +2821,14 @@ static_assert(std::is_trivially_destructible<ManagedWaitPreparation>::value,
 // returning, on the success path and on every error path. Only the continuation
 // context and the result count cross back to the caller: no ownership is
 // transferred through a local reference.
-TDLUA_NOINLINE inline ManagedWaitPreparation prepareManagedWait(
+#if defined(_MSC_VER)
+#define TDLUA_MANAGED_WAIT_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDLUA_MANAGED_WAIT_NOINLINE __attribute__((noinline))
+#else
+#define TDLUA_MANAGED_WAIT_NOINLINE
+#endif
+TDLUA_MANAGED_WAIT_NOINLINE inline ManagedWaitPreparation prepareManagedWait(
     lua_State *L, ManagedHandle *handle, bool timed, double timeout, WaitKind kind,
     const char *field)
 {
@@ -2842,6 +2853,8 @@ TDLUA_NOINLINE inline ManagedWaitPreparation prepareManagedWait(
     }
     return preparation;
 }
+
+#undef TDLUA_MANAGED_WAIT_NOINLINE
 
 inline int managedWait(lua_State *L, const char *type, WaitKind kind, const char *field)
 {
