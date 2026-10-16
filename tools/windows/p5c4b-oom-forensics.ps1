@@ -56,6 +56,19 @@ trap {
 Get-FileHash (Join-Path $lua 'lua54.dll'), (Join-Path $lua 'lua54.lib') |
     Format-List | Out-File (Join-Path $out 'lua-hashes.txt')
 
+# The debugger is located before any section that may need it: the backtrace
+# captured in-process is resolved with the same PDB by a separate CDB session.
+$debuggers = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64'
+if (-not (Test-Path "$debuggers\cdb.exe")) {
+    $installer = "$env:RUNNER_TEMP\winsdk-debuggers.exe"
+    Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2120843' -OutFile $installer
+    $install = Start-Process $installer -ArgumentList '/features OptionId.WindowsDesktopDebuggers /quiet /norestart' -Wait -PassThru
+    "debuggers installer exit=$($install.ExitCode)" | Out-File (Join-Path $out 'debuggers-install.txt')
+    if ($install.ExitCode -notin 0, 3010) { throw 'Debugger-only installation failed' }
+}
+if (-not (Test-Path "$debuggers\cdb.exe")) { throw 'CDB unavailable' }
+$symbolPath = "srv*$env:RUNNER_TEMP\p5c4b-sym*https://msdl.microsoft.com/download/symbols"
+
 function Build-OomBinary {
     param([string]$Name, [string]$Source, [string[]]$ExtraFlags = @())
     $exe = Join-Path $work "$Name.exe"
@@ -405,17 +418,6 @@ foreach ($item in @(@('control-ehsc', $control), @('probe-ehsc', $probe))) {
 }
 
 # --- 7. CDB: the error path on the binary that reproduces ------------------
-$debuggers = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64'
-if (-not (Test-Path "$debuggers\cdb.exe")) {
-    $installer = "$env:RUNNER_TEMP\winsdk-debuggers.exe"
-    Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2120843' -OutFile $installer
-    $install = Start-Process $installer -ArgumentList '/features OptionId.WindowsDesktopDebuggers /quiet /norestart' -Wait -PassThru
-    "debuggers installer exit=$($install.ExitCode)" | Out-File (Join-Path $out 'debuggers-install.txt')
-    if ($install.ExitCode -notin 0, 3010) { throw 'Debugger-only installation failed' }
-}
-if (-not (Test-Path "$debuggers\cdb.exe")) { throw 'CDB unavailable' }
-$symbolPath = "srv*$env:RUNNER_TEMP\p5c4b-sym*https://msdl.microsoft.com/download/symbols"
-
 # The P5C4B_TRACE build does not reproduce the double destruction: the debugger
 # therefore runs the plain probe build, the one that shares the control's flags
 # while still printing the guard counters at the end of the offset.

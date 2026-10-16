@@ -17,6 +17,7 @@
 
 #ifdef P5C4B_BACKTRACE
 #include <cstdint>
+#include <cstdio>
 #include <windows.h>
 #endif
 
@@ -63,10 +64,25 @@ void p5c4b_trace(const char *event)
 }
 
 #ifdef P5C4B_BACKTRACE
-// Reports the callers of a destructor run without a debugger: the walked
-// frames are labelled with the containing image (as the debugger names it) and
-// an offset, so the same run's PDB can resolve them afterwards.
-void p5c4b_dump_backtrace()
+// The destructor only walks the stack and stores the frames. Printing happens
+// later, outside the unwinding sequence, from the normal path: an earlier
+// version formatted from inside the destructor and the process died with
+// 0xC0000409 before printing anything.
+void *p5c4b_dtor_frames[24] = {nullptr};
+unsigned short p5c4b_dtor_frame_count = 0;
+unsigned short p5c4b_dtor_frame_reported = 0;
+
+void p5c4b_capture_backtrace()
+{
+    if (p5c4b_dtor_frame_count != 0) {
+        return;
+    }
+    p5c4b_dtor_frame_count = RtlCaptureStackBackTrace(1, 24, p5c4b_dtor_frames, nullptr);
+}
+
+// Reports the stored frames labelled with the containing image (as the
+// debugger names it) and an offset, so the same run's PDB can resolve them.
+void p5c4b_print_backtrace()
 {
     struct ModuleRange {
         const char *name;
@@ -89,11 +105,10 @@ void p5c4b_dump_backtrace()
             ++modules;
         }
     }
-    void *frames[24] = {nullptr};
-    const USHORT captured = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
-    std::cerr << "P5C4B dtor-backtrace frames=" << captured;
-    for (USHORT index = 0; index < captured; ++index) {
-        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(frames[index]);
+    std::cerr << "P5C4B dtor-backtrace frames=" << p5c4b_dtor_frame_count;
+    for (unsigned short index = 0; index < p5c4b_dtor_frame_count; ++index) {
+        const std::uintptr_t address =
+            reinterpret_cast<std::uintptr_t>(p5c4b_dtor_frames[index]);
         const char *name = "?";
         std::uintptr_t base = 0;
         for (std::size_t m = 0; m < modules; ++m) {
@@ -131,7 +146,7 @@ struct CountingGuard {
 #endif
 #ifdef P5C4B_BACKTRACE
         if (p5c4b_guard_dtors >= 2) {
-            p5c4b_dump_backtrace();
+            p5c4b_capture_backtrace();
         }
 #endif
     }
@@ -423,6 +438,15 @@ int sweep(int max_offset, bool inject)
             if (inject) allocator.fail_at = allocator.calls + offset;
             const int status = lua_pcall(L, 0, 1, 0);
             allocator.fail_at = 0;
+#ifdef P5C4B_BACKTRACE
+            // Printed here, after the jump has completed and no destructor is
+            // running: the frames were captured inside the destructor itself.
+            if (p5c4b_dtor_frame_count != 0 &&
+                p5c4b_dtor_frame_count != p5c4b_dtor_frame_reported) {
+                p5c4b_dtor_frame_reported = p5c4b_dtor_frame_count;
+                p5c4b_print_backtrace();
+            }
+#endif
             if (allocator.rejected) ++faults;
             rejected_calls += allocator.rejected;
             // The lease count observed here is the product-side effect of the
