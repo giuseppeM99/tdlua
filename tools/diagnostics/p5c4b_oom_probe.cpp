@@ -3,6 +3,7 @@
 #include "tdlua/common/request_router.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -16,7 +17,8 @@
 //   * P5C4B tracing of every rejected allocation (call index, size, realloc);
 //   * the guard failure is recorded and the sweep stops immediately, so the
 //     isolated process does not go on to use an already released core;
-//   * only sweep() runs, with a bounded offset range from argv[1].
+//   * the guard sweep takes its offset bound from argv[1] (zero skips it) and
+//     "all" as argv[2] runs the remaining sweeps, each reported separately.
 // Behaviour of the product code and the assertions of the original test are
 // untouched: no runtime fix is implemented here.
 // ---------------------------------------------------------------------------
@@ -751,12 +753,43 @@ void nestedTaskOomSweep()
 int main(int argc, char **argv)
 {
     const int max_offset = argc > 1 ? std::atoi(argv[1]) : 80;
+    const bool run_rest = argc > 2 && std::strcmp(argv[2], "all") == 0;
     try {
-        // The probe is focused: only the guard sweep runs, with a bounded
-        // offset range, so one isolated process and one debugger session
-        // observe exactly the failing window.
-        const int guard_failures = sweep(max_offset);
-        std::cout << "P5C4B probe done guard_failures=" << guard_failures << '\n';
+        // The probe is focused: by default only the guard sweep runs, with a
+        // bounded offset range, so one isolated process and one debugger
+        // session observe exactly the failing window. A zero offset skips it,
+        // and "all" runs the remaining sweeps, each reported separately, so the
+        // continuation path is exercised without the heap damaged by the guard
+        // sweep.
+        int guard_failures = 0;
+        if (max_offset > 0) {
+            guard_failures = sweep(max_offset);
+            std::cout << "P5C4B probe done guard_failures=" << guard_failures << '\n';
+        }
+        if (run_rest) {
+            struct Step {
+                const char *name;
+                void (*run)();
+            } steps[] = {
+                {"taskCreationSweep", taskCreationSweep},
+                {"taskExecutionSweep", taskExecutionSweep},
+                {"nestedTaskControl", nestedTaskControl},
+                {"taskNewThreadOom", taskNewThreadOom},
+                {"nestedTaskOomSweep", nestedTaskOomSweep},
+            };
+            for (const Step &step : steps) {
+                try {
+                    step.run();
+                    std::cout << "P5C4B step " << step.name << " completed" << '\n';
+                } catch (const std::exception &error) {
+                    std::cout << "P5C4B step " << step.name << " aborted: "
+                              << error.what() << '\n';
+                } catch (...) {
+                    std::cout << "P5C4B step " << step.name << " aborted: unknown"
+                              << '\n';
+                }
+            }
+        }
         return guard_failures == 0 ? 0 : 2;
     }
     catch (const std::exception &error) {
