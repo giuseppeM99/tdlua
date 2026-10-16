@@ -13,6 +13,12 @@ endif()
 set(_tdlua_base_version "${CMAKE_MATCH_1}")
 project(tdlua VERSION "${_tdlua_base_version}" LANGUAGES C CXX)
 
+# MSVC otherwise defaults to synchronous exception handling, which disables
+# the C++ unwinding required by TDLua's exception-safe cleanup paths.
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+endif()
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Keep the compilation database enabled for clangd and static analysis. This
 # is a project setting rather than a user-selectable backend option.
@@ -498,6 +504,7 @@ else()
   target_compile_features(tdlua PRIVATE cxx_std_11)
 endif()
 target_compile_definitions(tdlua PRIVATE
+    TDLUA_BUILDING_DLL
     "TDLUA_VERSION_STRING=\"${TDLUA_VERSION_STRING}\""
     "TDLUA_BASE_VERSION=\"${TDLUA_BASE_VERSION}\""
     "TDLUA_TDLIB_VERSION=\"${TDLUA_TDLIB_VERSION}\"")
@@ -549,9 +556,23 @@ if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
       # external link directories in the installed module's run path.
       set_property(TARGET tdlua PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
     endif()
+  elseif(WIN32)
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8
+       OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$"
+       OR NOT (MINGW OR MSVC))
+      message(FATAL_ERROR
+              "Windows TDLua JSON requires a 64-bit MinGW or MSVC toolchain")
+    endif()
+    if(_tdlua_backend STREQUAL "native")
+      message(FATAL_ERROR
+              "The native TDLib backend is not yet supported on Windows")
+    endif()
+    # Lua's Windows loader expects a DLL named after the module. Do not apply
+    # ELF or Mach-O loader flags on PE/COFF.
+    set_target_properties(tdlua PROPERTIES PREFIX "" SUFFIX ".dll")
   else()
     message(FATAL_ERROR
-            "Threaded TDLua currently supports Linux glibc x86_64/aarch64 and macOS arm64")
+            "Threaded TDLua currently supports Linux glibc x86_64/aarch64, macOS arm64, and Windows x64 MinGW/MSVC JSON")
   endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
@@ -628,6 +649,7 @@ endif()
 if(TDLUA_BUILD_TESTS)
     enable_testing()
     add_executable(tdlua_core_anchor_ownership_test "tests/core_anchor_ownership_test.cpp")
+    target_compile_definitions(tdlua_core_anchor_ownership_test PRIVATE TDLUA_TESTING)
     target_include_directories(tdlua_core_anchor_ownership_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(tdlua_core_anchor_ownership_test PRIVATE
@@ -659,7 +681,11 @@ if(TDLUA_BUILD_TESTS)
     target_link_libraries(tdlua_client_pump_test PRIVATE
         ${LUA_LIBRARIES} tdlua_lua_runtime)
     target_compile_features(tdlua_client_pump_test PRIVATE cxx_std_11)
-    target_compile_options(tdlua_client_pump_test PRIVATE -Wall -Wextra -Wpedantic)
+    if(MSVC)
+        target_compile_options(tdlua_client_pump_test PRIVATE /W4)
+    else()
+        target_compile_options(tdlua_client_pump_test PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
     tdlua_enable_sanitizers(tdlua_client_pump_test)
     add_test(NAME tdlua_client_pump COMMAND tdlua_client_pump_test)
 
@@ -702,6 +728,9 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(tdlua_buffering_accounting_test PRIVATE
             ${LUA_LIBRARIES} tdlua_lua_runtime Threads::Threads)
+        if(WIN32)
+            target_link_libraries(tdlua_buffering_accounting_test PRIVATE Psapi)
+        endif()
         target_compile_definitions(tdlua_buffering_accounting_test PRIVATE
             TDLUA_TESTING)
         target_compile_features(tdlua_buffering_accounting_test PRIVATE cxx_std_11)
@@ -732,6 +761,17 @@ if(TDLUA_BUILD_TESTS)
             COMMAND tdlua_retention_policy_poc_test)
     endif()
     target_compile_definitions(tdlua PRIVATE TDLUA_TESTING)
+    if(MINGW)
+        # Fake-client tests link against test-only C++ hooks in the DLL. GNU
+        # ld for PE/COFF needs an explicit export-all flag for those symbols.
+        # Keep it confined to this TDLUA_TESTING build.
+        target_link_options(tdlua PRIVATE -Wl,--export-all-symbols)
+    elseif(MSVC)
+        # The test executables discover TDLUA_TESTING hooks through the DLL's
+        # import library or GetProcAddress. Export them only in test builds;
+        # production DLLs retain the explicit luaopen_tdlua export alone.
+        set_target_properties(tdlua PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
     add_executable(tdlua_codec_test
         "tests/codec_test.cpp"
         "src/common/lua_json.cpp"
@@ -1116,6 +1156,18 @@ if(TDLUA_BUILD_TESTS)
             add_test(NAME tdlua_macos_residency
                 COMMAND tdlua_macos_residency_test "$<TARGET_FILE:tdlua>")
             set_tests_properties(tdlua_macos_residency PROPERTIES TIMEOUT 30)
+        elseif(WIN32)
+            add_executable(tdlua_windows_residency_test
+                "tests/windows_module_residency_test.cpp")
+            target_include_directories(tdlua_windows_residency_test PRIVATE
+                ${LUA_INCLUDE_DIRS})
+            target_link_libraries(tdlua_windows_residency_test PRIVATE
+                ${LUA_LIBRARIES})
+            target_compile_features(tdlua_windows_residency_test PRIVATE cxx_std_11)
+            add_dependencies(tdlua_windows_residency_test tdlua)
+            add_test(NAME tdlua_windows_residency
+                COMMAND tdlua_windows_residency_test "$<TARGET_FILE_DIR:tdlua>")
+            set_tests_properties(tdlua_windows_residency PROPERTIES TIMEOUT 120)
         endif()
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle

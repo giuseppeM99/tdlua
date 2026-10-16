@@ -324,7 +324,7 @@ std::size_t tdlua_test_live_scheduler_cores() noexcept
 }
 #endif
 
-LUALIB_API int luaopen_tdlua(lua_State *L)
+TDLUA_MODULE_API int luaopen_tdlua(lua_State *L)
 {
     if (!tdlua::ensureModuleResident()) {
         lua_pushliteral(L, "tdlua: could not pin module residency");

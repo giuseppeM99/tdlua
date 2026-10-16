@@ -2,9 +2,22 @@
 #include <algorithm>
 #include <ctime>
 #include <iostream>
-#include <pthread.h>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -29,8 +42,20 @@ class Fake final : public Source<int> {
         std::unique_lock<std::mutex> lock(mutex);
         ++calls;
         worker_threads.insert(std::this_thread::get_id());
+#ifdef _WIN32
+        if (!have_worker_thread) {
+            HANDLE duplicate = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                GetCurrentProcess(), &duplicate, 0, FALSE,
+                                DUPLICATE_SAME_ACCESS)) {
+                worker_thread = duplicate;
+                have_worker_thread = true;
+            }
+        }
+#else
         worker_thread = pthread_self();
         have_worker_thread = true;
+#endif
         changed.notify_all();
         if (paused) {
             entered = true;
@@ -114,6 +139,22 @@ class Fake final : public Source<int> {
     }
     std::uint64_t workerCpuNanoseconds()
     {
+#ifdef _WIN32
+        HANDLE thread;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!have_worker_thread) return 0;
+            thread = worker_thread;
+        }
+        FILETIME creation = {}, exit = {}, kernel = {}, user = {};
+        if (!GetThreadTimes(thread, &creation, &exit, &kernel, &user)) return 0;
+        ULARGE_INTEGER kernel_ticks = {}, user_ticks = {};
+        kernel_ticks.LowPart = kernel.dwLowDateTime;
+        kernel_ticks.HighPart = kernel.dwHighDateTime;
+        user_ticks.LowPart = user.dwLowDateTime;
+        user_ticks.HighPart = user.dwHighDateTime;
+        return (kernel_ticks.QuadPart + user_ticks.QuadPart) * 100;
+#else
         pthread_t thread;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -139,6 +180,7 @@ class Fake final : public Source<int> {
         return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
                static_cast<std::uint64_t>(value.tv_nsec);
 #endif
+#endif
     }
     std::size_t pending()
     {
@@ -153,8 +195,19 @@ class Fake final : public Source<int> {
     bool paused = false, entered = false, error = false;
     std::uint64_t calls = 0;
     std::set<std::thread::id> worker_threads;
+#ifdef _WIN32
+    HANDLE worker_thread = nullptr;
+#else
     pthread_t worker_thread;
+#endif
     bool have_worker_thread = false;
+
+    ~Fake() override
+    {
+#ifdef _WIN32
+        if (worker_thread) CloseHandle(worker_thread);
+#endif
+    }
 };
 
 static Item pop(const std::shared_ptr<Mailbox<int>> &box)
