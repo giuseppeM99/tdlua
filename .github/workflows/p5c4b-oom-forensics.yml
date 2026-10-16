@@ -71,7 +71,10 @@ jobs:
         run: |
           $out = "$env:GITHUB_WORKSPACE\.ci\p5c4b"
           foreach ($file in @('notes.txt', 'control-summary.txt', 'probe-summary.txt',
-                              'probe-rejections.txt', 'funclet-summary.txt', 'result.txt')) {
+                              'probe-rejections.txt', 'probe-rest-summary.txt',
+                              'probe-ehs-summary.txt', 'trace-guard-summary.txt',
+                              'catch-boundary-summary.txt', 'funclet-summary.txt',
+                              'result.txt')) {
             $path = Join-Path $out $file
             "--- $file ---"
             if (Test-Path $path) { Get-Content $path } else { '(missing)' }

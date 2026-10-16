@@ -4,20 +4,22 @@
 #
 # What it produces, on the original MSVC Release configuration (/O2 /Ob2
 # /DNDEBUG /MD /EHsc, Lua 5.4.8 built with debug symbols):
-#   1. the control failure: the unmodified test run in isolated processes,
-#      with its exit code and its first guard diagnostic;
+#   1. the control failure: the unmodified test run in isolated processes, with
+#      its exit code and its first guard diagnostic;
 #   2. the probe measurement: the sign of the leaked guard counter at the
 #      failing offset (skipped versus double destruction), the guard
 #      construction/destruction events, and the allocations that were rejected;
-#   3. the remaining sweeps (task creation/execution/nested OOM) run separately,
+#   3. the same probe built with P5C4B_TRACE and with /EHs instead of /EHsc, as
+#      diagnostic controls for the tracing and for the /EHc assumption;
+#   4. the remaining sweeps (task creation/execution/nested OOM) run separately,
 #      so the continuation path is exercised without the corrupted heap of the
 #      guard sweep;
-#   4. the error path under CDB: the frame that raises the Lua error, the stack
-#      that the non-local jump abandons, every SchedulerCore lifetime event and
-#      the stacks of the guard destructor invocations;
 #   5. the cleanup funclets owned by waitForResponse and by
-#      managedWaitContinuation in the disassembly, plus an /EHs comparison
-#      build as a diagnostic control for the /EHc assumption.
+#      managedWaitContinuation in the disassembly;
+#   6. the error path under CDB on the binary that reproduces: the frame that
+#      raises the Lua error, the stack that the non-local jump abandons, every
+#      SchedulerCore lifetime event and the stack of every invocation of the
+#      waitForResponse cleanup funclet and of the Guard destructor.
 #
 # This harness must be dropped before anything is merged.
 param(
@@ -82,24 +84,12 @@ function Read-ProbeFacts {
     param([string]$Log)
     $facts = [pscustomobject]@{
         offsets = @(); rejections = @(); guardEvents = @(); phases = @()
-        stopped = $null; exit = $null
     }
     foreach ($line in Get-Content $Log) {
-        if ($line -match '^P5C4B offset=(\d+) guards=(-?\d+)') {
-            $facts.offsets += $line
-        }
-        elseif ($line -match '^P5C4B reject ') {
-            $facts.rejections += $line
-        }
-        elseif ($line -match '^P5C4B trace: guard ') {
-            $facts.guardEvents += $line
-        }
-        elseif ($line -match '^P5C4B (phase|stopped)') {
-            $facts.phases += $line
-        }
-        elseif ($line -match '^exit=(\d+)') {
-            $facts.exit = $Matches[1]
-        }
+        if ($line -match '^P5C4B offset=(\d+) guards=(-?\d+)') { $facts.offsets += $line }
+        elseif ($line -match '^P5C4B reject ') { $facts.rejections += $line }
+        elseif ($line -match '^P5C4B trace: guard ') { $facts.guardEvents += $line }
+        elseif ($line -match '^P5C4B (phase|stopped)') { $facts.phases += $line }
     }
     return $facts
 }
@@ -141,8 +131,8 @@ $probeFacts = Read-ProbeFacts -Log $probeLog
   "flags=/O2 /Ob2 /DNDEBUG /MD /EHsc /DTDLUA_TESTING",
   "probe_exit=$probeCode") | Set-Content (Join-Path $out 'probe-summary.txt')
 $probeFacts.offsets | Add-Content (Join-Path $out 'probe-summary.txt')
-$probeFacts.rejections | Add-Content (Join-Path $out 'probe-rejections.txt')
 $probeFacts.rejections | Add-Content (Join-Path $out 'probe-summary.txt')
+$probeFacts.rejections | Set-Content (Join-Path $out 'probe-rejections.txt')
 
 # Sign of the leaked counter: a positive value means the destructor was
 # skipped while the object was alive, a negative one means the cleanup funclet
@@ -162,37 +152,30 @@ $negative = @($guardSign | Where-Object { $_ -lt 0 }).Count
 $notes.Add("probe: canary offsets=$($guardSign.Count); positive/skipped=$positive; " +
            "negative/double=$negative")
 
-# --- 3. trace probe, repeated: guard events and wait phases ----------------
+# --- 3. trace probe and /EHs probe: codegen and /EHc controls -------------
+$traceLog = Join-Path $work 'trace-guard-1.log'
 $traceCodes = @()
 for ($iteration = 1; $iteration -le $RepeatProbe; $iteration++) {
-    $log = Join-Path $work "trace-guard-$iteration.log"
-    $traceCodes += Invoke-OomBinary -Exe $probeTrace -MaxOffset 1 -Log $log
+    $traceLog = Join-Path $work "trace-guard-$iteration.log"
+    $traceCodes += Invoke-OomBinary -Exe $probeTrace -MaxOffset 1 -Log $traceLog
 }
 Copy-Item (Join-Path $work 'trace-guard-1.log') (Join-Path $out 'trace-guard-first.log')
-@("repeats=$($traceCodes.Count)",
+@("variant=/DP5C4B_TRACE with /EHsc (diagnostic control for the tracing)",
+  "repeats=$($traceCodes.Count)",
   "exit_codes=$($traceCodes -join ',')") | Set-Content (Join-Path $out 'trace-guard-summary.txt')
 $traceFacts = Read-ProbeFacts -Log (Join-Path $work 'trace-guard-1.log')
 $traceFacts.guardEvents | Add-Content (Join-Path $out 'trace-guard-summary.txt')
 $traceFacts.phases | Add-Content (Join-Path $out 'trace-guard-summary.txt')
-$dtorEvents = @($traceFacts.guardEvents | Where-Object { $_ -match 'guard dtor' })
-$ctorEvents = @($traceFacts.guardEvents | Where-Object { $_ -match 'guard ctor' })
-@("guard_ctors=$($ctorEvents.Count)",
-  "guard_dtors=$($dtorEvents.Count)") | Add-Content (Join-Path $out 'trace-guard-summary.txt')
-$notes.Add("trace probe: guard ctors=$($ctorEvents.Count) dtors=$($dtorEvents.Count) on the failing offset")
+$traceDtor = @($traceFacts.guardEvents | Where-Object { $_ -match 'guard dtor' }).Count
+$traceCtor = @($traceFacts.guardEvents | Where-Object { $_ -match 'guard ctor' }).Count
+@("guard_ctors=$traceCtor", "guard_dtors=$traceDtor") |
+    Add-Content (Join-Path $out 'trace-guard-summary.txt')
+@("trace_variant_guard_ctors=$traceCtor", "trace_variant_guard_dtors=$traceDtor") |
+    Add-Content (Join-Path $out 'probe-summary.txt')
 
-# --- 4. the remaining sweeps: the continuation path in isolation -----------
-$restLog = Join-Path $out 'probe-rest.log'
-$restCode = Invoke-OomBinary -Exe $probeTrace -MaxOffset 0 -All -Log $restLog
-@("probe=tools/diagnostics/p5c4b_oom_probe.cpp",
-  "mode=0 all (sweep skipped)",
-  "exit=$restCode") | Set-Content (Join-Path $out 'probe-rest-summary.txt')
-Select-String -Path $restLog -Pattern '^P5C4B step|^P5C4B probe done|^Task |^Nested |^Targeted |^exit=' |
-    ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-rest-summary.txt')
-
-# --- 5. /EHs diagnostic comparison ----------------------------------------
 $standardLog = Join-Path $out 'probe-ehs-guard.log'
 $standardCode = Invoke-OomBinary -Exe $probeStandard -MaxOffset 1 -Log $standardLog
-@("flags=/O2 /Ob2 /DNDEBUG /MD /EHs /DTDLUA_TESTING (diagnostic only)",
+@("variant=/EHs (diagnostic only: no /EHc assumption)",
   "exit=$standardCode") | Set-Content (Join-Path $out 'probe-ehs-summary.txt')
 Select-String -Path $standardLog -Pattern '^P5C4B offset|^P5C4B reject|^exit=' |
     ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-ehs-summary.txt')
@@ -200,16 +183,50 @@ $standardRestLog = Join-Path $out 'probe-ehs-rest.log'
 $standardRestCode = Invoke-OomBinary -Exe $probeStandard -MaxOffset 0 -All -Log $standardRestLog
 "rest_exit=$standardRestCode" | Add-Content (Join-Path $out 'probe-ehs-summary.txt')
 
+# --- 4. the remaining sweeps: the continuation path in isolation -----------
+$restLog = Join-Path $out 'probe-rest.log'
+$restCode = Invoke-OomBinary -Exe $probe -MaxOffset 0 -All -Log $restLog
+@("probe=tools/diagnostics/p5c4b_oom_probe.cpp",
+  "mode=0 all (guard sweep skipped)",
+  "exit=$restCode") | Set-Content (Join-Path $out 'probe-rest-summary.txt')
+Select-String -Path $restLog -Pattern '^P5C4B step|^P5C4B probe done|^Task |^Nested |^Targeted |^exit=' |
+    ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-rest-summary.txt')
+$notes.Add("remaining sweeps (task creation/execution/nested OOM): exit=$restCode")
+
+# --- 5. isolation probe for the prepareManagedWait catch boundary ----------
+$catch = Build-OomBinary -Name 'catch-boundary-ehsc' `
+    -Source "$root\tools\diagnostics\p5c4b_catch_boundary_probe.cpp" -ExtraFlags @('/EHsc')
+@("probe=tools/diagnostics/p5c4b_catch_boundary_probe.cpp",
+  "flags=/O2 /Ob2 /DNDEBUG /MD /EHsc /DTDLUA_TESTING",
+  "mode 0: control, no injected failure",
+  "mode 1: lua_pushstring inside the catch, allocation fails",
+  "mode 2: candidate fixed shape, push after the handler returned") |
+    Set-Content (Join-Path $out 'catch-boundary-summary.txt')
+foreach ($catchMode in 0, 1, 2) {
+    $log = Join-Path $out "catch-boundary-mode$catchMode.log"
+    & $catch $catchMode *> $log
+    "exit=$LASTEXITCODE" | Add-Content $log
+    Select-String -Path $log -Pattern '^P5C4B catch' |
+        ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'catch-boundary-summary.txt')
+}
+
 # --- 6. cleanup funclets in the disassembly --------------------------------
 function Export-Disassembly {
     param([string]$Name, [string]$Exe)
     $asm = Join-Path $out "disasm-$Name.txt"
     dumpbin.exe /nologo /disasm:nobytes $Exe | Out-File $asm
+    # Every label (function symbol or funclet) is a non-instruction line: keep
+    # the small list as provenance for the exact symbol names.
+    $labels = New-Object System.Collections.Generic.List[string]
+    foreach ($line in Get-Content $asm) {
+        if ($line -notmatch '^\s*[0-9A-Fa-f]+:') { $labels.Add($line) }
+    }
+    $labels | Where-Object { $_ -match '\S' } | Set-Content (Join-Path $out "labels-$Name.txt")
     return $asm
 }
 
 function Export-Function {
-    param([string]$Asm, [string]$Pattern, [string]$Destination)
+    param([string]$Asm, [string]$Name, [string]$Destination)
     $collected = New-Object System.Collections.Generic.List[string]
     $inside = $false
     foreach ($line in Get-Content $Asm) {
@@ -217,39 +234,74 @@ function Export-Function {
             if ($inside) { $collected.Add($line) }
             continue
         }
-        if ($line -match $Pattern) { $inside = $true; $collected.Add($line) }
+        # A block starts at any label that names the function: the symbol
+        # itself and, below it, each cleanup funclet the compiler emitted.
+        if ($line -match [regex]::Escape($Name)) { $inside = $true; $collected.Add($line) }
         elseif ($inside) { $inside = $false }
     }
     $collected | Set-Content $Destination
     return $collected.Count
 }
 
+# Returns the module offsets of the cleanup funclets owned by $Name.
+function Get-FuncletOffsets {
+    param([string]$Asm, [string]$Name, [string]$Exe)
+    $imageBase = 0
+    foreach ($line in (dumpbin.exe /headers $Exe)) {
+        if ($line -match '([0-9A-F]{8,})\s+image base') {
+            $imageBase = [Convert]::ToInt64($Matches[1], 16)
+            break
+        }
+    }
+    $offsets = New-Object System.Collections.Generic.List[string]
+    $label = $null
+    foreach ($line in Get-Content $Asm) {
+        if ($line -match '^\s*([0-9A-Fa-f]+):') {
+            if ($label) {
+                $address = [Convert]::ToInt64($Matches[1], 16)
+                $offsets.Add('0x' + ($address - $imageBase).ToString('x'))
+                $label = $null
+            }
+            continue
+        }
+        if ($line -match [regex]::Escape($Name) -and $line -match '::`1''::') { $label = $line }
+        else { $label = $null }
+    }
+    return [pscustomobject]@{ imageBase = $imageBase; offsets = $offsets }
+}
+
 $summary = New-Object System.Collections.Generic.List[string]
-foreach ($item in @(@('control-ehsc', $control), @('probe-ehsc-trace', $probeTrace))) {
+foreach ($item in @(@('control-ehsc', $control), @('probe-ehsc', $probe),
+                    @('probe-ehsc-trace', $probeTrace))) {
     $name = $item[0]
     $asm = Export-Disassembly -Name $name -Exe $item[1]
     foreach ($function in @('waitForResponse', 'managedWaitContinuation',
                             'managedWait', 'prepareManagedWait')) {
         $destination = Join-Path $out "func-$name-$function.txt"
-        $count = Export-Function -Asm $asm -Pattern "\?$function@" -Destination $destination
+        $count = Export-Function -Asm $asm -Name $function -Destination $destination
         $summary.Add("binary=$name function=$function lines=$count")
     }
 }
 $summary | Set-Content (Join-Path $out 'funclet-summary.txt')
-foreach ($item in @(@('control-ehsc', $control), @('probe-ehsc-trace', $probeTrace))) {
+
+foreach ($item in @(@('control-ehsc', $control), @('probe-ehsc', $probe))) {
     $name = $item[0]
+    # Funclets are emitted after the function body and are interleaved with the
+    # next function's labels, so they are collected from the whole disassembly.
+    $asm = Join-Path $out "disasm-$name.txt"
     foreach ($function in @('waitForResponse', 'managedWaitContinuation')) {
         $file = Join-Path $out "func-$name-$function.txt"
         $destination = Join-Path $out "funclets-$name-$function.txt"
-        $funclets = @(Select-String -Path $file -CaseSensitive -Pattern '::`1''::')
+        $funclets = @(Select-String -Path $asm -CaseSensitive -Pattern '::`1''::' |
+            Where-Object { $_.Line -match [regex]::Escape($function) })
         @("binary=$name function=$function funclets=$($funclets.Count)") | Set-Content $destination
         $funclets | ForEach-Object { $_.Line.Trim() } | Add-Content $destination
-        @(Select-String -Path $file -Pattern 'lua_error|lua_yieldk|lua_settop') |
+        @(Select-String -Path $file -Pattern 'lua_error|lua_yieldk|lua_settop|luaL_error') |
             ForEach-Object { $_.Line.Trim() } | Add-Content $destination
     }
 }
 
-# --- 7. CDB: the error path, the abandoned stack, the core lifetime --------
+# --- 7. CDB: the error path on the binary that reproduces ------------------
 $debuggers = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64'
 if (-not (Test-Path "$debuggers\cdb.exe")) {
     $installer = "$env:RUNNER_TEMP\winsdk-debuggers.exe"
@@ -260,28 +312,50 @@ if (-not (Test-Path "$debuggers\cdb.exe")) {
 }
 if (-not (Test-Path "$debuggers\cdb.exe")) { throw 'CDB unavailable' }
 $symbolPath = "srv*$env:RUNNER_TEMP\p5c4b-sym*https://msdl.microsoft.com/download/symbols"
-$traceName = 'probe-ehsc-trace'
-$traceExe = $work + '\' + "$traceName.exe"
 
-# Symbol discovery: records whether the fixture's Guard methods survived /O2,
-# where the frame that raises the Lua error is, and whether Lua's static
-# throw helper is available.
+# The P5C4B_TRACE build does not reproduce the double destruction: the debugger
+# therefore runs the plain probe build, the one that shares the control's flags
+# while still printing the guard counters at the end of the offset.
+$traceName = 'probe-ehsc'
+$traceExe = $work + '\' + "$traceName.exe"
 $symbolLog = Join-Path $out 'cdb-symbols.log'
 & "$debuggers\cdb.exe" -o -y $symbolPath `
     -logo (Join-Path $out 'cdb-symbols-debugger.log') `
-    -c "x $traceName!*Guard*; x $traceName!*waitForResponse*; x lua54!luaD_throw; x lua54!lua_error; q" `
+    -c "x $traceName!*Guard*; x $traceName!*waitForResponse*; x lua54!luaD_throw; x lua54!lua_error; x $traceName!tdlua::SchedulerCore::~SchedulerCore; q" `
     $traceExe 1 *> $symbolLog
+$symbols = @(Get-Content $symbolLog | Where-Object { $_ -match '!' }) |
+    Where-Object { $_ -notmatch 'Couldn|error' }
+$symbols | Set-Content (Join-Path $out 'cdb-symbols.txt')
 
 $extraBreakpoints = New-Object System.Collections.Generic.List[string]
 foreach ($line in Get-Content $symbolLog) {
-    if ($line -match '!(\?\?1Guard@[^ ]*)') {
+    if ($line -match '!(\?\?1Guard@[^ \r\n]*)') {
         $extraBreakpoints.Add('bu ' + $traceName + '!' + $Matches[1] +
             ' ".echo P5C4B-GUARD-DTOR; kb 20; g"')
     }
 }
+$waitedFrame = Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+    -Name 'waitForResponse' -Exe $traceExe
+@("image_base=0x$($waitedFrame.imageBase.ToString('x'))",
+  "waitForResponse_funclet_offsets=$($waitedFrame.offsets -join ',')") |
+    Add-Content (Join-Path $out 'funclet-summary.txt')
+$funcletIndex = 0
+foreach ($offset in $waitedFrame.offsets) {
+    $funcletIndex++
+    $extraBreakpoints.Add('u ' + $traceName + '+' + $offset + ' L1')
+    $extraBreakpoints.Add('bp ' + $traceName + '+' + $offset +
+        ' ".echo P5C4B-WAITFRAME-FUNCLET-' + $funcletIndex + '; kb 12; g"')
+}
+foreach ($offset in (Get-FuncletOffsets -Asm (Join-Path $out 'disasm-probe-ehsc.txt') `
+        -Name 'managedWaitContinuation' -Exe $traceExe).offsets) {
+    $funcletIndex++
+    $extraBreakpoints.Add('u ' + $traceName + '+' + $offset + ' L1')
+    $extraBreakpoints.Add('bp ' + $traceName + '+' + $offset +
+        ' ".echo P5C4B-CONTINUATION-FUNCLET; kb 12; g"')
+}
 
 function Invoke-Trace {
-    param([string]$Label, [int]$MaxOffset, [switch]$All)
+    param([string]$Label, [int]$MaxOffset, [switch]$All, [switch]$UnwindDetail)
     $script = Join-Path $out "trace-commands-$Label.txt"
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('sxd av')
@@ -292,6 +366,12 @@ function Invoke-Trace {
     $lines.Add('bu lua54!luaL_error ".echo P5C4B-RAISE-luaL_error; kb 30; g"')
     $lines.Add('bu ' + $traceName + '!tdlua::SchedulerCore::SchedulerCore ".echo P5C4B-CORE-CTOR; r @rcx; kb 12; g"')
     $lines.Add('bu ' + $traceName + '!tdlua::SchedulerCore::~SchedulerCore ".echo P5C4B-CORE-DTOR; r @rcx; kb 12; g"')
+    if ($UnwindDetail) {
+        # Every frame the non-local jump walks through passes the C++ frame
+        # handler: the stack there is the real sequence of abandoned frames.
+        $lines.Add('bu VCRUNTIME140_1!__CxxFrameHandler4 ".echo P5C4B-FRAME-HANDLER; kb 25; g"')
+        $lines.Add('bu VCRUNTIME140_1!__FrameHandler4::FrameUnwindToEmptyState ".echo P5C4B-UNWIND-EMPTY; kb 25; g"')
+    }
     foreach ($breakpoint in $extraBreakpoints) { $lines.Add($breakpoint) }
     $lines.Add('bl')
     $lines.Add('g')
@@ -313,12 +393,11 @@ function Invoke-Trace {
     }
 }
 
-Invoke-Trace -Label 'guard' -MaxOffset 1
+Invoke-Trace -Label 'guard' -MaxOffset 1 -UnwindDetail
 Invoke-Trace -Label 'rest' -MaxOffset 0 -All
 
 # --- verdict --------------------------------------------------------------
-# The raw disassemblies are derived evidence and unnecessarily large: the
-# extracted per-function bodies above carry the funclet names.
+# The raw disassemblies are derived evidence and unnecessarily large.
 Remove-Item (Join-Path $out 'disasm-*.txt') -Force
 $notes | Set-Content (Join-Path $out 'notes.txt')
 'P5C.4b managed routing OOM forensics complete' |
