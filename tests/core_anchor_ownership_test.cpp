@@ -225,7 +225,7 @@ void survivingHandles()
     const auto future = router->future();
     tdlua::pushManagedHandle(L, future, "tdlua.future");
     const int future_index = lua_gettop(L);
-    lua_getuservalue(L, future_index);
+    tdlua_lua_get_value_uservalue(L, future_index);
     require(luaL_testudata(L, -1, "tdlua.core") != nullptr,
             "future handle did not receive its CoreAnchor uservalue");
     lua_pop(L, 1);
@@ -235,7 +235,7 @@ void survivingHandles()
     lua_pop(L, 1);
     tdlua::pushManagedHandle(L, task, "tdlua.task");
     const int task_index = lua_gettop(L);
-    lua_getuservalue(L, task_index);
+    tdlua_lua_get_value_uservalue(L, task_index);
     require(luaL_testudata(L, -1, "tdlua.core") != nullptr,
             "Task handle did not receive its CoreAnchor uservalue");
     lua_pop(L, 1);
@@ -249,7 +249,7 @@ void survivingHandles()
     collect(L);
     for (const char *global : {"surviving_future", "surviving_task"}) {
         lua_getglobal(L, global);
-        lua_getuservalue(L, -1);
+        tdlua_lua_get_value_uservalue(L, -1);
         const bool retains_anchor = luaL_testudata(L, -1, "tdlua.core") != nullptr;
         std::cerr << "CoreAnchor diagnostic after client GC: " << global
                   << " uservalue_type=" << lua_typename(L, lua_type(L, -1))
