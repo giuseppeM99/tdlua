@@ -106,6 +106,11 @@ $probeTrace = Build-OomBinary -Name 'probe-ehsc-trace' `
 $probeStandard = Build-OomBinary -Name 'probe-ehs-trace' `
     -Source "$root\tools\diagnostics\p5c4b_oom_probe.cpp" `
     -ExtraFlags @('/EHs', '/DP5C4B_TRACE')
+# Candidate fix shape, measured in the diagnostic copy only: the Lua error is
+# raised from a helper frame that owns nothing, reached through a C++ call.
+$probeHelper = Build-OomBinary -Name 'probe-ehsc-helper' `
+    -Source "$root\tools\diagnostics\p5c4b_oom_probe.cpp" `
+    -ExtraFlags @('/EHsc', '/DP5C4B_ERROR_HELPER')
 
 # --- 1. control: the unmodified test, isolated processes -------------------
 $codes = @()
@@ -160,6 +165,17 @@ $negative = @($guardSign | Where-Object { $_ -lt 0 }).Count
     Add-Content (Join-Path $out 'probe-summary.txt')
 $notes.Add("probe: canary offsets=$($guardSign.Count); positive/skipped=$positive; " +
            "negative/double=$negative")
+
+# Candidate fix shape measured at the same offset: if the Lua error is raised
+# from a helper frame that owns nothing, the double destruction must disappear
+# while the injected failure still happens (rejected > 0, status != LUA_OK).
+$helperLog = Join-Path $out 'probe-helper.log'
+$helperCode = Invoke-OomBinary -Exe $probeHelper -MaxOffset 1 -Log $helperLog
+@("variant=/DP5C4B_ERROR_HELPER with /EHsc (candidate fix shape, diagnostic copy)",
+  "exit=$helperCode") | Set-Content (Join-Path $out 'probe-helper-summary.txt')
+Select-String -Path $helperLog -Pattern '^P5C4B offset|^P5C4B reject|^exit=' |
+    ForEach-Object { $_.Line } | Add-Content (Join-Path $out 'probe-helper-summary.txt')
+$notes.Add("candidate helper shape at offset 1: exit=$helperCode")
 
 # --- 3. trace probe and /EHs probe: codegen and /EHc controls -------------
 $traceLog = Join-Path $work 'trace-guard-1.log'

@@ -23,7 +23,10 @@
 //     the failing offset can be compared against a baseline offset;
 //   * the offset line also reports the SchedulerCore lease count observed
 //     after the wait; a stale cleanup funclet that runs a second ~shared_ptr
-//     leaves the control block one owner short of the baseline.
+//     leaves the control block one owner short of the baseline;
+//   * built with -DP5C4B_ERROR_HELPER it raises the Lua error through a
+//     non-inline helper frame that owns nothing, i.e. the candidate fix shape,
+//     so the same measurement can be repeated on the candidate.
 // Behaviour of the product code and the assertions of the original test are
 // untouched: no runtime fix is implemented here.
 // ---------------------------------------------------------------------------
@@ -220,6 +223,23 @@ struct Scenario {
 };
 
 Scenario *current = nullptr;
+#ifdef P5C4B_ERROR_HELPER
+// Candidate shape (diagnostic): raise the Lua error from a frame that owns no
+// automatic at all, reached through an ordinary C++ call instead of the
+// extern "C" Lua entry point. /EHc assumes the extern "C" call cannot unwind,
+// which is what leaves the caller's stale cleanup live.
+#if defined(_MSC_VER)
+#define P5C4B_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define P5C4B_NOINLINE __attribute__((noinline))
+#else
+#define P5C4B_NOINLINE
+#endif
+P5C4B_NOINLINE int raiseWaitError(lua_State *L)
+{
+    return lua_error(L);
+}
+#endif
 int waitForResponse(lua_State *L)
 {
     bool failed = false;
@@ -269,7 +289,11 @@ int waitForResponse(lua_State *L)
               << " live_cores=" << tdlua::liveSchedulerCores() << '\n';
 #endif
     // No owning C++ automatic object crosses this Lua error boundary.
+#ifdef P5C4B_ERROR_HELPER
+    return failed ? raiseWaitError(L) : results;
+#else
     return failed ? lua_error(L) : results;
+#endif
 }
 
 int sweep(int max_offset, bool inject)
