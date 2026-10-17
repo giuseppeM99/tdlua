@@ -67,6 +67,23 @@ bool hasTdJsonModuleLoaded()
            hasLoadedModuleWithPrefix(L"libtdjson.dll");
 }
 
+// The JSON backend loads TDLib through tdjson.dll, so that module must stay
+// resident. The native backend links TDLib statically into tdlua.dll, so no
+// tdjson module may appear: its absence is the observable form of the static
+// link. Both backends keep checking that tdlua.dll itself stays resident.
+void checkBackendDependency()
+{
+#if defined(TDLUA_NATIVE_BACKEND)
+    check(!hasTdJsonModuleLoaded(),
+          "native TDLua build loaded the tdjson dynamic dependency");
+    std::cout << "native backend: TDLib stays inside the pinned tdlua.dll image, no tdjson module is resident PASS\n";
+#else
+    check(hasTdJsonModuleLoaded(),
+          "TDLib JSON dependency is not resident with TDLua");
+    std::cout << "TDLib JSON dependency remains loaded with the pinned TDLua image PASS\n";
+#endif
+}
+
 void runVmScenario(const std::string& module_directory, int sequence)
 {
     lua_State* state = luaL_newstate();
@@ -125,9 +142,8 @@ int main(int argc, char** argv)
         runVmScenario(module_directory, 1);
         check(FreeLibrary(original) != 0, "FreeLibrary could not release original module handle");
         check(isModuleLoaded(L"tdlua.dll"), "pinned TDLua module unloaded after FreeLibrary");
-        check(hasTdJsonModuleLoaded(),
-              "TDLib JSON dependency is not resident with TDLua");
-        std::cout << "module and tdjson dependency remain loaded after original FreeLibrary PASS\n";
+        checkBackendDependency();
+        std::cout << "module remains loaded after original FreeLibrary PASS\n";
 
         runVmScenario(module_directory, 2);
         check(isModuleLoaded(L"tdlua.dll"), "TDLua module did not survive second VM teardown");

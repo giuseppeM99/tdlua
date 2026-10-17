@@ -1189,6 +1189,10 @@ if(TDLUA_BUILD_TESTS)
         elseif(WIN32)
             add_executable(tdlua_windows_residency_test
                 "tests/windows_module_residency_test.cpp")
+            if(_tdlua_backend STREQUAL "native")
+                target_compile_definitions(tdlua_windows_residency_test PRIVATE
+                    TDLUA_NATIVE_BACKEND)
+            endif()
             target_include_directories(tdlua_windows_residency_test PRIVATE
                 ${LUA_INCLUDE_DIRS})
             target_link_libraries(tdlua_windows_residency_test PRIVATE
