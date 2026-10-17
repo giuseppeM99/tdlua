@@ -1,0 +1,488 @@
+name: Windows MSVC native validation
+
+# Validates the MSVC Release build of the native backend against bundled pinned
+# TDLib. P5D.2 gated on build, link and manifest; P5D.3 additionally gates on the
+# full native runtime suite and its repetitions. It is intentionally kept
+# separate from the JSON workflow so the existing green JSON gate is untouched.
+
+on:
+  push:
+    branches: [p5d2-windows-native-build, p5d3-windows-native-runtime]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  windows-msvc-native:
+    name: Windows 2022 / MSVC x64 / Lua 5.4.8 / native
+    runs-on: windows-2022
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout pinned repository and TDLib
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Enable MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Select scratch build directory on the largest free drive
+        id: scratch
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force .ci\windows-msvc-native | Out-Null
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, Root,
+              @{n='FreeGB';e={[math]::Round($_.Free / 1GB, 1)}},
+              @{n='UsedGB';e={[math]::Round($_.Used / 1GB, 1)}} |
+            Format-Table -AutoSize | Out-String |
+            Tee-Object -FilePath .ci\windows-msvc-native\disk-before.log
+          $drives = @(Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $null -ne $_.Free } | Sort-Object Free -Descending)
+          if ($drives.Count -eq 0) { throw 'No filesystem drive reported free space' }
+          $target = $drives[0]
+          $buildRoot = Join-Path $target.Root 'tdlua-msvc-native-build'
+          New-Item -ItemType Directory -Force $buildRoot | Out-Null
+          "build_dir=$buildRoot" >> $env:GITHUB_OUTPUT
+          "TDLUA_BUILD_DIR=$buildRoot" >> $env:GITHUB_ENV
+          "Scratch build directory: $buildRoot on drive $($target.Name)" |
+            Tee-Object -FilePath .ci\windows-msvc-native\disk-choice.log
+
+      - name: Record runner and toolchain provenance
+        id: provenance
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = '.ci\windows-msvc-native\provenance.log'
+          @(
+            (Get-Date -Format o)
+            (Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber | Format-List | Out-String)
+            (Get-CimInstance Win32_Processor | Select-Object -First 1 Name, NumberOfCores, NumberOfLogicalProcessors | Format-List | Out-String)
+            (Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | Format-List | Out-String)
+            "VSCMD_ARG_TGT_ARCH=$env:VSCMD_ARG_TGT_ARCH"
+            (& cl.exe /Bv 2>&1 | Out-String)
+            (& cmake --version | Out-String)
+            (& ninja --version | Out-String)
+            "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+            "TDLib HEAD: $(& git -C td rev-parse HEAD)"
+            "TDLib gitlink: $(& git ls-tree HEAD td)"
+            "TDLib schema SHA-256: $((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)"
+          ) | Tee-Object -FilePath $log
+          if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') { throw 'MSVC environment is not x64' }
+          if ((git -C td rev-parse HEAD).Trim() -ne $env:TDLIB_COMMIT) { throw 'TDLib submodule commit mismatch' }
+          $tdlibStatus = @(& git -C td status --porcelain)
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect TDLib submodule status: $LASTEXITCODE" }
+          if ($tdlibStatus.Count -gt 0) { throw 'TDLib submodule has local modifications' }
+          $clText = (& cl.exe /Bv 2>&1 | Out-String)
+          $clVersion = [regex]::Match($clText, '19\.\d+\.\d+').Value
+          $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1).Name
+          $vcpkgCommit = (& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD).Trim()
+          "cl=$clVersion" >> $env:GITHUB_OUTPUT
+          "sdk=$sdk" >> $env:GITHUB_OUTPUT
+          "vcpkg=$vcpkgCommit" >> $env:GITHUB_OUTPUT
+          "schema=$((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)" >> $env:GITHUB_OUTPUT
+
+      - name: Install pinned tool dependencies with vcpkg
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          & $vcpkg install openssl:x64-windows zlib:x64-windows gperf:x64-windows 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\vcpkg-install.log
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed: $LASTEXITCODE" }
+          & $vcpkg list | Tee-Object -FilePath .ci\windows-msvc-native\vcpkg-packages.log
+          $tools = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\tools'
+          $gperf = Get-ChildItem $tools -Filter gperf.exe -Recurse | Select-Object -First 1
+          if (-not $gperf) { throw 'vcpkg did not install host gperf.exe' }
+          $env:PATH = "$($gperf.DirectoryName);$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          "Gperf path: $($gperf.FullName)" | Tee-Object -FilePath .ci\windows-msvc-native\gperf.log
+          & $gperf.FullName --version | Tee-Object -Append -FilePath .ci\windows-msvc-native\gperf.log
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "GPERF_EXECUTABLE=$($gperf.FullName)" >> $env:GITHUB_ENV
+          "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Build Lua 5.4.8 with MSVC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\windows\compile-lua-msvc.ps1 `
+            -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
+            -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua"
+          if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+          $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua"
+          dumpbin.exe /headers "$lua\lua54.dll" | Select-String '8664 machine' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Lua DLL is not PE x64' }
+          "LUA_INCLUDE_DIR=$lua" >> $env:GITHUB_ENV
+          "LUA_LIBRARY=$lua\lua54.lib" >> $env:GITHUB_ENV
+          "LUA_EXECUTABLE=$lua\lua.exe" >> $env:GITHUB_ENV
+          "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Configure TDLua native with bundled TDLib
+        id: tdlua-configure
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          cmake -S . -B $build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTDLUA_BACKEND=native `
+            -DTDLUA_BUNDLED_TDLIB=ON `
+            -DTDLUA_BUILD_TESTS=ON `
+            -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" `
+            -DLUA_LIBRARY="$env:LUA_LIBRARY" `
+            -DLUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DTDLUA_LUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\install" `
+            -DCMAKE_C_FLAGS=/DLUA_BUILD_AS_DLL `
+            -DCMAKE_CXX_FLAGS=/DLUA_BUILD_AS_DLL `
+            2>&1 | Tee-Object -FilePath .ci\windows-msvc-native\configure.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLua native configure failed: $LASTEXITCODE" }
+          "TDLUA_INSTALL_DIR=$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\install" >> $env:GITHUB_ENV
+          Copy-Item (Join-Path $build 'CMakeCache.txt') .ci\windows-msvc-native\CMakeCache.txt
+          $cache = Get-Content .ci\windows-msvc-native\CMakeCache.txt
+          foreach ($needle in @('TDLUA_BACKEND:STRING=native', 'TDLUA_BUNDLED_TDLIB:BOOL=ON',
+                                'TDLUA_BUILD_TESTS:BOOL=ON',
+                                'TD_INSTALL_STATIC_LIBRARIES:BOOL=ON', 'TD_INSTALL_SHARED_LIBRARIES:BOOL=OFF',
+                                'TD_ENABLE_LTO:BOOL=OFF')) {
+            if ($cache -notcontains $needle) { throw "Unexpected configured value: $needle" }
+          }
+
+      - name: Build pinned TDLib static libraries and code generators
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          cmake --build $build --config Release --parallel 4 `
+            --target tdclient tl_generate_tlo 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-static-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLib static/generator build failed: $LASTEXITCODE" }
+          $tdclient = Get-ChildItem -Path $build -Recurse -Filter 'tdclient.lib' |
+            Select-Object -First 1
+          if (-not $tdclient) { throw 'tdclient.lib was not produced by the static TDLib build' }
+          "TDLib static library: $($tdclient.FullName)" |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-static-artifacts.log
+          $tlParser = Get-ChildItem -Path $build -Recurse -Filter 'tl-parser.exe' |
+            Select-Object -First 1
+          if (-not $tlParser) { throw 'tl-parser.exe was not produced' }
+          $tdtl = Get-ChildItem -Path $build -Recurse -Filter 'tdtl.lib' | Select-Object -First 1
+          if (-not $tdtl) { throw 'tdtl.lib was not produced' }
+          "TDLib codegen tools: $($tlParser.FullName); $($tdtl.FullName)" |
+            Tee-Object -Append -FilePath .ci\windows-msvc-native\tdlib-static-artifacts.log
+
+      - name: Run the native codec generator and verify the shards
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          cmake --build $build --config Release --parallel 4 `
+            --target tdlua_native_generator tdlua_native_generated 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\generator.log
+          if ($LASTEXITCODE -ne 0) { throw "Native codec generation failed: $LASTEXITCODE" }
+          $gen = Join-Path $build 'generated\tdlua'
+          if (-not (Test-Path -LiteralPath $gen)) {
+            throw "Generated codec directory was not created: $gen"
+          }
+          # -Filter only supports * and ? on Windows, so select the numbered
+          # shards with an explicit regular expression instead.
+          $shards = @(Get-ChildItem -LiteralPath $gen -File |
+            Where-Object { $_.Name -match '^native_codec_\d+\.cpp$' })
+          $dispatch = Join-Path $gen 'native_codec_dispatch.cpp'
+          $header = Join-Path $gen 'native_codec_generated.h'
+          if ($shards.Count -ne 16) {
+            Get-ChildItem -LiteralPath $gen -File |
+              Select-Object Name, Length | Format-Table -AutoSize | Out-String |
+              Tee-Object -FilePath .ci\windows-msvc-native\generator-listing.log
+            throw "Expected 16 native codec shards, found $($shards.Count)"
+          }
+          if (-not (Test-Path $dispatch)) { throw 'native_codec_dispatch.cpp missing' }
+          if (-not (Test-Path $header)) { throw 'native_codec_generated.h missing' }
+          @(
+            "shard_count=$($shards.Count)"
+            "dispatch_bytes=$((Get-Item $dispatch).Length)"
+            "shard_bytes=$((($shards | Measure-Object Length -Sum).Sum))"
+            "header=$header"
+          ) | Set-Content .ci\windows-msvc-native\generator-summary.txt
+          $shards | Select-Object Name, Length |
+            Sort-Object Name | Format-Table -AutoSize | Out-String |
+            Tee-Object -FilePath .ci\windows-msvc-native\generator-shards.log
+
+      - name: Link the TDLua native module
+        id: tdlua-link
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          # Link the module first so a test-only compilation failure cannot hide
+          # whether the native DLL itself links against static TDLib. Keep going
+          # after errors so one run lists every broken target.
+          cmake --build $build --config Release --parallel 4 --target tdlua -- -k 0 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlua-module-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLua native module build failed: $LASTEXITCODE" }
+          $module = Join-Path $build 'tdlua.dll'
+          if (-not (Test-Path $module)) { throw 'tdlua.dll was not linked' }
+
+      - name: Build TDLua native regression tests
+        id: tdlua-build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          # Keep going after errors so one run lists every broken test target
+          # instead of stopping at the first link failure.
+          cmake --build $build --config Release --parallel 4 -- -k 0 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlua-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLua native test build failed: $LASTEXITCODE" }
+
+      - name: Verify MSVC Release compile configuration
+        if: always() && steps.tdlua-link.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $logDir = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc-native'
+          $compileCommands = Join-Path $build 'compile_commands.json'
+          if (-not (Test-Path $compileCommands)) { throw 'TDLua did not export compile_commands.json' }
+          $entries = Get-Content $compileCommands -Raw | ConvertFrom-Json
+          $cxxCommands = @($entries |
+            Where-Object { $_.file -match '\.cpp$' -and $_.command -match 'cl\.exe' -and $_.file -notmatch '[\\/]td[\\/]' })
+          if ($cxxCommands.Count -eq 0) { throw 'No MSVC C++ compile command was recorded for TDLua' }
+          $withoutEhsc = @($cxxCommands | Where-Object { $_.command -notmatch '[-/]EHsc\b' })
+          $withoutO2 = @($cxxCommands | Where-Object { $_.command -notmatch '[-/]O2\b' })
+          # /MD selects the dynamic Release CRT; /MDd would be the debug one.
+          $withoutMD = @($cxxCommands | Where-Object { $_.command -notmatch '[-/]MD(?!d)' })
+          $shardCommands = @($cxxCommands | Where-Object { $_.file -match 'native_codec_(dispatch|[0-9]+)\.cpp$' })
+          $shardWithoutBigobj = @($shardCommands | Where-Object { $_.command -notmatch '[-/]bigobj\b' })
+          $shardWithoutStd = @($shardCommands | Where-Object { $_.command -notmatch '[-/]std:c\+\+latest\b' })
+          $buildLogs = @('tdlua-module-build.log', 'tdlua-build.log') |
+            ForEach-Object { Join-Path $logDir $_ } | Where-Object { Test-Path $_ }
+          $c4530 = 0
+          foreach ($buildLogPath in $buildLogs) {
+            $c4530 += ([regex]::Matches((Get-Content $buildLogPath -Raw), 'C4530')).Count
+          }
+          $dependents = dumpbin.exe /dependents (Join-Path $build 'tdlua.dll') 2>&1 | Out-String
+          $dynamicCrt = [bool]($dependents -match '(?i)VCRUNTIME140\.dll')
+          @(
+            "cxx_compile_commands=$($cxxCommands.Count)"
+            "without_ehsc=$($withoutEhsc.Count)"
+            "without_O2=$($withoutO2.Count)"
+            "without_MD=$($withoutMD.Count)"
+            "native_shards_compiled=$($shardCommands.Count)"
+            "shards_without_bigobj=$($shardWithoutBigobj.Count)"
+            "shards_without_std_cxx_latest=$($shardWithoutStd.Count)"
+            "C4530_lines=$c4530"
+            "dynamic_crt_dependent=$($dynamicCrt.ToString().ToLowerInvariant())"
+          ) | Set-Content (Join-Path $logDir 'tdlua-compile-flags.txt')
+          if ($withoutEhsc.Count -gt 0) { throw "TDLua C++ compilation is not using /EHsc in $($withoutEhsc.Count) command(s)" }
+          if ($withoutO2.Count -gt 0) { throw "TDLua Release C++ compilation is not using /O2 in $($withoutO2.Count) command(s)" }
+          if ($withoutMD.Count -gt 0) { throw "TDLua C++ compilation is not using /MD in $($withoutMD.Count) command(s)" }
+          if ($shardCommands.Count -ne 17) { throw "Expected 17 generated codec translation units, found $($shardCommands.Count)" }
+          if ($shardWithoutBigobj.Count -gt 0) { throw "$($shardWithoutBigobj.Count) generated shard(s) were compiled without /bigobj" }
+          if ($shardWithoutStd.Count -gt 0) { throw "$($shardWithoutStd.Count) generated shard(s) were not compiled with the C++23 standard flag" }
+          if ($c4530 -ne 0) { throw "MSVC emitted C4530 $c4530 time(s): the /EHsc contract is broken" }
+          if (-not $dynamicCrt) { throw 'TDLua module does not import the dynamic CRT: expected /MD' }
+
+      - name: Verify module export table and dependencies
+        if: always() && steps.tdlua-link.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $module = Join-Path $build 'tdlua.dll'
+          dumpbin.exe /headers $module | Tee-Object -FilePath .ci\windows-msvc-native\tdlua-headers.log
+          dumpbin.exe /headers $module | Select-String '8664 machine' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'TDLua artifact is not PE x64' }
+          dumpbin.exe /dependents $module | Tee-Object -FilePath .ci\windows-msvc-native\tdlua-dependencies.log
+          $dependencyLog = dumpbin.exe /dependents $module | Out-String
+          if ($dependencyLog -match '(?i)tdjson') {
+            throw 'Native module unexpectedly depends on tdjson: the static TDLib link is wrong'
+          }
+          $exports = dumpbin.exe /exports $module
+          $exports | Tee-Object -FilePath .ci\windows-msvc-native\tdlua-exports-test.log
+          if (($exports | Select-String 'luaopen_tdlua').Count -lt 1) { throw 'luaopen_tdlua export missing' }
+          "native_deps_ok=true" | Set-Content .ci\windows-msvc-native\link-verdict.txt
+
+      - name: Enumerate the native CTest manifest
+        if: always() && steps.tdlua-link.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;$build;$env:PATH"
+          $env:LUA_CPATH = "$build\?.dll"
+          $testList = ctest --test-dir $build --show-only=json-v1 2>&1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate CTest tests' }
+          $testManifest = ($testList -join "`n") | ConvertFrom-Json
+          $testNames = @($testManifest.tests | ForEach-Object { $_.name })
+          $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
+          # Native Linux registers 30 tests. Windows replaces the Linux-only
+          # tdlua_signals with the platform-specific tdlua_windows_residency.
+          $expected = @(
+            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
+            'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
+            'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
+            'tdlua_buffering_accounting', 'tdlua_scheduler_concurrency',
+            'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
+            'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
+            'tdlua_vm_threads', 'tdlua_release', 'tdlua_uploadtravis',
+            'tdlua_native_codec', 'tdlua_native_decoder_safety', 'tdlua_native_generic_ticket',
+            'tdlua_native_schema', 'tdlua_hardening_backend', 'tdlua_lifecycle',
+            'tdlua_async', 'tdlua_backend_parity', 'tdlua_e2e_smoke',
+            'tdlua_managed_driver_backend', 'tdlua_windows_residency'
+          )
+          $delta = Compare-Object @($expected | Sort-Object) @($testNames | Sort-Object)
+          if ($delta) {
+            $delta | Format-Table -AutoSize | Out-String |
+              Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
+            throw "Native CTest manifest differs from the expected 30-test set; actual=$($testNames.Count)"
+          }
+          "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
+            Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
+
+      - name: Gate on the native CTest suite and its repetitions
+        id: ctest-gate
+        if: always() && steps.tdlua-build.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $logDir = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc-native'
+          $verdictPath = Join-Path $logDir 'runtime-gate-verdict.txt'
+          # The module imports the vcpkg OpenSSL and zlib DLLs, so their bin
+          # directory stays on PATH for the build-tree tests. The installed
+          # module is exercised later without the build tree on PATH.
+          $env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;$build;$env:PATH"
+          $env:LUA_CPATH = "$build\?.dll"
+          ctest --test-dir $build --output-on-failure -C Release 2>&1 |
+            Tee-Object -FilePath (Join-Path $logDir 'ctest-full.log')
+          $fullExit = $LASTEXITCODE
+          Set-Content -Path (Join-Path $logDir 'ctest-full-exit.txt') -Value $fullExit
+          "ctest_full_exit=$fullExit" | Set-Content $verdictPath
+          if ($fullExit -ne 0) { throw "The native CTest suite is not green: exit=$fullExit" }
+          # The manifest gate pins the registered set; this pins the executed
+          # result, so a silently skipped test cannot pass as green.
+          $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
+          if ($summary -notmatch '0 tests failed out of 30') {
+            throw 'The native CTest suite did not report 30/30: inspect ctest-full.log'
+          }
+          # Repeated runs are the gate, not a single sample. A flake is recorded
+          # in its log and classified; the gate is never muted for it.
+          $repeats = [ordered]@{
+            tdlua_managed_adapter = 100
+            tdlua_managed_routing_oom = 100
+            tdlua_release = 100
+            tdlua_receiver_runtime = 20
+            tdlua_receiver_generic_fifo_metadata = 20
+            tdlua_shutdown_admission = 20
+            tdlua_lifecycle = 20
+            tdlua_managed_driver_backend = 20
+            tdlua_windows_residency = 20
+          }
+          foreach ($name in $repeats.Keys) {
+            $count = $repeats[$name]
+            ctest --test-dir $build -C Release -R "^$name$" --repeat until-fail:$count 2>&1 |
+              Tee-Object -FilePath (Join-Path $logDir "repeat-$name.log")
+            $exit = $LASTEXITCODE
+            "repeat $name x$count exit=$exit" | Add-Content $verdictPath
+            if ($exit -ne 0) {
+              throw "Repeated test $name failed before completing $count runs: exit=$exit"
+            }
+          }
+          'native_runtime_gate=pass' | Add-Content $verdictPath
+
+      - name: Verify production linking and installation without TDLUA_TESTING
+        id: tdlua-production
+        if: always() && steps.tdlua-link.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $install = $env:TDLUA_INSTALL_DIR
+          # Reconfiguring the same build directory keeps the already built
+          # TDLib static objects and only drops the test hooks from TDLua.
+          cmake -S . -B $build -DTDLUA_BUILD_TESTS=OFF 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\production-configure.log
+          if ($LASTEXITCODE -ne 0) { throw "Production reconfigure failed: $LASTEXITCODE" }
+          cmake --build $build --config Release --parallel 4 --target tdlua 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\production-build.log
+          if ($LASTEXITCODE -ne 0) { throw "Production native link failed: $LASTEXITCODE" }
+          $module = Join-Path $build 'tdlua.dll'
+          $exports = dumpbin.exe /exports $module
+          $exports | Tee-Object -FilePath .ci\windows-msvc-native\tdlua-exports-production.log
+          if (($exports | Select-String 'luaopen_tdlua').Count -lt 1) { throw 'production luaopen_tdlua export missing' }
+          if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') {
+            throw 'test-only accessor leaked into the production native DLL'
+          }
+          # Install into a separate prefix and require the module from there, so
+          # the check cannot silently reuse the build tree.
+          if (Test-Path $install) { Remove-Item -Recurse -Force $install }
+          cmake --install $build --config Release 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\production-install.log
+          if ($LASTEXITCODE -ne 0) { throw "Production install failed: $LASTEXITCODE" }
+          $moduleDir = Join-Path $install 'lib\lua\5.4'
+          $installedModule = Join-Path $moduleDir 'tdlua.dll'
+          if (-not (Test-Path $installedModule)) { throw "Installed module missing: $installedModule" }
+          Get-ChildItem -Path $install -Recurse -File |
+            Select-Object FullName, Length | Format-Table -AutoSize | Out-String |
+            Tee-Object -FilePath .ci\windows-msvc-native\production-install-listing.log
+          $installedDeps = dumpbin.exe /dependents $installedModule | Out-String
+          $installedDeps | Tee-Object -FilePath .ci\windows-msvc-native\production-dependencies.log
+          if ($installedDeps -match '(?i)tdjson') {
+            throw 'Installed native module depends on tdjson: the static TDLib link is wrong'
+          }
+          # The module imports the vcpkg OpenSSL and zlib DLLs. Record where the
+          # loader finds them: they are external runtime dependencies, provided
+          # by vcpkg, and no copy is added to the installation.
+          $runtimeLibs = @()
+          foreach ($lib in @('libssl-3-x64.dll', 'libcrypto-3-x64.dll', 'z.dll')) {
+            $runtimeLibs += "--- $lib"
+            $runtimeLibs += (& where.exe $lib 2>&1)
+          }
+          $runtimeLibs | Tee-Object -FilePath .ci\windows-msvc-native\production-runtime-libs.log
+          # Only vcpkg's bin directory and the Lua runtime directory are on
+          # PATH; the build tree is deliberately absent.
+          $env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;$env:PATH"
+          $env:LUA_CPATH = "$moduleDir\?.dll"
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print("installed native module", t.version, t.api_version, t.tdlib_version)'
+          if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed for the installed production module' }
+          @(
+            "installed_module=$installedModule"
+            'production_require=pass'
+            'tdjson_dependency=false'
+            'external_runtime_dependencies=libssl-3-x64.dll,libcrypto-3-x64.dll,z.dll (vcpkg)'
+          ) | Set-Content .ci\windows-msvc-native\production-install-verdict.txt
+
+      - name: Enforce the native build and runtime gates
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logDir = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc-native'
+          if ('${{ steps.tdlua-link.outcome }}' -ne 'success') {
+            throw "The native module did not link: outcome=${{ steps.tdlua-link.outcome }}"
+          }
+          if ('${{ steps.tdlua-build.outcome }}' -ne 'success') {
+            throw "The native test build did not complete: outcome=${{ steps.tdlua-build.outcome }}"
+          }
+          if ('${{ steps.ctest-gate.outcome }}' -ne 'success') {
+            throw "The native runtime gate did not pass: outcome=${{ steps.ctest-gate.outcome }}"
+          }
+          if ('${{ steps.tdlua-production.outcome }}' -ne 'success') {
+            throw "The production module gate did not pass: outcome=${{ steps.tdlua-production.outcome }}"
+          }
+          foreach ($required in @('tdlua-compile-flags.txt', 'link-verdict.txt',
+                                  'ctest-manifest-verdict.txt', 'generator-summary.txt',
+                                  'runtime-gate-verdict.txt', 'production-install-verdict.txt')) {
+            if (-not (Test-Path (Join-Path $logDir $required))) {
+              throw "Native gate artifact missing: $required"
+            }
+          }
+          'All native build gates (P5D.2) and runtime gates (P5D.3) are recorded.' |
+            Tee-Object -FilePath .ci\windows-msvc-native\p5d3-gate-verdict.txt
+
+      - name: Upload native validation logs and manifests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msvc-native-${{ github.run_id }}
+          path: .ci/windows-msvc-native/
+          if-no-files-found: warn
+          retention-days: 30
