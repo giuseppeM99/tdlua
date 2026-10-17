@@ -7,7 +7,11 @@ name: Windows MSVC native validation
 
 on:
   push:
-    branches: [p5d2-windows-native-build, p5d3-windows-native-runtime]
+    branches:
+      - p5d2-windows-native-build
+      - p5d3-windows-native-runtime
+      - p5d4-native-integration
+      - v0.5.1-consolidated
   workflow_dispatch:
 
 permissions:
