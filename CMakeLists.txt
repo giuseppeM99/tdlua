@@ -47,6 +47,17 @@ function(tdlua_enable_sanitizers target)
   endif()
 endfunction()
 
+# A PE/COFF DLL exposes only the names listed in its module definition file, so
+# it does not re-export the symbols of the static libraries it was linked
+# against. Native-backend tests that build td_api values themselves therefore
+# link the same static TDLib as the module. On ELF and Mach-O the module's own
+# symbols remain visible to the tests and the link set is unchanged.
+function(tdlua_link_native_test_tdlib target)
+  if(_tdlua_backend STREQUAL "native" AND WIN32)
+    target_link_libraries(${target} PRIVATE Td::TdStatic)
+  endif()
+endfunction()
+
 if(TDLUA_ENABLE_SANITIZERS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   execute_process(
       COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libasan.so
@@ -939,6 +950,7 @@ if(TDLUA_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/td"
                 "${_tdlua_native_td_include_dirs}")
             target_compile_features(tdlua_lua51_managed_test PRIVATE cxx_std_23)
+            tdlua_link_native_test_tdlib(tdlua_lua51_managed_test)
         endif()
         tdlua_enable_sanitizers(tdlua_lua51_managed_test)
         add_test(NAME tdlua_lua51_managed COMMAND tdlua_lua51_managed_test)
@@ -967,6 +979,7 @@ if(TDLUA_BUILD_TESTS)
         target_include_directories(tdlua_release_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
             "${_tdlua_native_td_include_dirs}")
         target_compile_features(tdlua_release_test PRIVATE cxx_std_23)
+        tdlua_link_native_test_tdlib(tdlua_release_test)
     endif()
     tdlua_enable_sanitizers(tdlua_release_test)
     add_test(NAME tdlua_release COMMAND tdlua_release_test)
@@ -984,6 +997,7 @@ if(TDLUA_BUILD_TESTS)
             target_include_directories(tdlua_uploadtravis_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
                 "${_tdlua_native_td_include_dirs}")
             target_compile_features(tdlua_uploadtravis_test PRIVATE cxx_std_23)
+            tdlua_link_native_test_tdlib(tdlua_uploadtravis_test)
         endif()
         tdlua_enable_sanitizers(tdlua_uploadtravis_test)
         add_test(NAME tdlua_uploadtravis COMMAND tdlua_uploadtravis_test
