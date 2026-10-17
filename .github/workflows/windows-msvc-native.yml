@@ -215,8 +215,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
           # Link the module first so a test-only compilation failure cannot hide
-          # whether the native DLL itself links against static TDLib.
-          cmake --build $build --config Release --parallel 4 --target tdlua 2>&1 |
+          # whether the native DLL itself links against static TDLib. Keep going
+          # after errors so one run lists every broken target.
+          cmake --build $build --config Release --parallel 4 --target tdlua -- -k 0 2>&1 |
             Tee-Object -FilePath .ci\windows-msvc-native\tdlua-module-build.log
           if ($LASTEXITCODE -ne 0) { throw "TDLua native module build failed: $LASTEXITCODE" }
           $module = Join-Path $build 'tdlua.dll'
@@ -227,7 +228,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
-          cmake --build $build --config Release --parallel 4 2>&1 |
+          # Keep going after errors so one run lists every broken test target
+          # instead of stopping at the first link failure.
+          cmake --build $build --config Release --parallel 4 -- -k 0 2>&1 |
             Tee-Object -FilePath .ci\windows-msvc-native\tdlua-build.log
           if ($LASTEXITCODE -ne 0) { throw "TDLua native test build failed: $LASTEXITCODE" }
 
