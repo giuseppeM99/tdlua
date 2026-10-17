@@ -182,10 +182,21 @@ jobs:
             Tee-Object -FilePath .ci\windows-msvc-native\generator.log
           if ($LASTEXITCODE -ne 0) { throw "Native codec generation failed: $LASTEXITCODE" }
           $gen = Join-Path $build 'generated\tdlua'
-          $shards = @(Get-ChildItem $gen -Filter 'native_codec_[0-9]*.cpp')
+          if (-not (Test-Path -LiteralPath $gen)) {
+            throw "Generated codec directory was not created: $gen"
+          }
+          # -Filter only supports * and ? on Windows, so select the numbered
+          # shards with an explicit regular expression instead.
+          $shards = @(Get-ChildItem -LiteralPath $gen -File |
+            Where-Object { $_.Name -match '^native_codec_\d+\.cpp$' })
           $dispatch = Join-Path $gen 'native_codec_dispatch.cpp'
           $header = Join-Path $gen 'native_codec_generated.h'
-          if ($shards.Count -ne 16) { throw "Expected 16 native codec shards, found $($shards.Count)" }
+          if ($shards.Count -ne 16) {
+            Get-ChildItem -LiteralPath $gen -File |
+              Select-Object Name, Length | Format-Table -AutoSize | Out-String |
+              Tee-Object -FilePath .ci\windows-msvc-native\generator-listing.log
+            throw "Expected 16 native codec shards, found $($shards.Count)"
+          }
           if (-not (Test-Path $dispatch)) { throw 'native_codec_dispatch.cpp missing' }
           if (-not (Test-Path $header)) { throw 'native_codec_generated.h missing' }
           @(
@@ -198,19 +209,30 @@ jobs:
             Sort-Object Name | Format-Table -AutoSize | Out-String |
             Tee-Object -FilePath .ci\windows-msvc-native\generator-shards.log
 
-      - name: Build TDLua native module and regression tests
+      - name: Link the TDLua native module
+        id: tdlua-link
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          # Link the module first so a test-only compilation failure cannot hide
+          # whether the native DLL itself links against static TDLib.
+          cmake --build $build --config Release --parallel 4 --target tdlua 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlua-module-build.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLua native module build failed: $LASTEXITCODE" }
+          $module = Join-Path $build 'tdlua.dll'
+          if (-not (Test-Path $module)) { throw 'tdlua.dll was not linked' }
+
+      - name: Build TDLua native regression tests
         id: tdlua-build
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
           cmake --build $build --config Release --parallel 4 2>&1 |
             Tee-Object -FilePath .ci\windows-msvc-native\tdlua-build.log
-          if ($LASTEXITCODE -ne 0) { throw "TDLua native build failed: $LASTEXITCODE" }
-          $module = Join-Path $build 'tdlua.dll'
-          if (-not (Test-Path $module)) { throw 'tdlua.dll was not linked' }
+          if ($LASTEXITCODE -ne 0) { throw "TDLua native test build failed: $LASTEXITCODE" }
 
       - name: Verify MSVC Release compile configuration
-        if: always() && steps.tdlua-build.outcome == 'success'
+        if: always() && steps.tdlua-link.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
@@ -226,8 +248,12 @@ jobs:
           $shardCommands = @($cxxCommands | Where-Object { $_.file -match 'native_codec_(dispatch|[0-9]+)\.cpp$' })
           $shardWithoutBigobj = @($shardCommands | Where-Object { $_.command -notmatch '[-/]bigobj\b' })
           $shardWithoutStd = @($shardCommands | Where-Object { $_.command -notmatch '[-/]std:c\+\+latest\b' })
-          $buildLogPath = Join-Path $logDir 'tdlua-build.log'
-          $c4530 = if (Test-Path $buildLogPath) { ([regex]::Matches((Get-Content $buildLogPath -Raw), 'C4530')).Count } else { 0 }
+          $buildLogs = @('tdlua-module-build.log', 'tdlua-build.log') |
+            ForEach-Object { Join-Path $logDir $_ } | Where-Object { Test-Path $_ }
+          $c4530 = 0
+          foreach ($buildLogPath in $buildLogs) {
+            $c4530 += ([regex]::Matches((Get-Content $buildLogPath -Raw), 'C4530')).Count
+          }
           $dependents = dumpbin.exe /dependents (Join-Path $build 'tdlua.dll') 2>&1 | Out-String
           $dynamicCrt = [bool]($dependents -match '(?i)VCRUNTIME140\.dll')
           @(
@@ -249,7 +275,7 @@ jobs:
           if (-not $dynamicCrt) { throw 'TDLua module does not import the dynamic CRT: expected /MD' }
 
       - name: Verify module export table and dependencies
-        if: always() && steps.tdlua-build.outcome == 'success'
+        if: always() && steps.tdlua-link.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
@@ -268,7 +294,7 @@ jobs:
           "native_deps_ok=true" | Set-Content .ci\windows-msvc-native\link-verdict.txt
 
       - name: Enumerate the native CTest manifest
-        if: always() && steps.tdlua-build.outcome == 'success'
+        if: always() && steps.tdlua-link.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
@@ -320,7 +346,7 @@ jobs:
             Write-Output
 
       - name: Verify production linking without TDLUA_TESTING
-        if: always() && steps.tdlua-build.outcome == 'success'
+        if: always() && steps.tdlua-link.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
@@ -345,10 +371,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed for the production native build' }
 
       - name: Enforce the P5D.2 native build gates
-        if: always() && steps.tdlua-build.outcome == 'success'
+        if: always()
         run: |
           $ErrorActionPreference = 'Stop'
           $logDir = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc-native'
+          if ('${{ steps.tdlua-link.outcome }}' -ne 'success') {
+            throw "The native module did not link: outcome=${{ steps.tdlua-link.outcome }}"
+          }
+          if ('${{ steps.tdlua-build.outcome }}' -ne 'success') {
+            throw "The native test build did not complete: outcome=${{ steps.tdlua-build.outcome }}"
+          }
           foreach ($required in @('tdlua-compile-flags.txt', 'link-verdict.txt',
                                   'ctest-manifest-verdict.txt', 'generator-summary.txt')) {
             if (-not (Test-Path (Join-Path $logDir $required))) {
