@@ -152,6 +152,39 @@ inline void tdlua_lua_require_explicit_submission_context(lua_State *L)
 #endif
 }
 
+/* Converts an integral Lua number to lua_Integer, accepting the interval
+ * [-2^digits, 2^digits) for the value bits of lua_Integer. The bounds are exact
+ * powers of two, so they stay exact in every binary floating-point format.
+ * Casting the limits of lua_Integer to `long double` does not: with binary64
+ * `long double` it rounds 2^63-1 up to 2^63, so a number equal to 2^63 passes
+ * the interval check and reaches an out-of-range conversion. That conversion is
+ * undefined; on x86-64 it yields INT64_MIN and the round-trip check below
+ * rejects the value, on arm64 it saturates to INT64_MAX, which round-trips, so
+ * the value was silently replaced instead of rejected. */
+inline bool tdlua_lua_integral_number_value(lua_State *L, int index, lua_Integer &value)
+{
+    const lua_Number number = lua_tonumber(L, index);
+    const long double wide_number = static_cast<long double>(number);
+    const int integer_digits = std::numeric_limits<lua_Integer>::digits;
+    // Built from lua_Number, whose width and ABI are fixed for the target.
+    const lua_Number two_to_digits =
+        std::ldexp(static_cast<lua_Number>(1), integer_digits);
+    const long double minimum = -static_cast<long double>(two_to_digits);
+    const long double maximum = static_cast<long double>(two_to_digits);
+
+    if (!std::isfinite(wide_number) || std::floor(wide_number) != wide_number ||
+        wide_number < minimum || wide_number >= maximum) {
+        return false;
+    }
+
+    const lua_Integer integer = static_cast<lua_Integer>(number);
+    if (static_cast<long double>(integer) != wide_number) {
+        return false;
+    }
+    value = integer;
+    return true;
+}
+
 /* Lua 5.3 introduced a distinct integer value type.  Lua 5.1, Lua 5.2 and
  * LuaJIT expose lua_Integer in the C API, but their regular numeric values do
  * not provide the same reliable type distinction. */
@@ -168,24 +201,7 @@ inline bool tdlua_lua_integer_value(lua_State *L, int index, lua_Integer &value)
     }
     return false;
 #else
-    const lua_Number number = lua_tonumber(L, index);
-    const long double wide_number = static_cast<long double>(number);
-    const long double minimum =
-        static_cast<long double>((std::numeric_limits<lua_Integer>::min)());
-    const long double maximum =
-        static_cast<long double>((std::numeric_limits<lua_Integer>::max)());
-
-    if (!std::isfinite(wide_number) || std::floor(wide_number) != wide_number ||
-        wide_number < minimum || wide_number > maximum) {
-        return false;
-    }
-
-    const lua_Integer integer = static_cast<lua_Integer>(number);
-    if (static_cast<long double>(integer) != wide_number) {
-        return false;
-    }
-    value = integer;
-    return true;
+    return tdlua_lua_integral_number_value(L, index, value);
 #endif
 }
 
@@ -201,22 +217,7 @@ inline bool tdlua_lua_key_integer_value(lua_State *L, int index, lua_Integer &va
     if (lua_type(L, index) != LUA_TNUMBER) {
         return false;
     }
-    const lua_Number number = lua_tonumber(L, index);
-    const long double wide_number = static_cast<long double>(number);
-    const long double minimum =
-        static_cast<long double>((std::numeric_limits<lua_Integer>::min)());
-    const long double maximum =
-        static_cast<long double>((std::numeric_limits<lua_Integer>::max)());
-    if (!std::isfinite(wide_number) || std::floor(wide_number) != wide_number ||
-        wide_number < minimum || wide_number > maximum) {
-        return false;
-    }
-    const lua_Integer integer = static_cast<lua_Integer>(number);
-    if (static_cast<long double>(integer) != wide_number) {
-        return false;
-    }
-    value = integer;
-    return true;
+    return tdlua_lua_integral_number_value(L, index, value);
 #else
     return false;
 #endif
