@@ -152,52 +152,6 @@ static void test_resume(lua_State *L)
     lua_pop(L, 1);
 }
 
-static void test_push_integer(lua_State *L)
-{
-    const std::int64_t values[] = {
-        0, -42, 9007199254740992LL, 9007199254740993LL,
-        (std::numeric_limits<std::int64_t>::min)(),
-        (std::numeric_limits<std::int64_t>::max)()
-    };
-    for (const std::int64_t value : values) {
-        const int before = lua_gettop(L);
-        tdlua_lua_push_integer(L, value);
-        require(lua_gettop(L) == before + 1, "integer helper must push one value");
-#if LUA_VERSION_NUM >= 503
-        require(lua_isinteger(L, -1) && lua_tointeger(L, -1) == value,
-                "integer helper changed an int64");
-#else
-        if (value == 9007199254740993LL ||
-            value == (std::numeric_limits<std::int64_t>::max)()) {
-            require(lua_type(L, -1) == LUA_TSTRING &&
-                        lua_tostring(L, -1) == std::to_string(value),
-                    "integer helper rounded an int64 instead of using a string");
-        } else {
-            require(lua_type(L, -1) == LUA_TNUMBER &&
-                        static_cast<long double>(lua_tonumber(L, -1)) == value,
-                    "integer helper changed an exactly representable number");
-        }
-#endif
-        lua_pop(L, 1);
-    }
-}
-
-/* Numeric conversion boundaries.
- *
- * lua_Number is binary64 on every supported target, so INT64_MIN (-2^63) is
- * exactly representable while INT64_MAX is not: its nearest double is 2^63.
- * Every bound below is therefore built from std::ldexp instead of
- * static_cast<long double>(INT64_MAX), which rounds up to 2^63 whenever long
- * double is binary64 (MSVC x64, macOS arm64) and would hide exactly the defect
- * these cases must catch. The tests never cast a floating-point value outside
- * the int64 range, and never compare a lua_Number against long double(INT64_MAX).
- *
- * Lua value vs Lua table key matters here. The JSON value path calls
- * tdlua_lua_integer_value, which on Lua 5.3+ accepts only a real Lua integer, so
- * no float reaches the integral-number conversion. Integral floats still reach
- * it as numeric table keys through tdlua_lua_key_integer_value, and on Lua
- * 5.1/5.2/LuaJIT through both paths, because there every number is a float. */
-
 static lua_Number two_to(const int exponent)
 {
     return std::ldexp(static_cast<lua_Number>(1), exponent);
@@ -206,7 +160,8 @@ static lua_Number two_to(const int exponent)
 /* A 64-bit integer is exactly representable as binary64 when its significand
  * fits in 53 bits, i.e. when its bit width minus its trailing zero bits is at
  * most 53. Integer arithmetic keeps this expectation independent of long
- * double, which is binary64 on some targets and extended on others. */
+ * double, which is binary64 on some targets and extended on others, and of the
+ * function under test. */
 static bool exactly_representable_as_binary64(const std::int64_t value)
 {
     if (value == 0) {
@@ -228,6 +183,153 @@ static bool exactly_representable_as_binary64(const std::int64_t value)
     }
     return width - trailing <= 53;
 }
+
+/* Whether tdlua_can_push_integer must report the value as exactly pushable.
+ * Lua 5.3+ has an integer subtype, so an int64 always fits it. Older Lua
+ * stores every number as lua_Number, so only the values whose significand fits
+ * can be pushed as numbers; the rest must use the decimal string. */
+static bool can_push_as_number(const std::int64_t value)
+{
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+    (void)value;
+    return true;
+#else
+    return exactly_representable_as_binary64(value);
+#endif
+}
+
+/* Exercises both helpers on the same value and asserts the value and type Lua
+ * actually observes, with an expectation computed independently of
+ * tdlua_can_push_integer. */
+static void check_push_integer(lua_State *L, const std::int64_t value,
+                               const char *label)
+{
+    const bool expect_number = can_push_as_number(value);
+    require(tdlua_can_push_integer(value) == expect_number,
+            std::string(label) + ": wrong push classification");
+
+    const int before = lua_gettop(L);
+    tdlua_lua_push_integer(L, value);
+    require(lua_gettop(L) == before + 1, std::string(label) + ": must push one value");
+
+    if (expect_number) {
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
+        require(lua_isinteger(L, -1) && lua_tointeger(L, -1) == value,
+                std::string(label) + ": a JSON int64 must be a Lua integer");
+#else
+        require(lua_type(L, -1) == LUA_TNUMBER,
+                std::string(label) + ": an exact int64 must be a Lua number");
+        const lua_Number number = lua_tonumber(L, -1);
+        require(static_cast<std::int64_t>(number) == value,
+                std::string(label) + ": the Lua number changed the int64");
+        require(number == static_cast<lua_Number>(value),
+                std::string(label) + ": the Lua number is not the exact value");
+#endif
+    } else {
+        require(lua_type(L, -1) == LUA_TSTRING &&
+                    std::string(lua_tostring(L, -1)) == std::to_string(value),
+                std::string(label) + ": an unrepresentable int64 must be a decimal string");
+    }
+    lua_pop(L, 1);
+}
+
+static void test_push_integer(lua_State *L)
+{
+    require(std::numeric_limits<lua_Number>::radix == 2 &&
+                std::numeric_limits<lua_Number>::digits == 53,
+            "test assumption: lua_Number must be binary64");
+
+    struct Case {
+        const char *label;
+        std::int64_t value;
+        bool exactly_representable;
+    };
+    // Checked in integer arithmetic, never against the function under test.
+    // The set covers both sides of the 2^53 significand limit, INT64_MIN and
+    // INT64_MAX, powers of two at both ends of the exponent range, and large
+    // multiples of the spacing between adjacent binary64 values.
+    const Case cases[] = {
+        {"0", 0, true},
+        {"1", 1, true},
+        {"-1", -1, true},
+        {"-42", -42, true},
+        {"2^53 - 1", 9007199254740991LL, true},
+        {"2^53", 9007199254740992LL, true},
+        {"2^53 + 1", 9007199254740993LL, false},
+        {"2^53 + 2", 9007199254740994LL, true},
+        {"2^53 + 3", 9007199254740995LL, false},
+        {"2^53 + 4", 9007199254740996LL, true},
+        {"-2^53 - 1", -9007199254740993LL, false},
+        {"2^40", 1099511627776LL, true},
+        {"2^62", 4611686018427387904LL, true},
+        {"2^62 + 1", 4611686018427387905LL, false},
+        {"3 * 2^60", 3458764513820540928LL, true},
+        {"257 * 2^53", 2314850208468434944LL, true},
+        {"(2^53 + 1) * 2^9", 4611686018427388416LL, false},
+        {"(2^53 + 2) * 2^9", 4611686018427388928LL, true},
+        {"INT64_MIN + 1", (std::numeric_limits<std::int64_t>::min)() + 1, false},
+        {"INT64_MIN", (std::numeric_limits<std::int64_t>::min)(), true},
+        {"INT64_MAX", (std::numeric_limits<std::int64_t>::max)(), false},
+    };
+
+    for (const Case &c : cases) {
+        require(exactly_representable_as_binary64(c.value) == c.exactly_representable,
+                std::string("test assumption: wrong binary64 representability for ") +
+                    c.label);
+        check_push_integer(L, c.value, c.label);
+    }
+}
+
+/* The exact-representability rule must also reject a magnitude outside the
+ * format's exponent range. A binary64 lua_Number never reaches that branch,
+ * but a narrower binary format would, so the synthetic significand/exponent
+ * pairs below exercise it directly with fixed expectations. */
+static void test_int64_binary_format_fit()
+{
+    struct Case {
+        const char *label;
+        std::int64_t value;
+        int digits;
+        int max_exponent;
+        bool fits;
+    };
+    const Case cases[] = {
+        {"0 in binary64", 0, 53, 1024, true},
+        {"2^53 in binary64", 9007199254740992LL, 53, 1024, true},
+        {"2^53 + 1 in binary64", 9007199254740993LL, 53, 1024, false},
+        {"INT64_MIN in binary64", (std::numeric_limits<std::int64_t>::min)(), 53, 1024, true},
+        {"INT64_MAX in binary64", (std::numeric_limits<std::int64_t>::max)(), 53, 1024, false},
+        {"0 in binary16", 0, 11, 16, true},
+        {"2^11 in binary16", 2048LL, 11, 16, true},
+        {"65504 in binary16", 65504LL, 11, 16, true},
+        {"65505 in binary16", 65505LL, 11, 16, false},
+        {"2^16 in binary16", 65536LL, 11, 16, false},
+        {"INT64_MIN in binary16", (std::numeric_limits<std::int64_t>::min)(), 11, 16, false},
+        {"2^24 in binary32", 16777216LL, 24, 128, true},
+        {"2^24 + 1 in binary32", 16777217LL, 24, 128, false},
+        {"INT64_MIN in binary32", (std::numeric_limits<std::int64_t>::min)(), 24, 128, true},
+    };
+    for (const Case &c : cases) {
+        require(tdlua_int64_fits_binary_number(c.value, c.digits, c.max_exponent) == c.fits,
+                std::string("binary-format fit rule: ") + c.label);
+    }
+}
+
+/* Numeric conversion boundaries.
+ *
+ * lua_Number is binary64 on every supported target, so INT64_MIN (-2^63) is
+ * exactly representable while INT64_MAX is not: its nearest double is 2^63.
+ * Every bound below is therefore built from std::ldexp instead of
+ * static_cast<long double>(INT64_MAX), which rounds up to 2^63 whenever long
+ * double is binary64 (MSVC x64, macOS arm64) and would hide exactly the defect
+ * these cases must catch. The tests never cast a floating-point value outside
+ * the int64 range, and never compare a lua_Number against long double(INT64_MAX).
+ *
+ * Lua value vs Lua table key matters here. The JSON value path calls
+ * tdlua_lua_integer_value, which on Lua 5.3+ accepts only a real Lua integer, so
+ * no float reaches the integral-number conversion. Integral floats still reach
+ * it as numeric table keys through tdlua_lua_key_integer_value, and on Lua
+ * 5.1/5.2/LuaJIT through both paths, because there every number is a float. */
 
 static void require_json_integer(const json &value, const std::int64_t expected,
                                  const std::string &label)
@@ -546,6 +648,10 @@ static void test_numeric_push_round_trip(lua_State *L)
         {0, true},
         {-42, true},
         {9007199254740993LL, false},
+        {9007199254740994LL, true},
+        {(std::numeric_limits<std::int64_t>::min)() + 1, false},
+        {4611686018427388416LL, false},
+        {4611686018427388928LL, true},
         {9223372036854774784LL, true},
         {(std::numeric_limits<std::int64_t>::min)(), true},
         {(std::numeric_limits<std::int64_t>::max)(), false},
@@ -592,6 +698,7 @@ int main()
         test_unsupported_value(L);
         test_resume(L);
         test_push_integer(L);
+        test_int64_binary_format_fit();
         test_numeric_helper_boundaries(L);
         test_numeric_value_boundaries(L);
         test_numeric_key_boundaries(L);

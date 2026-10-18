@@ -141,6 +141,30 @@ bool float_fits_int64(const lua_Number number)
         number >= int64_lower_bound() && number < int64_upper_bound();
 }
 
+// Whether push_object can reproduce an int64 as an exact Lua number. Lua 5.3+
+// has an integer subtype, so any int64 fits it. Older Lua stores every number
+// as lua_Number, so only values whose binary significand holds the magnitude
+// can be pushed as numbers; the rest fall back to the decimal string. Decided
+// in integer arithmetic, independently of tdlua_can_push_integer, so the two
+// can be compared instead of the function being its own oracle.
+bool int64_reproducible_as_number(const std::int64_t value)
+{
+#if LUA_VERSION_NUM >= 503
+    (void)value;
+    return true;
+#else
+    if (std::numeric_limits<lua_Number>::radix != 2) return false;
+    if (value == 0) return true;
+    std::uint64_t magnitude = value < 0
+        ? static_cast<std::uint64_t>(-(value + 1)) + 1u
+        : static_cast<std::uint64_t>(value);
+    while ((magnitude & 1u) == 0) magnitude >>= 1;
+    int significant = 0;
+    for (; magnitude != 0; magnitude >>= 1) ++significant;
+    return significant <= std::numeric_limits<lua_Number>::digits;
+#endif
+}
+
 void test_int64_parity(lua_State *L)
 {
     const std::int64_t values[] = {0, 1, -1, 2147483648LL, 9007199254740991LL,
@@ -214,7 +238,10 @@ void test_int64_parity(lua_State *L)
         lua_pop(L, 2);
         tdlua_native::push_object(L, object);
         lua_getfield(L, -1, "custom_emoji_id");
-        if (tdlua_can_push_integer(value)) {
+        const bool expect_number = int64_reproducible_as_number(value);
+        require(tdlua_can_push_integer(value) == expect_number,
+                "tdlua_can_push_integer disagreed with the independent rule: " + text);
+        if (expect_number) {
             lua_Integer integer = 0;
             require(tdlua_lua_integer_value(L, -1, integer) && integer == value,
                     "native numeric output lost int64 precision");
@@ -224,7 +251,7 @@ void test_int64_parity(lua_State *L)
         }
         lua_pop(L, 2);
         std::cout << "int64 " << text << " string-input=exact native-output="
-                  << (tdlua_can_push_integer(value) ? "number" : "string")
+                  << (expect_number ? "number" : "string")
                   << " json-output=string\n";
     }
 }

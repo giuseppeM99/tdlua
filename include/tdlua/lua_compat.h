@@ -223,6 +223,40 @@ inline bool tdlua_lua_key_integer_value(lua_State *L, int index, lua_Integer &va
 #endif
 }
 
+/* Whether a binary floating-point format with `digits` significand bits and a
+ * largest exponent `max_exponent` represents the int64 exactly. A nonzero
+ * magnitude is 2^trailing * odd, so `odd` is the significand and the format
+ * holds the value when `odd` fits the significand and the magnitude stays
+ * inside the exponent range. Zero is exact. Only integer arithmetic is used,
+ * so the answer does not depend on `long double`, which is binary64 on MSVC
+ * x64 and macOS arm64 and made the former floating-point round-trip test
+ * tautological there. */
+inline bool tdlua_int64_fits_binary_number(std::int64_t value, int digits,
+                                           int max_exponent)
+{
+    if (value == 0) {
+        return true;
+    }
+    // Negating INT64_MIN would overflow: -(-9223372036854775808) is not an
+    // int64. Negate value + 1 and add one to recover the magnitude in uint64.
+    std::uint64_t odd = value < 0
+        ? static_cast<std::uint64_t>(-(value + 1)) + 1u
+        : static_cast<std::uint64_t>(value);
+    int trailing = 0;
+    while ((odd & 1u) == 0) {
+        odd >>= 1;
+        ++trailing;
+    }
+    int significant_bits = 0;
+    for (std::uint64_t rest = odd; rest != 0; rest >>= 1) {
+        ++significant_bits;
+    }
+    // The magnitude lies in [2^(total_bits - 1), 2^total_bits), so total_bits
+    // is its frexp-style exponent and must fit the format's exponent range.
+    const int total_bits = significant_bits + trailing;
+    return significant_bits <= digits && total_bits <= max_exponent;
+}
+
 inline bool tdlua_can_push_integer(std::int64_t value)
 {
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 503
@@ -232,8 +266,16 @@ inline bool tdlua_can_push_integer(std::int64_t value)
            wide_value <=
                static_cast<long double>((std::numeric_limits<lua_Integer>::max)());
 #else
-    const lua_Number number = static_cast<lua_Number>(value);
-    return static_cast<long double>(number) == static_cast<long double>(value);
+    // Lua 5.1, Lua 5.2 and LuaJIT store every number as lua_Number: push the
+    // exact value only when the significand holds it. A non-binary lua_Number
+    // is outside the rule below, so use the exact decimal string instead of
+    // rounding silently.
+    if (std::numeric_limits<lua_Number>::radix != 2) {
+        return false;
+    }
+    return tdlua_int64_fits_binary_number(
+        value, std::numeric_limits<lua_Number>::digits,
+        std::numeric_limits<lua_Number>::max_exponent);
 #endif
 }
 
