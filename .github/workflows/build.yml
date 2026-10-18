@@ -327,7 +327,7 @@ jobs:
           set -euo pipefail
           ctest --test-dir build-aarch64-native --repeat until-fail:100 \
             --output-on-failure --timeout 180 \
-            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_receiver_lifecycle_ownership|tdlua_failure_cleanup_phases|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
             2>&1 | tee .ci/aarch64-validation/native-repeat.log
 
       - name: Install production native module and TDLib package
@@ -422,7 +422,7 @@ jobs:
           set -euo pipefail
           ctest --test-dir build-aarch64-json --repeat until-fail:100 \
             --output-on-failure --timeout 180 \
-            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_receiver_lifecycle_ownership|tdlua_failure_cleanup_phases|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
             2>&1 | tee .ci/aarch64-validation/json-repeat.log
 
       - name: Install production JSON module and exercise it
