@@ -541,6 +541,37 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
+  legacy-number-precision:
+    name: Legacy Lua integer precision / binary64 long double
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Lua 5.2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblua5.2-dev lua5.2
+
+      - name: Build and run the codec test with binary64 long double
+        run: |
+          lua_library="$(find /usr/lib /lib -name 'liblua5.2.so' -print -quit)"
+          test -n "$lua_library"
+          # Lua 5.2 stores every number as lua_Number, so the int64 -> number
+          # conversion is the pre-5.3 branch. -mlong-double-64 reproduces the
+          # ABI of macOS arm64 and MSVC x64, where the former floating-point
+          # round-trip test was a tautology and rounded an unrepresentable
+          # int64 silently. It is confined to this isolated target and does not
+          # touch any other build.
+          g++ -std=c++11 -O2 -DNDEBUG -Wall -Wextra -Werror -mlong-double-64 \
+            -I include -I /usr/include/lua5.2 \
+            tests/codec_test.cpp src/common/lua_json.cpp \
+            -o "$RUNNER_TEMP/tdlua_codec_ld64" "$lua_library"
+          "$RUNNER_TEMP/tdlua_codec_ld64"
+          echo "binary64 long double: exact int64 values kept, unrepresentable ones use the decimal string"
+
   native:
     name: Native backend / C++23 / Lua 5.5
     runs-on: ubuntu-24.04
