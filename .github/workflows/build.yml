@@ -575,6 +575,11 @@ jobs:
   native:
     name: Native backend / C++23 / Lua 5.5
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -586,6 +591,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             curl \
             gperf \
@@ -593,6 +599,23 @@ jobs:
             openssl \
             libssl-dev \
             zlib1g-dev
+
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Build Lua 5.5
         run: |
@@ -607,6 +630,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
@@ -619,6 +644,9 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Report native compiler cache
+        run: ccache --show-stats
 
       - name: Prepare native Lua 5.5 artifact
         id: artifact
@@ -638,6 +666,11 @@ jobs:
   native-lua53:
     name: Native backend / C++23 / Lua 5.3
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -649,6 +682,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
             liblua5.3-dev \
@@ -658,12 +692,31 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.3.so -print -quit)"
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
@@ -676,6 +729,9 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Report native compiler cache
+        run: ccache --show-stats
 
       - name: Prepare native Lua 5.3 artifact
         id: artifact
@@ -695,6 +751,11 @@ jobs:
   native-lua52:
     name: Native backend / C++23 / Lua 5.2
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -706,6 +767,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
             liblua5.2-dev \
@@ -715,12 +777,31 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.2.so -print -quit)"
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
@@ -733,6 +814,9 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Report native compiler cache
+        run: ccache --show-stats
 
       - name: Prepare native Lua 5.2 artifact
         id: artifact
@@ -752,6 +836,11 @@ jobs:
   native-lua54:
     name: Native backend / C++23 / Lua 5.4
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -763,6 +852,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
             liblua5.4-dev \
@@ -772,12 +862,31 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
@@ -790,6 +899,9 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Report native compiler cache
+        run: ccache --show-stats
 
       - name: Prepare native Lua 5.4 artifact
         id: artifact
@@ -809,6 +921,11 @@ jobs:
   native-sanitizers:
     name: Native backend / TDLua ASan + UBSan
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -820,6 +937,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             curl \
             gperf \
@@ -827,6 +945,23 @@ jobs:
             openssl \
             libssl-dev \
             zlib1g-dev
+
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-debug-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-debug-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Build Lua 5.5
         run: |
@@ -841,6 +976,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_ENABLE_SANITIZERS=ON \
@@ -858,9 +995,17 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      - name: Report native compiler cache
+        run: ccache --show-stats
+
   native-luajit:
     name: Native backend / C++23 / LuaJIT 2.1
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -872,6 +1017,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
             libluajit-5.1-dev \
@@ -881,12 +1027,31 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
       - name: Configure native LuaJIT backend
         run: |
           luajit_library="$(find /usr/lib /lib -name libluajit-5.1.so -print -quit)"
           test -n "$luajit_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_BUNDLED_TDLIB=ON \
@@ -899,6 +1064,9 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      - name: Report native compiler cache
+        run: ccache --show-stats
 
       - name: Prepare native LuaJIT artifact
         id: artifact
