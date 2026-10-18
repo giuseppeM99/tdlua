@@ -749,6 +749,21 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_receiver_generic_fifo_metadata
             COMMAND tdlua_receiver_runtime_test --generic-fifo-metadata-only)
 
+        add_executable(tdlua_receiver_lifecycle_ownership_test
+            tests/receiver_lifecycle_ownership_test.cpp)
+        target_include_directories(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_receiver_lifecycle_ownership_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_receiver_lifecycle_ownership_test)
+        add_test(NAME tdlua_receiver_lifecycle_ownership
+            COMMAND tdlua_receiver_lifecycle_ownership_test)
+
         add_executable(tdlua_buffering_accounting_test
             tests/buffering_accounting_test.cpp)
         target_include_directories(tdlua_buffering_accounting_test PRIVATE
