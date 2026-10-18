@@ -764,6 +764,21 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_receiver_lifecycle_ownership
             COMMAND tdlua_receiver_lifecycle_ownership_test)
 
+        add_executable(tdlua_failure_cleanup_phases_test
+            tests/failure_cleanup_phases_test.cpp)
+        target_include_directories(tdlua_failure_cleanup_phases_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_failure_cleanup_phases_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_failure_cleanup_phases_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_failure_cleanup_phases_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_failure_cleanup_phases_test)
+        add_test(NAME tdlua_failure_cleanup_phases
+            COMMAND tdlua_failure_cleanup_phases_test)
+
         add_executable(tdlua_buffering_accounting_test
             tests/buffering_accounting_test.cpp)
         target_include_directories(tdlua_buffering_accounting_test PRIVATE
