@@ -16,8 +16,14 @@ env:
 
 jobs:
   tdlib:
-    name: Build static TDLib
+    name: Build pinned TDLib and static package
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-native-codegen-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -29,61 +35,168 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
+            liblua5.4-dev \
+            lua5.4 \
             ninja-build \
             openssl \
             libssl-dev \
             zlib1g-dev
 
-      - name: Restore TDLib build cache
-        id: tdlib-cache
+      # Runs after the dependencies so that cmake and ccache can report their
+      # versions; the compiler version and the TDLib pin are part of the cache
+      # key below.
+      - name: Record toolchain and pinned TDLib provenance
+        id: toolchain
+        run: |
+          set -euo pipefail
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          td_commit="$(git -C td rev-parse HEAD)"
+          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+          printf 'td_commit=%s\n' "$td_commit"
+          sha256sum td/td/generate/scheme/td_api.tl
+          cmake --version | head -n 1
+          ccache --version | head -n 1
+
+      - name: Restore pinned TDLib native codegen build
+        id: codegen-cache
         uses: actions/cache@v6
         with:
           path: |
-            td-build
-            .ci/tdlib
-            .ci/tdlib-static.tar.gz
-          key: tdlib-static-${{ runner.os }}-${{ hashFiles('td/**') }}
+            ${{ runner.temp }}/tdlua-native-bootstrap
+            ${{ runner.temp }}/tdlua-native-stage
+          key: tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
           restore-keys: |
-            tdlib-static-${{ runner.os }}-
+            tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
 
-      - name: Configure static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Build pinned TDLib and native codec tools
+        if: steps.codegen-cache.outputs.cache-hit != 'true'
         run: |
-          cmake -S td -B td-build -G Ninja \
+          set -euo pipefail
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          # A restored prefix match (pin bump) may hold a partially stale tree;
+          # configure from a clean directory and let ccache supply the objects.
+          rm -rf "$bootstrap" "$stage"
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B "$bootstrap" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DTD_INSTALL_STATIC_LIBRARIES=ON \
-            -DTD_INSTALL_SHARED_LIBRARIES=OFF \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/tdlib"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$stage" \
+            -DCMAKE_PREFIX_PATH="$stage" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library"
+          # The native backend links Td::TdStatic, and TDLib's static install
+          # rules export tdjson_static and tdjson_private. Build that archive
+          # explicitly so the installed package is complete.
+          cmake --build "$bootstrap" --target tdlua tdjson_static --parallel 2
+          cmake --install "$bootstrap"
+          # TDLib's install rules do not install the generated JSON header that
+          # native tests require; generate it and place it in the package.
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
 
-      - name: Build static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        run: cmake --build td-build --target tdjson_static
+      - name: Report codegen compiler cache
+        if: steps.codegen-cache.outputs.cache-hit != 'true'
+        run: ccache --show-stats
 
-      - name: Install static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+      - name: Verify pinned TDLib native codegen build
         run: |
-          cmake --install td-build
-          test -f "$GITHUB_WORKSPACE/.ci/tdlib/lib/libtdjson_static.a"
+          set -euo pipefail
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          test -f "$bootstrap/CMakeCache.txt"
+          grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$GITHUB_WORKSPACE" \
+            "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BACKEND:STRING=native$' "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BUNDLED_TDLIB:BOOL=ON$' "$bootstrap/CMakeCache.txt"
+          test -f "$bootstrap/td/tdtl/libtdtl.a"
+          test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
+          test -f "$bootstrap/td/tdutils/td/utils/config.h"
+          test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          grep -q 'Td::tdjson_private' "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          test -f "$stage/include/td/telegram/td_api_json.h"
+          test -f "$stage/lib/libtdjson_static.a"
+          test -z "$(git -C td status --porcelain)"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/td_api.tlo" td/td/generate/scheme/td_api.tl
+          test -s "$RUNNER_TEMP/td_api.tlo"
+          sha256sum "$bootstrap/td/tdtl/libtdtl.a" \
+            "$bootstrap/td/td/generate/tl-parser/tl-parser" \
+            "$stage/include/td/telegram/td_api_json.h" \
+            "$RUNNER_TEMP/td_api.tlo"
+
+      # The stage is also the prefix the native jobs use, so it carries TDLua's
+      # own install: the Lua module, its CMake package and the licences. The
+      # JSON jobs want the static TDLib package only, exactly what the
+      # standalone TDLib job used to publish, so those trees are left out and
+      # the result is checked instead of trusted.
+      - name: Package static TDLib package
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          test -f "$stage/lib/libtdjson_static.a"
           tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
           test -n "$tdlib_version"
-          printf '%s\n' "$tdlib_version" > "$GITHUB_WORKSPACE/.ci/tdlib/tdlib-version.txt"
-          tar -C "$GITHUB_WORKSPACE/.ci/tdlib" \
-            -czf "$GITHUB_WORKSPACE/.ci/tdlib-static.tar.gz" .
+          printf '%s\n' "$tdlib_version" > "$stage/tdlib-version.txt"
+          tar -C "$stage" -czf "$RUNNER_TEMP/tdlib-static.tar.gz" \
+            --exclude='./lib/lua' --exclude='./lib/lua/*' \
+            --exclude='./lib/cmake/tdlua' --exclude='./lib/cmake/tdlua/*' \
+            --exclude='./share' --exclude='./share/*' \
+            .
+          tar -tzf "$RUNNER_TEMP/tdlib-static.tar.gz" > "$RUNNER_TEMP/tdlib-static-members.txt"
+          if grep -qE '^\./(lib/lua|lib/cmake/tdlua|share)(/|$)' "$RUNNER_TEMP/tdlib-static-members.txt"; then
+            echo "the static TDLib package still carries TDLua's own install" >&2
+            exit 1
+          fi
+          for member in \
+            ./lib/libtdjson_static.a \
+            ./lib/cmake/Td/TdConfig.cmake \
+            ./include/td/telegram/td_api.h \
+            ./tdlib-version.txt; do
+            grep -qxF "$member" "$RUNNER_TEMP/tdlib-static-members.txt"
+          done
+          ls -l "$RUNNER_TEMP/tdlib-static.tar.gz"
+          sha256sum "$RUNNER_TEMP/tdlib-static.tar.gz"
 
-      - name: Verify static TDLib cache
+      - name: Package pinned TDLib native codegen build
         run: |
-          test -f .ci/tdlib/lib/libtdjson_static.a
-          test -f .ci/tdlib/tdlib-version.txt
-          test -f .ci/tdlib-static.tar.gz
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/tdlib-native-codegen.tar.gz" \
+            tdlua-native-stage tdlua-native-bootstrap
+          ls -l "$RUNNER_TEMP/tdlib-native-codegen.tar.gz"
+          sha256sum "$RUNNER_TEMP/tdlib-native-codegen.tar.gz"
+
+      - name: Upload pinned TDLib native codegen build
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload static TDLib package
         uses: actions/upload-artifact@v7
         with:
           name: tdlib-static
-          path: .ci/tdlib-static.tar.gz
+          path: ${{ runner.temp }}/tdlib-static.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -575,11 +688,7 @@ jobs:
   native:
     name: Native backend / C++23 / Lua 5.5
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
-      CCACHE_COMPRESS: 1
-      CCACHE_COMPRESSLEVEL: 6
-      CCACHE_MAXSIZE: 2G
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -591,7 +700,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache \
             cmake \
             curl \
             gperf \
@@ -600,22 +708,19 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Record toolchain
-        id: toolchain
-        run: |
-          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
-          ccache --version | head -n 1
-
-      - name: Restore native compiler cache
-        uses: actions/cache@v6
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
         with:
-          path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
-          restore-keys: |
-            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
 
-      - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Build Lua 5.5
         run: |
@@ -630,11 +735,11 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.5 \
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
@@ -644,9 +749,6 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
-
-      - name: Report native compiler cache
-        run: ccache --show-stats
 
       - name: Prepare native Lua 5.5 artifact
         id: artifact
@@ -666,11 +768,7 @@ jobs:
   native-lua53:
     name: Native backend / C++23 / Lua 5.3
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
-      CCACHE_COMPRESS: 1
-      CCACHE_COMPRESSLEVEL: 6
-      CCACHE_MAXSIZE: 2G
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -682,7 +780,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache \
             cmake \
             gperf \
             liblua5.3-dev \
@@ -692,22 +789,19 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Record toolchain
-        id: toolchain
-        run: |
-          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
-          ccache --version | head -n 1
-
-      - name: Restore native compiler cache
-        uses: actions/cache@v6
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
         with:
-          path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
-          restore-keys: |
-            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
 
-      - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Configure native backend
         run: |
@@ -715,11 +809,11 @@ jobs:
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.3 \
             -DLUA_EXECUTABLE="$(command -v lua5.3)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
@@ -729,9 +823,6 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
-
-      - name: Report native compiler cache
-        run: ccache --show-stats
 
       - name: Prepare native Lua 5.3 artifact
         id: artifact
@@ -751,11 +842,7 @@ jobs:
   native-lua52:
     name: Native backend / C++23 / Lua 5.2
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
-      CCACHE_COMPRESS: 1
-      CCACHE_COMPRESSLEVEL: 6
-      CCACHE_MAXSIZE: 2G
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -767,7 +854,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache \
             cmake \
             gperf \
             liblua5.2-dev \
@@ -777,22 +863,19 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Record toolchain
-        id: toolchain
-        run: |
-          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
-          ccache --version | head -n 1
-
-      - name: Restore native compiler cache
-        uses: actions/cache@v6
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
         with:
-          path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
-          restore-keys: |
-            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
 
-      - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Configure native backend
         run: |
@@ -800,11 +883,11 @@ jobs:
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.2 \
             -DLUA_EXECUTABLE="$(command -v lua5.2)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.2 \
@@ -814,9 +897,6 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
-
-      - name: Report native compiler cache
-        run: ccache --show-stats
 
       - name: Prepare native Lua 5.2 artifact
         id: artifact
@@ -836,11 +916,7 @@ jobs:
   native-lua54:
     name: Native backend / C++23 / Lua 5.4
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
-      CCACHE_COMPRESS: 1
-      CCACHE_COMPRESSLEVEL: 6
-      CCACHE_MAXSIZE: 2G
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -852,7 +928,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache \
             cmake \
             gperf \
             liblua5.4-dev \
@@ -862,22 +937,19 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Record toolchain
-        id: toolchain
-        run: |
-          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
-          ccache --version | head -n 1
-
-      - name: Restore native compiler cache
-        uses: actions/cache@v6
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
         with:
-          path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
-          restore-keys: |
-            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
 
-      - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Configure native backend
         run: |
@@ -885,11 +957,11 @@ jobs:
           test -n "$lua_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.4 \
             -DLUA_EXECUTABLE="$(command -v lua5.4)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
@@ -899,9 +971,6 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
-
-      - name: Report native compiler cache
-        run: ccache --show-stats
 
       - name: Prepare native Lua 5.4 artifact
         id: artifact
@@ -1001,11 +1070,7 @@ jobs:
   native-luajit:
     name: Native backend / C++23 / LuaJIT 2.1
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
-      CCACHE_COMPRESS: 1
-      CCACHE_COMPRESSLEVEL: 6
-      CCACHE_MAXSIZE: 2G
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -1017,7 +1082,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache \
             cmake \
             gperf \
             libluajit-5.1-dev \
@@ -1027,22 +1091,19 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
-      - name: Record toolchain
-        id: toolchain
-        run: |
-          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
-          ccache --version | head -n 1
-
-      - name: Restore native compiler cache
-        uses: actions/cache@v6
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
         with:
-          path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
-          restore-keys: |
-            tdlua-native-release-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
 
-      - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Configure native LuaJIT backend
         run: |
@@ -1050,11 +1111,11 @@ jobs:
           test -n "$luajit_library"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_IMPLEMENTATION=luajit \
             -DLUA_EXECUTABLE="$(command -v luajit)" \
             -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
@@ -1064,9 +1125,6 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
-
-      - name: Report native compiler cache
-        run: ccache --show-stats
 
       - name: Prepare native LuaJIT artifact
         id: artifact
