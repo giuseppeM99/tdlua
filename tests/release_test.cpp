@@ -518,9 +518,18 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     // deadline passed to each receive rather than imposing a scheduler SLA.
     require(cross_max_wait <= 0.025001, "cross-client receive exceeded the poll timeout");
     const auto check_cross_deadline = [&](const std::vector<Fake::ReceiveTrace>& trace) {
+        if (trace.empty()) return;
+        // A timed poll starts its deadline when poll() is entered, which is
+        // necessarily later than any instant captured outside the call.
+        // Anchoring the remaining budget on the caller's clock would charge the
+        // scheduler for the caller's own compile and dispatch overhead, so a
+        // preempted caller fails spuriously. Anchor on the first transport call
+        // of the same poll: the deadline is then provably not later than
+        // anchor + timeout, which is the tightest sound bound available here.
+        const auto deadline_anchor = trace.front().started;
         for (const auto& entry : trace) {
             const double elapsed_before_receive =
-                std::chrono::duration<double>(entry.started - cross_poll_started).count();
+                std::chrono::duration<double>(entry.started - deadline_anchor).count();
             const double remaining_budget = std::max(0.0, 0.025 - elapsed_before_receive);
             require(entry.timeout <= remaining_budget + 0.001,
                     "cross-client receive exceeded its remaining poll deadline");
@@ -755,9 +764,15 @@ void scenarios(lua_State *L, Fake &f, Fake &other) {
     std::size_t managed_response_count=0;
     bool tight_empty_receive_loop=false;
     std::size_t rapid_empty_receive_streak=0;
+    // Same anchoring rule as the cross-client deadline check: measure the
+    // remaining budget from the first transport call of this poll, not from an
+    // instant captured before poll() was entered.
+    const auto managed_deadline_anchor = deadline_trace.empty()
+        ? managed_only_poll_start
+        : deadline_trace.front().started;
     for (const auto &entry : deadline_trace) {
         const double elapsed_before_receive=std::chrono::duration<double>(
-            entry.started-managed_only_poll_start).count();
+            entry.started-managed_deadline_anchor).count();
         const double remaining_budget=std::max(0.0, 0.04-elapsed_before_receive);
         if (entry.timeout > remaining_budget+0.001 ||
             entry.timeout > previous_requested_wait+0.001)
