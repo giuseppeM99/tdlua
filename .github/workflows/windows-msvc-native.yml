@@ -20,6 +20,11 @@ permissions:
 env:
   TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
   CMAKE_BUILD_PARALLEL_LEVEL: 4
+  # vcpkg's default binary cache lives under %LOCALAPPDATA% on the runner, so it
+  # is empty at the start of every job and OpenSSL, zlib and gperf are compiled
+  # again each time. Point the files provider at a workspace directory that the
+  # job caches and restores instead.
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.ci/vcpkg-archives,readwrite
 
 jobs:
   windows-msvc-native:
@@ -88,17 +93,44 @@ jobs:
           if ($tdlibStatus.Count -gt 0) { throw 'TDLib submodule has local modifications' }
           $clText = (& cl.exe /Bv 2>&1 | Out-String)
           $clVersion = [regex]::Match($clText, '19\.\d+\.\d+').Value
-          $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory |
-            Sort-Object Name -Descending | Select-Object -First 1).Name
+          # The SDK version has to come from the environment the compiler uses.
+          # The directory listing is only the last resort: it also contains
+          # entries such as 'wdf', which sort above the version directories and
+          # used to end up in the cache key.
+          $sdk = ([regex]::Match([string]$env:INCLUDE, 'Windows Kits\\10\\Include\\(\d+\.\d+\.\d+\.\d+)')).Groups[1].Value
+          if (-not $sdk -and $env:WindowsSDKVersion) {
+            $sdk = $env:WindowsSDKVersion.TrimEnd('\')
+          }
+          if (-not $sdk) {
+            $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1).Name
+            "Neither INCLUDE nor WindowsSDKVersion named the SDK; fell back to the newest version directory" |
+              Tee-Object -Append -FilePath $log
+          }
+          if (-not $sdk) { throw 'Could not determine the Windows SDK version in use' }
           $vcpkgCommit = (& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD).Trim()
           "cl=$clVersion" >> $env:GITHUB_OUTPUT
           "sdk=$sdk" >> $env:GITHUB_OUTPUT
           "vcpkg=$vcpkgCommit" >> $env:GITHUB_OUTPUT
           "schema=$((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)" >> $env:GITHUB_OUTPUT
 
+      - name: Restore the pinned vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.ci/vcpkg-archives
+          key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
+          restore-keys: |
+            vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-
+
       - name: Install pinned tool dependencies with vcpkg
+        id: vcpkg-install
         run: |
           $ErrorActionPreference = 'Stop'
+          # VCPKG_BINARY_SOURCES points here. Create it first so a restore miss
+          # cannot turn into a vcpkg failure.
+          New-Item -ItemType Directory -Force .ci\vcpkg-archives | Out-Null
           $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
           & $vcpkg install openssl:x64-windows zlib:x64-windows gperf:x64-windows 2>&1 |
             Tee-Object -FilePath .ci\windows-msvc-native\vcpkg-install.log
@@ -113,6 +145,13 @@ jobs:
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           "GPERF_EXECUTABLE=$($gperf.FullName)" >> $env:GITHUB_ENV
           "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Save the vcpkg binary cache
+        if: steps.vcpkg-install.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ci/vcpkg-archives
+          key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
 
       - name: Build Lua 5.4.8 with MSVC
         run: |
@@ -129,17 +168,171 @@ jobs:
           "LUA_EXECUTABLE=$lua\lua.exe" >> $env:GITHUB_ENV
           "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
 
-      - name: Configure TDLua native with bundled TDLib
+      - name: Restore the pinned static TDLib package and codegen tools
+        id: tdlib-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ runner.temp }}/tdlua-native-stage
+            ${{ runner.temp }}/tdlua-native-bootstrap
+          # No restore-keys: this entry holds a build tree, not a package store,
+          # so a near miss would leave a CMake cache from another toolchain
+          # behind. The recipe hash covers every file that can change what TDLib
+          # is built with, including the top level CMakeLists.txt that selects
+          # TD_INSTALL_STATIC_LIBRARIES.
+          key: tdlib-msvc-native-v2-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'td/CMakeLists.txt', 'tools/windows/verify-tdlib-package.ps1', '.github/workflows/windows-msvc-native.yml') }}
+
+      - name: Assess the restored TDLib package
+        id: tdlib-assess
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reuse = 'false'
+          $reason = 'nothing was restored: the package will be built'
+          # The same check the certification step runs, but a failure here means
+          # the restored package is discarded and rebuilt instead of failing the
+          # job on a cache the run cannot replace.
+          if ('${{ steps.tdlib-cache.outputs.cache-hit }}' -eq 'true') {
+            try {
+              & .\tools\windows\verify-tdlib-package.ps1 `
+                -Stage "$env:RUNNER_TEMP\tdlua-native-stage" `
+                -Bootstrap "$env:RUNNER_TEMP\tdlua-native-bootstrap" `
+                -SchemaPath 'td\td\generate\scheme\td_api.tl' `
+                -SchemaHash '${{ steps.provenance.outputs.schema }}' `
+                -Version '1.8.68' `
+                -SourceDirectory $env:GITHUB_WORKSPACE `
+                -Compiler (Get-Command cl.exe).Source `
+                -Mode check 2>&1 |
+                Tee-Object -FilePath .ci\windows-msvc-native\tdlib-package-assessment.log
+              $reuse = 'true'
+              $reason = 'the restored package matches its manifest'
+            } catch {
+              $reuse = 'false'
+              $reason = "the restored package was rejected and will be rebuilt: $($_.Exception.Message)"
+            }
+          }
+          "reuse=$reuse" >> $env:GITHUB_OUTPUT
+          $reason | Tee-Object -FilePath .ci\windows-msvc-native\tdlib-cache-decision.txt
+
+      - name: Build and install the static TDLib package and codegen tools
+        if: steps.tdlib-assess.outputs.reuse != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Both directories stay outside the workspace and under a stable path,
+          # because the bootstrap build records absolute paths in CMakeCache.txt
+          # and the restored package has to keep resolving them.
+          $bootstrap = "$env:RUNNER_TEMP\tdlua-native-bootstrap"
+          $stage = "$env:RUNNER_TEMP\tdlua-native-stage"
+          # A package is reused only after its manifest checked out, so anything
+          # still on disk here is a rejected restore: start from a clean tree.
+          foreach ($dir in @($bootstrap, $stage)) {
+            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+          }
+          cmake -S . -B $bootstrap -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_INSTALL_PREFIX="$stage" `
+            -DCMAKE_PREFIX_PATH="$stage" `
+            -DTDLUA_BACKEND=native `
+            -DTDLUA_BUNDLED_TDLIB=ON `
+            -DTDLUA_BUILD_TESTS=OFF `
+            -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" `
+            -DLUA_LIBRARY="$env:LUA_LIBRARY" `
+            -DLUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DTDLUA_LUA_EXECUTABLE="$env:LUA_EXECUTABLE" `
+            -DCMAKE_C_FLAGS=/DLUA_BUILD_AS_DLL `
+            -DCMAKE_CXX_FLAGS=/DLUA_BUILD_AS_DLL `
+            2>&1 | Tee-Object -FilePath .ci\windows-msvc-native\tdlib-bootstrap-configure.log
+          if ($LASTEXITCODE -ne 0) { throw "Bundled TDLib bootstrap configure failed: $LASTEXITCODE" }
+          Copy-Item (Join-Path $bootstrap 'CMakeCache.txt') .ci\windows-msvc-native\tdlib-bootstrap-cache.txt
+          $bootstrapCache = Get-Content .ci\windows-msvc-native\tdlib-bootstrap-cache.txt
+          foreach ($needle in @('TDLUA_BACKEND:STRING=native', 'TDLUA_BUNDLED_TDLIB:BOOL=ON',
+                                'TD_INSTALL_STATIC_LIBRARIES:BOOL=ON', 'TD_INSTALL_SHARED_LIBRARIES:BOOL=OFF',
+                                'TD_ENABLE_LTO:BOOL=OFF')) {
+            if ($bootstrapCache -notcontains $needle) { throw "Unexpected bootstrap value: $needle" }
+          }
+          # The module links Td::TdStatic, and TDLib only installs tdjson_static
+          # when static libraries are enabled, so build both explicitly.
+          cmake --build $bootstrap --config Release --parallel 4 `
+            --target tdlua tdjson_static 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-bootstrap-build.log
+          if ($LASTEXITCODE -ne 0) { throw "Bundled TDLib bootstrap build failed: $LASTEXITCODE" }
+          cmake --install $bootstrap --config Release 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-bootstrap-install.log
+          if ($LASTEXITCODE -ne 0) { throw "Bundled TDLib bootstrap install failed: $LASTEXITCODE" }
+          if (-not (Test-Path "$stage\lib\cmake\Td\TdStaticTargets.cmake")) {
+            throw 'The staged TDLib package does not export TdStaticTargets.cmake'
+          }
+          # The native tests include td/telegram/td_api_json.h, which TDLib's own
+          # generator writes into the source tree and the install package does
+          # not ship. Produce it here from the pinned schema and stage it with
+          # the package, so that a cache hit has nothing left to build.
+          cmake --build $bootstrap --config Release --parallel 1 `
+            --target tl_generate_json 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-json-header.log
+          if ($LASTEXITCODE -ne 0) { throw "TDLib JSON header generation failed: $LASTEXITCODE" }
+          $jsonHeader = 'td\td\generate\auto\td\telegram\td_api_json.h'
+          if (-not (Test-Path -LiteralPath $jsonHeader)) {
+            $found = Get-ChildItem -Path $bootstrap -Recurse -Filter 'td_api_json.h' -File |
+              Select-Object -First 1
+            if (-not $found) { throw 'td_api_json.h was not generated' }
+            $jsonHeader = $found.FullName
+          }
+          New-Item -ItemType Directory -Force "$stage\include\td\telegram" | Out-Null
+          Copy-Item -LiteralPath $jsonHeader "$stage\include\td\telegram\td_api_json.h" -Force
+
+      - name: Verify the TDLib package and codegen tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bootstrap = "$env:RUNNER_TEMP\tdlua-native-bootstrap"
+          $stage = "$env:RUNNER_TEMP\tdlua-native-stage"
+          $schemaHash = (Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash
+          # Certification: the same checks the assessment ran, applied to the
+          # package this run actually has, whether it was restored or built. It
+          # also writes the manifest that later runs compare against.
+          & .\tools\windows\verify-tdlib-package.ps1 `
+            -Stage $stage `
+            -Bootstrap $bootstrap `
+            -SchemaPath 'td\td\generate\scheme\td_api.tl' `
+            -SchemaHash '${{ steps.provenance.outputs.schema }}' `
+            -Version '1.8.68' `
+            -SourceDirectory $env:GITHUB_WORKSPACE `
+            -Compiler (Get-Command cl.exe).Source `
+            -Mode write 2>&1 |
+            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-package-verify.log
+          $manifest = @(Get-Content "$stage\tdlib-stage-manifest.txt")
+          Copy-Item "$stage\tdlib-stage-manifest.txt" .ci\windows-msvc-native\tdlib-stage-manifest.txt -Force
+          @(
+            "td_api_schema_sha256=$schemaHash"
+            "tdlib_commit=$env:TDLIB_COMMIT"
+            "bootstrap=$bootstrap"
+            "stage=$stage"
+            "cl=${{ steps.provenance.outputs.cl }}"
+            "sdk=${{ steps.provenance.outputs.sdk }}"
+            "vcpkg=${{ steps.provenance.outputs.vcpkg }}"
+            "manifest_entries=$($manifest.Count)"
+            "package_reused=${{ steps.tdlib-assess.outputs.reuse }}"
+          ) | Set-Content .ci\windows-msvc-native\tdlib-package-provenance.txt
+          $manifest | Add-Content .ci\windows-msvc-native\tdlib-package-provenance.txt
+          @(
+            'tdlib_package_ok=true'
+            "tdlib_package_reused=${{ steps.tdlib-assess.outputs.reuse }}"
+          ) | Set-Content .ci\windows-msvc-native\tdlib-package-verdict.txt
+
+      - name: Configure TDLua native against the staged TDLib package
         id: tdlua-configure
         run: |
           $ErrorActionPreference = 'Stop'
           $build = $env:TDLUA_BUILD_DIR
+          $stage = "$env:RUNNER_TEMP\tdlua-native-stage"
           cmake -S . -B $build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DTDLUA_BACKEND=native `
-            -DTDLUA_BUNDLED_TDLIB=ON `
+            -DTDLUA_BUNDLED_TDLIB=OFF `
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$env:RUNNER_TEMP\tdlua-native-bootstrap" `
+            -DCMAKE_PREFIX_PATH="$stage" `
             -DTDLUA_BUILD_TESTS=ON `
             -DLUA_INCLUDE_DIR="$env:LUA_INCLUDE_DIR" `
             -DLUA_LIBRARY="$env:LUA_LIBRARY" `
@@ -153,33 +346,18 @@ jobs:
           "TDLUA_INSTALL_DIR=$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\install" >> $env:GITHUB_ENV
           Copy-Item (Join-Path $build 'CMakeCache.txt') .ci\windows-msvc-native\CMakeCache.txt
           $cache = Get-Content .ci\windows-msvc-native\CMakeCache.txt
-          foreach ($needle in @('TDLUA_BACKEND:STRING=native', 'TDLUA_BUNDLED_TDLIB:BOOL=ON',
-                                'TDLUA_BUILD_TESTS:BOOL=ON',
-                                'TD_INSTALL_STATIC_LIBRARIES:BOOL=ON', 'TD_INSTALL_SHARED_LIBRARIES:BOOL=OFF',
-                                'TD_ENABLE_LTO:BOOL=OFF')) {
+          foreach ($needle in @('TDLUA_BACKEND:STRING=native', 'TDLUA_BUNDLED_TDLIB:BOOL=OFF',
+                                'TDLUA_BUILD_TESTS:BOOL=ON')) {
             if ($cache -notcontains $needle) { throw "Unexpected configured value: $needle" }
           }
-
-      - name: Build pinned TDLib static libraries and code generators
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $build = $env:TDLUA_BUILD_DIR
-          cmake --build $build --config Release --parallel 4 `
-            --target tdclient tl_generate_tlo 2>&1 |
-            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-static-build.log
-          if ($LASTEXITCODE -ne 0) { throw "TDLib static/generator build failed: $LASTEXITCODE" }
-          $tdclient = Get-ChildItem -Path $build -Recurse -Filter 'tdclient.lib' |
-            Select-Object -First 1
-          if (-not $tdclient) { throw 'tdclient.lib was not produced by the static TDLib build' }
-          "TDLib static library: $($tdclient.FullName)" |
-            Tee-Object -FilePath .ci\windows-msvc-native\tdlib-static-artifacts.log
-          $tlParser = Get-ChildItem -Path $build -Recurse -Filter 'tl-parser.exe' |
-            Select-Object -First 1
-          if (-not $tlParser) { throw 'tl-parser.exe was not produced' }
-          $tdtl = Get-ChildItem -Path $build -Recurse -Filter 'tdtl.lib' | Select-Object -First 1
-          if (-not $tdtl) { throw 'tdtl.lib was not produced' }
-          "TDLib codegen tools: $($tlParser.FullName); $($tdtl.FullName)" |
-            Tee-Object -Append -FilePath .ci\windows-msvc-native\tdlib-static-artifacts.log
+          # The point of the cache is to link against the staged package. Assert
+          # that find_package resolved to it instead of a bundled TDLib copy.
+          $tdDir = $cache | Where-Object { $_ -like 'Td_DIR:PATH=*' }
+          if (-not $tdDir) { throw 'The native build did not resolve a Td package' }
+          if ($tdDir -notlike "*tdlua-native-stage*") {
+            throw "The native build is not using the staged TDLib package: $tdDir"
+          }
+          "TDLib package: $tdDir" | Set-Content .ci\windows-msvc-native\tdlib-package-location.txt
 
       - name: Run the native codec generator and verify the shards
         run: |
@@ -241,6 +419,18 @@ jobs:
           cmake --build $build --config Release --parallel 4 -- -k 0 2>&1 |
             Tee-Object -FilePath .ci\windows-msvc-native\tdlua-build.log
           if ($LASTEXITCODE -ne 0) { throw "TDLua native test build failed: $LASTEXITCODE" }
+
+      # Save the package only after the native tests compiled against it: they
+      # are the consumers of td_api_json.h, and an entry that no consumer can
+      # use must never become what future runs restore.
+      - name: Save the verified TDLib package and codegen tools
+        if: success() && steps.tdlib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ runner.temp }}/tdlua-native-stage
+            ${{ runner.temp }}/tdlua-native-bootstrap
+          key: tdlib-msvc-native-v2-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'td/CMakeLists.txt', 'tools/windows/verify-tdlib-package.ps1', '.github/workflows/windows-msvc-native.yml') }}
 
       - name: Verify MSVC Release compile configuration
         if: always() && steps.tdlua-link.outcome == 'success'
@@ -476,7 +666,8 @@ jobs:
           }
           foreach ($required in @('tdlua-compile-flags.txt', 'link-verdict.txt',
                                   'ctest-manifest-verdict.txt', 'generator-summary.txt',
-                                  'runtime-gate-verdict.txt', 'production-install-verdict.txt')) {
+                                  'runtime-gate-verdict.txt', 'production-install-verdict.txt',
+                                  'tdlib-package-verdict.txt', 'tdlib-package-location.txt')) {
             if (-not (Test-Path (Join-Path $logDir $required))) {
               throw "Native gate artifact missing: $required"
             }

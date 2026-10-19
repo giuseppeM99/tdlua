@@ -30,6 +30,11 @@ permissions:
 env:
   TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
   CMAKE_BUILD_PARALLEL_LEVEL: 2
+  # vcpkg's default binary cache lives under %LOCALAPPDATA% on the runner, so it
+  # is empty at the start of every job and OpenSSL, zlib and gperf are compiled
+  # again each time. Point the files provider at a workspace directory that the
+  # job caches and restores instead.
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.ci/vcpkg-archives,readwrite
 
 jobs:
   windows-msvc-json:
@@ -81,16 +86,44 @@ jobs:
           if ($tdlibStatus.Count -gt 0) { throw 'TDLib submodule has local modifications' }
           $clText = (& cl.exe /Bv 2>&1 | Out-String)
           $clVersion = [regex]::Match($clText, '19\.\d+\.\d+').Value
-          $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+          # The SDK version has to come from the environment the compiler uses.
+          # The directory listing is only the last resort: it also contains
+          # entries such as 'wdf', which sort above the version directories and
+          # used to end up in the cache key.
+          $sdk = ([regex]::Match([string]$env:INCLUDE, 'Windows Kits\\10\\Include\\(\d+\.\d+\.\d+\.\d+)')).Groups[1].Value
+          if (-not $sdk -and $env:WindowsSDKVersion) {
+            $sdk = $env:WindowsSDKVersion.TrimEnd('\')
+          }
+          if (-not $sdk) {
+            $sdk = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1).Name
+            "Neither INCLUDE nor WindowsSDKVersion named the SDK; fell back to the newest version directory" |
+              Tee-Object -Append -FilePath $log
+          }
+          if (-not $sdk) { throw 'Could not determine the Windows SDK version in use' }
           $vcpkgCommit = (& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD).Trim()
           "cl=$clVersion" >> $env:GITHUB_OUTPUT
           "sdk=$sdk" >> $env:GITHUB_OUTPUT
           "vcpkg=$vcpkgCommit" >> $env:GITHUB_OUTPUT
           "schema=$((Get-FileHash -Algorithm SHA256 td\td\generate\scheme\td_api.tl).Hash)" >> $env:GITHUB_OUTPUT
 
+      - name: Restore the pinned vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.ci/vcpkg-archives
+          key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
+          restore-keys: |
+            vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-
+
       - name: Install pinned tool dependencies with vcpkg
+        id: vcpkg-install
         run: |
           $ErrorActionPreference = 'Stop'
+          # VCPKG_BINARY_SOURCES points here. Create it first so a restore miss
+          # cannot turn into a vcpkg failure.
+          New-Item -ItemType Directory -Force .ci\vcpkg-archives | Out-Null
           $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
           & $vcpkg install openssl:x64-windows zlib:x64-windows gperf:x64-windows 2>&1 | Tee-Object -FilePath .ci\windows-msvc\vcpkg-install.log
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed: $LASTEXITCODE" }
@@ -103,6 +136,13 @@ jobs:
           & $gperf.FullName --version | Tee-Object -Append -FilePath .ci\windows-msvc\gperf.log
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Save the vcpkg binary cache
+        if: steps.vcpkg-install.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ci/vcpkg-archives
+          key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
 
       - name: Restore pinned TDLib MSVC package
         id: tdlib-cache
