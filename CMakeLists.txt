@@ -320,9 +320,25 @@ else()
       message(FATAL_ERROR
               "TDLUA_TDLIB_CODEGEN_BUILD_DIR must be a bundled native build of this source tree using the same C++ compiler")
     endif()
+    # The bundled build names the codec library and the schema compiler after
+    # the active toolchain: MSVC produces tdtl.lib, the Unix linkers produce
+    # libtdtl.a, and a Windows host always appends .exe to the compiler.
+    if(MSVC)
+      set(_tdlua_codegen_library_name "tdtl.lib")
+    else()
+      set(_tdlua_codegen_library_name "libtdtl.a")
+    endif()
+    if(WIN32)
+      set(_tdlua_codegen_tl_parser_name "tl-parser.exe")
+    else()
+      set(_tdlua_codegen_tl_parser_name "tl-parser")
+    endif()
+    set(_tdlua_codegen_library_relative "td/tdtl/${_tdlua_codegen_library_name}")
+    set(_tdlua_codegen_tl_parser_relative
+        "td/td/generate/tl-parser/${_tdlua_codegen_tl_parser_name}")
     foreach(_tdlua_codegen_artifact
-            "td/tdtl/libtdtl.a"
-            "td/td/generate/tl-parser/tl-parser"
+            "${_tdlua_codegen_library_relative}"
+            "${_tdlua_codegen_tl_parser_relative}"
             "td/tdutils/td/utils/config.h")
       if(NOT EXISTS "${_tdlua_codegen_build_dir}/${_tdlua_codegen_artifact}")
         message(FATAL_ERROR
@@ -330,9 +346,9 @@ else()
       endif()
     endforeach()
     set(_tdlua_native_codegen_library
-        "${_tdlua_codegen_build_dir}/td/tdtl/libtdtl.a")
+        "${_tdlua_codegen_build_dir}/${_tdlua_codegen_library_relative}")
     set(_tdlua_native_tl_parser
-        "${_tdlua_codegen_build_dir}/td/td/generate/tl-parser/tl-parser")
+        "${_tdlua_codegen_build_dir}/${_tdlua_codegen_tl_parser_relative}")
     get_target_property(_tdlua_native_td_include_dirs
         Td::TdStatic INTERFACE_INCLUDE_DIRECTORIES)
     if(NOT _tdlua_native_td_include_dirs)
