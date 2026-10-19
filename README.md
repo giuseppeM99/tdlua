@@ -290,6 +290,22 @@ returns `nil`. Zero gives one nonblocking progress opportunity, including
 current-client and dependency reads, without an idle sleep. A generic event
 behind other transport objects may require another zero-timeout call.
 
+One monotonic deadline is shared by every read the call makes: each read is asked
+for at most the time still remaining to that deadline, never for a fresh copy of
+the public timeout. The budget asked of distinct transports is capped
+independently, so the sum of the requested budgets can exceed the public timeout
+even though no single read overruns the deadline. Keep three quantities apart:
+the requested budget (what the scheduler passes to a transport), the effective
+wait (what that transport actually blocks for) and the wall time of the call,
+which also covers Lua dispatch and lock contention.
+
+In a timed `poll()`, once a generic update has been selected for the current
+client the call returns after that client's read instead of starting the
+remaining cross-client dependency round. The pending Task keeps its owner and its
+binding, and the next drive step of the same client (`poll()`, `loop()` or a
+`:wait()`) pumps the dependency before the Task is resumed. Zero-timeout `poll()`
+and untimed `poll()`/`loop()` keep their dependency round unchanged.
+
 ```lua
 local future = client:getMe()
 local me = future:wait()
@@ -481,6 +497,12 @@ generic events. `receive()` and `poll()` express generic interest only while
 their respective operation runs. If a generic consumer and a handler-only
 loop run concurrently, generic interest takes precedence.
 
+Demand is created by an operation that is actually waiting or driving, not by
+configuration: an in-flight `receive()`, a `poll()` or `loop(callback)` that is
+currently selecting, and the managed driver while it still has pending requests
+or ready states. When no client expresses demand, the shared receiver stops
+draining the source.
+
 The receiver/backend generic buffer keeps at most 1024 pending generic event
 tickets per client and expires tickets after 120 seconds. When full, it drops
 the oldest eligible generic event. The count limits tickets, not bytes or total
@@ -489,6 +511,13 @@ assigned to handlers do not use this buffer limit. A slow serial handler, many
 suspended callback tasks, or a Lua callback that blocks without yielding can
 still retain substantial memory. TDLua does not provide a process-wide memory
 cap for handler queues or Lua coroutine state.
+
+Drops are accounted in the receiver statistics: `dropped_overflow` when the
+capacity pushed the oldest eligible event out, `dropped_expired` when a ticket
+aged out, and `dropped_unsolicited`/`dropped_by_handler_filter` when the handler
+filter discarded an update. Managed responses have no equivalent per-client
+limit, so a client that is never consumed keeps accepting them without a bound;
+consume it or close it.
 
 ## From receive loops to managed async
 
