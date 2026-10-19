@@ -249,8 +249,10 @@ void testCrossClientDependencyScheduling(lua_State *L)
         run(L, "assert(selected ~= nil and selected.value == 42)");
         require(cross.ownerReads() == 1,
                 "timed poll did not read the owner transport exactly once");
-        require(cross.dependencyReads() == 1,
-                "timed poll did not record the single dependency round");
+        require(cross.dependencyReads() == 0,
+                ("timed poll pumped the cross-client dependency " +
+                 std::to_string(cross.dependencyReads()) +
+                 " time(s) after selecting an update").c_str());
         releaseCrossClient(L);
     }
 
@@ -265,8 +267,8 @@ void testCrossClientDependencyScheduling(lua_State *L)
             run(L, "assert(selected ~= nil and selected.value == 50)");
             require(cross.ownerReads() == 1,
                     "timed poll read the owner transport more than once");
-            require(cross.dependencyReads() == count,
-                    "timed poll did not record one dependency round per client");
+            require(cross.dependencyReads() == 0,
+                    "timed poll started a dependency round after a selection");
             releaseCrossClient(L);
         }
     }

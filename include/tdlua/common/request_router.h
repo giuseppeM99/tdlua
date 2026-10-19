@@ -1712,8 +1712,18 @@ public:
         // delivering a managed response. Do not start another transport read
         // on a dependent client after that deadline; tick() below still
         // routes the response and resumes any work it made ready.
-        if (!deadline || nonblocking_step ||
-            std::chrono::steady_clock::now() < *deadline) {
+        //
+        // A timed poll that already selected an update returns to the caller
+        // immediately, so the remaining dependency round would only delay the
+        // return: the dependency stays in running_tasks_, its binding keeps it
+        // reachable, and the next driveStep of this core pumps it. Untimed
+        // drivers and zero-timeout polls keep their round unchanged.
+        const bool timed_selection_complete =
+            deadline != nullptr && !nonblocking_step &&
+            managed_driver_.selected_update != LUA_NOREF;
+        if (!timed_selection_complete &&
+            (!deadline || nonblocking_step ||
+             std::chrono::steady_clock::now() < *deadline)) {
             pumpCrossClientDependencies(dependencies, deadline);
         }
         if (!deadline) {
