@@ -320,18 +320,20 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Linux registers 30 tests. Windows replaces the Linux-only
+          # Native Linux registers 32 tests. Windows replaces the Linux-only
           # tdlua_signals with the platform-specific tdlua_windows_residency.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
             'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
             'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
+            'tdlua_receiver_lifecycle_ownership',
             'tdlua_buffering_accounting', 'tdlua_scheduler_concurrency',
             'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
             'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
             'tdlua_vm_threads', 'tdlua_release', 'tdlua_uploadtravis',
             'tdlua_native_codec', 'tdlua_native_decoder_safety', 'tdlua_native_generic_ticket',
             'tdlua_native_schema', 'tdlua_hardening_backend', 'tdlua_lifecycle',
+            'tdlua_failure_cleanup_phases',
             'tdlua_async', 'tdlua_backend_parity', 'tdlua_e2e_smoke',
             'tdlua_managed_driver_backend', 'tdlua_windows_residency'
           )
@@ -339,7 +341,7 @@ jobs:
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 30-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 32-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -366,8 +368,8 @@ jobs:
           # The manifest gate pins the registered set; this pins the executed
           # result, so a silently skipped test cannot pass as green.
           $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
-          if ($summary -notmatch '0 tests failed out of 30') {
-            throw 'The native CTest suite did not report 30/30: inspect ctest-full.log'
+          if ($summary -notmatch '0 tests failed out of 32') {
+            throw 'The native CTest suite did not report 32/32: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.

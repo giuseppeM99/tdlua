@@ -345,6 +345,7 @@ jobs:
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
             'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
             'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
+            'tdlua_receiver_lifecycle_ownership',
             'tdlua_buffering_accounting', 'tdlua_scheduler_concurrency',
             'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
             'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
@@ -352,14 +353,16 @@ jobs:
             'tdlua_hardening_fake', 'tdlua_handler_only_prefilter', 'tdlua_handler_mutation',
             'tdlua_managed_driver', 'tdlua_m5_conformance', 'tdlua_simple_bot_example',
             'tdlua_async_demo', 'tdlua_vm_threads', 'tdlua_release', 'tdlua_uploadtravis',
-            'tdlua_hardening_backend', 'tdlua_lifecycle', 'tdlua_async',
+            'tdlua_hardening_backend', 'tdlua_lifecycle',
+            'tdlua_failure_cleanup_phases',
+            'tdlua_async',
             'tdlua_backend_parity', 'tdlua_e2e_smoke', 'tdlua_managed_driver_backend',
             'tdlua_windows_residency'
           )
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the 36-test MinGW/Linux baseline; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the 38-test MinGW/Linux baseline; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency')
