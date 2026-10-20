@@ -118,15 +118,15 @@ jobs:
 
           printf 'release_tag=%s\nbase_version=%s\n' "$tag" "$base_version" >> "$GITHUB_ENV"
 
-      # The install ships a vendored copy so it does not depend on td/ being
-      # checked out. When the pinned submodule is present, prove the copy is
-      # still the license of that exact TDLib.
-      - name: Verify the vendored TDLib license matches the pinned submodule
+      # The install takes the license from the pinned submodule, so the
+      # bundle must carry it; a payload with a module but no license is not
+      # distributable.
+      - name: Verify the TDLib license source
         run: |
           set -euo pipefail
-          test -f legal/TDLib-LICENSE_1_0.txt
-          diff -u td/LICENSE_1_0.txt legal/TDLib-LICENSE_1_0.txt
-          sha256sum legal/TDLib-LICENSE_1_0.txt
+          test -f td/LICENSE_1_0.txt
+          grep -q 'Boost Software License' td/LICENSE_1_0.txt
+          sha256sum td/LICENSE_1_0.txt
 
       - name: Create source bundle
         run: |
@@ -145,7 +145,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-meta
           for package in tdlua tdlua-luajit; do
-            python3 tools/release/generate-rockspec.py \
+            lua5.4 tools/release/generate-rockspec.lua \
               --rockspec "${package}-scm-1.rockspec" \
               --output-dir release-meta \
               --base-version "$base_version" \
@@ -210,7 +210,8 @@ jobs:
           cp "tdlua-${release_tag}-source.tar.gz" "$payload/"
           cp release-meta/*.rockspec "$payload/"
           cp "$RUNNER_TEMP/tdlua-artifacts"/*.so "$payload/"
-          cp LICENSE NOTICE legal/TDLib-LICENSE_1_0.txt "$payload/"
+          cp LICENSE NOTICE "$payload/"
+          cp td/LICENSE_1_0.txt "$payload/TDLib-LICENSE_1_0.txt"
 
           cd "$payload"
           sha256sum * > SHA256SUMS
@@ -253,7 +254,6 @@ jobs:
             "tdlua-${release_tag}/dist.info" \
             "tdlua-${release_tag}/LICENSE" \
             "tdlua-${release_tag}/NOTICE" \
-            "tdlua-${release_tag}/legal/TDLib-LICENSE_1_0.txt" \
             "tdlua-${release_tag}/td/LICENSE_1_0.txt" \
             "tdlua-${release_tag}/base64/LICENSE"; do
             grep -qx "$required" "$RUNNER_TEMP/source-listing.txt"
