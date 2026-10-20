@@ -23,6 +23,10 @@ on:
       - 'tests/**'
       - 'tools/windows/**'
       - 'td'
+  # release-package.yml calls this workflow so the Windows package is built in
+  # the same run as the payload. A standalone push run is unchanged: the branch
+  # filter above already excludes packaging branches and tags.
+  workflow_call:
 
 permissions:
   contents: read
@@ -541,6 +545,156 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
 
+      - name: Package the Windows x64 JSON module
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-install'
+          $prodBuild = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-production'
+          $tdlibBin = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib\bin'
+          $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin'
+          $rootParent = Join-Path $env:RUNNER_TEMP 'tdlua-pkg-json'
+          $root = Join-Path $rootParent 'tdlua'
+          if (Test-Path $rootParent) { Remove-Item -Recurse -Force $rootParent }
+          New-Item -ItemType Directory -Force -Path $root, (Join-Path $root 'share\licenses\tdlua') | Out-Null
+
+          $module = Join-Path $install 'lib\lua\5.4\tdlua.dll'
+          if (-not (Test-Path $module)) { throw "installed module missing: $module" }
+          $tdjson = Join-Path $tdlibBin 'tdjson.dll'
+          if (-not (Test-Path $tdjson)) { throw "TDLib JSON DLL missing: $tdjson" }
+          Copy-Item $module (Join-Path $root 'tdlua.dll')
+          Copy-Item $tdjson (Join-Path $root 'tdjson.dll')
+
+          # Ship only DLLs that the module and its dependencies actually import
+          # and that are not provided by Windows or by the host's Microsoft
+          # CRT. Resolve the whole transitive graph instead of hardcoding a list:
+          # a vcpkg update that renames a runtime DLL must fail here, not at the
+          # user's first require().
+          $hostProvided = @(
+            'lua54.dll',
+            'kernel32.dll', 'user32.dll', 'advapi32.dll', 'ws2_32.dll',
+            'shell32.dll', 'ole32.dll', 'oleaut32.dll', 'crypt32.dll',
+            'bcrypt.dll', 'secur32.dll', 'iphlpapi.dll', 'dnsapi.dll',
+            'userenv.dll', 'psapi.dll', 'dbghelp.dll', 'msvcrt.dll',
+            'ntdll.dll', 'shlwapi.dll', 'version.dll', 'winmm.dll',
+            'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll',
+            'concrt140.dll', 'ucrtbase.dll'
+          )
+          $searchDirs = @($tdlibBin, $vcpkgBin)
+          $pending = New-Object System.Collections.Queue
+          Get-ChildItem $root -Filter *.dll | ForEach-Object { $pending.Enqueue($_.FullName) }
+          $seen = @{}
+          $shipped = @()
+          while ($pending.Count -gt 0) {
+            $file = $pending.Dequeue()
+            $leaf = Split-Path $file -Leaf
+            $key = $leaf.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $deps = & dumpbin.exe /dependents $file 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed for $file" }
+            foreach ($line in $deps) {
+              if ($line -notmatch '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { continue }
+              $name = $Matches[1]
+              $lower = $name.ToLowerInvariant()
+              if ($lower -match '^(api-ms-win-|ext-ms-)') { continue }
+              if ($hostProvided -contains $lower) { continue }
+              $target = Join-Path $root $name
+              if (Test-Path $target) {
+                $pending.Enqueue($target)
+                continue
+              }
+              $resolved = $null
+              foreach ($dir in $searchDirs) {
+                $candidate = Join-Path $dir $name
+                if (Test-Path $candidate) { $resolved = $candidate; break }
+              }
+              if (-not $resolved) {
+                throw "unresolved runtime dependency $name, imported by $leaf"
+              }
+              Copy-Item $resolved $target
+              $shipped += $name
+              $pending.Enqueue($target)
+            }
+          }
+          $shipped = @($shipped | Sort-Object -Unique)
+
+          foreach ($license in @(
+              @('LICENSE', 'LICENSE'),
+              @('NOTICE', 'NOTICE'),
+              @('td\LICENSE_1_0.txt', 'TDLib-LICENSE_1_0.txt'))) {
+            $source = Join-Path $env:GITHUB_WORKSPACE $license[0]
+            if (-not (Test-Path $source)) { throw "license missing: $source" }
+            Copy-Item $source (Join-Path $root ('share\licenses\tdlua\' + $license[1]))
+          }
+          # Every redistributed third-party DLL must carry its notice. vcpkg
+          # keeps the upstream license text under share/<port>/copyright.
+          foreach ($port in @('openssl', 'zlib')) {
+            $notice = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows\share\$port\copyright"
+            if (-not (Test-Path $notice)) { throw "vcpkg notice missing: $notice" }
+            Copy-Item $notice (Join-Path $root "share\licenses\tdlua\$port-copyright.txt")
+          }
+
+          $version = (Get-Content (Join-Path $prodBuild 'tdlua-version.txt') -Raw).Trim()
+          if (-not $version) { throw 'tdlua-version.txt is empty' }
+          $tdConfig = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\tdlib\lib\cmake\Td\TdConfigVersion.cmake'
+          $tdlibVersion = (Select-String -Path $tdConfig -Pattern 'set\(PACKAGE_VERSION "([^"]+)"\)').Matches[0].Groups[1].Value
+          if (-not $tdlibVersion) { throw 'TDLib version not found in TdConfigVersion.cmake' }
+          $moduleSha = (Get-FileHash -Algorithm SHA256 (Join-Path $root 'tdlua.dll')).Hash.ToLowerInvariant()
+          @(
+            'package=tdlua'
+            "version=$version"
+            'platform=windows-x64'
+            'os=windows'
+            'arch=x86_64'
+            'lua_implementation=Lua'
+            'lua_version=5.4'
+            'backend=json'
+            "tdlib_version=$tdlibVersion"
+            "source_sha=$env:GITHUB_SHA"
+            'module=tdlua.dll'
+            "module_sha256=$moduleSha"
+            "redistributed_dlls=tdjson.dll,$($shipped -join ',')"
+          ) | Set-Content (Join-Path $root 'MANIFEST.txt')
+
+          $zip = Join-Path $env:RUNNER_TEMP 'tdlua-5.4-win64-json.zip'
+          if (Test-Path $zip) { Remove-Item $zip }
+          Compress-Archive -Path $root -DestinationPath $zip
+
+          # Verify the ZIP, not the build tree: extract elsewhere, then require
+          # the module with only the extracted directory, the separately
+          # provided Lua 5.4 runtime and the system directories on PATH.
+          $verify = Join-Path $env:RUNNER_TEMP 'tdlua-pkg-verify-json'
+          if (Test-Path $verify) { Remove-Item -Recurse -Force $verify }
+          Expand-Archive -Path $zip -DestinationPath $verify
+          $extracted = Join-Path $verify 'tdlua'
+          $extractedModule = Join-Path $extracted 'tdlua.dll'
+          if (-not (Test-Path $extractedModule)) { throw 'extracted module missing' }
+          $manifest = Get-Content (Join-Path $extracted 'MANIFEST.txt') -Raw
+          if ($manifest -notmatch "(?m)^source_sha=$([regex]::Escape($env:GITHUB_SHA))$") {
+            throw 'package manifest does not name this commit'
+          }
+          $extractedSha = (Get-FileHash -Algorithm SHA256 $extractedModule).Hash.ToLowerInvariant()
+          if ($extractedSha -ne $moduleSha) { throw 'extracted module hash differs from manifest' }
+          $exports = dumpbin.exe /exports $extractedModule
+          if (($exports | Select-String 'luaopen_tdlua').Count -ne 1) { throw 'extracted package has no single luaopen_tdlua export' }
+          if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') { throw 'test accessor found in extracted package' }
+          $env:PATH = "$extracted;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;C:\Windows\system32;C:\Windows"
+          $env:LUA_CPATH = "$extracted\?.dll"
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version); print("extracted package", t.version, t.api_version, t.tdlib_version)'
+          if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed for the extracted JSON package' }
+          @(
+            "zip=$zip"
+            "zip_sha256=$((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant())"
+            'extracted_require=pass'
+            "redistributed_dlls=$($shipped -join ',')"
+            'lua54_shipped=false'
+            'crt_shipped=false'
+          ) | Set-Content .ci\windows-msvc\package-verdict.txt
+          Get-FileHash -Algorithm SHA256 $zip | Tee-Object -FilePath .ci\windows-msvc\package-sha256.log
+          Get-ChildItem $extracted -File | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String |
+            Tee-Object -FilePath .ci\windows-msvc\package-listing.log
+
       - name: Diagnose managed adapter heap corruption with MSVC AddressSanitizer
         if: always() && contains(github.event.head_commit.message, '[msvc-asan-diagnostic]') && steps.tdlua-build.outcome == 'success'
         run: |
@@ -614,6 +768,14 @@ jobs:
           if ($ctestExit -ne 0) { throw "Full CTest failed: $ctestExit" }
           $repeatFailure = '.ci\windows-msvc\repeat-failure.txt'
           if (Test-Path $repeatFailure) { throw (Get-Content $repeatFailure -Raw) }
+
+      - name: Upload Windows JSON package
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-windows-x64-json-package
+          path: ${{ runner.temp }}/tdlua-5.4-win64-json.zip
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload MSVC validation logs and manifests
         if: always()

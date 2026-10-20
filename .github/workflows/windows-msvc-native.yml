@@ -13,6 +13,9 @@ on:
       - p5d4-native-integration
       - v0.5.1-consolidated
   workflow_dispatch:
+  # Called by release-package.yml so the native Windows package is produced in
+  # the same run as the payload. Branch pushes are unchanged.
+  workflow_call:
 
 permissions:
   contents: read
@@ -647,6 +650,150 @@ jobs:
             'external_runtime_dependencies=libssl-3-x64.dll,libcrypto-3-x64.dll,z.dll (vcpkg)'
           ) | Set-Content .ci\windows-msvc-native\production-install-verdict.txt
 
+      - name: Package the Windows x64 native module
+        if: steps.tdlua-production.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = $env:TDLUA_BUILD_DIR
+          $install = $env:TDLUA_INSTALL_DIR
+          $tdStage = Join-Path $env:RUNNER_TEMP 'tdlua-native-stage'
+          $vcpkgBin = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\bin'
+          $rootParent = Join-Path $env:RUNNER_TEMP 'tdlua-pkg-native'
+          $root = Join-Path $rootParent 'tdlua'
+          if (Test-Path $rootParent) { Remove-Item -Recurse -Force $rootParent }
+          New-Item -ItemType Directory -Force -Path $root, (Join-Path $root 'share\licenses\tdlua') | Out-Null
+
+          $module = Join-Path $install 'lib\lua\5.4\tdlua.dll'
+          if (-not (Test-Path $module)) { throw "installed native module missing: $module" }
+          Copy-Item $module (Join-Path $root 'tdlua.dll')
+
+          # The same transitive-DLL rule as the JSON package. TDLib is linked
+          # statically, so tdjson.dll must never appear in this graph; the BFS
+          # would copy it if the static link silently turned dynamic.
+          $hostProvided = @(
+            'lua54.dll',
+            'kernel32.dll', 'user32.dll', 'advapi32.dll', 'ws2_32.dll',
+            'shell32.dll', 'ole32.dll', 'oleaut32.dll', 'crypt32.dll',
+            'bcrypt.dll', 'secur32.dll', 'iphlpapi.dll', 'dnsapi.dll',
+            'userenv.dll', 'psapi.dll', 'dbghelp.dll', 'msvcrt.dll',
+            'ntdll.dll', 'shlwapi.dll', 'version.dll', 'winmm.dll',
+            'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll',
+            'concrt140.dll', 'ucrtbase.dll'
+          )
+          $pending = New-Object System.Collections.Queue
+          $pending.Enqueue((Join-Path $root 'tdlua.dll'))
+          $seen = @{}
+          $shipped = @()
+          while ($pending.Count -gt 0) {
+            $file = $pending.Dequeue()
+            $leaf = Split-Path $file -Leaf
+            $key = $leaf.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $deps = & dumpbin.exe /dependents $file 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed for $file" }
+            foreach ($line in $deps) {
+              if ($line -notmatch '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { continue }
+              $name = $Matches[1]
+              $lower = $name.ToLowerInvariant()
+              if ($lower -eq 'tdjson.dll') {
+                throw 'the native module imports tdjson.dll: the static TDLib link is wrong'
+              }
+              if ($lower -match '^(api-ms-win-|ext-ms-)') { continue }
+              if ($hostProvided -contains $lower) { continue }
+              $target = Join-Path $root $name
+              if (Test-Path $target) {
+                $pending.Enqueue($target)
+                continue
+              }
+              $resolved = Join-Path $vcpkgBin $name
+              if (-not (Test-Path $resolved)) {
+                throw "unresolved runtime dependency $name, imported by $leaf"
+              }
+              Copy-Item $resolved $target
+              $shipped += $name
+              $pending.Enqueue($target)
+            }
+          }
+          $shipped = @($shipped | Sort-Object -Unique)
+
+          foreach ($license in @(
+              @('LICENSE', 'LICENSE'),
+              @('NOTICE', 'NOTICE'),
+              @('td\LICENSE_1_0.txt', 'TDLib-LICENSE_1_0.txt'))) {
+            $source = Join-Path $env:GITHUB_WORKSPACE $license[0]
+            if (-not (Test-Path $source)) { throw "license missing: $source" }
+            Copy-Item $source (Join-Path $root ('share\licenses\tdlua\' + $license[1]))
+          }
+          foreach ($port in @('openssl', 'zlib')) {
+            $notice = Join-Path $env:VCPKG_ROOT "installed\x64-windows\share\$port\copyright"
+            if (-not (Test-Path $notice)) { throw "vcpkg notice missing: $notice" }
+            Copy-Item $notice (Join-Path $root "share\licenses\tdlua\$port-copyright.txt")
+          }
+
+          $version = (Get-Content (Join-Path $build 'tdlua-version.txt') -Raw).Trim()
+          if (-not $version) { throw 'tdlua-version.txt is empty' }
+          $tdConfig = Join-Path $tdStage 'lib\cmake\Td\TdConfigVersion.cmake'
+          $tdlibVersion = (Select-String -Path $tdConfig -Pattern 'set\(PACKAGE_VERSION "([^"]+)"\)').Matches[0].Groups[1].Value
+          if (-not $tdlibVersion) { throw 'TDLib version not found in TdConfigVersion.cmake' }
+          $moduleSha = (Get-FileHash -Algorithm SHA256 (Join-Path $root 'tdlua.dll')).Hash.ToLowerInvariant()
+          @(
+            'package=tdlua'
+            "version=$version"
+            'platform=windows-x64'
+            'os=windows'
+            'arch=x86_64'
+            'lua_implementation=Lua'
+            'lua_version=5.4'
+            'backend=native'
+            "tdlib_version=$tdlibVersion"
+            "source_sha=$env:GITHUB_SHA"
+            'module=tdlua.dll'
+            "module_sha256=$moduleSha"
+            "redistributed_dlls=$($shipped -join ',')"
+          ) | Set-Content (Join-Path $root 'MANIFEST.txt')
+
+          $zip = Join-Path $env:RUNNER_TEMP 'tdlua-5.4-win64-native.zip'
+          if (Test-Path $zip) { Remove-Item $zip }
+          Compress-Archive -Path $root -DestinationPath $zip
+
+          $verify = Join-Path $env:RUNNER_TEMP 'tdlua-pkg-verify-native'
+          if (Test-Path $verify) { Remove-Item -Recurse -Force $verify }
+          Expand-Archive -Path $zip -DestinationPath $verify
+          $extracted = Join-Path $verify 'tdlua'
+          $extractedModule = Join-Path $extracted 'tdlua.dll'
+          if (-not (Test-Path $extractedModule)) { throw 'extracted native module missing' }
+          if (Test-Path (Join-Path $extracted 'tdjson.dll')) { throw 'native package contains tdjson.dll' }
+          if ((dumpbin.exe /dependents $extractedModule) -match '(?i)tdjson') {
+            throw 'extracted native module imports tdjson.dll'
+          }
+          $manifest = Get-Content (Join-Path $extracted 'MANIFEST.txt') -Raw
+          if ($manifest -notmatch "(?m)^source_sha=$([regex]::Escape($env:GITHUB_SHA))$") {
+            throw 'package manifest does not name this commit'
+          }
+          $extractedSha = (Get-FileHash -Algorithm SHA256 $extractedModule).Hash.ToLowerInvariant()
+          if ($extractedSha -ne $moduleSha) { throw 'extracted module hash differs from manifest' }
+          $exports = dumpbin.exe /exports $extractedModule
+          if (($exports | Select-String 'luaopen_tdlua').Count -lt 1) { throw 'extracted package has no luaopen_tdlua export' }
+          if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') { throw 'test accessor found in extracted package' }
+          $env:PATH = "$extracted;$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;C:\Windows\system32;C:\Windows"
+          $env:LUA_CPATH = "$extracted\?.dll"
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version); print("extracted package", t.version, t.api_version, t.tdlib_version)'
+          if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed for the extracted native package' }
+          @(
+            "zip=$zip"
+            "zip_sha256=$((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant())"
+            'extracted_require=pass'
+            'tdjson_shipped=false'
+            "redistributed_dlls=$($shipped -join ',')"
+            'lua54_shipped=false'
+            'crt_shipped=false'
+          ) | Set-Content .ci\windows-msvc-native\package-verdict.txt
+          Get-FileHash -Algorithm SHA256 $zip | Tee-Object -FilePath .ci\windows-msvc-native\package-sha256.log
+          Get-ChildItem $extracted -File | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String |
+            Tee-Object -FilePath .ci\windows-msvc-native\package-listing.log
+
       - name: Enforce the native build and runtime gates
         if: always()
         run: |
@@ -674,6 +821,14 @@ jobs:
           }
           'All native build gates (P5D.2) and runtime gates (P5D.3) are recorded.' |
             Tee-Object -FilePath .ci\windows-msvc-native\p5d3-gate-verdict.txt
+
+      - name: Upload Windows native package
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-windows-x64-native-package
+          path: ${{ runner.temp }}/tdlua-5.4-win64-native.zip
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload native validation logs and manifests
         if: always()
