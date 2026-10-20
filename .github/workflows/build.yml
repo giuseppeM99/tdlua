@@ -214,7 +214,10 @@ jobs:
 
   linux-aarch64:
     name: Linux AArch64 / JSON and native / Lua 5.4
-    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
+    # AArch64 is a release gate: it must also run for the packaging branch and
+    # for a release tag, not only for the consolidated branches. A skipped gate
+    # is not a green gate, so the ref filter cannot hide the job.
+    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:
@@ -472,6 +475,114 @@ jobs:
           LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
             lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4" \
             2>&1 | tee .ci/aarch64-validation/json-installed-e2e.log
+
+      - name: Package AArch64 production modules
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tdlua-packages"
+          rm -rf "$out"
+          mkdir -p "$out"
+          version="$(cat build-aarch64-json-install/tdlua-version.txt)"
+          tdlib_version="$(sed -n 's/^set(PACKAGE_VERSION "\([^"]*\)")/\1/p' \
+            .ci/aarch64-tdlib/lib/cmake/Td/TdConfigVersion.cmake)"
+          test -n "$tdlib_version"
+
+          # A package is built from the install prefix, never from the build
+          # tree, so the archive cannot pick up uninstalled objects.
+          package() {
+            backend="$1"
+            stage="$2"
+            name="tdlua-5.4-aarch64-${backend}"
+            root="$RUNNER_TEMP/tdlua-packages/${name}"
+            rm -rf "$root"
+            mkdir -p "$root/lib/lua/5.4" "$root/share/licenses/tdlua"
+            install -m 755 "$stage/lib/lua/5.4/tdlua.so" \
+              "$root/lib/lua/5.4/tdlua.so"
+            for license in LICENSE NOTICE TDLib-LICENSE_1_0.txt; do
+              test -f "$stage/share/licenses/tdlua/$license"
+              install -m 644 "$stage/share/licenses/tdlua/$license" \
+                "$root/share/licenses/tdlua/$license"
+            done
+            module_sha="$(sha256sum "$root/lib/lua/5.4/tdlua.so" | cut -d ' ' -f 1)"
+            {
+              echo "package=tdlua"
+              echo "version=${version}"
+              echo "platform=linux-aarch64"
+              echo "os=linux"
+              echo "arch=aarch64"
+              echo "lua_implementation=Lua"
+              echo "lua_version=5.4"
+              echo "backend=${backend}"
+              echo "tdlib_version=${tdlib_version}"
+              echo "source_sha=${GITHUB_SHA}"
+              echo "module=lib/lua/5.4/tdlua.so"
+              echo "module_sha256=${module_sha}"
+            } > "$root/MANIFEST.txt"
+            tar -C "$out" -czf "$out/${name}.tar.gz" "$name"
+          }
+
+          package json "$PWD/.ci/aarch64-json-install"
+          package native "$PWD/.ci/aarch64-tdlib"
+
+          # Verify every archive from a directory that is neither the build tree
+          # nor the install prefix: extraction, architecture, exported symbols,
+          # manifest provenance, licenses and a real require().
+          verify() {
+            backend="$1"
+            archive="$2"
+            dir="$RUNNER_TEMP/verify-aarch64-${backend}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            tar -xzf "$archive" -C "$dir"
+            root="$dir/tdlua-5.4-aarch64-${backend}"
+            module="$root/lib/lua/5.4/tdlua.so"
+            test -f "$module"
+            readelf -h "$module" | grep -q 'Machine:.*AArch64'
+            readelf -d "$module" | grep -q 'FLAGS_1.*NODELETE'
+            if readelf -d "$module" | grep -q 'libtdjson'; then
+              echo "::error::${backend} module links a dynamic TDLib JSON library"
+              exit 1
+            fi
+            nm -D --defined-only "$module" | grep -q '[[:space:]]luaopen_tdlua$'
+            if nm -D --defined-only "$module" | grep -q 'tdlua_[A-Za-z0-9_]*_test_'; then
+              echo "::error::${backend} package exports test hooks"
+              exit 1
+            fi
+            grep -qx "source_sha=${GITHUB_SHA}" "$root/MANIFEST.txt"
+            grep -qx "backend=${backend}" "$root/MANIFEST.txt"
+            grep -qx "lua_version=5.4" "$root/MANIFEST.txt"
+            grep -qx "platform=linux-aarch64" "$root/MANIFEST.txt"
+            test -f "$root/share/licenses/tdlua/LICENSE"
+            test -f "$root/share/licenses/tdlua/NOTICE"
+            test -f "$root/share/licenses/tdlua/TDLib-LICENSE_1_0.txt"
+            TDLIB_VERSION="$tdlib_version" \
+            LUA_CPATH="$root/lib/lua/5.4/?.so;;" lua5.4 -e '
+              local tdlua = require("tdlua")
+              assert(type(tdlua.version) == "string", "missing version")
+              assert(type(tdlua.api_version) == "string", "missing api_version")
+              assert(tdlua.tdlib_version == os.getenv("TDLIB_VERSION"),
+                "wrong TDLib version")
+              print("extracted package loaded: " .. tdlua.version)
+            '
+            {
+              echo "=== ${backend} package ==="
+              sha256sum "$archive"
+              tar -tzf "$archive"
+              readelf -d "$module"
+            } > "$RUNNER_TEMP/tdlua-packages/${backend}-verification.log"
+          }
+
+          verify json "$out/tdlua-5.4-aarch64-json.tar.gz"
+          verify native "$out/tdlua-5.4-aarch64-native.tar.gz"
+          ls -l "$out"
+
+      - name: Upload AArch64 release packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-linux-aarch64-packages
+          path: ${{ runner.temp }}/tdlua-packages/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload AArch64 build and test evidence
         if: always()
