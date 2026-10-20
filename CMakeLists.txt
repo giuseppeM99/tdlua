@@ -685,22 +685,29 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
 # TDLib ends up inside the module for both backends: statically from the bundle
 # with TDLUA_BUNDLED_TDLIB=ON, and statically from an external Td package with
-# TDLUA_BUNDLED_TDLIB=OFF. Its license therefore ships with every install.
-# The text comes from the pinned submodule, the only copy that is guaranteed to
-# describe the TDLib being linked; a tree without td/ fails loudly instead of
-# silently installing no license.
+# TDLUA_BUNDLED_TDLIB=OFF. Its license therefore ships with every install, and
+# the text is taken from the pinned submodule so the copy always describes the
+# TDLib that is linked.
+#
+# A tree without td/ is legitimate for a build against a prebuilt Td (the CI
+# matrix does exactly that), so a missing file is a warning here rather than an
+# error. The release workflow requires the submodule and refuses to assemble a
+# payload whose install has no TDLib-LICENSE_1_0.txt, which is where the license
+# is not optional.
 set(TDLUA_TDLIB_LICENSE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/td/LICENSE_1_0.txt"
     CACHE FILEPATH "Boost license text of the TDLib linked into the module")
-if(NOT EXISTS "${TDLUA_TDLIB_LICENSE_FILE}")
-  message(FATAL_ERROR
-    "TDLib license not found at ${TDLUA_TDLIB_LICENSE_FILE}. "
-    "Initialize the pinned submodule with 'git submodule update --init td', "
-    "or point TDLUA_TDLIB_LICENSE_FILE at the Boost license text of the TDLib "
-    "you link with -DTDLUA_BUNDLED_TDLIB=OFF.")
+if(EXISTS "${TDLUA_TDLIB_LICENSE_FILE}")
+  install(FILES "${TDLUA_TDLIB_LICENSE_FILE}"
+      DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
+      RENAME "TDLib-LICENSE_1_0.txt")
+else()
+  message(WARNING
+    "TDLib license not found at ${TDLUA_TDLIB_LICENSE_FILE}: this install will "
+    "not ship TDLib-LICENSE_1_0.txt. Initialize the pinned submodule with "
+    "'git submodule update --init td', or pass "
+    "-DTDLUA_TDLIB_LICENSE_FILE=<path to LICENSE_1_0.txt> when linking an "
+    "external Td with TDLUA_BUNDLED_TDLIB=OFF.")
 endif()
-install(FILES "${TDLUA_TDLIB_LICENSE_FILE}"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
-    RENAME "TDLib-LICENSE_1_0.txt")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
 

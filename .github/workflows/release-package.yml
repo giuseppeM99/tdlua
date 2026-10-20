@@ -201,6 +201,13 @@ jobs:
             print("loaded tdlua " .. tdlua.version .. " (api " .. tdlua.api_version .. ", TDLib " .. tdlua.tdlib_version .. ")")
           '
 
+          # The tarball carries the pinned submodule, so this install must ship
+          # the TDLib license; a module distributed without it is a regression.
+          installed_license="$(find "$tree" -name TDLib-LICENSE_1_0.txt -print -quit)"
+          test -n "$installed_license"
+          cmp "$installed_license" "$root/td/LICENSE_1_0.txt"
+          test -f "$(find "$tree" -name NOTICE -print -quit)"
+
       - name: Assemble payload and checksums
         run: |
           set -euo pipefail
