@@ -683,11 +683,16 @@ install(FILES
 )
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
-if(TDLUA_BUNDLED_TDLIB)
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/td/LICENSE_1_0.txt"
-      DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
-      RENAME "TDLib-LICENSE_1_0.txt")
-endif()
+# TDLib ends up inside the module for both backends: statically from the bundle
+# with TDLUA_BUNDLED_TDLIB=ON, and statically from an external Td package with
+# TDLUA_BUNDLED_TDLIB=OFF. Install the license in both cases from a copy
+# verified against the pinned submodule (see NOTICE), so the install no longer
+# relies on td/ being checked out.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/legal/TDLib-LICENSE_1_0.txt"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
+    RENAME "TDLib-LICENSE_1_0.txt")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
 
 if(TDLUA_BUILD_TESTS)
     enable_testing()

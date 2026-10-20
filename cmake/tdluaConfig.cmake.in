@@ -3,15 +3,20 @@
 
 @PACKAGE_INIT@
 
-include(CMakeFindDependencyMacro)
-
-if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../Td/TdConfig.cmake")
-    set(Td_DIR "${CMAKE_CURRENT_LIST_DIR}/../Td")
-endif()
-find_dependency(Td CONFIG REQUIRED)
+# TDLua::tdlua is a shared module: TDLib and every other build dependency are
+# linked into it privately, so the imported target has no Td or Lua entries in
+# INTERFACE_LINK_LIBRARIES and consumers do not need a Td package to use it.
+# Look for Td only if a future export ever exposes it through the interface.
 
 set(TDLUA_BACKEND "@TDLUA_BACKEND@")
 set(TDLUA_TDLIB_VERSION "@TDLUA_TDLIB_VERSION@")
 set(TDLUA_JSON_STATIC "@TDLUA_JSON_STATIC@")
 
 include("${CMAKE_CURRENT_LIST_DIR}/TDLuaTargets.cmake")
+
+get_target_property(_tdlua_interface_libraries TDLua::tdlua INTERFACE_LINK_LIBRARIES)
+if(_tdlua_interface_libraries MATCHES "(^|;)Td::")
+    include(CMakeFindDependencyMacro)
+    find_dependency(Td CONFIG REQUIRED)
+endif()
+unset(_tdlua_interface_libraries)

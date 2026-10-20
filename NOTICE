@@ -1,0 +1,43 @@
+TDLua — third-party notices
+===========================
+
+TDLua is distributed under the BSD-3-Clause license; see LICENSE.
+
+Binaries of the module embed or link the components below. This file lists
+them so that a binary package carries the same attribution as the source
+tree. It is installed next to the licenses in
+<prefix>/share/licenses/tdlua/.
+
+TDLib 1.8.68 — Boost Software License 1.0
+-----------------------------------------
+Source: https://github.com/tdlib/td
+Pinned submodule commit: c15d3f5a5de6e3ba5839822c451152e5e18bb700
+License text: legal/TDLib-LICENSE_1_0.txt
+SHA-256 of that file at the pinned commit:
+  c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566
+
+TDLib is linked into the module for both backends: statically with
+TDLUA_BUNDLED_TDLIB=OFF plus a static Td package, and statically from the
+bundled submodule with TDLUA_BUNDLED_TDLIB=ON. The Boost license text is
+shipped in every install regardless of how TDLib was obtained, because the
+build no longer depends on the submodule being checked out to find it.
+
+base64 — zlib-style permissive license
+--------------------------------------
+Source: https://github.com/ReneNyffenegger/cpp-base64
+Pinned submodule commit: 6420804f7ba10e8c3049c6e3b59ec88c88d808a6
+The submodule is part of the source tarball and carries its own LICENSE
+file. No base64 code is compiled into the module.
+
+Runtime dependencies not redistributed
+--------------------------------------
+The module loads these from the host system and they are not bundled:
+
+  Lua 5.1-5.5 / LuaJIT   MIT
+  OpenSSL 3              Apache-2.0
+  zlib                   zlib
+  libstdc++ / libc++     GPL-3.0-or-later WITH GCC-exception-3.1 / Apache-2.0 WITH LLVM-exception
+  libm, libgcc_s, libc   glibc LGPL-2.1-or-later
+
+Windows packages bundle the non-system DLLs (OpenSSL, zlib) next to the
+module; their license texts are added to the package when it is produced.
