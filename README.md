@@ -6,8 +6,10 @@
 
 TDLua uses a multithreaded architecture with a dedicated C++ receiver worker and per-client FIFO mailboxes. All Lua interactions, including callbacks, managed request handling, and coroutine resumption, are confined to the Lua VM's owning thread.
 
-The v0.5.0 build requires Linux x86_64 with glibc and an ELF loader that honors
-`NODELETE`. Dynamic unloading is unsupported.
+The library is validated on Linux x86-64 and AArch64, Windows x64 and macOS
+arm64. The exact binary variants and their Lua ABIs are listed in
+[Distributed packages](#distributed-packages). Unsupported platforms and Lua
+builds remain unverified. Dynamic unloading is unsupported.
 
 ## Installation
 You first need to install
@@ -106,6 +108,76 @@ out, its eventual response is consumed by the managed router and is not later
 returned by raw `receive()`. Use an explicit Future when you need to retain its
 handle and wait again after a timeout.
 
+## Distributed packages
+
+A release payload carries 16 binary variants. The archive name, the manifest
+inside it and the checksum list all state the same ABI; a module is never
+presented as generic across Lua versions.
+
+| Platform | Lua ABI | Backends | Artifact |
+| --- | --- | --- | --- |
+| Linux x86-64 | Lua 5.2, 5.3, 5.4, 5.5, LuaJIT 2.1 | JSON and native | `tdlua-<lua>[-native]-<version>-linux-x86_64.so` |
+| Linux AArch64 | Lua 5.4 | JSON and native | `tdlua-5.4-aarch64-{json,native}.tar.gz` |
+| Windows x64 | Lua 5.4 | JSON and native | `tdlua-5.4-win64-{json,native}.zip` |
+| macOS arm64 | Lua 5.4 | JSON and native | `tdlua-5.4-macos-arm64-{json,native}.tar.gz` |
+
+Every non-x86-64 archive contains `MANIFEST.txt`, the module, the applicable
+licenses and, for the JSON backend, the TDLib shared library. The manifest
+records `platform`, `arch`, `lua_implementation`, `lua_version`, `backend`,
+`tdlib_version`, `source_sha`, `module`, `module_sha256` and any
+platform-specific floor, such as `dependency_minos_max` on macOS.
+
+### Lua ABI
+
+Each module is compiled against exactly one Lua header set. Loading a 5.4
+module into Lua 5.3, Lua 5.5 or LuaJIT is unsupported: the Lua C API layout
+differs and the process can crash instead of raising a Lua error. TDLua does
+not add a runtime ABI check. The file name and the manifest are the contract;
+name the installed module directory after the ABI you built against.
+
+### Linux
+
+The x86-64 modules are the flat `.so` files introduced in the previous release
+and are built on Ubuntu 24.04 with glibc 2.39 against OpenSSL 3, zlib and
+libstdc++. They are verified for that ABI, not as portable Linux binaries:
+musl, Alpine and other glibc versions are not validated. The AArch64 archives
+install under `lib/lua/5.4/` and link TDLib statically in both backends, so
+they need the same OpenSSL 3 and zlib runtime but no `libtdjson`.
+
+### Windows
+
+The ZIP extracts a `tdlua/` directory. It contains `tdlua.dll` and, for the
+JSON backend, `tdjson.dll` plus the transitive OpenSSL and zlib DLLs. The Lua
+DLL (`lua54.dll`) and the MSVC runtime are supplied by the host and are not in
+the archive. Point `package.cpath` at `tdlua/?.dll`; the module's dependencies
+sit next to it and are resolved from that directory. The build is MSVC x64 for
+the Lua 5.4.8 ABI; another DLL that exposes the same ABI is expected to load,
+but only the CI-validated Lua build is tested.
+
+### macOS
+
+The archives place the module in `lib/lua/5.4/` and, for JSON, the TDLib dylib
+in `lib/`. The module refers to `@rpath/libtdjson.<version>.dylib`, resolved
+through `@loader_path/../..`, so the extracted tree is relocatable. Lua is a
+host dependency: the module links `@rpath/liblua.5.4.dylib`, not an absolute
+Homebrew path, and the loader must find a Lua 5.4 library through the module
+directory or `DYLD_LIBRARY_PATH`. OpenSSL is not bundled: both backends use
+Homebrew `openssl@3`, and the native manifest records its prefix. The declared
+deployment target is macOS 13.0; `dependency_minos_max` is the effective floor
+when a linked library already requires a newer system. Only the runner OS is
+tested, so older systems are not claimed as validated.
+
+### Verification and checksums
+
+Each archive is extracted and loaded outside its build tree on the runner that
+produced it, including a real `require("tdlua")`, architecture checks, the
+export table and the absence of test hooks. The payload job repeats the
+structural checks, verifies that every manifest names the release commit and
+compares `module_sha256` with the extracted module. It refuses a missing,
+renamed or foreign archive; a failure cannot be hidden by shrinking the
+payload. `SHA256SUMS` covers every published file, and the dry run downloads
+the payload again and verifies it end to end.
+
 ## Runtime profiles
 
 The implementation targets these profiles for both backends. Build and test
@@ -157,10 +229,11 @@ while `2^53 + 1` and `INT64_MAX` are native strings. No FFI/cdata representation
 is required. On Lua 5.3+, use Lua integers or decimal strings for int64 inputs;
 explicit floats become JSON floats, which TDLib rejects for these fields.
 
-The validated v0.5.0 build target is Linux x86_64 with glibc. The local test
-matrix passed both backends on Lua 5.1, 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1.
-Those results apply to the tested source revision; other platforms and Lua
-builds remain unverified.
+The tested source revision passed both backends on Lua 5.1.5, 5.2, 5.3, 5.4,
+5.5 and LuaJIT 2.1 on Linux x86-64. The release matrix adds Linux AArch64,
+Windows x64 and macOS arm64 on Lua 5.4. Those results apply to the tested
+source revision and toolchains; other platforms, Lua patch releases and
+modified VMs remain unverified.
 
 ## Stock Lua 5.1 Managed Explicit
 
