@@ -321,7 +321,7 @@ jobs:
           minos() {
             otool -l "$1" | awk '
               /LC_BUILD_VERSION/ { seen = 1; next }
-              seen && $1 == "minos" { print $2; exit }'
+              seen && $1 == "minos" && !printed { print $2; printed = 1 }'
           }
 
           name="tdlua-5.4-macos-arm64-native"
@@ -345,7 +345,7 @@ jobs:
           fi
 
           module="$root/lib/lua/5.4/tdlua.so"
-          lua_ref="$(otool -L "$module" | awk '/liblua/{print $1; exit}')"
+          lua_ref="$(otool -L "$module" | awk '/liblua/ && !found { print $1; found = 1 }')"
           test -n "$lua_ref"
           if [ "$lua_ref" != "@rpath/liblua.5.4.dylib" ]; then
             # Same rule as the JSON package: the host supplies Lua 5.4, and
@@ -420,12 +420,12 @@ jobs:
             echo '::error::native package contains a TDLib dylib'
             exit 1
           fi
-          if otool -L "$extracted_module" | awk '{print $1}' | grep -q '^/.*liblua'; then
+          if otool -L "$extracted_module" | awk '{print $1}' | grep '^/.*liblua' >/dev/null; then
             echo '::error::package still links an absolute Lua library'
             exit 1
           fi
-          lipo -archs "$extracted_module" | grep -qx arm64
-          nm -gU "$extracted_module" | grep -q '_luaopen_tdlua$'
+          lipo -archs "$extracted_module" | grep -x arm64 >/dev/null
+          nm -gU "$extracted_module" | grep '_luaopen_tdlua$' >/dev/null
           if nm -gU "$extracted_module" | grep -E '_tdlua_(test_|json_test_)'; then
             echo '::error::package exports test hooks'
             exit 1

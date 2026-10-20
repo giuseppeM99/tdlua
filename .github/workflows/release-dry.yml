@@ -60,10 +60,10 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*-source.tar.gz' | wc -l)" -eq 1
           for archive in tdlua-5.4-aarch64-*.tar.gz tdlua-5.4-macos-arm64-*.tar.gz; do
-            tar -tzf "$archive" | grep -q '/lib/lua/5.4/tdlua.so$'
+            tar -tzf "$archive" | grep '/lib/lua/5.4/tdlua.so$' >/dev/null
           done
           for archive in tdlua-5.4-win64-*.zip; do
-            unzip -l "$archive" | grep -q 'tdlua/tdlua.dll$'
+            unzip -l "$archive" | grep 'tdlua/tdlua.dll$' >/dev/null
           done
           for file in LICENSE NOTICE TDLib-LICENSE_1_0.txt SHA256SUMS; do
             test -f "$file"

@@ -211,19 +211,19 @@ jobs:
             verify_manifest "$root" "$backend" "$platform_name"
             module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
             if [ "$platform_name" = linux-aarch64 ]; then
-              readelf -h "$module" | grep -q 'Machine:.*AArch64'
+              readelf -h "$module" | grep 'Machine:.*AArch64' >/dev/null
               # readelf is target-independent; nm on the x86_64 payload runner
               # cannot read an AArch64 object without binutils-multiarch.
-              readelf -sW --dyn-syms "$module" | grep -q 'luaopen_tdlua$'
-              if readelf -sW --dyn-syms "$module" | grep -q 'tdlua_[A-Za-z0-9_]*_test_'; then
+              readelf -sW --dyn-syms "$module" | grep 'luaopen_tdlua$' >/dev/null
+              if readelf -sW --dyn-syms "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
                 echo "::error::${archive} exports test hooks"
                 exit 1
               fi
             else
-              file "$module" | grep -q 'Mach-O 64-bit.*arm64'
+              file "$module" | grep 'Mach-O 64-bit.*arm64' >/dev/null
               if [ "$backend" = json ]; then
-                find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit | grep -q .
-              elif find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit | grep -q .; then
+                test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"
+              elif test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"; then
                 echo "::error::${archive} carries a TDLib dylib"
                 exit 1
               fi
@@ -243,7 +243,7 @@ jobs:
             root="$dir/tdlua"
             verify_manifest "$root" "$backend" "windows-x64"
             module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
-            file "$module" | grep -q 'PE32+.*x86-64'
+            file "$module" | grep 'PE32+.*x86-64' >/dev/null
             if [ "$backend" = json ]; then
               test -f "$root/tdjson.dll"
             else

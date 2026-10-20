@@ -537,14 +537,14 @@ jobs:
             root="$dir/tdlua-5.4-aarch64-${backend}"
             module="$root/lib/lua/5.4/tdlua.so"
             test -f "$module"
-            readelf -h "$module" | grep -q 'Machine:.*AArch64'
-            readelf -d "$module" | grep -q 'FLAGS_1.*NODELETE'
-            if readelf -d "$module" | grep -q 'libtdjson'; then
+            readelf -h "$module" | grep 'Machine:.*AArch64' >/dev/null
+            readelf -d "$module" | grep 'FLAGS_1.*NODELETE' >/dev/null
+            if readelf -d "$module" | grep 'libtdjson' >/dev/null; then
               echo "::error::${backend} module links a dynamic TDLib JSON library"
               exit 1
             fi
-            nm -D --defined-only "$module" | grep -q '[[:space:]]luaopen_tdlua$'
-            if nm -D --defined-only "$module" | grep -q 'tdlua_[A-Za-z0-9_]*_test_'; then
+            nm -D --defined-only "$module" | grep '[[:space:]]luaopen_tdlua$' >/dev/null
+            if nm -D --defined-only "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
               echo "::error::${backend} package exports test hooks"
               exit 1
             fi
