@@ -701,6 +701,10 @@ jobs:
               }
               if ($lower -match '^(api-ms-win-|ext-ms-)') { continue }
               if ($hostProvided -contains $lower) { continue }
+              # A DLL that ships with Windows (for example Normaliz.dll, which
+              # TDLib imports for NLS normalization) belongs to the host and
+              # must not be copied into the package.
+              if (Test-Path (Join-Path $env:SystemRoot "System32\$name")) { continue }
               $target = Join-Path $root $name
               if (Test-Path $target) {
                 $pending.Enqueue($target)
