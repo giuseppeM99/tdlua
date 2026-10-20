@@ -644,7 +644,7 @@ jobs:
           $tdlibVersion = (Select-String -Path $tdConfig -Pattern 'set\(PACKAGE_VERSION "([^"]+)"\)').Matches[0].Groups[1].Value
           if (-not $tdlibVersion) { throw 'TDLib version not found in TdConfigVersion.cmake' }
           $moduleSha = (Get-FileHash -Algorithm SHA256 (Join-Path $root 'tdlua.dll')).Hash.ToLowerInvariant()
-          @(
+          $manifestLines = @(
             'package=tdlua'
             "version=$version"
             'platform=windows-x64'
@@ -658,7 +658,10 @@ jobs:
             'module=tdlua.dll'
             "module_sha256=$moduleSha"
             "redistributed_dlls=tdjson.dll,$($shipped -join ',')"
-          ) | Set-Content (Join-Path $root 'MANIFEST.txt')
+          )
+          # LF keeps the manifest readable by grep -x in the Linux payload job.
+          [System.IO.File]::WriteAllText((Join-Path $root 'MANIFEST.txt'),
+            ($manifestLines -join "`n") + "`n")
 
           $zip = Join-Path $env:RUNNER_TEMP 'tdlua-5.4-win64-json.zip'
           if (Test-Path $zip) { Remove-Item $zip }
@@ -673,8 +676,8 @@ jobs:
           $extracted = Join-Path $verify 'tdlua'
           $extractedModule = Join-Path $extracted 'tdlua.dll'
           if (-not (Test-Path $extractedModule)) { throw 'extracted module missing' }
-          $manifest = Get-Content (Join-Path $extracted 'MANIFEST.txt') -Raw
-          if ($manifest -notmatch "(?m)^source_sha=$([regex]::Escape($env:GITHUB_SHA))$") {
+          $manifest = Get-Content (Join-Path $extracted 'MANIFEST.txt')
+          if ($manifest -notcontains "source_sha=$env:GITHUB_SHA") {
             throw 'package manifest does not name this commit'
           }
           $extractedSha = (Get-FileHash -Algorithm SHA256 $extractedModule).Hash.ToLowerInvariant()
