@@ -685,10 +685,20 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
 # TDLib ends up inside the module for both backends: statically from the bundle
 # with TDLUA_BUNDLED_TDLIB=ON, and statically from an external Td package with
-# TDLUA_BUNDLED_TDLIB=OFF. Install the license in both cases from a copy
-# verified against the pinned submodule (see NOTICE), so the install no longer
-# relies on td/ being checked out.
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/legal/TDLib-LICENSE_1_0.txt"
+# TDLUA_BUNDLED_TDLIB=OFF. Its license therefore ships with every install.
+# The text comes from the pinned submodule, the only copy that is guaranteed to
+# describe the TDLib being linked; a tree without td/ fails loudly instead of
+# silently installing no license.
+set(TDLUA_TDLIB_LICENSE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/td/LICENSE_1_0.txt"
+    CACHE FILEPATH "Boost license text of the TDLib linked into the module")
+if(NOT EXISTS "${TDLUA_TDLIB_LICENSE_FILE}")
+  message(FATAL_ERROR
+    "TDLib license not found at ${TDLUA_TDLIB_LICENSE_FILE}. "
+    "Initialize the pinned submodule with 'git submodule update --init td', "
+    "or point TDLUA_TDLIB_LICENSE_FILE at the Boost license text of the TDLib "
+    "you link with -DTDLUA_BUNDLED_TDLIB=OFF.")
+endif()
+install(FILES "${TDLUA_TDLIB_LICENSE_FILE}"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
     RENAME "TDLib-LICENSE_1_0.txt")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"

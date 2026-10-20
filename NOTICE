@@ -12,15 +12,16 @@ TDLib 1.8.68 — Boost Software License 1.0
 -----------------------------------------
 Source: https://github.com/tdlib/td
 Pinned submodule commit: c15d3f5a5de6e3ba5839822c451152e5e18bb700
-License text: legal/TDLib-LICENSE_1_0.txt
+License text: td/LICENSE_1_0.txt in the pinned submodule,
+installed as TDLib-LICENSE_1_0.txt
 SHA-256 of that file at the pinned commit:
   c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566
 
 TDLib is linked into the module for both backends: statically with
 TDLUA_BUNDLED_TDLIB=OFF plus a static Td package, and statically from the
-bundled submodule with TDLUA_BUNDLED_TDLIB=ON. The Boost license text is
-shipped in every install regardless of how TDLib was obtained, because the
-build no longer depends on the submodule being checked out to find it.
+bundled submodule with TDLUA_BUNDLED_TDLIB=ON. The license text is copied
+from the pinned submodule into every install, so the copy always describes
+the TDLib that is actually linked.
 
 base64 — zlib-style permissive license
 --------------------------------------
