@@ -569,6 +569,20 @@ jobs:
           cmake --install build-install --prefix "$RUNNER_TEMP/tdlua-install"
           test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare static Lua artifact
         id: artifact
         run: |
@@ -649,6 +663,20 @@ jobs:
       - name: Check Lua examples
         run: |
           "$RUNNER_TEMP/lua55/bin/luac" -p examples/luajit.lua
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare static Lua artifact
         id: artifact
@@ -762,6 +790,20 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare native Lua 5.5 artifact
         id: artifact
         run: |
@@ -835,6 +877,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.3 artifact
         id: artifact
@@ -910,6 +966,20 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare native Lua 5.2 artifact
         id: artifact
         run: |
@@ -983,6 +1053,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.4 artifact
         id: artifact
@@ -1138,6 +1222,20 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare native LuaJIT artifact
         id: artifact
         run: |
@@ -1205,6 +1303,20 @@ jobs:
           ctest --test-dir build --output-on-failure -R '^tdlua_'
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
             exit 1
           fi
 
