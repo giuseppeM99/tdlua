@@ -5,6 +5,14 @@ name: Build TDLua
 
 on:
   push:
+    # A tag push is validated by release.yml, which calls this workflow. Running
+    # the standalone copy too would duplicate the whole matrix on every release.
+    tags-ignore:
+      - "v*"
+    # Packaging branches are validated by release-dry.yml, which calls this
+    # workflow for the same commit; the standalone run would duplicate it.
+    branches-ignore:
+      - "p71*-packaging*"
   pull_request:
   workflow_call:
 

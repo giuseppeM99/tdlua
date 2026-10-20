@@ -1,0 +1,271 @@
+# Copyright (c) 2018-2026 Giuseppe Marino
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Builds and verifies the release payload without publishing anything.
+#
+# Called by release.yml on a tag (which then publishes) and by release-dry.yml
+# on a branch push (which stops after verification). The publish path lives
+# only in release.yml, so a dry run cannot create a release even when it is
+# invoked from the same workflow file tree.
+
+name: Release package
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Tag the payload is named after (default v<dist.info version>)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+jobs:
+  validate:
+    name: Validate all supported runtimes
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  package:
+    name: Assemble and verify the release payload
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            liblua5.4-dev \
+            libssl-dev \
+            lua5.4 \
+            luarocks \
+            ninja-build \
+            zlib1g-dev
+
+      - name: Download validated runtime artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tdlua-*-static
+          path: ${{ runner.temp }}/tdlua-artifacts
+          merge-multiple: true
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      # Everything consumed by this job must come from the exact commit under
+      # test: the validated artifacts were produced by the same run, and the
+      # source bundle is archived from HEAD. A tag build additionally proves
+      # that HEAD is the tagged commit, so no gate can refer to another SHA.
+      - name: Verify version, tag and runtime matrix
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' dist.info)"
+          test -n "$base_version"
+
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="v${base_version}"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+            test "$(git describe --exact-match --tags HEAD)" = "$tag"
+          fi
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+
+          artifacts="$RUNNER_TEMP/tdlua-artifacts"
+          count="$(find "$artifacts" -type f -name '*.so' | wc -l)"
+          test "$count" -eq 10
+          for pattern in \
+            'tdlua-5.2-*.so' \
+            'tdlua-5.3-*.so' \
+            'tdlua-5.4-*.so' \
+            'tdlua-5.5-*.so' \
+            'tdlua-luajit-*.so' \
+            'tdlua-5.2-native-*.so' \
+            'tdlua-5.3-native-*.so' \
+            'tdlua-5.4-native-*.so' \
+            'tdlua-5.5-native-*.so' \
+            'tdlua-luajit-native-*.so'; do
+            find "$artifacts" -type f -name "$pattern" -print -quit | grep -q .
+          done
+
+          printf 'release_tag=%s\nbase_version=%s\n' "$tag" "$base_version" >> "$GITHUB_ENV"
+
+      # The install ships a vendored copy so it does not depend on td/ being
+      # checked out. When the pinned submodule is present, prove the copy is
+      # still the license of that exact TDLib.
+      - name: Verify the vendored TDLib license matches the pinned submodule
+        run: |
+          set -euo pipefail
+          test -f legal/TDLib-LICENSE_1_0.txt
+          diff -u td/LICENSE_1_0.txt legal/TDLib-LICENSE_1_0.txt
+          sha256sum legal/TDLib-LICENSE_1_0.txt
+
+      - name: Create source bundle
+        run: |
+          set -euo pipefail
+          root="tdlua-${release_tag}"
+          mkdir -p "release/${root}"
+          git archive HEAD | tar -x -C "release/${root}"
+          for module in td base64; do
+            mkdir -p "release/${root}/${module}"
+            git -C "${module}" archive HEAD | tar -x -C "release/${root}/${module}"
+          done
+          tar -C release -czf "tdlua-${release_tag}-source.tar.gz" "${root}"
+
+      - name: Generate and verify release rockspecs
+        run: |
+          set -euo pipefail
+          mkdir -p release-meta
+          for package in tdlua tdlua-luajit; do
+            python3 tools/release/generate-rockspec.py \
+              --rockspec "${package}-scm-1.rockspec" \
+              --output-dir release-meta \
+              --base-version "$base_version" \
+              --tag "$release_tag"
+          done
+
+          for package in tdlua tdlua-luajit; do
+            rockspec="release-meta/${package}-${base_version}-1.rockspec"
+            test -f "$rockspec"
+            grep -qx "package = \"${package}\"" "$rockspec"
+            grep -qx "version = \"${base_version}-1\"" "$rockspec"
+            grep -q "url = \"https://github.com/giuseppeM99/tdlua/releases/download/${release_tag}/tdlua-${release_tag}-source.tar.gz\"" "$rockspec"
+            if grep -q 'branch = ' "$rockspec"; then
+              echo "::error file=${rockspec}::release rockspec must not pin a branch"
+              exit 1
+            fi
+            luarocks lint "$rockspec"
+          done
+          ls -l release-meta
+
+      # Install from the artifact users actually download, not from the
+      # checkout: the tarball is extracted, the generated rockspec builds it
+      # with the static TDLib package this run already validated.
+      - name: Install from the release source tarball
+        env:
+          TDLUA_BUNDLED_TDLIB: "OFF"
+          TDLUA_JSON_STATIC: "ON"
+          TDLUA_BACKEND: json
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/release-src"
+          tree="$RUNNER_TEMP/luarocks-tree"
+          rm -rf "$src" "$tree"
+          mkdir -p "$src"
+          tar -xzf "tdlua-${release_tag}-source.tar.gz" -C "$src"
+          root="$src/tdlua-${release_tag}"
+          test -f "$root/dist.info"
+          test -f "$root/td/CMakeLists.txt"
+          test -f "$root/base64/LICENSE"
+
+          export CMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib"
+          cd "$root"
+          luarocks --lua-version 5.4 --tree "$tree" make \
+            "$GITHUB_WORKSPACE/release-meta/tdlua-${base_version}-1.rockspec"
+
+          module="$tree/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          LUA_CPATH="$tree/lib/lua/5.4/?.so;;" LUA_PATH="" lua5.4 -e '
+            local tdlua = require("tdlua")
+            assert(type(tdlua.version) == "string", "missing version")
+            assert(type(tdlua.api_version) == "string", "missing api_version")
+            assert(type(tdlua.tdlib_version) == "string", "missing tdlib_version")
+            print("loaded tdlua " .. tdlua.version .. " (api " .. tdlua.api_version .. ", TDLib " .. tdlua.tdlib_version .. ")")
+          '
+
+      - name: Assemble payload and checksums
+        run: |
+          set -euo pipefail
+          payload="$GITHUB_WORKSPACE/payload"
+          rm -rf "$payload"
+          mkdir -p "$payload"
+          cp "tdlua-${release_tag}-source.tar.gz" "$payload/"
+          cp release-meta/*.rockspec "$payload/"
+          cp "$RUNNER_TEMP/tdlua-artifacts"/*.so "$payload/"
+          cp LICENSE NOTICE legal/TDLib-LICENSE_1_0.txt "$payload/"
+
+          cd "$payload"
+          sha256sum * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Verify payload contents
+        run: |
+          set -euo pipefail
+          cd payload
+
+          # Only the validated Linux x86_64 matrix is published. Windows, macOS
+          # and AArch64 packages belong to P7.1C and must not be implied.
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          test -f "tdlua-${release_tag}-source.tar.gz"
+          test -f SHA256SUMS
+          for file in LICENSE NOTICE TDLib-LICENSE_1_0.txt; do
+            test -f "$file"
+          done
+
+          # A production module must not export test hooks.
+          if nm -D --defined-only ./*.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::a release module exports test hooks"
+            exit 1
+          fi
+
+          # The source bundle comes from git archive only: no agent state, no
+          # build trees, no sessions or credentials. The trailing slash keeps
+          # files that merely start with "build" (td/example/build-*.sh) in.
+          tar -tzf "tdlua-${release_tag}-source.tar.gz" > "$RUNNER_TEMP/source-listing.txt"
+          if grep -E '(^|/)(\.agent|\.git|\.ci|build[^/]*)/' "$RUNNER_TEMP/source-listing.txt"; then
+            echo "::error::source bundle contains excluded paths"
+            exit 1
+          fi
+          if grep -Ei '\.session$|/tdata/|(^|/)\.netrc$|(^|/)\.env$|id_rsa|\.pem$' "$RUNNER_TEMP/source-listing.txt"; then
+            echo "::error::source bundle contains credentials or session data"
+            exit 1
+          fi
+          for required in \
+            "tdlua-${release_tag}/dist.info" \
+            "tdlua-${release_tag}/LICENSE" \
+            "tdlua-${release_tag}/NOTICE" \
+            "tdlua-${release_tag}/legal/TDLib-LICENSE_1_0.txt" \
+            "tdlua-${release_tag}/td/LICENSE_1_0.txt" \
+            "tdlua-${release_tag}/base64/LICENSE"; do
+            grep -qx "$required" "$RUNNER_TEMP/source-listing.txt"
+          done
+
+          echo "payload verified:"
+          ls -l
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-release-package
+          path: payload/
+          if-no-files-found: error
+          retention-days: 7
