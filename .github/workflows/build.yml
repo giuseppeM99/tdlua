@@ -64,7 +64,7 @@ jobs:
           td_commit="$(git -C td rev-parse HEAD)"
           test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
           test -z "$(git -C td status --porcelain)"
-          printf 'td_commit=%s\n' "$td_commit"
+          printf 'td_commit=%s\n' "$td_commit" >> "$GITHUB_OUTPUT"
           sha256sum td/td/generate/scheme/td_api.tl
           cmake --version | head -n 1
           ccache --version | head -n 1
@@ -76,9 +76,13 @@ jobs:
           path: |
             ${{ runner.temp }}/tdlua-native-bootstrap
             ${{ runner.temp }}/tdlua-native-stage
-          key: tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          # The restored tree holds generated TDLib sources and binaries, which
+          # are only valid for the pinned commit that produced them. Keep the
+          # commit in both the key and the fallback prefix so a pin bump cannot
+          # reuse a stale codegen build; v2 marks the first keyed generation.
+          key: tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v2-${{ steps.toolchain.outputs.td_commit }}-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
           restore-keys: |
-            tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+            tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v2-${{ steps.toolchain.outputs.td_commit }}-
 
       - name: Reset compiler cache statistics
         run: ccache --zero-stats
