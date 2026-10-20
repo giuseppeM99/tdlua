@@ -32,9 +32,42 @@ jobs:
     permissions:
       contents: read
 
+  # Platform packages are built in this same run, not downloaded from an
+  # unrelated run of another branch. A skipped call is not a green gate: the
+  # package job needs all four, so a failure or a missing artifact stops the
+  # payload before anything is uploaded.
+  windows-json:
+    name: Windows x64 JSON package
+    uses: ./.github/workflows/windows-msvc-json.yml
+    permissions:
+      contents: read
+
+  windows-native:
+    name: Windows x64 native package
+    uses: ./.github/workflows/windows-msvc-native.yml
+    permissions:
+      contents: read
+
+  macos-json:
+    name: macOS arm64 JSON package
+    uses: ./.github/workflows/macos-json.yml
+    permissions:
+      contents: read
+
+  macos-native:
+    name: macOS arm64 native package
+    uses: ./.github/workflows/macos-native.yml
+    permissions:
+      contents: read
+
   package:
     name: Assemble and verify the release payload
-    needs: validate
+    needs:
+      - validate
+      - windows-json
+      - windows-native
+      - macos-json
+      - macos-native
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -55,6 +88,7 @@ jobs:
             lua5.4 \
             luarocks \
             ninja-build \
+            unzip \
             zlib1g-dev
 
       - name: Download validated runtime artifacts
@@ -62,6 +96,13 @@ jobs:
         with:
           pattern: tdlua-*-static
           path: ${{ runner.temp }}/tdlua-artifacts
+          merge-multiple: true
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tdlua-*-package*
+          path: ${{ runner.temp }}/tdlua-platform
           merge-multiple: true
 
       - name: Download static TDLib package
@@ -116,7 +157,108 @@ jobs:
             find "$artifacts" -type f -name "$pattern" -print -quit | grep -q .
           done
 
+          # The six non-x86_64 packages complete the 16-variant matrix. A
+          # missing or renamed archive fails here rather than reaching
+          # SHA256SUMS as a smaller payload.
+          platform="$RUNNER_TEMP/tdlua-platform"
+          test "$(find "$platform" -maxdepth 1 -type f | wc -l)" -eq 6
+          for package in \
+            tdlua-5.4-aarch64-json.tar.gz \
+            tdlua-5.4-aarch64-native.tar.gz \
+            tdlua-5.4-macos-arm64-json.tar.gz \
+            tdlua-5.4-macos-arm64-native.tar.gz \
+            tdlua-5.4-win64-json.zip \
+            tdlua-5.4-win64-native.zip; do
+            test -f "$platform/$package"
+          done
+
           printf 'release_tag=%s\nbase_version=%s\n' "$tag" "$base_version" >> "$GITHUB_ENV"
+
+      - name: Verify the platform packages
+        run: |
+          set -euo pipefail
+          platform="$RUNNER_TEMP/tdlua-platform"
+
+          verify_manifest() {
+            root="$1"
+            backend="$2"
+            platform_name="$3"
+            test -f "$root/MANIFEST.txt"
+            grep -qx "source_sha=${GITHUB_SHA}" "$root/MANIFEST.txt"
+            grep -qx "backend=${backend}" "$root/MANIFEST.txt"
+            grep -qx "lua_version=5.4" "$root/MANIFEST.txt"
+            grep -qx "platform=${platform_name}" "$root/MANIFEST.txt"
+            module="$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            test -n "$module"
+            test -f "$root/$module"
+            expected="$(sed -n 's/^module_sha256=//p' "$root/MANIFEST.txt")"
+            actual="$(sha256sum "$root/$module" | cut -d ' ' -f 1)"
+            test "$expected" = "$actual"
+            test -f "$root/share/licenses/tdlua/LICENSE"
+            test -f "$root/share/licenses/tdlua/NOTICE"
+            test -f "$root/share/licenses/tdlua/TDLib-LICENSE_1_0.txt"
+          }
+
+          for spec in \
+            "tdlua-5.4-aarch64-json.tar.gz|json|linux-aarch64" \
+            "tdlua-5.4-aarch64-native.tar.gz|native|linux-aarch64" \
+            "tdlua-5.4-macos-arm64-json.tar.gz|json|macos-arm64" \
+            "tdlua-5.4-macos-arm64-native.tar.gz|native|macos-arm64"; do
+            IFS='|' read -r archive backend platform_name <<< "$spec"
+            dir="$(mktemp -d)"
+            tar -xzf "$platform/$archive" -C "$dir"
+            root="$dir/${archive%.tar.gz}"
+            verify_manifest "$root" "$backend" "$platform_name"
+            module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            if [ "$platform_name" = linux-aarch64 ]; then
+              readelf -h "$module" | grep -q 'Machine:.*AArch64'
+              # readelf is target-independent; nm on the x86_64 payload runner
+              # cannot read an AArch64 object without binutils-multiarch.
+              readelf -sW --dyn-syms "$module" | grep -q 'luaopen_tdlua$'
+              if readelf -sW --dyn-syms "$module" | grep -q 'tdlua_[A-Za-z0-9_]*_test_'; then
+                echo "::error::${archive} exports test hooks"
+                exit 1
+              fi
+            else
+              file "$module" | grep -q 'Mach-O 64-bit.*arm64'
+              if [ "$backend" = json ]; then
+                find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit | grep -q .
+              elif find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit | grep -q .; then
+                echo "::error::${archive} carries a TDLib dylib"
+                exit 1
+              fi
+            fi
+            if tar -tzf "$platform/$archive" | grep -E '(_test|\.pdb$|\.so\.debug)'; then
+              echo "::error::${archive} contains build-only files"
+              exit 1
+            fi
+          done
+
+          for spec in \
+            "tdlua-5.4-win64-json.zip|json" \
+            "tdlua-5.4-win64-native.zip|native"; do
+            IFS='|' read -r archive backend <<< "$spec"
+            dir="$(mktemp -d)"
+            unzip -q "$platform/$archive" -d "$dir"
+            root="$dir/tdlua"
+            verify_manifest "$root" "$backend" "windows-x64"
+            module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            file "$module" | grep -q 'PE32+.*x86-64'
+            if [ "$backend" = json ]; then
+              test -f "$root/tdjson.dll"
+            else
+              test ! -f "$root/tdjson.dll"
+            fi
+            # The Lua DLL and the MSVC CRT stay with the host.
+            test ! -f "$root/lua54.dll"
+            if unzip -l "$platform/$archive" | grep -E '(_test|\.pdb)'; then
+              echo "::error::${archive} contains build-only files"
+              exit 1
+            fi
+          done
+
+          echo "platform packages verified:"
+          ls -l "$platform"
 
       # The install takes the license from the pinned submodule, so the
       # bundle must carry it; a payload with a module but no license is not
@@ -217,6 +359,8 @@ jobs:
           cp "tdlua-${release_tag}-source.tar.gz" "$payload/"
           cp release-meta/*.rockspec "$payload/"
           cp "$RUNNER_TEMP/tdlua-artifacts"/*.so "$payload/"
+          cp "$RUNNER_TEMP/tdlua-platform"/*.tar.gz "$payload/"
+          cp "$RUNNER_TEMP/tdlua-platform"/*.zip "$payload/"
           cp LICENSE NOTICE "$payload/"
           cp td/LICENSE_1_0.txt "$payload/TDLib-LICENSE_1_0.txt"
 
@@ -229,14 +373,24 @@ jobs:
           set -euo pipefail
           cd payload
 
-          # Only the validated Linux x86_64 matrix is published. Windows, macOS
-          # and AArch64 packages belong to P7.1C and must not be implied.
+          # Only artifacts built by this run and by the gates it called are
+          # published: 10 Linux x86_64 modules, 2 AArch64, 2 Windows, 2 macOS.
           test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
           test -f "tdlua-${release_tag}-source.tar.gz"
           test -f SHA256SUMS
+          variants=$((10 + 4 + 2))
+          test "$variants" -eq 16
           for file in LICENSE NOTICE TDLib-LICENSE_1_0.txt; do
             test -f "$file"
+          done
+
+          # Every published file must be covered by the manifest, not merely
+          # hash-checked by the files that happen to be listed.
+          for file in ./*.so ./*.tar.gz ./*.zip ./*.rockspec LICENSE NOTICE TDLib-LICENSE_1_0.txt; do
+            grep -qx "[0-9a-f]*  ${file#./}" SHA256SUMS
           done
 
           # A production module must not export test hooks.
