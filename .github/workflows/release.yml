@@ -65,9 +65,8 @@ jobs:
           set -euo pipefail
           base_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' dist.info)"
           root="tdlua-${RELEASE_TAG}"
-          source_url="https://github.com/giuseppeM99/tdlua/releases/download/${RELEASE_TAG}/tdlua-${RELEASE_TAG}-source.tar.gz"
 
-          mkdir -p "release/${root}" release-artifacts
+          mkdir -p "release/${root}" release-artifacts release-meta
           git archive HEAD | tar -x -C "release/${root}"
           for module in td base64; do
             mkdir -p "release/${root}/${module}"
@@ -75,14 +74,15 @@ jobs:
           done
           tar -C release -czf "tdlua-${RELEASE_TAG}-source.tar.gz" "${root}"
 
+          # LuaRocks only accepts <package>-<version>-<revision>.rockspec, so the
+          # filename is derived from the declared package and the version in
+          # dist.info rather than from the git tag.
           for package in tdlua tdlua-luajit; do
-            rockspec="${package}-${RELEASE_TAG}.rockspec"
-            cp "${package}-scm-1.rockspec" "$rockspec"
-            sed -i \
-              -e "s/version = \"scm-1\"/version = \"${base_version}-1\"/" \
-              -e "s|url = \"git+https://github.com/giuseppeM99/tdlua.git\"|url = \"${source_url}\"|" \
-              -e '/branch = "master"/d' \
-              "$rockspec"
+            python3 tools/release/generate-rockspec.py \
+              --rockspec "${package}-scm-1.rockspec" \
+              --output-dir release-meta \
+              --base-version "$base_version" \
+              --tag "$RELEASE_TAG"
           done
 
           cp "$RUNNER_TEMP/tdlua-artifacts"/*.so release-artifacts/
@@ -93,6 +93,5 @@ jobs:
           generate_release_notes: true
           files: |
             tdlua-${{ github.ref_name }}-source.tar.gz
-            tdlua-${{ github.ref_name }}.rockspec
-            tdlua-luajit-${{ github.ref_name }}.rockspec
+            release-meta/*.rockspec
             release-artifacts/*.so
