@@ -395,7 +395,9 @@ jobs:
           # platform archives are named explicitly. A renamed or duplicated
           # artifact fails here, and the total is derived from the files that
           # matched instead of being asserted as a constant.
-          tdlib_version="$(sed -n 's/^project(TDLib VERSION \([0-9.]*\)).*/\1/p' td/CMakeLists.txt | head -1)"
+          # The TDLib version in the module names comes from the pinned
+          # submodule of this checkout, not from a second hardcoded copy.
+          tdlib_version="$(awk '/^project\(TDLib VERSION/ { print $3; exit }' "$GITHUB_WORKSPACE/td/CMakeLists.txt")"
           test -n "$tdlib_version"
           variants=0
           for abi in 5.2 5.3 5.4 5.5 luajit; do
