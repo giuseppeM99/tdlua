@@ -449,6 +449,19 @@ for the next `poll()` or `loop(callback)` without another event-handler dispatch
 Closing the client discards a selection still pending in the scheduler. A
 selection already transferred to a Task remains owned by that Task.
 
+Handlers and selection are separate. `poll()` and `loop()` run the registered
+update handlers while they drive the scheduler, but an update consumed by a
+handler is delivered there once and is not returned again by `receive()` or
+`poll()`. Running a handler or a `poll()` callback does not by itself make a
+blocking `poll()` return: `poll(timeout)` keeps waiting, and keeps running
+handlers, until it selects a generic event or the deadline expires, and
+`poll()` without a timeout can stay blocked after handlers have run. An
+application driven mainly by handlers uses `loop()`, which keeps handler
+interest active for its whole run, as `examples/uploadtravis.lua` does. A host
+loop that must periodically check Lua conditions uses a finite timeout such as
+`poll(nil, 0.25)` or the nonblocking `poll(0)`, not an untimed `poll()`;
+`receive(timeout)` has the same role for the raw interface.
+
 `receive()` retains its 10-second default. `receive(0)` checks objects already
 available to the client and returns immediately; it does not call TDLib's
 receive function. An object not yet routed by the receiver may become available
