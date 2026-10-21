@@ -376,7 +376,14 @@ jobs:
             exit 1
           fi
           LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
-            lua5.4 -e 'local t=require("tdlua"); assert(t.version:match("^0%.5%.0")); print("installed native module", t.version)' \
+            lua5.4 -e '
+              local declared = assert(io.open("dist.info")):read("a"):match([[version = "([^"]+)"]])
+              local t = require("tdlua")
+              assert(t.api_version == declared, "api_version does not match dist.info")
+              assert(t.version == t.api_version .. "-" .. t.tdlib_version,
+                     "version is not api_version .. \"-\" .. tdlib_version")
+              print("installed native module", t.version)
+            ' \
             2>&1 | tee .ci/aarch64-validation/native-installed-require.log
           LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
             lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4" \
@@ -473,7 +480,14 @@ jobs:
             exit 1
           fi
           LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
-            lua5.4 -e 'local t=require("tdlua"); assert(t.version:match("^0%.5%.0")); print("installed JSON module", t.version)' \
+            lua5.4 -e '
+              local declared = assert(io.open("dist.info")):read("a"):match([[version = "([^"]+)"]])
+              local t = require("tdlua")
+              assert(t.api_version == declared, "api_version does not match dist.info")
+              assert(t.version == t.api_version .. "-" .. t.tdlib_version,
+                     "version is not api_version .. \"-\" .. tdlib_version")
+              print("installed JSON module", t.version)
+            ' \
             2>&1 | tee .ci/aarch64-validation/json-installed-require.log
           LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
             lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4" \
