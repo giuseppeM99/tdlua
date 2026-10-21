@@ -731,6 +731,17 @@ if(TDLUA_BUILD_TESTS)
     target_compile_features(tdlua_managed_routing_oom_test PRIVATE cxx_std_11)
     tdlua_enable_sanitizers(tdlua_managed_routing_oom_test)
     add_test(NAME tdlua_managed_routing_oom COMMAND tdlua_managed_routing_oom_test)
+    add_executable(tdlua_managed_metatable_oom_test
+        "tests/managed_metatable_oom_test.cpp")
+    target_compile_definitions(tdlua_managed_metatable_oom_test PRIVATE TDLUA_TESTING)
+    target_include_directories(tdlua_managed_metatable_oom_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_managed_metatable_oom_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_managed_metatable_oom_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_managed_metatable_oom_test)
+    add_test(NAME tdlua_managed_metatable_oom
+        COMMAND tdlua_managed_metatable_oom_test)
     add_executable(tdlua_json_push_oom_test
         "tests/json_push_oom_test.cpp" "src/common/lua_json.cpp")
     target_include_directories(tdlua_json_push_oom_test PRIVATE
