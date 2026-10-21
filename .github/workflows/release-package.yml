@@ -389,7 +389,30 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
           test -f "tdlua-${release_tag}-source.tar.gz"
           test -f SHA256SUMS
-          variants=$((10 + 4 + 2))
+
+          # The declared matrix, verified by name and then counted. The ten
+          # Linux x86-64 modules are five Lua ABIs times two backends; the six
+          # platform archives are named explicitly. A renamed or duplicated
+          # artifact fails here, and the total is derived from the files that
+          # matched instead of being asserted as a constant.
+          tdlib_version="$(sed -n 's/^project(TDLib VERSION \([0-9.]*\)).*/\1/p' td/CMakeLists.txt | head -1)"
+          test -n "$tdlib_version"
+          variants=0
+          for abi in 5.2 5.3 5.4 5.5 luajit; do
+            test -f "tdlua-${abi}-${base_version}-${tdlib_version}-linux-x86_64.so"
+            test -f "tdlua-${abi}-native-${base_version}-${tdlib_version}-linux-x86_64.so"
+            variants=$((variants + 2))
+          done
+          for archive in \
+            tdlua-5.4-aarch64-json.tar.gz \
+            tdlua-5.4-aarch64-native.tar.gz \
+            tdlua-5.4-macos-arm64-json.tar.gz \
+            tdlua-5.4-macos-arm64-native.tar.gz \
+            tdlua-5.4-win64-json.zip \
+            tdlua-5.4-win64-native.zip; do
+            test -f "$archive"
+            variants=$((variants + 1))
+          done
           test "$variants" -eq 16
           for file in LICENSE NOTICE TDLib-LICENSE_1_0.txt; do
             test -f "$file"
