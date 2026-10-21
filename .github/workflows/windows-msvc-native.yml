@@ -12,9 +12,24 @@ on:
       - p5d3-windows-native-runtime
       - p5d4-native-integration
       - v0.5.1-consolidated
+  pull_request:
+    branches:
+      - vnext-portability-clean
+      - v0.5.1-consolidated
+    paths:
+      - '.github/workflows/windows-msvc-native.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'include/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'tools/windows/**'
+      - 'td'
   workflow_dispatch:
   # Called by release-package.yml so the native Windows package is produced in
-  # the same run as the payload. Branch pushes are unchanged.
+  # the same run as the payload. Branch pushes are unchanged. Pull requests to
+  # the consolidated branches now run it as well, so the native backend is gated
+  # before a merge instead of only after one.
   workflow_call:
 
 permissions:
