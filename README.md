@@ -110,7 +110,7 @@ handle and wait again after a timeout.
 
 ## Distributed packages
 
-A release payload carries 16 binary variants. The archive name, the manifest
+The 0.5.1 payload carries 16 binary variants. The archive name, the manifest
 inside it and the checksum list all state the same ABI; a module is never
 presented as generic across Lua versions.
 
@@ -125,7 +125,10 @@ Every non-x86-64 archive contains `MANIFEST.txt`, the module, the applicable
 licenses and, for the JSON backend, the TDLib shared library. The manifest
 records `platform`, `arch`, `lua_implementation`, `lua_version`, `backend`,
 `tdlib_version`, `source_sha`, `module`, `module_sha256` and any
-platform-specific floor, such as `dependency_minos_max` on macOS.
+platform-specific floor, such as `dependency_minos_max` on macOS. Platforms
+that expect host libraries also record `external_runtime`, measured on the
+module: for Linux AArch64 that is the Lua, OpenSSL, zlib and C++ runtime
+sonames it imports.
 
 ### Lua ABI
 
@@ -178,6 +181,55 @@ renamed or foreign archive; a failure cannot be hidden by shrinking the
 payload. `SHA256SUMS` covers every published file, and the dry run downloads
 the payload again and verifies it end to end.
 
+## Migrating from 0.5.0
+
+TDLua 0.5.1 keeps the 0.5.0 Lua API, the scheduler contracts and the TDLib pin
+(1.8.68). Most users only replace the module; the rest of this section lists the
+changes that can be observed from Lua.
+
+### Actions
+
+- Replace the module with the 0.5.1 build for the same Lua ABI. The module file
+  name does not change shape, so an installation path such as
+  `lib/lua/5.4/tdlua.so` keeps working. Do not load a module built for another
+  Lua version: the ABI check is the file name and the manifest, not a runtime
+  probe.
+- On Windows, use the `tdlua-5.4-win64-{json,native}.zip` archive. It contains
+  `tdlua.dll` and, for JSON, `tdjson.dll`; the host still provides `lua54.dll`
+  and the MSVC runtime.
+- On macOS, use the `tdlua-5.4-macos-arm64-{json,native}.tar.gz` archive. The
+  module needs a Lua 5.4 library reachable from the module directory or
+  `DYLD_LIBRARY_PATH`, and Homebrew `openssl@3` remains a host dependency.
+- On Linux AArch64, the new archives install under `lib/lua/5.4/` and need the
+  OpenSSL 3 and zlib runtime, but not `libtdjson`.
+- If you install through LuaRocks, use `tdlua-0.5.1-1.rockspec` or
+  `tdlua-luajit-0.5.1-1.rockspec`. The 0.5.0 rockspecs still declare the old
+  version and source.
+
+### Behaviour changes
+
+- An update published while a bounded `receive(timeout)` is in flight is no
+  longer dropped when that call times out. It stays available to the next
+  generic read and does not consume generic quota once consumed.
+- On MSVC x64 and macOS arm64, where `long double` is binary64, an int64 that a
+  Lua number cannot represent exactly is now returned as a decimal string
+  instead of a rounded number. A Lua number equal to 2^63 passed as input is
+  refused instead of being accepted as `INT64_MAX`. Code that already treated
+  int64 fields as number-or-string, as documented, needs no change; code that
+  only ran on Linux x86-64 is unaffected.
+- A timed poll that already selected an update returns without the extra
+  cross-client dependency round. The data returned is the same; the call can
+  just return sooner.
+
+### Not changed
+
+- No Lua function was removed or respecified, and no new required argument was
+  added.
+- `send`, `receive`, `poll`, `loop`, `execute`, `await`, Futures, Tasks and the
+  managed routing semantics keep the 0.5.0 contract.
+- TDLib stays at 1.8.68. Upstream TDLib findings and `CleanupIncomplete` limits
+  are not resolved by this release.
+
 ## Runtime profiles
 
 The implementation targets these profiles for both backends. Build and test
@@ -213,7 +265,7 @@ cmake --build build-luajit --target tdlua
 Add `-DTDLUA_BACKEND=native` for the native backend. Non-default installations
 can supply matching `LUA_INCLUDE_DIR` and `LUA_LIBRARY` paths. LuaJIT modules
 install under the Lua 5.1 ABI directory. For LuaRocks, use
-`tdlua-luajit-0.5.0-1.rockspec` or `tdlua-luajit-scm-1.rockspec` with a LuaRocks
+`tdlua-luajit-0.5.1-1.rockspec` or `tdlua-luajit-scm-1.rockspec` with a LuaRocks
 installation configured for LuaJIT. These separate packages require the
 runtime-provided `luajit` dependency as well as the Lua 5.1 ABI; they do not
 claim stock Lua 5.1 support. They install the same `tdlua` module, so choose one
