@@ -219,6 +219,14 @@ jobs:
                 echo "::error::${archive} exports test hooks"
                 exit 1
               fi
+              # The manifest must state the dependencies the module actually
+              # imports, not a hand-written list.
+              expected_external="$(LC_ALL=C readelf -d "$module" \
+                | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
+                | grep -v -E '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux)' \
+                | paste -sd, -)"
+              test -n "$expected_external"
+              grep -qx "external_runtime=${expected_external}" "$root/MANIFEST.txt"
             else
               file "$module" | grep 'Mach-O 64-bit.*arm64' >/dev/null
               if [ "$backend" = json ]; then

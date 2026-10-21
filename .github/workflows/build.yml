@@ -504,6 +504,14 @@ jobs:
                 "$root/share/licenses/tdlua/$license"
             done
             module_sha="$(sha256sum "$root/lib/lua/5.4/tdlua.so" | cut -d ' ' -f 1)"
+            # Runtime dependencies as the dynamic loader sees them. glibc and
+            # the ELF interpreter are part of the validated Ubuntu baseline, not
+            # package requirements, so they stay out of the manifest.
+            external_runtime="$(LC_ALL=C readelf -d "$root/lib/lua/5.4/tdlua.so" \
+              | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
+              | grep -v -E '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux)' \
+              | paste -sd, -)"
+            test -n "$external_runtime"
             {
               echo "package=tdlua"
               echo "version=${version}"
@@ -517,6 +525,7 @@ jobs:
               echo "source_sha=${GITHUB_SHA}"
               echo "module=lib/lua/5.4/tdlua.so"
               echo "module_sha256=${module_sha}"
+              echo "external_runtime=${external_runtime}"
             } > "$root/MANIFEST.txt"
             tar -C "$out" -czf "$out/${name}.tar.gz" "$name"
           }
