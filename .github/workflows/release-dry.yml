@@ -17,8 +17,10 @@ on:
   push:
     branches:
       # The consolidated branch is already validated by build.yml on push;
-      # running the dry run there would execute the whole matrix twice.
+      # running the dry run there would execute the whole matrix twice. The
+      # packaging and release-metadata branches are only validated here.
       - "p71*-packaging*"
+      - "p72*"
 
 permissions:
   contents: read

@@ -2,11 +2,13 @@ name: macOS arm64 native portability
 
 on:
   push:
-    # Packaging branches are built through release-dry.yml; a standalone run
-    # would duplicate the same commit on macOS. The branches filter also keeps
-    # this workflow off tag pushes, where release.yml calls it explicitly.
+    # Packaging and release-metadata branches are built through
+    # release-dry.yml; a standalone run would duplicate the same commit on
+    # macOS. The branches filter also keeps this workflow off tag pushes, where
+    # release.yml calls it explicitly.
     branches-ignore:
       - "p71*-packaging*"
+      - "p72*"
     paths:
       - .github/workflows/macos-native.yml
       - CMakeLists.txt

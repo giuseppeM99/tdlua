@@ -2,12 +2,13 @@ name: macOS arm64 JSON portability
 
 on:
   push:
-    # Packaging branches are built by release-dry.yml through workflow_call;
-    # a standalone push run would duplicate macOS on the same commit. The
-    # branches filter also keeps this workflow off tag pushes, where
-    # release.yml calls it explicitly.
+    # Packaging and release-metadata branches are built by release-dry.yml
+    # through workflow_call; a standalone push run would duplicate macOS on the
+    # same commit. The branches filter also keeps this workflow off tag pushes,
+    # where release.yml calls it explicitly.
     branches-ignore:
       - "p71*-packaging*"
+      - "p72*"
     paths:
       - .github/workflows/macos-json.yml
       - CMakeLists.txt

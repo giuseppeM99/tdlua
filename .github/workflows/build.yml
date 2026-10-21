@@ -9,10 +9,12 @@ on:
     # the standalone copy too would duplicate the whole matrix on every release.
     tags-ignore:
       - "v*"
-    # Packaging branches are validated by release-dry.yml, which calls this
-    # workflow for the same commit; the standalone run would duplicate it.
+    # Packaging and release-metadata branches are validated by release-dry.yml,
+    # which calls this workflow for the same commit; the standalone run would
+    # duplicate the whole matrix.
     branches-ignore:
       - "p71*-packaging*"
+      - "p72*"
   pull_request:
   workflow_call:
 
@@ -214,10 +216,11 @@ jobs:
 
   linux-aarch64:
     name: Linux AArch64 / JSON and native / Lua 5.4
-    # AArch64 is a release gate: it must also run for the packaging branch and
-    # for a release tag, not only for the consolidated branches. A skipped gate
-    # is not a green gate, so the ref filter cannot hide the job.
-    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
+    # AArch64 is a release gate: it must also run for the packaging and
+    # release-metadata branches and for a release tag, not only for the
+    # consolidated branches. A skipped gate is not a green gate, so the ref
+    # filter cannot hide the job.
+    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/heads/p72') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:
