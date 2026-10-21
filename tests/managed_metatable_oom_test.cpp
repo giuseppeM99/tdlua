@@ -199,6 +199,7 @@ struct OffsetResult {
     bool incomplete_after_retry = false;
     bool handle_leaked = false;
     bool state_alive = false;
+    std::size_t rejected_calls = 0;
 };
 
 // Creates a handle of the requested kind on a fully initialized metatable,
@@ -259,6 +260,7 @@ OffsetResult run_offset(Kind kind, std::size_t offset, bool two_failures)
     const int status = call_ensure(L);
     allocator.armed = false;
     result.injected = allocator.rejected != 0;
+    result.rejected_calls += allocator.rejected;
     result.failed = status != 0 || first.cpp_exception;
 
     const Fields after = inspect(L, metatable_name(kind));
@@ -272,6 +274,7 @@ OffsetResult run_offset(Kind kind, std::size_t offset, bool two_failures)
         const int second_status = call_ensure(L);
         allocator.armed = false;
         result.second_injected = allocator.rejected != 0;
+        result.rejected_calls += allocator.rejected;
         result.incomplete_after_second =
             !absent_or_complete(inspect(L, metatable_name(kind)));
         (void)second_status;
@@ -302,7 +305,7 @@ struct Sweep {
     std::size_t incomplete_after_retry = 0;
     std::size_t leaked = 0;
     std::size_t alive = 0;
-    std::size_t rejected = 0;
+    std::size_t rejected_calls = 0;
 };
 
 Sweep sweep(Kind kind, std::size_t max_offset, std::size_t double_limit)
@@ -321,6 +324,7 @@ Sweep sweep(Kind kind, std::size_t max_offset, std::size_t double_limit)
         if (result.incomplete_after_retry) ++summary.incomplete_after_retry;
         if (result.handle_leaked) ++summary.leaked;
         if (result.state_alive) ++summary.alive;
+        summary.rejected_calls += result.rejected_calls;
     }
     return summary;
 }
@@ -386,18 +390,22 @@ int main()
 
     std::printf("future: offsets=%zu injected=%zu failed=%zu "
                 "incomplete_after_failure=%zu incomplete_after_second=%zu "
-                "incomplete_after_retry=%zu leaked=%zu alive_after_close=%zu\n",
+                "incomplete_after_retry=%zu leaked=%zu alive_after_close=%zu "
+                "rejected_calls=%zu\n",
                 future.offsets, future.injected, future.failed,
                 future.incomplete_after_failure,
                 future.incomplete_after_second,
-                future.incomplete_after_retry, future.leaked, future.alive);
+                future.incomplete_after_retry, future.leaked, future.alive,
+                future.rejected_calls);
     std::printf("task: offsets=%zu injected=%zu failed=%zu "
                 "incomplete_after_failure=%zu incomplete_after_second=%zu "
-                "incomplete_after_retry=%zu leaked=%zu alive_after_close=%zu\n",
+                "incomplete_after_retry=%zu leaked=%zu alive_after_close=%zu "
+                "rejected_calls=%zu\n",
                 task.offsets, task.injected, task.failed,
                 task.incomplete_after_failure,
                 task.incomplete_after_second,
-                task.incomplete_after_retry, task.leaked, task.alive);
+                task.incomplete_after_retry, task.leaked, task.alive,
+                task.rejected_calls);
 
     const bool normal = normal_path();
     std::printf("normal_path=%d\n", normal ? 1 : 0);
