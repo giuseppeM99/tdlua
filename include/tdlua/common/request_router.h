@@ -3154,23 +3154,37 @@ inline void installManagedIteration(lua_State *L)
     lua_setfield(L, metatable, "__pairs");
 }
 
+// Build the metatable off-registry and publish it only once every fallible
+// step has completed. luaL_newmetatable would publish an empty table first, so
+// an allocation failure while filling it would leave a registered metatable
+// without __index/__gc that the luaL_newmetatable guard never repairs
+// (SEC-02A: the Future/Task finalizer must never be missing).
+inline void installManagedMetatable(lua_State *L, const char *name,
+                                    lua_CFunction index, bool managed_index)
+{
+    lua_getfield(L, LUA_REGISTRYINDEX, name);
+    const bool exists = !lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (exists) return;
+    lua_newtable(L);
+    if (managed_index) {
+        pushManagedFunction(L, index, completeManagedTrampoline, true);
+    } else {
+        lua_pushcfunction(L, index);
+    }
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, managedGc);
+    lua_setfield(L, -2, "__gc");
+    installManagedIteration(L);
+    lua_setfield(L, LUA_REGISTRYINDEX, name);
+}
+
 // Future and Task handles share the same lifetime bookkeeping. Their uservalue
 // keeps the CoreAnchor reachable while the handle remains visible to Lua.
 inline void ensureManagedMetatables(lua_State *L)
 {
-    if (luaL_newmetatable(L, "tdlua.future")) {
-        pushManagedFunction(L, futureIndex, completeManagedTrampoline, true);
-        lua_setfield(L, -2, "__index");
-        lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
-        installManagedIteration(L);
-    }
-    lua_pop(L, 1);
-    if (luaL_newmetatable(L, "tdlua.task")) {
-        lua_pushcfunction(L, taskIndex); lua_setfield(L, -2, "__index");
-        lua_pushcfunction(L, managedGc); lua_setfield(L, -2, "__gc");
-        installManagedIteration(L);
-    }
-    lua_pop(L, 1);
+    installManagedMetatable(L, "tdlua.future", futureIndex, true);
+    installManagedMetatable(L, "tdlua.task", taskIndex, false);
 }
 inline void pushManagedHandle(lua_State *L, const ManagedStatePtr &state, const char *type)
 {
