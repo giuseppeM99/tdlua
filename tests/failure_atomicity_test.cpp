@@ -101,6 +101,77 @@ int noop(lua_State *)
     return 0;
 }
 
+int handler_a(lua_State *L)
+{
+    lua_pushinteger(L, 101);
+    return 1;
+}
+
+int handler_b(lua_State *L)
+{
+    lua_pushinteger(L, 202);
+    return 1;
+}
+
+int g_serial_calls = 0;
+
+int serial_handler(lua_State *L)
+{
+    ++g_serial_calls;
+    lua_pushinteger(L, g_serial_calls);
+    return 1;
+}
+
+tdlua::RequestRouter *g_reentrant_router = nullptr;
+std::string g_reentrant_type;
+int g_reentrant_calls = 0;
+
+int reentrant_handler(lua_State *L)
+{
+    ++g_reentrant_calls;
+    const int top = lua_gettop(L);
+    lua_pushcfunction(L, handler_b);
+    g_reentrant_router->onEvent(L, g_reentrant_type, -1, false);
+    lua_settop(L, top);
+    return 0;
+}
+
+void install_handler(tdlua::RequestRouter &router, lua_State *L,
+                     const std::string &type, lua_CFunction handler,
+                     bool concurrent = false)
+{
+    const int top = lua_gettop(L);
+    lua_pushcfunction(L, handler);
+    router.onEvent(L, type, -1, concurrent);
+    lua_settop(L, top);
+}
+
+int invoke_handler(tdlua::RequestRouter &router, lua_State *L,
+                   const std::string &type)
+{
+    const int top = lua_gettop(L);
+    require(router.pushEventHandler(L, type), "onEvent: handler is missing");
+    require(lua_pcall(L, 0, 1, 0) == LUA_OK,
+            "onEvent: handler invocation failed");
+    const int value = static_cast<int>(lua_tointeger(L, -1));
+    lua_settop(L, top);
+    return value;
+}
+
+bool g_ready_prefill_done = false;
+const std::size_t kReadyPrefill = 4095;
+
+void ready_prefill_hook(tdlua::SchedulerCore *core)
+{
+    if (g_ready_prefill_done) return;
+    g_ready_prefill_done = true;
+    // The deque constructor already owns one block. Fill every block and arm
+    // the next allocation, which is the real ready_.push_back growth.
+    g_cpp_fail_at = -1;
+    core->fillReadyForTesting(kReadyPrefill);
+    g_cpp_fail_at = 0;
+}
+
 lua_State *make_state(Allocator &allocator)
 {
 #if LUA_VERSION_NUM >= 505
@@ -345,6 +416,224 @@ void test_event_task_atomicity()
 }
 
 // ---------------------------------------------------------------------------
+// onEvent: a failed replacement must leave the previous handler fully
+// published, with no orphan reference and no invalidated serial queue.
+
+void test_event_registration_atomicity()
+{
+    Vm vm;
+    const std::string type = "failure.onEvent";
+    const std::string other = "failure.onEvent.other";
+    bool saw_replacement_failure = false;
+    bool saw_new_type_failure = false;
+
+    // Same key: registration allocation and Lua reference creation fail before
+    // the map assignment. Handler A must remain the published handler.
+    for (long cpp = 0; cpp <= 4; ++cpp) {
+        {
+            tdlua::RequestRouter router(vm.L);
+            install_handler(router, vm.L, type, handler_a);
+            require(invoke_handler(router, vm.L, type) == 101,
+                    "onEvent: initial handler is not active");
+
+            const int base = lua_gettop(vm.L);
+            lua_pushcfunction(vm.L, handler_b);
+            if (cpp != 0) arm_cpp(cpp);
+            const bool failed = run_catching([&] {
+                router.onEvent(vm.L, type, -1, false);
+            });
+            disarm_cpp();
+            lua_settop(vm.L, base);
+
+            auto stats = router.bufferStats();
+            if (failed) {
+                saw_replacement_failure = true;
+                require(invoke_handler(router, vm.L, type) == 101,
+                        "onEvent: failed replacement retired handler A");
+                require(stats.lua_registry_refs == 1,
+                        "onEvent: replacement leaked a reference");
+                install_handler(router, vm.L, type, handler_b);
+            }
+            require(invoke_handler(router, vm.L, type) == 202,
+                    "onEvent: successful replacement did not publish B");
+            stats = router.bufferStats();
+            require(stats.lua_registry_refs == 1,
+                    "onEvent: replacement left an orphan reference");
+
+            router.offEvent(type);
+            require(router.bufferStats().lua_registry_refs == 0,
+                    "onEvent: offEvent leaked the handler reference");
+            router.clear();
+        }
+    }
+    require(saw_replacement_failure,
+            "onEvent: no same-type replacement failure was observed");
+
+    // Same key: Lua allocation failure while copying the handler reference.
+    for (long lua = 1; lua <= 12; ++lua) {
+        {
+            tdlua::RequestRouter router(vm.L);
+            install_handler(router, vm.L, type, handler_a);
+            require(invoke_handler(router, vm.L, type) == 101,
+                    "onEvent: initial handler is not active");
+
+            const int base = lua_gettop(vm.L);
+            lua_pushcfunction(vm.L, handler_b);
+            vm.allocator.arm(static_cast<std::size_t>(lua));
+            const bool failed = run_catching([&] {
+                router.onEvent(vm.L, type, -1, false);
+            });
+            vm.allocator.disarm();
+            lua_settop(vm.L, base);
+
+            auto stats = router.bufferStats();
+            if (failed) {
+                saw_replacement_failure = true;
+                require(invoke_handler(router, vm.L, type) == 101,
+                        "onEvent: Lua failure retired handler A");
+                require(stats.lua_registry_refs == 1,
+                        "onEvent: Lua failure leaked a reference");
+                install_handler(router, vm.L, type, handler_b);
+            }
+            require(invoke_handler(router, vm.L, type) == 202,
+                    "onEvent: Lua retry did not publish B");
+            stats = router.bufferStats();
+            require(stats.lua_registry_refs == 1,
+                    "onEvent: Lua retry left an orphan reference");
+
+            router.offEvent(type);
+            require(router.bufferStats().lua_registry_refs == 0,
+                    "onEvent: Lua failure leaked the handler reference");
+            router.clear();
+        }
+    }
+
+    // A new map key allocates a node. Failure there must leave A untouched and
+    // the new type absent; a retry then publishes both handlers.
+    for (long cpp = 0; cpp <= 6; ++cpp) {
+        {
+            tdlua::RequestRouter router(vm.L);
+            install_handler(router, vm.L, type, handler_a);
+            require(invoke_handler(router, vm.L, type) == 101,
+                    "onEvent: initial handler is not active");
+
+            const int base = lua_gettop(vm.L);
+            lua_pushcfunction(vm.L, handler_b);
+            if (cpp != 0) arm_cpp(cpp);
+            const bool failed = run_catching([&] {
+                router.onEvent(vm.L, other, -1, false);
+            });
+            disarm_cpp();
+            lua_settop(vm.L, base);
+
+            auto stats = router.bufferStats();
+            if (failed) {
+                saw_new_type_failure = true;
+                require(invoke_handler(router, vm.L, type) == 101,
+                        "onEvent: new-type failure retired handler A");
+                require(!router.hasEventHandler(other),
+                        "onEvent: failed new type was published");
+                require(stats.lua_registry_refs == 1,
+                        "onEvent: new-type failure leaked a reference");
+                install_handler(router, vm.L, other, handler_b);
+            } else {
+                require(invoke_handler(router, vm.L, type) == 101,
+                        "onEvent: new-type success retired handler A");
+            }
+            require(invoke_handler(router, vm.L, other) == 202,
+                    "onEvent: new type is not active");
+            stats = router.bufferStats();
+            require(stats.lua_registry_refs == 2,
+                    "onEvent: two handlers do not have two references");
+
+            router.offEvent(other);
+            require(router.bufferStats().lua_registry_refs == 1,
+                    "onEvent: offEvent leaked the second reference");
+            router.offEvent(type);
+            require(router.bufferStats().lua_registry_refs == 0,
+                    "onEvent: teardown leaked a handler reference");
+            router.clear();
+        }
+    }
+    require(saw_new_type_failure,
+            "onEvent: no new-type publication failure was observed");
+
+    // A serial handler's queued updates belong to the old registration. A
+    // failed replacement must not discard them or leave the registration
+    // active with no owner.
+    {
+        tdlua::RequestRouter router(vm.L);
+        g_serial_calls = 0;
+        install_handler(router, vm.L, type, serial_handler, false);
+        require(router.deferEvent(type, [](lua_State *state) {
+            lua_pushinteger(state, 1);
+        }), "onEvent: first serial defer failed");
+        require(router.deferEvent(type, [](lua_State *state) {
+            lua_pushinteger(state, 2);
+        }), "onEvent: second serial defer failed");
+
+        const int base = lua_gettop(vm.L);
+        lua_pushcfunction(vm.L, handler_b);
+        arm_cpp(0);
+        const bool failed = run_catching([&] {
+            router.onEvent(vm.L, type, -1, false);
+        });
+        disarm_cpp();
+        lua_settop(vm.L, base);
+        require(failed, "onEvent: serial replacement failure was not observed");
+        require(router.hasEventHandler(type),
+                "onEvent: serial handler A is not active");
+
+        g_serial_calls = 0;
+        router.tick();
+        require(g_serial_calls == 2,
+                "onEvent: failed replacement discarded serial queued updates");
+        require(router.bufferStats().handler_queued_updates == 0,
+                "onEvent: serial queue was not drained");
+        require(router.bufferStats().lua_registry_refs == 1,
+                "onEvent: serial teardown leaked a reference");
+
+        router.offEvent(type);
+        require(router.bufferStats().lua_registry_refs == 0,
+                "onEvent: serial offEvent leaked a reference");
+        router.clear();
+    }
+
+    // Replacing the registration from inside its own running serial handler.
+    // The running Task owns a copied callback reference, so retiring A must
+    // not invalidate the active frame; B becomes the published handler.
+    {
+        tdlua::RequestRouter router(vm.L);
+        g_reentrant_router = &router;
+        g_reentrant_type = type;
+        g_reentrant_calls = 0;
+        install_handler(router, vm.L, type, reentrant_handler, false);
+        require(router.deferEvent(type, [](lua_State *state) {
+            lua_pushinteger(state, 1);
+        }), "onEvent: active serial defer failed");
+
+        router.tick();
+        g_reentrant_router = nullptr;
+        require(g_reentrant_calls == 1,
+                "onEvent: active serial handler did not run");
+        require(router.hasEventHandler(type),
+                "onEvent: active replacement retired handler B");
+        require(invoke_handler(router, vm.L, type) == 202,
+                "onEvent: active replacement did not publish handler B");
+        auto stats = router.bufferStats();
+        require(stats.lua_registry_refs == 1,
+                "onEvent: active replacement leaked a reference");
+        require(stats.handler_queued_updates == 0,
+                "onEvent: active replacement left a stale serial queue");
+
+        router.offEvent(type);
+        require(router.bufferStats().lua_registry_refs == 0,
+                "onEvent: active offEvent leaked a reference");
+        router.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // createUpdateTask / selectPollUpdate: the selected update and the ready entry
 // cannot survive a failed Task publication.
 
@@ -435,6 +724,71 @@ void test_update_task_atomicity()
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ready_ growth: the first push into an empty deque uses its constructor block.
+// This case fills those blocks from a TDLUA_TESTING seam and then fails the
+// next allocation, which is a real deque block allocation.
+
+void test_ready_growth_atomicity()
+{
+    Vm vm;
+    tdlua::RequestRouter router(vm.L);
+    PollPump pump;
+    pump.router = &router;
+    pump.first = true;
+    router.setPump(&pump, poll_pump);
+    lua_pushcfunction(vm.L, noop);
+    const int callback = lua_gettop(vm.L);
+
+    g_ready_prefill_done = false;
+    tdlua::setReadyCreationHookForTesting(ready_prefill_hook);
+    const bool failed = run_catching([&] {
+        (void)router.core()->selectPollUpdate(vm.L, callback, false);
+    });
+    tdlua::setReadyCreationHookForTesting(nullptr);
+    const bool target_allocation_attempted = g_cpp_fail_at == -1;
+    disarm_cpp();
+    lua_settop(vm.L, callback - 1);
+
+    require(failed, "readygrowth: deque growth failure was not observed");
+    require(target_allocation_attempted,
+            "readygrowth: the failing allocation was not ready_.push_back");
+    auto stats = router.bufferStats();
+    require(!stats.poll_selecting,
+            "readygrowth: poll selection flag survived failure");
+    require(stats.event_states == 0,
+            "readygrowth: failed task state survived");
+    require(stats.ready_states == kReadyPrefill,
+            "readygrowth: pre-existing ready states changed");
+    require(stats.lua_registry_refs == 0,
+            "readygrowth: failed task leaked a reference");
+    require(stats.selected_updates == 0,
+            "readygrowth: failed task kept the selected update");
+
+    pump.first = true;
+    lua_pushcfunction(vm.L, noop);
+    const int retry_callback = lua_gettop(vm.L);
+    const bool retry_failed = run_catching([&] {
+        (void)router.core()->selectPollUpdate(vm.L, retry_callback, false);
+    });
+    lua_settop(vm.L, retry_callback - 1);
+    require(!retry_failed, "readygrowth: retry failed");
+    stats = router.bufferStats();
+    require(stats.event_states == 1,
+            "readygrowth: retry did not create the task");
+    require(stats.ready_states == 1,
+            "readygrowth: retry did not publish ready");
+    require(stats.lua_registry_refs == 2,
+            "readygrowth: retry did not own callback and update references");
+
+    router.clear();
+    stats = router.bufferStats();
+    require(stats.event_states == 0 && stats.ready_states == 0,
+            "readygrowth: teardown left task state");
+    require(stats.lua_registry_refs == 0,
+            "readygrowth: teardown left Lua references");
 }
 
 // ---------------------------------------------------------------------------
@@ -703,9 +1057,17 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "case: createEventTask\n");
             test_event_task_atomicity();
         }
+        if (enabled("onEvent")) {
+            std::fprintf(stderr, "case: onEvent\n");
+            test_event_registration_atomicity();
+        }
         if (enabled("createUpdateTask")) {
             std::fprintf(stderr, "case: createUpdateTask\n");
             test_update_task_atomicity();
+        }
+        if (enabled("readyGrowth")) {
+            std::fprintf(stderr, "case: readyGrowth\n");
+            test_ready_growth_atomicity();
         }
         if (enabled("runLoop")) {
             std::fprintf(stderr, "case: runLoop\n");

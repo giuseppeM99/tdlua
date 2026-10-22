@@ -265,6 +265,21 @@ inline void setTaskThreadCreationHookForTesting(TaskThreadCreationHook hook)
 {
     taskThreadCreationHook() = hook;
 }
+
+// The first push into an empty standard deque uses the block allocated by its
+// constructor, so an allocation injected at that point does not exercise
+// ready_.push_back. Tests use this seam to fill the existing blocks and then
+// fail the next allocation, which is the real deque growth.
+using ReadyCreationHook = void (*)(SchedulerCore *);
+inline ReadyCreationHook &readyCreationHook()
+{
+    static thread_local ReadyCreationHook hook = nullptr;
+    return hook;
+}
+inline void setReadyCreationHookForTesting(ReadyCreationHook hook)
+{
+    readyCreationHook() = hook;
+}
 #endif
 
 // The userdata lives on the suspended coroutine's stack, independently of
@@ -925,6 +940,9 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             state->response_ref = update_ref;
             if (kind == RequestKind::LoopTask)
                 state->loop_observer = managed_driver_.loop_observer;
+#ifdef TDLUA_TESTING
+            if (readyCreationHook()) readyCreationHook()(this);
+#endif
             ready_.push_back(state);
             return state;
         } catch (const TDLuaLuaError &) {
@@ -1672,6 +1690,19 @@ public:
     }
 #endif
 #ifdef TDLUA_TESTING
+    // Diagnostic seam for the deque-growth regression. These states are
+    // terminal so an ordinary tick retires them without invoking user code.
+    void fillReadyForTesting(std::size_t count)
+    {
+        for (std::size_t index = 0; index < count; ++index) {
+            State state(new ManagedState());
+            state->core = shared_from_this();
+            state->kind = RequestKind::PollTask;
+            state->status = ManagedStatus::Failed;
+            ready_.push_back(state);
+        }
+    }
+
     struct BufferStats {
         std::size_t pending_requests = 0;
         std::size_t live_states = 0;
