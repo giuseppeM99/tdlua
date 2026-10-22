@@ -12,7 +12,6 @@ on:
       - p5d3-windows-native-runtime
       - p5d4-native-integration
       - v0.5.1-consolidated
-      - sec03-oom-failure-atomicity
   pull_request:
     branches:
       - vnext-portability-clean

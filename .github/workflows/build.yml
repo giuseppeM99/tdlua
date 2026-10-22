@@ -220,7 +220,7 @@ jobs:
     # release-metadata branches and for a release tag, not only for the
     # consolidated branches. A skipped gate is not a green gate, so the ref
     # filter cannot hide the job.
-    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || github.ref == 'refs/heads/sec03-oom-failure-atomicity' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/heads/p72') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
+    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/heads/p72') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:
