@@ -466,6 +466,50 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         return reference.value;
     }
 
+    // Copy an existing reference without placing a temporary value on the
+    // caller's stack. The protected frame owns both the source lookup and the
+    // new reference, so a Lua allocation failure leaves only the Lua error
+    // object on L.
+    int copyLuaReference(lua_State *L, int source_ref)
+    {
+        struct Reference {
+            SchedulerCore *core;
+            int source;
+            int value;
+        } reference = {this, source_ref, LUA_NOREF};
+        protectedLua(L, [](lua_State *state, void *context) {
+            auto *reference = static_cast<Reference *>(context);
+            if (reference->source == LUA_NOREF ||
+                reference->source == LUA_REFNIL) {
+                reference->value = LUA_REFNIL;
+                return;
+            }
+            if (!pushCoreReferences(state, reference->core))
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            lua_rawgeti(state, -1, reference->source);
+            reference->value = luaL_ref(state, -2);
+        }, &reference);
+        return reference.value;
+    }
+
+    // Reference the current thread from inside the protected frame. The caller
+    // does not have to push a temporary value on its own stack.
+    int createThreadReference(lua_State *L)
+    {
+        struct Reference {
+            SchedulerCore *core;
+            int value;
+        } reference = {this, LUA_NOREF};
+        protectedLua(L, [](lua_State *state, void *context) {
+            auto *reference = static_cast<Reference *>(context);
+            if (!pushCoreReferences(state, reference->core))
+                throw std::runtime_error("tdlua: scheduler storage unavailable");
+            lua_pushthread(state);
+            reference->value = luaL_ref(state, -2);
+        }, &reference);
+        return reference.value;
+    }
+
     void releaseLuaReference(int &ref)
     {
         if (ref != LUA_NOREF && ref != LUA_REFNIL &&
@@ -604,11 +648,23 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         state->core = shared_from_this();
         state->kind = kind;
         if (isUpdateCallbackTask(kind)) {
+            // std::vector::push_back has the strong guarantee for a
+            // non-throwing value type: a failed allocation leaves the vector
+            // unchanged.
             event_states_.push_back(state);
         } else {
             state->request_id = next_++;
-            pending_[state->request_id] = state;
-            live_states_[state->request_id] = state;
+            try {
+                pending_[state->request_id] = state;
+                live_states_[state->request_id] = state;
+            } catch (...) {
+                // The only fallible step after the first publication is the
+                // second map insertion. Remove the first one before the state
+                // becomes unobservable.
+                pending_.erase(state->request_id);
+                live_states_.erase(state->request_id);
+                throw;
+            }
             trackPendingRequest(state);
         }
         return state;
@@ -640,6 +696,21 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
             live_states_.erase(state->request_id);
         }
         releaseLuaReferences(state);
+    }
+
+    // Undo a Task setup that failed before its final publication. The function
+    // owns update_ref on entry, so the reference is either still in the local
+    // variable or already in state->response_ref.
+    void withdrawTaskState(State &state, int &update_ref, int owner_top)
+    {
+        if (state) {
+            if (state->response_ref == LUA_NOREF)
+                state->response_ref = update_ref;
+            rollbackTaskCreation(state);
+        } else {
+            releaseLuaReference(update_ref);
+        }
+        lua_settop(lua_owner_, owner_top);
     }
 
     void failTaskSetup(const State &state, const char *message)
@@ -801,26 +872,49 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
 
     State createEventTask(const EventRegistrationPtr &registration, int update_ref)
     {
-        const State state = createState(RequestKind::EventTask);
-        state->event_registration = registration;
-        pushLuaReference(lua_owner_, registration->handler_ref);
-        state->callback_ref = createLuaReference(lua_owner_, -1);
-        lua_pop(lua_owner_, 1);
-        state->response_ref = update_ref;
-        return state;
+        const int owner_top = lua_gettop(lua_owner_);
+        State state;
+        try {
+            state = createState(RequestKind::EventTask);
+            state->event_registration = registration;
+            state->callback_ref =
+                copyLuaReference(lua_owner_, registration->handler_ref);
+            state->response_ref = update_ref;
+            return state;
+        } catch (const TDLuaLuaError &) {
+            withdrawTaskState(state, update_ref, owner_top);
+            throw std::runtime_error(
+                "tdlua: event task reference allocation failed");
+        } catch (...) {
+            // The function takes ownership of update_ref at entry. On failure
+            // the state, its copied callback reference and the update must all
+            // disappear together.
+            withdrawTaskState(state, update_ref, owner_top);
+            throw;
+        }
     }
 
     State createUpdateTask(RequestKind kind, int callback_ref, int update_ref)
     {
-        const State state = createState(kind);
-        pushLuaReference(lua_owner_, callback_ref);
-        state->callback_ref = createLuaReference(lua_owner_, -1);
-        lua_pop(lua_owner_, 1);
-        state->response_ref = update_ref;
-        if (kind == RequestKind::LoopTask)
-            state->loop_observer = managed_driver_.loop_observer;
-        ready_.push_back(state);
-        return state;
+        const int owner_top = lua_gettop(lua_owner_);
+        State state;
+        try {
+            state = createState(kind);
+            state->callback_ref =
+                copyLuaReference(lua_owner_, callback_ref);
+            state->response_ref = update_ref;
+            if (kind == RequestKind::LoopTask)
+                state->loop_observer = managed_driver_.loop_observer;
+            ready_.push_back(state);
+            return state;
+        } catch (const TDLuaLuaError &) {
+            withdrawTaskState(state, update_ref, owner_top);
+            throw std::runtime_error(
+                "tdlua: update task reference allocation failed");
+        } catch (...) {
+            withdrawTaskState(state, update_ref, owner_top);
+            throw;
+        }
     }
 
     void discardQueuedLoopUpdates(const std::shared_ptr<LoopObserver> &observer)
@@ -844,18 +938,39 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         const int update_ref = observer->queued_updates.front();
         observer->queued_updates.pop_front();
         observer->active = true;
-        createUpdateTask(RequestKind::LoopTask, observer->callback_ref, update_ref);
+        try {
+            createUpdateTask(RequestKind::LoopTask, observer->callback_ref,
+                             update_ref);
+        } catch (...) {
+            // createUpdateTask consumed update_ref on failure. Without a Task
+            // the observer cannot make progress, so withdraw the whole queue
+            // instead of leaving an active observer with no owner.
+            observer->active = false;
+            requestLoopStop(observer);
+        }
     }
 
     void queueOrScheduleLoopUpdate(
         const std::shared_ptr<LoopObserver> &observer, int update_ref)
     {
         if (!observer->concurrent && observer->active) {
-            observer->queued_updates.push_back(update_ref);
+            try {
+                observer->queued_updates.push_back(update_ref);
+            } catch (...) {
+                releaseLuaReference(update_ref);
+            }
             return;
         }
+        const bool previous_active = observer->active;
         observer->active = true;
-        createUpdateTask(RequestKind::LoopTask, observer->callback_ref, update_ref);
+        try {
+            createUpdateTask(RequestKind::LoopTask, observer->callback_ref,
+                             update_ref);
+        } catch (...) {
+            // createUpdateTask consumed update_ref and rolled back the Task.
+            // Keep the observer usable for a later update.
+            observer->active = previous_active;
+        }
     }
 
     void finishLoopTask(const State &state)
@@ -897,7 +1012,20 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         const int update_ref = registration->queued_updates.front();
         registration->queued_updates.pop_front();
         registration->active = true;
-        ready_.push_back(createEventTask(registration, update_ref));
+        State next;
+        try {
+            next = createEventTask(registration, update_ref);
+            ready_.push_back(next);
+        } catch (...) {
+            // createEventTask already withdrew its own state and the update
+            // reference. A failure in ready_ leaves a fully built state that
+            // must be rolled back here. Drop the remaining serial queue as an
+            // explicit withdrawal: no Task owns it and no later finish would
+            // drain it without a new event.
+            if (next) rollbackTaskCreation(next);
+            registration->active = false;
+            discardQueuedEvents(registration);
+        }
     }
 
     void bindDeferredEvent(DeferredEvent event)
@@ -913,20 +1041,30 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
         const EventRegistrationPtr registration = found->second;
         if (!registration->concurrent && registration->active) {
-            registration->queued_updates.push_back(event.update_ref);
+            try {
+                registration->queued_updates.push_back(event.update_ref);
+            } catch (...) {
+                releaseLuaReference(event.update_ref);
+            }
             return;
         }
         if (!registration->concurrent) {
             registration->active = true;
         }
+        State next;
         try {
-            ready_.push_back(createEventTask(registration, event.update_ref));
+            next = createEventTask(registration, event.update_ref);
+            ready_.push_back(next);
         } catch (...) {
-            releaseLuaReference(event.update_ref);
+            // createEventTask consumed event.update_ref and rolled back any
+            // partially published state. A ready_ failure leaves a complete
+            // state that is withdrawn here. Drop the serial queue so a later
+            // event cannot overtake older queued deliveries.
+            if (next) rollbackTaskCreation(next);
             if (!registration->concurrent) {
                 registration->active = false;
             }
-            throw;
+            discardQueuedEvents(registration);
         }
     }
 
@@ -1070,11 +1208,22 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         releaseLuaReference(state->callback_ref);
         releaseLuaReference(state->context_ref);
         state->status = ManagedStatus::Running;
-        running_tasks_[thread] = state;
-        TaskBinding binding;
-        binding.core = shared_from_this();
-        binding.state = state;
-        taskBindings()[thread] = binding;
+        try {
+            running_tasks_[thread] = state;
+            TaskBinding binding;
+            binding.core = shared_from_this();
+            binding.state = state;
+            taskBindings()[thread] = binding;
+        } catch (...) {
+            // A Task whose thread binding cannot be published has no owner:
+            // remove the partial binding and finish it through the normal
+            // setup-failure path.
+            removeRunningTask(thread);
+            lua_settop(thread, thread_top);
+            lua_settop(lua_owner_, owner_top);
+            failTaskSetup(state, "tdlua: task binding failed");
+            return;
+        }
         // Pin the owner core before the initial callback can enter Lua and
         // yield into a dependency owned by another core.
         int status = LUA_ERRRUN;
@@ -1295,6 +1444,26 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
                          std::chrono::duration<double>(timeout));
     }
 
+    void detachContinuationBinding(lua_State *L,
+                                   ContinuationState *continuation)
+    {
+        const auto binding = taskBindings().find(L);
+        if (binding != taskBindings().end() &&
+            binding->second.continuation == continuation) {
+            binding->second.continuation = nullptr;
+        }
+    }
+
+    static void discardContinuation(ContinuationState *continuation)
+    {
+        if (!continuation) return;
+        continuation->consumed = true;
+        continuation->dependency.reset();
+        continuation->task.reset();
+        continuation->dependency_core.reset();
+        continuation->task_core.reset();
+    }
+
     int beginYield(lua_State *L, const State &state, WaitKind kind,
                    const char *field, bool timed, double timeout)
     {
@@ -1390,21 +1559,44 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         if (timed) {
             registration.deadline = deadlineFor(timeout);
         }
-        lua_pushthread(L);
-        registration.thread_ref = createLuaReference(L, -1);
-        lua_pop(L, 1);
+        try {
+            registration.thread_ref = createThreadReference(L);
+        } catch (const TDLuaLuaError &) {
+            // The protected boundary left only its error object on top. Remove
+            // the unfinished continuation below it so lua_error can use the
+            // original error unchanged.
+            lua_remove(L, context);
+            detachContinuationBinding(L, continuation);
+            discardContinuation(continuation);
+            throw;
+        } catch (...) {
+            lua_settop(L, context - 1);
+            detachContinuationBinding(L, continuation);
+            discardContinuation(continuation);
+            throw;
+        }
         // Lua allocation may have run the client finalizer while preparing
         // storage. Do not install a new wait on an already terminal state.
         if (isTerminalState(state)) {
             releaseLuaReference(registration.thread_ref);
-            continuation->consumed = true;
-            continuation->dependency.reset();
-            continuation->task.reset();
+            detachContinuationBinding(L, continuation);
+            discardContinuation(continuation);
             lua_pop(L, 1);
             return 0;
         }
-        waiters_[L] = registration;
-        waitBindings()[L] = shared_from_this();
+        bool waiter_inserted = false;
+        try {
+            waiters_.emplace(L, registration);
+            waiter_inserted = true;
+            waitBindings().emplace(L, shared_from_this());
+        } catch (...) {
+            if (waiter_inserted) waiters_.erase(L);
+            releaseLuaReference(registration.thread_ref);
+            lua_settop(L, context - 1);
+            detachContinuationBinding(L, continuation);
+            discardContinuation(continuation);
+            throw;
+        }
         ++state->waiter_count;
         continuation->consumed = false;
         return context;
@@ -1827,33 +2019,61 @@ public:
             throw std::runtime_error("tdlua: poll timeout must be finite and non-negative");
         const auto deadline = timed ? deadlineFor(timeout)
                                     : std::chrono::steady_clock::time_point::max();
-        managed_driver_.poll_selecting = true;
+        managed_driver_.poll_selecting = false;
         bool attempted = false;
-        while (managed_driver_.selected_update == LUA_NOREF && hasPump()) {
-            if (timed && attempted && std::chrono::steady_clock::now() >= deadline)
-                break;
-            tdlua_lua_vm_checkpoint(L);
-            driveStep(managedReceiveSlice(), timed ? &deadline : nullptr);
-            attempted = true;
+        bool selecting = false;
+        try {
+            while (managed_driver_.selected_update == LUA_NOREF && hasPump()) {
+                if (timed && attempted &&
+                    std::chrono::steady_clock::now() >= deadline)
+                    break;
+                // The first checkpoint installs its cached chunk with a
+                // non-protected load. Run it before publishing poll_selecting
+                // so an allocator longjmp cannot leave the flag set.
+                tdlua_lua_vm_checkpoint(L);
+                if (!selecting) {
+                    managed_driver_.poll_selecting = true;
+                    selecting = true;
+                }
+                driveStep(managedReceiveSlice(), timed ? &deadline : nullptr);
+                attempted = true;
+            }
+            tick();
+            if (managed_driver_.selected_update == LUA_NOREF) {
+                lua_pushnil(L);
+                managed_driver_.poll_selecting = false;
+                return State();
+            }
+            if (!callback) {
+                pushLuaReference(L, managed_driver_.selected_update);
+                releaseLuaReference(managed_driver_.selected_update);
+                managed_driver_.poll_selecting = false;
+                return State();
+            }
+            int callback_ref = createLuaReference(L, callback);
+            const int update_ref = managed_driver_.selected_update;
+            managed_driver_.selected_update = LUA_NOREF;
+            State state;
+            try {
+                state = createUpdateTask(RequestKind::PollTask, callback_ref,
+                                         update_ref);
+            } catch (...) {
+                // createUpdateTask owns only its copy of callback_ref and the
+                // update. The caller's reference still has to be released, and
+                // the transfer already cleared selected_update.
+                releaseLuaReference(callback_ref);
+                throw;
+            }
+            releaseLuaReference(callback_ref);
+            managed_driver_.poll_selecting = false;
+            // The caller first creates the handle, then may perform an
+            // ordinary drain. It never joins this Task, including after a
+            // managed yield.
+            return state;
+        } catch (...) {
+            managed_driver_.poll_selecting = false;
+            throw;
         }
-        tick();
-        if (managed_driver_.selected_update == LUA_NOREF) {
-            lua_pushnil(L);
-            return State();
-        }
-        if (!callback) {
-            pushLuaReference(L, managed_driver_.selected_update);
-            releaseLuaReference(managed_driver_.selected_update);
-            return State();
-        }
-        int callback_ref = createLuaReference(L, callback);
-        const int update_ref = managed_driver_.selected_update;
-        managed_driver_.selected_update = LUA_NOREF;
-        State state = createUpdateTask(RequestKind::PollTask, callback_ref, update_ref);
-        releaseLuaReference(callback_ref);
-        // The caller first creates the handle, then may perform an ordinary
-        // drain. It never joins this Task, including after a managed yield.
-        return state;
     }
 
     bool hasNormalLoopInterest() const
@@ -1988,16 +2208,40 @@ public:
     }
     std::uint64_t await(lua_State *L)
     {
+        if (waiters_.count(L) || waitBindings().count(L)) {
+            throw std::runtime_error(
+                "tdlua: coroutine is already waiting on TDLua");
+        }
+        const int entry_top = lua_gettop(L);
         const State state = awaitState(L);
         if (lua_status(L) == LUA_YIELD) {
             WaitRegistration registration;
             registration.dependency = state;
             registration.direct_resume = true;
-            lua_pushthread(L);
-            registration.thread_ref = createLuaReference(L, -1);
-            lua_pop(L, 1);
-            waiters_[L] = registration;
-            waitBindings()[L] = shared_from_this();
+            bool waiter_inserted = false;
+            try {
+                // The thread reference is created inside its own protected
+                // frame, so a failure leaves only the Lua error object on L.
+                registration.thread_ref = createThreadReference(L);
+                waiters_.emplace(L, registration);
+                waiter_inserted = true;
+                waitBindings().emplace(L, shared_from_this());
+            } catch (const TDLuaLuaError &) {
+                if (waiter_inserted) waiters_.erase(L);
+                releaseLuaReference(registration.thread_ref);
+                rollbackTaskCreation(state);
+                // The coroutine stays yielded and must resume with the stack
+                // it had on entry, not with a leftover Lua error object.
+                lua_settop(L, entry_top);
+                throw std::runtime_error(
+                    "tdlua: await reference allocation failed");
+            } catch (...) {
+                if (waiter_inserted) waiters_.erase(L);
+                releaseLuaReference(registration.thread_ref);
+                rollbackTaskCreation(state);
+                lua_settop(L, entry_top);
+                throw;
+            }
             ++state->waiter_count;
         }
         return state->request_id;
