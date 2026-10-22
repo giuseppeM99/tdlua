@@ -66,6 +66,8 @@ public:
             bool concurrent);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type);
+    bool hasHandler(const std::string &type) const
+    { return router_.hasEventHandler(type); }
     void clear();
     void discardSelectedUpdate();
 #ifdef TDLUA_TESTING

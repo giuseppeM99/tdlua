@@ -49,6 +49,8 @@ public:
             bool concurrent);
     void off(const std::string &type);
     bool pushHandler(lua_State *L, const std::string &type);
+    bool hasHandler(const std::string &type) const
+    { return router_.hasEventHandler(type); }
     // Managed pumps need to expose unsolicited updates to SchedulerCore;
     // ordinary receive() keeps the legacy dispatch behavior.
     tdlua::RouteKind dispatch(nlohmann::json &event,
