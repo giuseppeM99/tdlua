@@ -528,10 +528,11 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Linux registers 32 tests. Windows replaces the Linux-only
+          # Native Linux registers 33 tests. Windows replaces the Linux-only
           # tdlua_signals with the platform-specific tdlua_windows_residency.
           $expected = @(
-            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
+            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
+            'tdlua_managed_metatable_oom', 'tdlua_json_push_oom',
             'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
             'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
             'tdlua_receiver_lifecycle_ownership',
@@ -549,7 +550,7 @@ jobs:
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 32-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 33-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -576,8 +577,8 @@ jobs:
           # The manifest gate pins the registered set; this pins the executed
           # result, so a silently skipped test cannot pass as green.
           $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
-          if ($summary -notmatch '0 tests failed out of 32') {
-            throw 'The native CTest suite did not report 32/32: inspect ctest-full.log'
+          if ($summary -notmatch '0 tests failed out of 33') {
+            throw 'The native CTest suite did not report 33/33: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.

@@ -386,7 +386,8 @@ jobs:
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Set-Content .ci\windows-msvc\ctest-test-names.txt
           $expectedTestNames = @(
-            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom', 'tdlua_json_push_oom',
+            'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
+            'tdlua_managed_metatable_oom', 'tdlua_json_push_oom',
             'tdlua_client_pump', 'tdlua_lua_protected', 'tdlua_shutdown_admission',
             'tdlua_receiver_runtime', 'tdlua_receiver_generic_fifo_metadata',
             'tdlua_receiver_lifecycle_ownership',
@@ -406,7 +407,7 @@ jobs:
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the 38-test MinGW/Linux baseline; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the 39-test MinGW/Linux baseline; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency')
