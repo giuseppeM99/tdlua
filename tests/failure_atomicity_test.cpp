@@ -7,8 +7,10 @@
 // or Lua reference survives a failed publication.
 #include "tdlua/common/request_router.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -16,6 +18,9 @@
 namespace {
 
 long g_cpp_fail_at = -1;
+std::size_t g_cpp_allocations = 0;
+std::size_t g_cpp_first_new_size = 0;
+std::size_t g_cpp_failed_size = 0;
 
 void arm_cpp(long offset)
 {
@@ -159,16 +164,43 @@ int invoke_handler(tdlua::RequestRouter &router, lua_State *L,
 }
 
 bool g_ready_prefill_done = false;
-const std::size_t kReadyPrefill = 4095;
+std::size_t g_ready_prefill_count = 0;
+std::size_t g_ready_growth_allocation_size = 0;
+
+struct ReadyGrowthPoint {
+    std::size_t count;
+    std::size_t allocation_size;
+};
+
+// std::deque's block size is implementation-defined. Use a probe deque of the
+// same element type to find the size at which the next push allocates, instead
+// of assuming libstdc++'s 4095. The probe is empty like ready_ in this test, so
+// the first observed growth point is the actual boundary.
+ReadyGrowthPoint ready_growth_point()
+{
+    std::deque<tdlua::ManagedStatePtr> probe;
+    const tdlua::ManagedStatePtr element(new tdlua::ManagedState());
+    for (std::size_t count = 0; count < 1000000; ++count) {
+        const std::size_t before = g_cpp_allocations;
+        g_cpp_first_new_size = 0;
+        probe.push_back(element);
+        if (g_cpp_allocations != before) {
+            require(g_cpp_first_new_size != 0,
+                    "readygrowth: deque allocation size not observed");
+            return ReadyGrowthPoint{count, g_cpp_first_new_size};
+        }
+    }
+    throw TestFailure{"readygrowth: deque growth point not found"};
+}
 
 void ready_prefill_hook(tdlua::SchedulerCore *core)
 {
     if (g_ready_prefill_done) return;
     g_ready_prefill_done = true;
-    // The deque constructor already owns one block. Fill every block and arm
-    // the next allocation, which is the real ready_.push_back growth.
+    // Fill exactly to the measured boundary; the next push is the real
+    // ready_.push_back growth. No failure is armed while filling.
     g_cpp_fail_at = -1;
-    core->fillReadyForTesting(kReadyPrefill);
+    core->fillReadyForTesting(g_ready_prefill_count);
     g_cpp_fail_at = 0;
 }
 
@@ -742,25 +774,31 @@ void test_ready_growth_atomicity()
     lua_pushcfunction(vm.L, noop);
     const int callback = lua_gettop(vm.L);
 
+    const ReadyGrowthPoint growth = ready_growth_point();
+    g_ready_prefill_count = growth.count;
+    g_ready_growth_allocation_size = growth.allocation_size;
     g_ready_prefill_done = false;
+    g_cpp_failed_size = 0;
     tdlua::setReadyCreationHookForTesting(ready_prefill_hook);
     const bool failed = run_catching([&] {
         (void)router.core()->selectPollUpdate(vm.L, callback, false);
     });
     tdlua::setReadyCreationHookForTesting(nullptr);
-    const bool target_allocation_attempted = g_cpp_fail_at == -1;
+    const bool target_allocation_attempted = g_cpp_failed_size != 0;
     disarm_cpp();
     lua_settop(vm.L, callback - 1);
 
     require(failed, "readygrowth: deque growth failure was not observed");
     require(target_allocation_attempted,
             "readygrowth: the failing allocation was not ready_.push_back");
+    require(g_cpp_failed_size == g_ready_growth_allocation_size,
+            "readygrowth: a non-deque allocation failed before ready_.push_back");
     auto stats = router.bufferStats();
     require(!stats.poll_selecting,
             "readygrowth: poll selection flag survived failure");
     require(stats.event_states == 0,
             "readygrowth: failed task state survived");
-    require(stats.ready_states == kReadyPrefill,
+    require(stats.ready_states == g_ready_prefill_count,
             "readygrowth: pre-existing ready states changed");
     require(stats.lua_registry_refs == 0,
             "readygrowth: failed task leaked a reference");
@@ -1019,8 +1057,11 @@ void test_lua_error_in_catch()
 
 void *operator new(std::size_t size)
 {
+    ++g_cpp_allocations;
+    if (g_cpp_first_new_size == 0) g_cpp_first_new_size = size;
     if (g_cpp_fail_at == 0) {
         g_cpp_fail_at = -1;
+        g_cpp_failed_size = size;
         throw std::bad_alloc();
     }
     if (g_cpp_fail_at > 0) --g_cpp_fail_at;
