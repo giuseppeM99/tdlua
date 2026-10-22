@@ -4,6 +4,7 @@
 #include "tdlua/binding/lua_binding.h"
 #include "tdlua/backend/json/client.h"
 #include "tdlua/backend/json/runtime.h"
+#include "tdlua/common/request_router.h"
 
 #include <deque>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -296,6 +298,48 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         after_generic.consumer_interests != before_generic.consumer_interests ||
         after_generic.handler_only_consumers != before_generic.handler_only_consumers)
         throw std::runtime_error("generic loop did not retain its scoped generic interest");
+
+    // A failure while replacing a handler must leave both the scheduler
+    // registration and the receiver prefilter on A. Exercise the complete
+    // binding path, not only RequestRouter::onEvent.
+    runLua(L,
+           "recovery_seen=0; replacement_seen=0; "
+           "c:on('updateNewMessage', function() "
+           " recovery_seen=recovery_seen+1; c:off('updateNewMessage') end)");
+    tdlua::setEventPublicationHookForTesting([](const std::string &) {
+        throw std::bad_alloc();
+    });
+    try {
+        runLua(L,
+               "local ok, err=pcall(function() "
+               " c:on('updateNewMessage', function() "
+               "  replacement_seen=replacement_seen+1; "
+               "  c:off('updateNewMessage') end) "
+               "end); assert(not ok)");
+    } catch (...) {
+        tdlua::setEventPublicationHookForTesting(nullptr);
+        throw;
+    }
+    tdlua::setEventPublicationHookForTesting(nullptr);
+
+    const auto before_recovery = runtime.stats();
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 41}});
+    runLua(L, "c:loop(); assert(recovery_seen==1 and replacement_seen==0)");
+    const auto after_recovery = runtime.stats();
+    if (after_recovery.published - before_recovery.published != 1 ||
+        after_recovery.dropped_by_handler_filter !=
+            before_recovery.dropped_by_handler_filter)
+        throw std::runtime_error(
+            "failed on() replacement disabled the receiver prefilter");
+
+    // Retry B: A must be replaced, and the next update must reach only B.
+    runLua(L,
+           "c:on('updateNewMessage', function() "
+           " replacement_seen=replacement_seen+1; c:off('updateNewMessage') end)");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 43}});
+    runLua(L, "c:loop(); assert(recovery_seen==1 and replacement_seen==1)");
 
     // The nested protection frame must release interest when Lua raises.
     runtime.injectReceivedForTesting(

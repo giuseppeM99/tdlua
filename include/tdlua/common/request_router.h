@@ -280,6 +280,20 @@ inline void setReadyCreationHookForTesting(ReadyCreationHook hook)
 {
     readyCreationHook() = hook;
 }
+
+// Allows the binding-level regression to fail the publication after the new
+// registration and its Lua reference exist, using the same catch path as a
+// real std::bad_alloc.
+using EventPublicationHook = void (*)(const std::string &);
+inline EventPublicationHook &eventPublicationHook()
+{
+    static thread_local EventPublicationHook hook = nullptr;
+    return hook;
+}
+inline void setEventPublicationHookForTesting(EventPublicationHook hook)
+{
+    eventPublicationHook() = hook;
+}
 #endif
 
 // The userdata lives on the suspended coroutine's stack, independently of
@@ -2231,6 +2245,9 @@ public:
         registration->handler_ref = createLuaReference(L, callback);
         EventRegistrationPtr previous;
         try {
+#ifdef TDLUA_TESTING
+            if (eventPublicationHook()) eventPublicationHook()(type);
+#endif
             const auto found = events_.find(type);
             if (found != events_.end()) previous = found->second;
             events_[type] = registration;
