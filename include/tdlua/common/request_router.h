@@ -3176,6 +3176,11 @@ inline void installManagedMetatable(lua_State *L, const char *name,
     lua_pushcfunction(L, managedGc);
     lua_setfield(L, -2, "__gc");
     installManagedIteration(L);
+    // luaL_newmetatable sets __name before publishing (natively on Lua 5.3+,
+    // through compat-5.3 on 5.1/5.2/LuaJIT). Reproduce it on every supported
+    // runtime so error messages and userdata representations do not change.
+    lua_pushstring(L, name);
+    lua_setfield(L, -2, "__name");
     lua_setfield(L, LUA_REGISTRYINDEX, name);
 }
 

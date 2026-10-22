@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace {
@@ -140,12 +141,21 @@ int call_ensure(lua_State *L)
     return status;
 }
 
+// The effective luaL_newmetatable installs __name (natively on Lua 5.3+,
+// through compat-5.3 on 5.1/5.2/LuaJIT). The probe records the behavior of the
+// runtime under test so the managed metatables are compared with what
+// luaL_newmetatable would have produced, not with a hardcoded version check.
+bool g_runtime_sets_name = false;
+
 struct Fields {
     bool present = false;
     bool index = false;
     bool gc = false;
     bool pairs = false;
     bool ipairs = false;
+    bool name_present = false;
+    bool name_is_string = false;
+    bool name_matches = false;
 };
 
 Fields inspect(lua_State *L, const char *name)
@@ -165,14 +175,23 @@ Fields inspect(lua_State *L, const char *name)
         *slots[i] = !lua_isnil(L, -1);
         lua_pop(L, 1);
     }
+    lua_getfield(L, -1, "__name");
+    fields.name_present = !lua_isnil(L, -1);
+    fields.name_is_string = lua_type(L, -1) == LUA_TSTRING;
+    if (fields.name_is_string)
+        fields.name_matches = std::strcmp(lua_tostring(L, -1), name) == 0;
+    lua_pop(L, 1);
     lua_pop(L, 1);
     return fields;
 }
 
 bool complete(const Fields &fields)
 {
+    const bool name_ok = g_runtime_sets_name
+                             ? (fields.name_is_string && fields.name_matches)
+                             : !fields.name_present;
     return fields.present && fields.index && fields.gc && fields.pairs &&
-           fields.ipairs;
+           fields.ipairs && name_ok;
 }
 
 // The atomic contract: after any failure the name is either unregistered or
@@ -329,6 +348,25 @@ Sweep sweep(Kind kind, std::size_t max_offset, std::size_t double_limit)
     return summary;
 }
 
+// Returns true when this runtime's luaL_newmetatable installs __name. The probe
+// uses its own name so the comparison cannot depend on the managed tables.
+bool runtime_sets_metatable_name()
+{
+    Allocator allocator;
+    lua_State *L = make_state(allocator);
+    if (!L) return false;
+    luaL_openlibs(L);
+    bool sets = false;
+    luaL_newmetatable(L, "sec02a.name.probe");
+    lua_getfield(L, -1, "__name");
+    if (lua_type(L, -1) == LUA_TSTRING)
+        sets = std::strcmp(lua_tostring(L, -1), "sec02a.name.probe") == 0;
+    lua_pop(L, 1);
+    lua_pop(L, 1);
+    lua_close(L);
+    return sets;
+}
+
 // Without allocation failures the metatables are complete, a second call keeps
 // the same object identity, and handles are finalized normally.
 bool normal_path()
@@ -382,6 +420,9 @@ bool normal_path()
 
 int main()
 {
+    g_runtime_sets_name = runtime_sets_metatable_name();
+    std::printf("runtime_sets_name=%d\n", g_runtime_sets_name ? 1 : 0);
+
     const std::size_t max_offset = 400;
     const std::size_t double_limit = 32;
 
