@@ -528,8 +528,8 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Linux registers 33 tests. Windows replaces the Linux-only
-          # tdlua_signals with the platform-specific tdlua_windows_residency.
+          # Native Windows registers 34 tests: the Linux native baseline plus the
+          # platform-specific tdlua_windows_residency.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
             'tdlua_managed_metatable_oom', 'tdlua_json_push_oom',
@@ -544,13 +544,14 @@ jobs:
             'tdlua_native_schema', 'tdlua_hardening_backend', 'tdlua_lifecycle',
             'tdlua_failure_cleanup_phases',
             'tdlua_async', 'tdlua_backend_parity', 'tdlua_e2e_smoke',
-            'tdlua_managed_driver_backend', 'tdlua_windows_residency'
+            'tdlua_managed_driver_backend', 'tdlua_windows_residency',
+            'tdlua_failure_atomicity'
           )
           $delta = Compare-Object @($expected | Sort-Object) @($testNames | Sort-Object)
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 33-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 34-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -577,8 +578,8 @@ jobs:
           # The manifest gate pins the registered set; this pins the executed
           # result, so a silently skipped test cannot pass as green.
           $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
-          if ($summary -notmatch '0 tests failed out of 33') {
-            throw 'The native CTest suite did not report 33/33: inspect ctest-full.log'
+          if ($summary -notmatch '0 tests failed out of 34') {
+            throw 'The native CTest suite did not report 34/34: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.

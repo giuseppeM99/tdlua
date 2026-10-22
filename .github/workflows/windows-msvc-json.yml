@@ -402,12 +402,12 @@ jobs:
             'tdlua_failure_cleanup_phases',
             'tdlua_async',
             'tdlua_backend_parity', 'tdlua_e2e_smoke', 'tdlua_managed_driver_backend',
-            'tdlua_windows_residency'
+            'tdlua_windows_residency', 'tdlua_failure_atomicity'
           )
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the 39-test MinGW/Linux baseline; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the expected 40-test set; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency')

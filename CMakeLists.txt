@@ -731,6 +731,17 @@ if(TDLUA_BUILD_TESTS)
     target_compile_features(tdlua_managed_routing_oom_test PRIVATE cxx_std_11)
     tdlua_enable_sanitizers(tdlua_managed_routing_oom_test)
     add_test(NAME tdlua_managed_routing_oom COMMAND tdlua_managed_routing_oom_test)
+    add_executable(tdlua_failure_atomicity_test
+        "tests/failure_atomicity_test.cpp")
+    target_compile_definitions(tdlua_failure_atomicity_test PRIVATE TDLUA_TESTING)
+    target_include_directories(tdlua_failure_atomicity_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_failure_atomicity_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_failure_atomicity_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_failure_atomicity_test)
+    add_test(NAME tdlua_failure_atomicity
+        COMMAND tdlua_failure_atomicity_test)
     add_executable(tdlua_managed_metatable_oom_test
         "tests/managed_metatable_oom_test.cpp")
     target_compile_definitions(tdlua_managed_metatable_oom_test PRIVATE TDLUA_TESTING)
