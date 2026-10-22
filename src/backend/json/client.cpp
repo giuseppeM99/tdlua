@@ -4,7 +4,9 @@
 #include "tdlua/backend/json/client.h"
 #include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/client_pump.h"
+#include "tdlua/common/request_router.h"
 #include <chrono>
+#include <new>
 #include <td/telegram/td_json_client.h>
 #include <utility>
 
@@ -14,6 +16,11 @@ using json = nlohmann::json;
 
 #ifdef TDLUA_TESTING
 TDLua *client_with_injected_drain_failure = nullptr;
+
+void fail_event_publication(const std::string &)
+{
+    throw std::bad_alloc();
+}
 #endif
 
 void json_transport_send(void *context, std::uint64_t request_id,
@@ -498,5 +505,11 @@ void TDLua::injectTransport(Transport transport)
         JsonRuntime::instance().replaceWithFake(client_id);
     }
     injected_transport_ = transport;
+}
+
+void TDLua::setEventPublicationFailureForTesting(bool fail)
+{
+    tdlua::setEventPublicationHookForTesting(
+        fail ? &fail_event_publication : nullptr);
 }
 #endif

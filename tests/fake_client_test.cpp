@@ -4,7 +4,6 @@
 #include "tdlua/binding/lua_binding.h"
 #include "tdlua/backend/json/client.h"
 #include "tdlua/backend/json/runtime.h"
-#include "tdlua/common/request_router.h"
 
 #include <deque>
 #include <chrono>
@@ -12,7 +11,6 @@
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <new>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -306,9 +304,7 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
            "recovery_seen=0; replacement_seen=0; "
            "c:on('updateNewMessage', function() "
            " recovery_seen=recovery_seen+1; c:off('updateNewMessage') end)");
-    tdlua::setEventPublicationHookForTesting([](const std::string &) {
-        throw std::bad_alloc();
-    });
+    client->setEventPublicationFailureForTesting(true);
     try {
         runLua(L,
                "local ok, err=pcall(function() "
@@ -317,10 +313,10 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
                "  c:off('updateNewMessage') end) "
                "end); assert(not ok)");
     } catch (...) {
-        tdlua::setEventPublicationHookForTesting(nullptr);
+        client->setEventPublicationFailureForTesting(false);
         throw;
     }
-    tdlua::setEventPublicationHookForTesting(nullptr);
+    client->setEventPublicationFailureForTesting(false);
 
     const auto before_recovery = runtime.stats();
     runtime.injectReceivedForTesting(

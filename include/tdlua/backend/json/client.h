@@ -80,6 +80,9 @@ public:
 #ifdef TDLUA_TESTING
     void injectTransport(Transport transport);
     void failNextDrainForTesting() noexcept;
+    // Defined in the shared module so the hook state lives beside the router
+    // that consumes it, including across the Windows DLL boundary.
+    void setEventPublicationFailureForTesting(bool fail);
     std::int32_t clientIdForTesting() const { return client_id; }
     struct ConsumerInterestForTesting {
         std::size_t generic = 0;
