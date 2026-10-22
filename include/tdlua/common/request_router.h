@@ -378,6 +378,26 @@ inline bool pushCoreReferences(lua_State *L, const SchedulerCore *core)
     return false;
 }
 
+// The deferred-event push and its reference have to share one protected Lua
+// frame: the push may allocate, and a failure must not leave a value or an
+// error object on the owner stack.
+template<class Push>
+struct DeferredEventPush {
+    Push *push;
+    SchedulerCore *core;
+    int reference;
+};
+
+template<class Push>
+inline void pushDeferredEvent(lua_State *L, void *context)
+{
+    auto *state = static_cast<DeferredEventPush<Push> *>(context);
+    if (!pushCoreReferences(L, state->core))
+        throw std::runtime_error("tdlua: scheduler storage unavailable");
+    (*state->push)(L);
+    state->reference = luaL_ref(L, -2);
+}
+
 inline int managedFieldLookup(lua_State *L)
 {
     lua_pushvalue(L, 2);
@@ -1938,15 +1958,39 @@ public:
         if (!managed_driver_.pump_active || !events_enabled_) return;
         if (managed_driver_.poll_selecting &&
             managed_driver_.selected_update == LUA_NOREF) {
-            push(lua_owner_);
-            managed_driver_.selected_update = createLuaReference(lua_owner_, -1);
-            lua_pop(lua_owner_, 1);
+            const int owner_top = lua_gettop(lua_owner_);
+            try {
+                push(lua_owner_);
+                managed_driver_.selected_update =
+                    createLuaReference(lua_owner_, -1);
+                lua_pop(lua_owner_, 1);
+            } catch (const TDLuaLuaError &) {
+                // The selection cannot be rooted. Stop the poll instead of
+                // leaving it spinning on a pump that already delivered this
+                // update. The selection slot is still empty.
+                lua_settop(lua_owner_, owner_top);
+                throw std::runtime_error(
+                    "tdlua: poll update reference allocation failed");
+            } catch (...) {
+                lua_settop(lua_owner_, owner_top);
+                throw;
+            }
         } else if (managed_driver_.loop_observer &&
                    !managed_driver_.loop_observer->stopped) {
             const auto observer = managed_driver_.loop_observer;
-            push(lua_owner_);
-            const int ref = createLuaReference(lua_owner_, -1);
-            lua_pop(lua_owner_, 1);
+            const int owner_top = lua_gettop(lua_owner_);
+            int ref = LUA_NOREF;
+            try {
+                push(lua_owner_);
+                ref = createLuaReference(lua_owner_, -1);
+                lua_pop(lua_owner_, 1);
+            } catch (const TDLuaLuaError &) {
+                lua_settop(lua_owner_, owner_top);
+                return;
+            } catch (...) {
+                lua_settop(lua_owner_, owner_top);
+                throw;
+            }
             queueOrScheduleLoopUpdate(observer, ref);
         }
     }
@@ -2094,13 +2138,22 @@ public:
     void runLoop(lua_State *L, int callback, bool concurrent)
     {
         if (callback) {
-            managed_driver_.loop_observer.reset(new LoopObserver());
-            managed_driver_.loop_observer->concurrent = concurrent;
-            managed_driver_.loop_observer->callback_ref = createLuaReference(L, callback);
+            // Build and validate the observer before publishing it. A failed
+            // callback reference must leave any previous observer in place.
+            std::shared_ptr<LoopObserver> observer(new LoopObserver());
+            observer->concurrent = concurrent;
+            observer->callback_ref = createLuaReference(L, callback);
+            std::shared_ptr<LoopObserver> previous =
+                managed_driver_.loop_observer;
+            managed_driver_.loop_observer = observer;
+            if (previous && previous != observer) {
+                requestLoopStop(previous);
+                releaseLuaReference(previous->callback_ref);
+            }
             if (managed_driver_.selected_update != LUA_NOREF) {
                 const int update_ref = managed_driver_.selected_update;
-                queueOrScheduleLoopUpdate(managed_driver_.loop_observer, update_ref);
                 managed_driver_.selected_update = LUA_NOREF;
+                queueOrScheduleLoopUpdate(observer, update_ref);
             }
         }
         while (true) {
@@ -2142,11 +2195,23 @@ public:
         if (!lua_isfunction(L, callback)) {
             throw std::runtime_error("tdlua: event handler must be a function");
         }
-        removeEventRegistration(type);
         EventRegistrationPtr registration(new EventRegistration());
         registration->concurrent = concurrent;
         registration->handler_ref = createLuaReference(L, callback);
-        events_[type] = registration;
+        EventRegistrationPtr previous;
+        try {
+            const auto found = events_.find(type);
+            if (found != events_.end()) previous = found->second;
+            events_[type] = registration;
+        } catch (...) {
+            // The map still owns the previous handler. Release only the new
+            // reference that has not been published.
+            releaseLuaReference(registration->handler_ref);
+            throw;
+        }
+        // Publish first, then retire the old registration. A running task
+        // keeps its own callback reference, so it can finish safely.
+        if (previous) releaseEventRegistration(previous);
     }
 
     void offEvent(const std::string &type)
@@ -2183,14 +2248,24 @@ public:
         }
         const auto scheduler_lease = shared_from_this();
         (void)scheduler_lease;
-        push(lua_owner_);
-        int update_ref = createLuaReference(lua_owner_, -1);
-        lua_pop(lua_owner_, 1);
-        DeferredEvent event;
-        event.type = type;
-        event.update_ref = update_ref;
-        deferred_events_.push_back(std::move(event));
-        return true;
+        const int owner_top = lua_gettop(lua_owner_);
+        int update_ref = LUA_NOREF;
+        try {
+            DeferredEventPush<Push> context = {&push, this, LUA_NOREF};
+            protectedLua(lua_owner_, pushDeferredEvent<Push>, &context);
+            update_ref = context.reference;
+            DeferredEvent event;
+            event.type = type;
+            event.update_ref = update_ref;
+            deferred_events_.push_back(std::move(event));
+            return true;
+        } catch (...) {
+            // Best effort: an event that cannot be rooted or queued is
+            // withdrawn, and the owner stack returns to its entry shape.
+            releaseLuaReference(update_ref);
+            lua_settop(lua_owner_, owner_top);
+            return false;
+        }
     }
     std::uint64_t request(lua_State *L, int callback, int context)
     {
