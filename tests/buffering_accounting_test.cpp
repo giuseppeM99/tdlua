@@ -20,7 +20,18 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 #include <thread>
 #include <utility>
 #include <vector>
@@ -134,6 +145,14 @@ struct PushResponse {
 
 std::size_t rssKb()
 {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return 0;
+    }
+    return static_cast<std::size_t>(counters.WorkingSetSize / 1024);
+#else
     std::ifstream status("/proc/self/status");
     std::string key;
     while (status >> key) {
@@ -147,16 +166,31 @@ std::size_t rssKb()
         std::getline(status, remainder);
     }
     return 0;
+#endif
 }
 
 std::uint64_t cpuUs()
 {
+#ifdef _WIN32
+    FILETIME creation = {}, exit = {}, kernel = {}, user = {};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    ULARGE_INTEGER kernel_ticks = {}, user_ticks = {};
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    return static_cast<std::uint64_t>(
+        (kernel_ticks.QuadPart + user_ticks.QuadPart) / 10);
+#else
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     return static_cast<std::uint64_t>(usage.ru_utime.tv_sec) * 1000000ULL +
         static_cast<std::uint64_t>(usage.ru_utime.tv_usec) +
         static_cast<std::uint64_t>(usage.ru_stime.tv_sec) * 1000000ULL +
         static_cast<std::uint64_t>(usage.ru_stime.tv_usec);
+#endif
 }
 
 std::size_t luaKb(lua_State *L)

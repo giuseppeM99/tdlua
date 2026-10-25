@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "tdlua/common/receiver.h"
 #include "tdlua/lua_compat.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -63,7 +70,11 @@ int main(int argc, char **argv)
         check(L != nullptr, "could not create Lua state");
         luaL_openlibs(L);
         lua_getglobal(L, "package");
+#ifdef _WIN32
+        lua_pushstring(L, (directory + "/?.dll").c_str());
+#else
         lua_pushstring(L, (directory + "/?.so").c_str());
+#endif
         lua_setfield(L, -2, "cpath"); lua_pop(L, 1);
         run(L, "td=require('tdlua'); td.setLogLevel(0)");
         run(L, "function checkAuthorization() "
@@ -72,22 +83,51 @@ int main(int argc, char **argv)
                " assert(coroutine.resume(co)); "
                " for i=1,200 do if done then break end client:receive(0.01) end; "
                " assert(done) end");
+#ifdef _WIN32
+        HMODULE dso = nullptr;
+        check(GetModuleHandleExW(0, L"tdlua.dll", &dso) != 0,
+              "module was not loaded through require");
+#else
         void *dso = dlopen((directory + "/tdlua.so").c_str(), RTLD_NOW | RTLD_NOLOAD);
         check(dso, "module was not loaded through require");
+#endif
         using Control = int (*)(int);
         using Ledger = tdlua::receiver::FailureCleanup::Stats (*)();
         using Stats = tdlua::receiver::RuntimeStats (*)();
+#ifdef _WIN32
+        const auto control = reinterpret_cast<Control>(GetProcAddress(dso, ("tdlua_" + backend + "_test_control").c_str()));
+        const auto ledger = reinterpret_cast<Ledger>(GetProcAddress(dso, ("tdlua_" + backend + "_test_cleanup_stats").c_str()));
+        const auto stats = reinterpret_cast<Stats>(GetProcAddress(dso, ("tdlua_" + backend + "_test_stats").c_str()));
+#else
         const auto control = reinterpret_cast<Control>(dlsym(dso, ("tdlua_" + backend + "_test_control").c_str()));
         const auto ledger = reinterpret_cast<Ledger>(dlsym(dso, ("tdlua_" + backend + "_test_cleanup_stats").c_str()));
         const auto stats = reinterpret_cast<Stats>(dlsym(dso, ("tdlua_" + backend + "_test_stats").c_str()));
+#endif
         check(control && ledger && stats, "testing hooks unavailable");
-        auto *cores = static_cast<std::size_t *>(dlsym(dso,
-            "_ZZN5tdlua18liveSchedulerCoresEvE5count"));
+        // Query TLS in the module that owns it. Mach-O exposes a TLV descriptor
+        // for a thread_local symbol, not the calling thread's counter storage.
+        using CoreCount = std::size_t (*)();
+#ifdef _WIN32
+        const auto cores = reinterpret_cast<CoreCount>(
+            GetProcAddress(dso, "tdlua_test_live_scheduler_cores"));
+#else
+        const auto cores = reinterpret_cast<CoreCount>(
+            dlsym(dso, "tdlua_test_live_scheduler_cores"));
+#endif
         using CreationHook = void (*)(void (*)(int));
+#ifdef _WIN32
+        auto set_creation_hook = reinterpret_cast<CreationHook>(
+            GetProcAddress(dso, "tdlua_json_test_creation_hook"));
+#else
         auto set_creation_hook = reinterpret_cast<CreationHook>(
             dlsym(dso, "tdlua_json_test_creation_hook"));
+#endif
         check(cores && (backend != "json" || set_creation_hook), "construction counters unavailable");
+#ifdef _WIN32
+        check(FreeLibrary(dso) != 0, "could not release module reference");
+#else
         dlclose(dso);
+#endif
         // JSON exposes each construction boundary. Native has one equivalent
         // factory fault, armed through its control hook.
         if (backend == "json") {
@@ -103,13 +143,16 @@ int main(int argc, char **argv)
                 const auto owners_before = stats().owners;
                 construction_stage = stage;
                 set_creation_hook(failConstruction);
+                lua_pushinteger(L, stage); lua_setglobal(L, "diagnostic_stage");
                 run(L, "local ok,err=pcall(function() return td() end); "
-                       "assert(not ok and err:find('bad_alloc'))");
+                       "print('construction fault stage='..diagnostic_stage..' pcall_ok='.."
+                       "tostring(ok)..' error='..tostring(err)); "
+                       "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true)))");
                 set_creation_hook(nullptr);
                 lua_gc(L, LUA_GCCOLLECT, 0);
                 lua_gc(L, LUA_GCCOLLECT, 0);
                 const auto after = ledger();
-                check(stats().owners == owners_before && *cores == 0 && stats().clients == 0 && stats().tombstones == 0 &&
+                check(stats().owners == owners_before && cores() == 0 && stats().clients == 0 && stats().tombstones == 0 &&
                       after.records == 0 && after.reserved == 0 && after.active_sends == 0 &&
                       after.uncertain == 0 && after.materialized == before.materialized &&
                       after.closes == before.closes, "factory rollback retained core/client or materialized an actor");
@@ -121,11 +164,13 @@ int main(int argc, char **argv)
             check(control(value(ControlAction::FailNextClientCreation)) == 1,
                   "construction fault not armed");
             run(L, "local ok,err=pcall(function() return td() end); "
-                   "assert(not ok and err:find('bad_alloc'))");
+                   "print('native construction fault pcall_ok='..tostring(ok).."
+                   "' error='..tostring(err)); "
+                   "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true)))");
             lua_gc(L, LUA_GCCOLLECT, 0);
             lua_gc(L, LUA_GCCOLLECT, 0);
             const auto after = ledger();
-            check(stats().owners == owners_before && *cores == 0 && stats().clients == 0 && stats().tombstones == 0 &&
+            check(stats().owners == owners_before && cores() == 0 && stats().clients == 0 && stats().tombstones == 0 &&
                   after.records == 0 && after.reserved == 0 && after.active_sends == 0 &&
                   after.uncertain == 0 && after.materialized == before.materialized &&
                   after.closes == before.closes,
@@ -140,7 +185,10 @@ int main(int argc, char **argv)
             check(control(value(ControlAction::FailNextSend)) == 1, "send fault not armed");
             lua_pushstring(L, request); lua_setglobal(L, "shutdown_name");
             run(L, "local ok,err=pcall(function() return client[shutdown_name](client) end); "
-                   "assert(not ok and err:find('bad_alloc')); assert(not client:isClosed()); "
+                   "print('shutdown fault request='..shutdown_name..' pcall_ok='.."
+                   "tostring(ok)..' error='..tostring(err)..' closed='.."
+                   "tostring(client:isClosed())); "
+                   "assert(not ok and (err:find('bad_alloc',1,true) or err:find('bad allocation',1,true))); assert(not client:isClosed()); "
                    "checkAuthorization(); "
                    "client=nil; collectgarbage('collect'); collectgarbage('collect')");
             check(control(value(ControlAction::WaitForTerminalAck)) == 1,
@@ -175,10 +223,10 @@ int main(int argc, char **argv)
                "assert(not ok and err:find('client closed')); "
                "failed_handle=nil; collectgarbage('collect'); collectgarbage('collect')");
         const auto detached = stats();
-        std::cout << "Failed GC counters: cores=" << *cores
+        std::cout << "Failed GC counters: cores=" << cores()
                   << " clients=" << detached.clients << " tombstones=" << detached.tombstones
                   << " owners=" << detached.owners << '\n';
-        check(*cores == 0 && detached.clients == detached.tombstones,
+        check(cores() == 0 && detached.clients == detached.tombstones,
               "Failed GC retained an application client/core");
         std::cout << "Failed GC: callback-free settlement, zero application clients/cores PASS\n";
         lua_close(L); L = nullptr;

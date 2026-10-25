@@ -13,6 +13,12 @@ endif()
 set(_tdlua_base_version "${CMAKE_MATCH_1}")
 project(tdlua VERSION "${_tdlua_base_version}" LANGUAGES C CXX)
 
+# MSVC otherwise defaults to synchronous exception handling, which disables
+# the C++ unwinding required by TDLua's exception-safe cleanup paths.
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+endif()
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Keep the compilation database enabled for clangd and static analysis. This
 # is a project setting rather than a user-selectable backend option.
@@ -38,6 +44,17 @@ function(tdlua_enable_sanitizers target)
         -fno-omit-frame-pointer
         -fno-sanitize=vptr)
     target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+  endif()
+endfunction()
+
+# A PE/COFF DLL exposes only the names listed in its module definition file, so
+# it does not re-export the symbols of the static libraries it was linked
+# against. Native-backend tests that build td_api values themselves therefore
+# link the same static TDLib as the module. On ELF and Mach-O the module's own
+# symbols remain visible to the tests and the link set is unchanged.
+function(tdlua_link_native_test_tdlib target)
+  if(_tdlua_backend STREQUAL "native" AND WIN32)
+    target_link_libraries(${target} PRIVATE Td::TdStatic)
   endif()
 endfunction()
 
@@ -303,9 +320,25 @@ else()
       message(FATAL_ERROR
               "TDLUA_TDLIB_CODEGEN_BUILD_DIR must be a bundled native build of this source tree using the same C++ compiler")
     endif()
+    # The bundled build names the codec library and the schema compiler after
+    # the active toolchain: MSVC produces tdtl.lib, the Unix linkers produce
+    # libtdtl.a, and a Windows host always appends .exe to the compiler.
+    if(MSVC)
+      set(_tdlua_codegen_library_name "tdtl.lib")
+    else()
+      set(_tdlua_codegen_library_name "libtdtl.a")
+    endif()
+    if(WIN32)
+      set(_tdlua_codegen_tl_parser_name "tl-parser.exe")
+    else()
+      set(_tdlua_codegen_tl_parser_name "tl-parser")
+    endif()
+    set(_tdlua_codegen_library_relative "td/tdtl/${_tdlua_codegen_library_name}")
+    set(_tdlua_codegen_tl_parser_relative
+        "td/td/generate/tl-parser/${_tdlua_codegen_tl_parser_name}")
     foreach(_tdlua_codegen_artifact
-            "td/tdtl/libtdtl.a"
-            "td/td/generate/tl-parser/tl-parser"
+            "${_tdlua_codegen_library_relative}"
+            "${_tdlua_codegen_tl_parser_relative}"
             "td/tdutils/td/utils/config.h")
       if(NOT EXISTS "${_tdlua_codegen_build_dir}/${_tdlua_codegen_artifact}")
         message(FATAL_ERROR
@@ -313,9 +346,27 @@ else()
       endif()
     endforeach()
     set(_tdlua_native_codegen_library
-        "${_tdlua_codegen_build_dir}/td/tdtl/libtdtl.a")
+        "${_tdlua_codegen_build_dir}/${_tdlua_codegen_library_relative}")
     set(_tdlua_native_tl_parser
-        "${_tdlua_codegen_build_dir}/td/td/generate/tl-parser/tl-parser")
+        "${_tdlua_codegen_build_dir}/${_tdlua_codegen_tl_parser_relative}")
+    get_target_property(_tdlua_native_td_include_dirs
+        Td::TdStatic INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT _tdlua_native_td_include_dirs)
+      message(FATAL_ERROR
+              "The imported Td::TdStatic target does not export its include directory")
+    endif()
+    if(TDLUA_BUILD_TESTS)
+      set(_tdlua_external_td_json_header_found FALSE)
+      foreach(_tdlua_td_include_dir IN LISTS _tdlua_native_td_include_dirs)
+        if(EXISTS "${_tdlua_td_include_dir}/td/telegram/td_api_json.h")
+          set(_tdlua_external_td_json_header_found TRUE)
+        endif()
+      endforeach()
+      if(NOT _tdlua_external_td_json_header_found)
+        message(FATAL_ERROR
+                "Native tests with external TDLib require td/telegram/td_api_json.h in the imported TDLib include directory")
+      endif()
+    endif()
     set(_tdlua_tdjson_private_target Td::tdjson_private)
   else()
     find_package(Td CONFIG REQUIRED)
@@ -376,8 +427,13 @@ else()
       "src/backend/json/dispatcher.cpp"
   )
 endif()
+list(APPEND tdlua_srcs "src/common/module_residency.cpp")
 
 if(_tdlua_backend STREQUAL "native")
+  if(NOT _tdlua_native_td_include_dirs)
+    set(_tdlua_native_td_include_dirs
+        "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+  endif()
   set(TDLUA_NATIVE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/tdlua")
   set(TDLUA_NATIVE_GENERATED_HEADER "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.h")
   set(TDLUA_NATIVE_SHARD_COUNT "${TDLUA_NATIVE_SHARDS}")
@@ -392,7 +448,16 @@ if(_tdlua_backend STREQUAL "native")
   if(TDLUA_BUNDLED_TDLIB)
     set(TDLUA_TD_API_TLO "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto/tlo/td_api.tlo")
     set(_tdlua_native_codegen_library_target tdtl)
-    set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    if(TARGET tl_generate_tlo)
+      set(_tdlua_native_tlo_dependency tl_generate_tlo)
+    elseif(EXISTS "${TDLUA_TD_API_TLO}")
+      # TDLib omits its executable schema-generation targets while
+      # cross-compiling. Reuse the pinned host-generated TLO when available.
+      set(_tdlua_native_tlo_dependency)
+    else()
+      message(FATAL_ERROR
+              "Native cross-build requires the pinned TDLib schema file '${TDLUA_TD_API_TLO}'. Generate TDLib sources with a host build first.")
+    endif()
   else()
     set(TDLUA_TD_API_TLO "${TDLUA_NATIVE_GENERATED_DIR}/td_api.tlo")
     add_library(tdlua_external_tdtl STATIC IMPORTED GLOBAL)
@@ -439,6 +504,14 @@ if(_tdlua_backend STREQUAL "native")
   )
   add_custom_target(tdlua_native_generated
       DEPENDS "${TDLUA_NATIVE_GENERATED_DIR}/native_codec_generated.stamp")
+  if(MSVC)
+    # Each generated shard is a large translation unit of TL codec code
+    # (~1.2 MB, ~23k lines). TDLib applies /bigobj to its own generated
+    # sources for the same reason: the default COFF section limit is too low.
+    set_source_files_properties(
+        ${TDLUA_NATIVE_GENERATED_PARTS} "${TDLUA_NATIVE_DISPATCH}"
+        PROPERTIES COMPILE_OPTIONS "/bigobj")
+  endif()
   list(APPEND tdlua_srcs ${TDLUA_NATIVE_GENERATED_PARTS} "${TDLUA_NATIVE_DISPATCH}")
 endif()
 
@@ -450,7 +523,9 @@ target_include_directories(tdlua PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 if(_tdlua_backend STREQUAL "native")
-  target_include_directories(tdlua PRIVATE "${TDLUA_NATIVE_GENERATED_DIR}")
+  target_include_directories(tdlua PRIVATE
+      "${TDLUA_NATIVE_GENERATED_DIR}"
+      "${_tdlua_native_td_include_dirs}")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
@@ -464,6 +539,7 @@ else()
   target_compile_features(tdlua PRIVATE cxx_std_11)
 endif()
 target_compile_definitions(tdlua PRIVATE
+    TDLUA_BUILDING_DLL
     "TDLUA_VERSION_STRING=\"${TDLUA_VERSION_STRING}\""
     "TDLUA_BASE_VERSION=\"${TDLUA_BASE_VERSION}\""
     "TDLUA_TDLIB_VERSION=\"${TDLUA_TDLIB_VERSION}\"")
@@ -471,6 +547,12 @@ if(_tdlua_backend STREQUAL "json")
   target_compile_definitions(tdlua PRIVATE TDLUA_JSON_BACKEND)
 else()
   target_compile_definitions(tdlua PRIVATE TDLUA_NATIVE_BACKEND)
+endif()
+if(_tdlua_backend STREQUAL "native" AND WIN32)
+  # TDLib's Windows headers can pull in Windows.h, whose min/max function-like
+  # macros collide with std::min/std::max and numeric_limits::min()/max() used
+  # by TDLua's shared headers. NOMINMAX keeps those identifiers macro-free.
+  target_compile_definitions(tdlua PRIVATE NOMINMAX)
 endif()
 
 
@@ -485,18 +567,56 @@ else()
   target_link_libraries(tdlua PRIVATE Td::TdJson)
 endif()
 if(_tdlua_backend STREQUAL "json" OR _tdlua_backend STREQUAL "native")
-  # The threaded runtime's residency contract is reviewed only on this platform.
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    message(FATAL_ERROR "Threaded TDLua currently requires Linux x86_64/glibc")
-  endif()
-  include(CheckCSourceCompiles)
-  check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
-  if(NOT TDLUA_GLIBC)
-    message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
-  endif()
   find_package(Threads REQUIRED)
   target_link_libraries(tdlua PRIVATE Threads::Threads)
-  target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # CMAKE_SYSTEM_PROCESSOR describes the target, including cross builds.
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64)$")
+      message(FATAL_ERROR
+              "Threaded TDLua requires Linux glibc x86_64 or aarch64")
+    endif()
+    include(CheckCSourceCompiles)
+    check_c_source_compiles("#include <features.h>\n#ifndef __GLIBC__\n#error glibc required\n#endif\nint main(void) { return 0; }" TDLUA_GLIBC)
+    if(NOT TDLUA_GLIBC)
+      message(FATAL_ERROR "Threaded TDLua requires a glibc ELF loader with NODELETE")
+    endif()
+    target_link_options(tdlua PRIVATE -Wl,-z,nodelete)
+  elseif(APPLE)
+    if(CMAKE_OSX_ARCHITECTURES)
+      if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+      endif()
+    elseif(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+      message(FATAL_ERROR "macOS TDLua is currently validated only for arm64")
+    endif()
+    # Lua searches for .so modules on macOS too. Keep the module name expected
+    # by require() while CMake emits a Mach-O shared library.
+    set_target_properties(tdlua PROPERTIES SUFFIX ".so")
+    if(_tdlua_backend STREQUAL "native")
+      # Native TDLib links system/Homebrew dylibs such as OpenSSL. Retain their
+      # external link directories in the installed module's run path.
+      set_property(TARGET tdlua PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    endif()
+  elseif(WIN32)
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8
+       OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$"
+       OR NOT (MINGW OR MSVC))
+      message(FATAL_ERROR
+              "Windows TDLua requires a 64-bit MinGW or MSVC toolchain")
+    endif()
+    if(_tdlua_backend STREQUAL "native" AND NOT MSVC)
+      # The native backend links TDLib's C++ static libraries, which this
+      # project only builds and validates with MSVC on Windows.
+      message(FATAL_ERROR
+              "The native TDLib backend on Windows requires the MSVC toolchain")
+    endif()
+    # Lua's Windows loader expects a DLL named after the module. Do not apply
+    # ELF or Mach-O loader flags on PE/COFF.
+    set_target_properties(tdlua PROPERTIES PREFIX "" SUFFIX ".dll")
+  else()
+    message(FATAL_ERROR
+            "Threaded TDLua currently supports Linux glibc x86_64/aarch64, macOS arm64, and Windows x64 MinGW JSON or MSVC JSON/native")
+  endif()
 endif()
 if(TDLUA_BUNDLED_TDLIB AND UNIX AND _tdlua_backend STREQUAL "json"
    AND NOT _tdlua_json_static)
@@ -563,15 +683,36 @@ install(FILES
 )
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
-if(TDLUA_BUNDLED_TDLIB)
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/td/LICENSE_1_0.txt"
+# TDLib ends up inside the module for both backends: statically from the bundle
+# with TDLUA_BUNDLED_TDLIB=ON, and statically from an external Td package with
+# TDLUA_BUNDLED_TDLIB=OFF. Its license therefore ships with every install, and
+# the text is taken from the pinned submodule so the copy always describes the
+# TDLib that is linked.
+#
+# A tree without td/ is legitimate for a build against a prebuilt Td (the CI
+# matrix does exactly that), so a missing file is a warning here rather than an
+# error. The release workflow requires the submodule and refuses to assemble a
+# payload whose install has no TDLib-LICENSE_1_0.txt, which is where the license
+# is not optional.
+set(TDLUA_TDLIB_LICENSE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/td/LICENSE_1_0.txt"
+    CACHE FILEPATH "Boost license text of the TDLib linked into the module")
+if(EXISTS "${TDLUA_TDLIB_LICENSE_FILE}")
+  install(FILES "${TDLUA_TDLIB_LICENSE_FILE}"
       DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua"
       RENAME "TDLib-LICENSE_1_0.txt")
+else()
+  message(WARNING
+    "TDLib license not found at ${TDLUA_TDLIB_LICENSE_FILE}: this install will "
+    "not ship TDLib-LICENSE_1_0.txt. Initialize the pinned submodule with "
+    "'git submodule update --init td', or pass "
+    "-DTDLUA_TDLIB_LICENSE_FILE=<path to LICENSE_1_0.txt> when linking an "
+    "external Td with TDLUA_BUNDLED_TDLIB=OFF.")
 endif()
 
 if(TDLUA_BUILD_TESTS)
     enable_testing()
     add_executable(tdlua_core_anchor_ownership_test "tests/core_anchor_ownership_test.cpp")
+    target_compile_definitions(tdlua_core_anchor_ownership_test PRIVATE TDLUA_TESTING)
     target_include_directories(tdlua_core_anchor_ownership_test PRIVATE
         ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(tdlua_core_anchor_ownership_test PRIVATE
@@ -588,6 +729,28 @@ if(TDLUA_BUILD_TESTS)
     target_compile_features(tdlua_managed_routing_oom_test PRIVATE cxx_std_11)
     tdlua_enable_sanitizers(tdlua_managed_routing_oom_test)
     add_test(NAME tdlua_managed_routing_oom COMMAND tdlua_managed_routing_oom_test)
+    add_executable(tdlua_failure_atomicity_test
+        "tests/failure_atomicity_test.cpp")
+    target_compile_definitions(tdlua_failure_atomicity_test PRIVATE TDLUA_TESTING)
+    target_include_directories(tdlua_failure_atomicity_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_failure_atomicity_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_failure_atomicity_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_failure_atomicity_test)
+    add_test(NAME tdlua_failure_atomicity
+        COMMAND tdlua_failure_atomicity_test)
+    add_executable(tdlua_managed_metatable_oom_test
+        "tests/managed_metatable_oom_test.cpp")
+    target_compile_definitions(tdlua_managed_metatable_oom_test PRIVATE TDLUA_TESTING)
+    target_include_directories(tdlua_managed_metatable_oom_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_managed_metatable_oom_test PRIVATE
+        ${LUA_LIBRARIES} tdlua_lua_runtime)
+    target_compile_features(tdlua_managed_metatable_oom_test PRIVATE cxx_std_11)
+    tdlua_enable_sanitizers(tdlua_managed_metatable_oom_test)
+    add_test(NAME tdlua_managed_metatable_oom
+        COMMAND tdlua_managed_metatable_oom_test)
     add_executable(tdlua_json_push_oom_test
         "tests/json_push_oom_test.cpp" "src/common/lua_json.cpp")
     target_include_directories(tdlua_json_push_oom_test PRIVATE
@@ -603,7 +766,11 @@ if(TDLUA_BUILD_TESTS)
     target_link_libraries(tdlua_client_pump_test PRIVATE
         ${LUA_LIBRARIES} tdlua_lua_runtime)
     target_compile_features(tdlua_client_pump_test PRIVATE cxx_std_11)
-    target_compile_options(tdlua_client_pump_test PRIVATE -Wall -Wextra -Wpedantic)
+    if(MSVC)
+        target_compile_options(tdlua_client_pump_test PRIVATE /W4)
+    else()
+        target_compile_options(tdlua_client_pump_test PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
     tdlua_enable_sanitizers(tdlua_client_pump_test)
     add_test(NAME tdlua_client_pump COMMAND tdlua_client_pump_test)
 
@@ -640,12 +807,45 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_receiver_generic_fifo_metadata
             COMMAND tdlua_receiver_runtime_test --generic-fifo-metadata-only)
 
+        add_executable(tdlua_receiver_lifecycle_ownership_test
+            tests/receiver_lifecycle_ownership_test.cpp)
+        target_include_directories(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_receiver_lifecycle_ownership_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_receiver_lifecycle_ownership_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_receiver_lifecycle_ownership_test)
+        add_test(NAME tdlua_receiver_lifecycle_ownership
+            COMMAND tdlua_receiver_lifecycle_ownership_test)
+
+        add_executable(tdlua_failure_cleanup_phases_test
+            tests/failure_cleanup_phases_test.cpp)
+        target_include_directories(tdlua_failure_cleanup_phases_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_failure_cleanup_phases_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_failure_cleanup_phases_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_failure_cleanup_phases_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_failure_cleanup_phases_test)
+        add_test(NAME tdlua_failure_cleanup_phases
+            COMMAND tdlua_failure_cleanup_phases_test)
+
         add_executable(tdlua_buffering_accounting_test
             tests/buffering_accounting_test.cpp)
         target_include_directories(tdlua_buffering_accounting_test PRIVATE
             ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(tdlua_buffering_accounting_test PRIVATE
             ${LUA_LIBRARIES} tdlua_lua_runtime Threads::Threads)
+        if(WIN32)
+            target_link_libraries(tdlua_buffering_accounting_test PRIVATE Psapi)
+        endif()
         target_compile_definitions(tdlua_buffering_accounting_test PRIVATE
             TDLUA_TESTING)
         target_compile_features(tdlua_buffering_accounting_test PRIVATE cxx_std_11)
@@ -676,6 +876,17 @@ if(TDLUA_BUILD_TESTS)
             COMMAND tdlua_retention_policy_poc_test)
     endif()
     target_compile_definitions(tdlua PRIVATE TDLUA_TESTING)
+    if(MINGW)
+        # Fake-client tests link against test-only C++ hooks in the DLL. GNU
+        # ld for PE/COFF needs an explicit export-all flag for those symbols.
+        # Keep it confined to this TDLUA_TESTING build.
+        target_link_options(tdlua PRIVATE -Wl,--export-all-symbols)
+    elseif(MSVC)
+        # The test executables discover TDLUA_TESTING hooks through the DLL's
+        # import library or GetProcAddress. Export them only in test builds;
+        # production DLLs retain the explicit luaopen_tdlua export alone.
+        set_target_properties(tdlua PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
     add_executable(tdlua_codec_test
         "tests/codec_test.cpp"
         "src/common/lua_json.cpp"
@@ -824,8 +1035,10 @@ if(TDLUA_BUILD_TESTS)
         if(_tdlua_backend STREQUAL "native")
             target_compile_definitions(tdlua_lua51_managed_test PRIVATE TDLUA_NATIVE_BACKEND)
             target_include_directories(tdlua_lua51_managed_test PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/td" "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+                "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                "${_tdlua_native_td_include_dirs}")
             target_compile_features(tdlua_lua51_managed_test PRIVATE cxx_std_23)
+            tdlua_link_native_test_tdlib(tdlua_lua51_managed_test)
         endif()
         tdlua_enable_sanitizers(tdlua_lua51_managed_test)
         add_test(NAME tdlua_lua51_managed COMMAND tdlua_lua51_managed_test)
@@ -852,12 +1065,33 @@ if(TDLUA_BUILD_TESTS)
     if(_tdlua_backend STREQUAL "native")
         target_compile_definitions(tdlua_release_test PRIVATE TDLUA_NATIVE_BACKEND)
         target_include_directories(tdlua_release_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto")
+            "${_tdlua_native_td_include_dirs}")
         target_compile_features(tdlua_release_test PRIVATE cxx_std_23)
+        tdlua_link_native_test_tdlib(tdlua_release_test)
     endif()
     tdlua_enable_sanitizers(tdlua_release_test)
     add_test(NAME tdlua_release COMMAND tdlua_release_test)
     set_tests_properties(tdlua_release PROPERTIES TIMEOUT 30)
+    if(NOT TDLUA_USE_LUA51_CONTINUATION)
+        add_executable(tdlua_uploadtravis_test "tests/uploadtravis_test.cpp")
+        target_include_directories(tdlua_uploadtravis_test PRIVATE ${LUA_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(tdlua_uploadtravis_test PRIVATE tdlua ${LUA_LIBRARIES}
+            tdlua_lua_runtime)
+        target_compile_definitions(tdlua_uploadtravis_test PRIVATE TDLUA_TESTING)
+        target_compile_features(tdlua_uploadtravis_test PRIVATE cxx_std_11)
+        if(_tdlua_backend STREQUAL "native")
+            target_compile_definitions(tdlua_uploadtravis_test PRIVATE TDLUA_NATIVE_BACKEND)
+            target_include_directories(tdlua_uploadtravis_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                "${_tdlua_native_td_include_dirs}")
+            target_compile_features(tdlua_uploadtravis_test PRIVATE cxx_std_23)
+            tdlua_link_native_test_tdlib(tdlua_uploadtravis_test)
+        endif()
+        tdlua_enable_sanitizers(tdlua_uploadtravis_test)
+        add_test(NAME tdlua_uploadtravis COMMAND tdlua_uploadtravis_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/uploadtravis.lua")
+        set_tests_properties(tdlua_uploadtravis PROPERTIES TIMEOUT 30)
+    endif()
     if(TDLUA_USE_LUAJIT_CONTINUATION)
         add_test(NAME tdlua_release_jit_off COMMAND tdlua_release_test --jit-off)
         add_test(NAME tdlua_vm_threads_jit_off COMMAND tdlua_vm_threads_test --jit-off)
@@ -872,7 +1106,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         if(NOT TDLUA_BUNDLED_TDLIB)
@@ -898,7 +1132,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}"
         )
         target_link_libraries(tdlua_native_decoder_safety_test PRIVATE
@@ -919,7 +1153,7 @@ if(TDLUA_BUILD_TESTS)
             ${LUA_INCLUDE_DIRS}
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/td"
-            "${CMAKE_CURRENT_SOURCE_DIR}/td/td/generate/auto"
+            "${_tdlua_native_td_include_dirs}"
             "${TDLUA_NATIVE_GENERATED_DIR}")
         if(NOT TDLUA_BUNDLED_TDLIB)
             target_include_directories(tdlua_native_generic_ticket_test PRIVATE
@@ -1024,6 +1258,39 @@ if(TDLUA_BUILD_TESTS)
                     "$<TARGET_FILE_DIR:tdlua>"
         )
         set_tests_properties(tdlua_managed_driver_backend PROPERTIES TIMEOUT 30)
+        if(APPLE)
+            add_executable(tdlua_macos_residency_test
+                "tests/macos_module_residency_test.cpp")
+            if(_tdlua_backend STREQUAL "native")
+                target_compile_definitions(tdlua_macos_residency_test PRIVATE
+                    TDLUA_NATIVE_BACKEND)
+            endif()
+            target_include_directories(tdlua_macos_residency_test PRIVATE
+                ${LUA_INCLUDE_DIRS})
+            target_link_libraries(tdlua_macos_residency_test PRIVATE
+                ${LUA_LIBRARIES} ${CMAKE_DL_LIBS})
+            target_compile_features(tdlua_macos_residency_test PRIVATE cxx_std_11)
+            add_dependencies(tdlua_macos_residency_test tdlua)
+            add_test(NAME tdlua_macos_residency
+                COMMAND tdlua_macos_residency_test "$<TARGET_FILE:tdlua>")
+            set_tests_properties(tdlua_macos_residency PROPERTIES TIMEOUT 30)
+        elseif(WIN32)
+            add_executable(tdlua_windows_residency_test
+                "tests/windows_module_residency_test.cpp")
+            if(_tdlua_backend STREQUAL "native")
+                target_compile_definitions(tdlua_windows_residency_test PRIVATE
+                    TDLUA_NATIVE_BACKEND)
+            endif()
+            target_include_directories(tdlua_windows_residency_test PRIVATE
+                ${LUA_INCLUDE_DIRS})
+            target_link_libraries(tdlua_windows_residency_test PRIVATE
+                ${LUA_LIBRARIES})
+            target_compile_features(tdlua_windows_residency_test PRIVATE cxx_std_11)
+            add_dependencies(tdlua_windows_residency_test tdlua)
+            add_test(NAME tdlua_windows_residency
+                COMMAND tdlua_windows_residency_test "$<TARGET_FILE_DIR:tdlua>")
+            set_tests_properties(tdlua_windows_residency PROPERTIES TIMEOUT 120)
+        endif()
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle
             tdlua_async

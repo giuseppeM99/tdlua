@@ -75,7 +75,10 @@ static void json_on(tdlua_binding::ClientHandle client, lua_State *L,
     try {
         td->dispatcher().on(L, type, callback_index, concurrent);
     } catch (...) {
-        td->setHandlerRegistered(type, false);
+        // onEvent is failure-atomic: a failed replacement leaves the previous
+        // scheduler handler published. Keep the receiver prefilter in sync with
+        // the handler that actually survived.
+        td->setHandlerRegistered(type, td->dispatcher().hasHandler(type));
         throw;
     }
 }

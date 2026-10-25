@@ -181,10 +181,31 @@ struct Scenario {
 };
 
 Scenario *current = nullptr;
-int waitForResponse(lua_State *L)
-{
+
+#if defined(_MSC_VER)
+#define TDLUA_OOM_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDLUA_OOM_NOINLINE __attribute__((noinline))
+#else
+#define TDLUA_OOM_NOINLINE
+#endif
+
+// Trivially destructible, so the frame that raises the Lua error owns no
+// cleanup state of its own.
+struct WaitOutcome {
     bool failed = false;
     int results = 0;
+};
+
+// Every automatic object with a destructor lives in this helper: the guard, the
+// SchedulerCore lease and the ManagedState reference are all destroyed before
+// it returns. Under /EHc MSVC does not model the state change out of a cleanup
+// region that precedes an extern "C" call, so a non-local Lua jump out of the
+// frame that still owns them re-runs their destructors (P5C.4b). Returning only
+// trivial data keeps that cleanup state out of the caller.
+TDLUA_OOM_NOINLINE WaitOutcome performWait(lua_State *L)
+{
+    WaitOutcome outcome;
     try {
         struct Guard {
             int &count;
@@ -194,14 +215,20 @@ int waitForResponse(lua_State *L)
         const auto core = current->router.core();
         const auto state = current->state;
         require(core->waitSynchronously(L, state, true, .01,
-                                       tdlua::WaitKind::Result, results),
+                                       tdlua::WaitKind::Result, outcome.results),
                 "unexpected timeout");
-        results = core->pushResult(L, state);
+        outcome.results = core->pushResult(L, state);
     } catch (const TDLuaLuaError &) {
-        failed = true;
+        outcome.failed = true;
     }
+    return outcome;
+}
+
+int waitForResponse(lua_State *L)
+{
     // No owning C++ automatic object crosses this Lua error boundary.
-    return failed ? lua_error(L) : results;
+    const WaitOutcome outcome = performWait(L);
+    return outcome.failed ? lua_error(L) : outcome.results;
 }
 
 void sweep()
@@ -229,7 +256,15 @@ void sweep()
             allocator.fail_at = 0;
             if (allocator.rejected) ++faults;
             rejected_calls += allocator.rejected;
-            require(scenario.guards == 0, "Lua error skipped a C++ destructor");
+            if (scenario.guards != 0) {
+                std::cerr << "guard diagnostic: offset=" << offset
+                          << " allocator_calls=" << allocator.calls
+                          << " rejected=" << allocator.rejected
+                          << " status=" << status
+                          << " task_status=" << static_cast<int>(scenario.state->status)
+                          << " stack_type=" << lua_typename(L, lua_type(L, -1)) << '\n';
+                require(false, "Lua error skipped a C++ destructor");
+            }
             require(scenario.router.pendingCount() == 0, "pending request remained");
             require(scenario.state->waiter_count == 0, "waiter remained");
             require(scenario.state->handle_count == 1, "handle count changed");

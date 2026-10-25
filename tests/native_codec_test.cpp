@@ -10,6 +10,7 @@
 
 #include <td/telegram/td_api.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -115,6 +116,55 @@ void expect_omitted_set_tdlib_parameters(lua_State *L)
     lua_pop(L, 1);
 }
 
+// The int64 boundaries as binary64 values, without extended precision.
+// INT64_MIN (-2^63) is representable exactly as a double, INT64_MAX is not:
+// its nearest double is 2^63, and accepting that value would make the test
+// expect an int64 the codec cannot hold. Deriving both bounds from std::ldexp
+// keeps the classification independent of long double, which is binary64 on
+// MSVC and would round INT64_MAX up to 2^63.
+lua_Number int64_lower_bound()
+{
+    return -std::ldexp(static_cast<lua_Number>(1), 63);
+}
+
+lua_Number int64_upper_bound()
+{
+    return std::ldexp(static_cast<lua_Number>(1), 63);
+}
+
+// Mirrors the codec contract for a Lua number: finite, integral, and inside
+// [INT64_MIN, 2^63). Every double in that interval converts to int64 without
+// changing value, and that is the only interval with that property.
+bool float_fits_int64(const lua_Number number)
+{
+    return std::isfinite(number) && std::floor(number) == number &&
+        number >= int64_lower_bound() && number < int64_upper_bound();
+}
+
+// Whether push_object can reproduce an int64 as an exact Lua number. Lua 5.3+
+// has an integer subtype, so any int64 fits it. Older Lua stores every number
+// as lua_Number, so only values whose binary significand holds the magnitude
+// can be pushed as numbers; the rest fall back to the decimal string. Decided
+// in integer arithmetic, independently of tdlua_can_push_integer, so the two
+// can be compared instead of the function being its own oracle.
+bool int64_reproducible_as_number(const std::int64_t value)
+{
+#if LUA_VERSION_NUM >= 503
+    (void)value;
+    return true;
+#else
+    if (std::numeric_limits<lua_Number>::radix != 2) return false;
+    if (value == 0) return true;
+    std::uint64_t magnitude = value < 0
+        ? static_cast<std::uint64_t>(-(value + 1)) + 1u
+        : static_cast<std::uint64_t>(value);
+    while ((magnitude & 1u) == 0) magnitude >>= 1;
+    int significant = 0;
+    for (; magnitude != 0; magnitude >>= 1) ++significant;
+    return significant <= std::numeric_limits<lua_Number>::digits;
+#endif
+}
+
 void test_int64_parity(lua_State *L)
 {
     const std::int64_t values[] = {0, 1, -1, 2147483648LL, 9007199254740991LL,
@@ -138,11 +188,13 @@ void test_int64_parity(lua_State *L)
             else if (integer_input) lua_pushinteger(L, static_cast<lua_Integer>(value));
             else lua_pushnumber(L, static_cast<lua_Number>(value));
             lua_setfield(L, -2, "set_id");
-            const long double number = static_cast<lua_Number>(value);
-            const bool fits = numeric_string || integer_input || (number >= static_cast<long double>(
-                (std::numeric_limits<std::int64_t>::min)()) && number <= static_cast<long double>(
-                (std::numeric_limits<std::int64_t>::max)()));
-            const auto expected = numeric_string || integer_input ? value :
+            const lua_Number number = static_cast<lua_Number>(value);
+            const bool exact_input = numeric_string || integer_input;
+            const bool fits = exact_input || float_fits_int64(number);
+            // The floating-point conversion runs only after float_fits_int64
+            // has established that the value is inside the representable
+            // interval.
+            const std::int64_t expected = exact_input ? value :
                 fits ? static_cast<std::int64_t>(number) : 0;
             bool native_ok = false;
             try {
@@ -186,7 +238,10 @@ void test_int64_parity(lua_State *L)
         lua_pop(L, 2);
         tdlua_native::push_object(L, object);
         lua_getfield(L, -1, "custom_emoji_id");
-        if (tdlua_can_push_integer(value)) {
+        const bool expect_number = int64_reproducible_as_number(value);
+        require(tdlua_can_push_integer(value) == expect_number,
+                "tdlua_can_push_integer disagreed with the independent rule: " + text);
+        if (expect_number) {
             lua_Integer integer = 0;
             require(tdlua_lua_integer_value(L, -1, integer) && integer == value,
                     "native numeric output lost int64 precision");
@@ -196,9 +251,80 @@ void test_int64_parity(lua_State *L)
         }
         lua_pop(L, 2);
         std::cout << "int64 " << text << " string-input=exact native-output="
-                  << (tdlua_can_push_integer(value) ? "number" : "string")
+                  << (expect_number ? "number" : "string")
                   << " json-output=string\n";
     }
+}
+
+// Feeds one Lua number straight to the codec and checks the acceptance rule and
+// the decoded value. The label records the exact value that reaches the codec,
+// because a value like INT64_MAX is not representable as a double and arrives
+// rounded.
+void expect_float_input(lua_State *L, const lua_Number number, const char *label)
+{
+    const bool expected_fits = float_fits_int64(number);
+    lua_newtable(L);
+    lua_pushliteral(L, "getStickerSet");
+    lua_setfield(L, -2, "_");
+    lua_pushnumber(L, number);
+    lua_setfield(L, -2, "set_id");
+
+    bool accepted = false;
+    std::int64_t decoded = 0;
+    try {
+        const auto request = tdlua_native::from_lua(L, -1, "request");
+        const auto &typed = static_cast<const td::td_api::getStickerSet &>(*request);
+        decoded = typed.set_id_;
+        accepted = true;
+    } catch (const tdlua_native::CodecError &) {}
+    lua_pop(L, 1);
+
+    require(accepted == expected_fits,
+            std::string("native float input has the wrong acceptance: ") + label);
+    if (accepted) {
+        require(decoded == static_cast<std::int64_t>(number),
+                std::string("native float input changed the value: ") + label);
+    }
+}
+
+void test_float_boundaries(lua_State *L)
+{
+    const lua_Number two_63 = int64_upper_bound();
+    const lua_Number positive_infinity = (std::numeric_limits<lua_Number>::infinity)();
+    const lua_Number negative_infinity = -positive_infinity;
+    const lua_Number int64_max_as_number =
+        static_cast<lua_Number>((std::numeric_limits<std::int64_t>::max)());
+    const lua_Number int64_min_as_number =
+        static_cast<lua_Number>((std::numeric_limits<std::int64_t>::min)());
+
+    expect_float_input(L, 0.0, "0");
+    expect_float_input(L, 1.0, "1");
+    expect_float_input(L, -1.0, "-1");
+    expect_float_input(L, 2147483648.0, "2^31");
+    expect_float_input(L, 9007199254740991.0, "2^53-1");
+    expect_float_input(L, 9007199254740992.0, "2^53");
+    expect_float_input(L, 9007199254740994.0, "2^53+2");
+    expect_float_input(L, 9007199254740993.0, "2^53+1 as a double, rounds to 2^53");
+    expect_float_input(L, int64_min_as_number, "INT64_MIN as lua_Number");
+    expect_float_input(L, int64_max_as_number,
+        "INT64_MAX as lua_Number, rounds to 2^63");
+    expect_float_input(L, two_63, "2^63 exactly");
+    expect_float_input(L, std::nextafter(two_63, 0.0),
+        "largest double below 2^63");
+    expect_float_input(L, std::nextafter(-two_63, 0.0),
+        "smallest double above INT64_MIN");
+    expect_float_input(L, std::nextafter(-two_63, negative_infinity),
+        "next double below -2^63");
+    expect_float_input(L, -two_63 * 2.0, "-2^64");
+    expect_float_input(L, two_63 * 2.0, "2^64");
+    expect_float_input(L, 0.5, "0.5");
+    expect_float_input(L, -0.5, "-0.5");
+    expect_float_input(L, 1.5, "1.5");
+    expect_float_input(L, -1.5, "-1.5");
+    expect_float_input(L, (std::numeric_limits<lua_Number>::quiet_NaN)(), "NaN");
+    expect_float_input(L, positive_infinity, "+inf");
+    expect_float_input(L, negative_infinity, "-inf");
+    std::cout << "float boundaries: int64 interval and special values classified\n";
 }
 
 void test_native_response_push_oom()
@@ -273,6 +399,7 @@ int main()
 
     try {
         test_int64_parity(L);
+        test_float_boundaries(L);
         expect_int64(L, "0", 0);
         expect_int64(L, "-9223372036854775808",
                      (std::numeric_limits<std::int64_t>::min)());

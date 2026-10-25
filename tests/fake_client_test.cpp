@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+extern "C" int tdlua_json_test_control(int action);
+
 namespace {
 
 using json = nlohmann::json;
@@ -210,6 +212,37 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         registered.driver_demands != before_registration.driver_demands)
         throw std::runtime_error("on() created consumer interest without a driver");
 
+    // A one-shot receive by B can acquire an unsolicited update for A while
+    // A only has a registered handler. Hold the source until the update is
+    // queued so the worker's classification point is deterministic.
+    const auto before_inactive = runtime.stats();
+    if (!tdlua_json_test_control(0))
+        throw std::runtime_error("could not pause receiver source for inactive-client test");
+    try {
+        runLua(L, "assert(d:receive(0) == nil)");
+        if (!tdlua_json_test_control(2))
+            throw std::runtime_error("receiver did not enter the paused source");
+        runtime.injectReceivedForTesting(
+            client_id, json{{"@type", "updateNewMessage"}, {"value", 11}});
+        if (!tdlua_json_test_control(1))
+            throw std::runtime_error("could not release receiver source");
+        if (!runtime.waitForClassifiedForTesting(
+                before_inactive.published + before_inactive.dropped_unsolicited + 1,
+                std::chrono::seconds(2)))
+            throw std::runtime_error("receiver did not classify the inactive client's update");
+    } catch (...) {
+        tdlua_json_test_control(1);
+        throw;
+    }
+    const auto after_inactive = runtime.stats();
+    if (after_inactive.received != before_inactive.received + 1 ||
+        after_inactive.published != before_inactive.published ||
+        after_inactive.dropped_unsolicited != before_inactive.dropped_unsolicited + 1 ||
+        after_inactive.handler_only_consumers != before_inactive.handler_only_consumers)
+        throw std::runtime_error(
+            "an update acquired for an inactive client was not dropped exactly once");
+
+    const auto before_handler_only = runtime.stats();
     runtime.injectReceivedForTesting(
         client_id, json{{"@type", "updateDeleteMessage"}, {"value", 9}});
     runtime.injectReceivedForTesting(
@@ -217,12 +250,12 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
     runLua(L, "c:loop(); assert(#handler_seen==1 and handler_seen[1]==17)");
 
     const auto handler_only = runtime.stats();
-    if (handler_only.dropped_by_handler_filter - before_registration.dropped_by_handler_filter != 1 ||
-        handler_only.dropped_unsolicited - before_registration.dropped_unsolicited != 1 ||
-        handler_only.dropped_overflow != before_registration.dropped_overflow ||
-        handler_only.published - before_registration.published != 1 ||
-        handler_only.consumer_interests != before_registration.consumer_interests ||
-        handler_only.handler_only_consumers != before_registration.handler_only_consumers)
+    if (handler_only.dropped_by_handler_filter - before_handler_only.dropped_by_handler_filter != 1 ||
+        handler_only.dropped_unsolicited - before_handler_only.dropped_unsolicited != 1 ||
+        handler_only.dropped_overflow != before_handler_only.dropped_overflow ||
+        handler_only.published - before_handler_only.published != 1 ||
+        handler_only.consumer_interests != before_handler_only.consumer_interests ||
+        handler_only.handler_only_consumers != before_handler_only.handler_only_consumers)
         throw std::runtime_error("handler-only loop did not filter and release interest exactly once");
 
     // Registering and then removing a type before acquisition must update the
@@ -263,6 +296,46 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         after_generic.consumer_interests != before_generic.consumer_interests ||
         after_generic.handler_only_consumers != before_generic.handler_only_consumers)
         throw std::runtime_error("generic loop did not retain its scoped generic interest");
+
+    // A failure while replacing a handler must leave both the scheduler
+    // registration and the receiver prefilter on A. Exercise the complete
+    // binding path, not only RequestRouter::onEvent.
+    runLua(L,
+           "recovery_seen=0; replacement_seen=0; "
+           "c:on('updateNewMessage', function() "
+           " recovery_seen=recovery_seen+1; c:off('updateNewMessage') end)");
+    client->setEventPublicationFailureForTesting(true);
+    try {
+        runLua(L,
+               "local ok, err=pcall(function() "
+               " c:on('updateNewMessage', function() "
+               "  replacement_seen=replacement_seen+1; "
+               "  c:off('updateNewMessage') end) "
+               "end); assert(not ok)");
+    } catch (...) {
+        client->setEventPublicationFailureForTesting(false);
+        throw;
+    }
+    client->setEventPublicationFailureForTesting(false);
+
+    const auto before_recovery = runtime.stats();
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 41}});
+    runLua(L, "c:loop(); assert(recovery_seen==1 and replacement_seen==0)");
+    const auto after_recovery = runtime.stats();
+    if (after_recovery.published - before_recovery.published != 1 ||
+        after_recovery.dropped_by_handler_filter !=
+            before_recovery.dropped_by_handler_filter)
+        throw std::runtime_error(
+            "failed on() replacement disabled the receiver prefilter");
+
+    // Retry B: A must be replaced, and the next update must reach only B.
+    runLua(L,
+           "c:on('updateNewMessage', function() "
+           " replacement_seen=replacement_seen+1; c:off('updateNewMessage') end)");
+    runtime.injectReceivedForTesting(
+        client_id, json{{"@type", "updateNewMessage"}, {"value", 43}});
+    runLua(L, "c:loop(); assert(recovery_seen==1 and replacement_seen==1)");
 
     // The nested protection frame must release interest when Lua raises.
     runtime.injectReceivedForTesting(

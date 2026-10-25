@@ -5,9 +5,11 @@ package.cpath = assert(arg[1]) .. '/?.so;' .. package.cpath
 local tdlua = require 'tdlua'
 tdlua.setLogLevel(0)
 
-local function finish_shutdown(target)
-    local future = target:close()
-    assert(not target:isClosed())
+local function finish_shutdown(target, future)
+    if not future then
+        future = target:close()
+        assert(not target:isClosed())
+    end
     for _ = 1, 100 do
         if target:isClosed() then break end
         target:receive(0.1)
@@ -27,52 +29,50 @@ finish_shutdown(client)
 assert(client:poll() == nil and client:poll(function() error('closed callback') end) == nil)
 client:loop()
 
--- A new client emits an authorization update after its first submission.
+-- A managed reply is not a promise that TDLib also emits an unsolicited
+-- authorization update. Use close lifecycle updates to exercise poll routing.
 client = tdlua()
-future = client:getAuthorizationState()
+local close = client:close()
 local update = client:poll()
 assert(update and update._request_id == nil)
-client:loop()
-assert(future:ready())
-finish_shutdown(client)
+finish_shutdown(client, close)
 
+-- The callback PollTask observes a lifecycle update from the same close.
 client = tdlua()
-future = client:getAuthorizationState()
+close = client:close()
 local task = client:poll(function(u)
     assert(u._request_id == nil)
-    local response = client:getAuthorizationState():wait()
-    return false, response._request_id
+    return false
 end)
 assert(task and task._request_id == nil)
 client:loop()
-local ordinary_false, request_id = task:wait()
-assert(ordinary_false == false and request_id)
-finish_shutdown(client)
+assert(task:wait() == false)
+finish_shutdown(client, close)
 
 for _,concurrent in ipairs({true,false}) do
     client = tdlua()
-    future = client:getAuthorizationState()
+    close = client:close()
     local calls = 0
     client:loop(function(u)
         assert(u._request_id == nil)
         calls = calls + 1
-        client:getAuthorizationState():wait()
         return false
     end, {concurrent=concurrent})
-    assert(calls >= 1 and future:ready())
-    finish_shutdown(client)
+    assert(calls == 1)
+    finish_shutdown(client, close)
 end
 
 client = tdlua()
-future = client:getAuthorizationState()
 local called = false
-client:on('updateAuthorizationState', function()
+client:on('updateAuthorizationState', function(update)
+    assert(update._ == 'updateAuthorizationState')
     called = true
     client:off('updateAuthorizationState')
 end)
+close = client:close()
 client:loop()
-assert(called and future:ready())
-finish_shutdown(client)
+assert(called)
+finish_shutdown(client, close)
 
 -- Exercise a recoverable handler error while lifecycle demand keeps the
 -- receiver alive; registration alone must not retain unsolicited updates.

@@ -40,6 +40,20 @@ void collect(lua_State *L)
     lua_gc(L, LUA_GCCOLLECT, 0);
     lua_gc(L, LUA_GCCOLLECT, 0);
 }
+std::size_t coreAnchorCount(lua_State *L)
+{
+    const int top = lua_gettop(L);
+    tdlua::pushCoreAnchors(L);
+    const int anchors = lua_gettop(L);
+    std::size_t count = 0;
+    lua_pushnil(L);
+    while (lua_next(L, anchors)) {
+        ++count;
+        lua_pop(L, 1);
+    }
+    lua_settop(L, top);
+    return count;
+}
 std::size_t constructionRoots(lua_State *L)
 {
     std::size_t count = 0;
@@ -208,13 +222,25 @@ void survivingHandles()
     require(lua_pcall(L, 0, 1, 0) == LUA_OK, "client creation failed");
     auto *router = *static_cast<tdlua::RequestRouter **>(lua_touserdata(L, -1));
     require(constructionRoots(L) == 0, "attachment retained its temporary root");
+    const std::weak_ptr<tdlua::SchedulerCore> expected_core = router->core();
+    const std::size_t finalizers_before = tdlua::coreAnchorFinalizerCountForTesting();
     const auto future = router->future();
     tdlua::pushManagedHandle(L, future, "tdlua.future");
+    const int future_index = lua_gettop(L);
+    tdlua_lua_get_value_uservalue(L, future_index);
+    require(luaL_testudata(L, -1, "tdlua.core") != nullptr,
+            "future handle did not receive its CoreAnchor uservalue");
+    lua_pop(L, 1);
     lua_setglobal(L, "surviving_future");
     run(L, "return function() callback_ran = true end");
     const auto task = router->task(L, -1, 0, false);
     lua_pop(L, 1);
     tdlua::pushManagedHandle(L, task, "tdlua.task");
+    const int task_index = lua_gettop(L);
+    tdlua_lua_get_value_uservalue(L, task_index);
+    require(luaL_testudata(L, -1, "tdlua.core") != nullptr,
+            "Task handle did not receive its CoreAnchor uservalue");
+    lua_pop(L, 1);
     lua_setglobal(L, "surviving_task");
     run(L, "waiting = coroutine.create(function() surviving_future:wait(); resumed = true end); "
            "assert(coroutine.resume(waiting))");
@@ -223,6 +249,20 @@ void survivingHandles()
     require(destroyed == before + 1, "client deleted twice with retained handles");
     lua_pop(L, 1);
     collect(L);
+    for (const char *global : {"surviving_future", "surviving_task"}) {
+        lua_getglobal(L, global);
+        tdlua_lua_get_value_uservalue(L, -1);
+        const bool retains_anchor = luaL_testudata(L, -1, "tdlua.core") != nullptr;
+        std::cerr << "CoreAnchor diagnostic after client GC: " << global
+                  << " uservalue_type=" << lua_typename(L, lua_type(L, -1))
+                  << " retains_anchor=" << retains_anchor
+                  << " live_cores=" << tdlua::liveSchedulerCores()
+                  << " core_expired=" << expected_core.expired()
+                  << " finalizers="
+                  << (tdlua::coreAnchorFinalizerCountForTesting() - finalizers_before)
+                  << " anchors=" << coreAnchorCount(L) << '\n';
+        lua_pop(L, 2);
+    }
     require(!clients && tdlua::liveSchedulerCores() == 1, "handles lost the anchor");
     run(L, "assert(not callback_ran and not resumed); "
            "assert(surviving_future:ready() and surviving_task:ready()); "

@@ -2,9 +2,26 @@
 #include <algorithm>
 #include <ctime>
 #include <iostream>
-#include <pthread.h>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 using namespace tdlua::receiver;
 using Clock = std::chrono::steady_clock;
@@ -25,8 +42,20 @@ class Fake final : public Source<int> {
         std::unique_lock<std::mutex> lock(mutex);
         ++calls;
         worker_threads.insert(std::this_thread::get_id());
+#ifdef _WIN32
+        if (!have_worker_thread) {
+            HANDLE duplicate = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                GetCurrentProcess(), &duplicate, 0, FALSE,
+                                DUPLICATE_SAME_ACCESS)) {
+                worker_thread = duplicate;
+                have_worker_thread = true;
+            }
+        }
+#else
         worker_thread = pthread_self();
         have_worker_thread = true;
+#endif
         changed.notify_all();
         if (paused) {
             entered = true;
@@ -110,18 +139,48 @@ class Fake final : public Source<int> {
     }
     std::uint64_t workerCpuNanoseconds()
     {
+#ifdef _WIN32
+        HANDLE thread;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!have_worker_thread) return 0;
+            thread = worker_thread;
+        }
+        FILETIME creation = {}, exit = {}, kernel = {}, user = {};
+        if (!GetThreadTimes(thread, &creation, &exit, &kernel, &user)) return 0;
+        ULARGE_INTEGER kernel_ticks = {}, user_ticks = {};
+        kernel_ticks.LowPart = kernel.dwLowDateTime;
+        kernel_ticks.HighPart = kernel.dwHighDateTime;
+        user_ticks.LowPart = user.dwLowDateTime;
+        user_ticks.HighPart = user.dwHighDateTime;
+        return (kernel_ticks.QuadPart + user_ticks.QuadPart) * 100;
+#else
         pthread_t thread;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!have_worker_thread) return 0;
             thread = worker_thread;
         }
+#if defined(__APPLE__)
+        thread_basic_info_data_t info = {};
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(pthread_mach_thread_np(thread), THREAD_BASIC_INFO,
+                        reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS)
+            return 0;
+        const auto seconds = static_cast<std::uint64_t>(info.user_time.seconds) +
+                             static_cast<std::uint64_t>(info.system_time.seconds);
+        const auto microseconds = static_cast<std::uint64_t>(info.user_time.microseconds) +
+                                  static_cast<std::uint64_t>(info.system_time.microseconds);
+        return seconds * 1000000000ULL + microseconds * 1000ULL;
+#else
         clockid_t clock_id;
         if (pthread_getcpuclockid(thread, &clock_id) != 0) return 0;
         timespec value = {};
         if (clock_gettime(clock_id, &value) != 0) return 0;
         return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
                static_cast<std::uint64_t>(value.tv_nsec);
+#endif
+#endif
     }
     std::size_t pending()
     {
@@ -136,8 +195,19 @@ class Fake final : public Source<int> {
     bool paused = false, entered = false, error = false;
     std::uint64_t calls = 0;
     std::set<std::thread::id> worker_threads;
+#ifdef _WIN32
+    HANDLE worker_thread = nullptr;
+#else
     pthread_t worker_thread;
+#endif
     bool have_worker_thread = false;
+
+    ~Fake() override
+    {
+#ifdef _WIN32
+        if (worker_thread) CloseHandle(worker_thread);
+#endif
+    }
 };
 
 static Item pop(const std::shared_ptr<Mailbox<int>> &box)
@@ -742,14 +812,18 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
                            tdlua::ResponseClass::ManagedProtected),
           "pending poll callback dependency was not admitted");
     engine.endSend(1, false, 701, true);
+    source->awaitCalls(1);
 
     // poll(callback) holds consumer interest for its C call. Once it returns a
     // pending Task, only the callback's managed request remains as demand.
+    // The first global receive began before the temporary poll interest, so
+    // wait for a second receive after release before publishing the probe.
     check(engine.setConsumerInterest(1, true),
           "poll consumer interest was not acquired");
     check(engine.setConsumerInterest(1, false),
           "poll consumer interest was not released on return");
     auto b_driver = engine.acquireDriver(2);
+    source->awaitCalls(2);
     const auto pending_stats = engine.stats();
     check(pending_stats.driver_demands == 1 && pending_stats.request_demands == 1 &&
               pending_stats.consumer_interests == 0,
@@ -763,9 +837,17 @@ static void pendingPollTaskDoesNotRetainUnsolicited()
     check(engine.waitForClassified(classified_before_update + 1, Ms(2000)),
           "shared receiver did not classify A's unsolicited update");
     const auto unsolicited_stats = engine.stats();
-    check(unsolicited_stats.dropped_unsolicited == dropped_before_update + 1 &&
-              unsolicited_stats.depth == depth_before_update && a_box->stats().depth == 0,
-          "pending PollTask incorrectly retained a later unsolicited update");
+    if (unsolicited_stats.dropped_unsolicited != dropped_before_update + 1 ||
+        unsolicited_stats.depth != depth_before_update || a_box->stats().depth != 0) {
+        throw std::runtime_error(
+            "pending PollTask retention counters: dropped=" +
+            std::to_string(unsolicited_stats.dropped_unsolicited - dropped_before_update) +
+            ", runtime_depth_delta=" +
+            std::to_string(unsolicited_stats.depth - depth_before_update) +
+            ", client_depth=" + std::to_string(a_box->stats().depth) +
+            ", published_delta=" +
+            std::to_string(unsolicited_stats.published - pending_stats.published));
+    }
 
     source->push(1, 702, false, 701);
     check(engine.waitForClassified(classified_before_update + 2, Ms(2000)),

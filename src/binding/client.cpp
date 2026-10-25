@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "tdlua/binding/lua_binding.h"
+#include "tdlua/common/module_residency.h"
 #ifdef TDLUA_JSON_BACKEND
 #include "tdlua/backend/json/runtime.h"
 #elif defined(TDLUA_NATIVE_BACKEND)
@@ -316,8 +317,20 @@ static luaL_Reg module_functions[] = {
 
 extern "C" {
 
-LUALIB_API int luaopen_tdlua(lua_State *L)
+#ifdef TDLUA_TESTING
+std::size_t tdlua_test_live_scheduler_cores() noexcept
 {
+    return tdlua::liveSchedulerCores();
+}
+#endif
+
+TDLUA_MODULE_API int luaopen_tdlua(lua_State *L)
+{
+    if (!tdlua::ensureModuleResident()) {
+        lua_pushliteral(L, "tdlua: could not pin module residency");
+        return lua_error(L);
+    }
+
     const int initialized = tdlua_binding::protected_call(L, [&]() -> int {
 #ifdef TDLUA_JSON_BACKEND
         tdlua_json_initialize_vm(L);
