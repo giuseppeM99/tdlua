@@ -1,0 +1,462 @@
+# Copyright (c) 2018-2026 Giuseppe Marino
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Builds and verifies the release payload without publishing anything.
+#
+# Called by release.yml on a tag (which then publishes) and by release-dry.yml
+# on a branch push (which stops after verification). The publish path lives
+# only in release.yml, so a dry run cannot create a release even when it is
+# invoked from the same workflow file tree.
+
+name: Release package
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Tag the payload is named after (default v<dist.info version>)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+jobs:
+  validate:
+    name: Validate all supported runtimes
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  # Platform packages are built in this same run, not downloaded from an
+  # unrelated run of another branch. A skipped call is not a green gate: the
+  # package job needs all four, so a failure or a missing artifact stops the
+  # payload before anything is uploaded.
+  windows-json:
+    name: Windows x64 JSON package
+    uses: ./.github/workflows/windows-msvc-json.yml
+    permissions:
+      contents: read
+
+  windows-native:
+    name: Windows x64 native package
+    uses: ./.github/workflows/windows-msvc-native.yml
+    permissions:
+      contents: read
+
+  macos-json:
+    name: macOS arm64 JSON package
+    uses: ./.github/workflows/macos-json.yml
+    permissions:
+      contents: read
+
+  macos-native:
+    name: macOS arm64 native package
+    uses: ./.github/workflows/macos-native.yml
+    permissions:
+      contents: read
+
+  package:
+    name: Assemble and verify the release payload
+    needs:
+      - validate
+      - windows-json
+      - windows-native
+      - macos-json
+      - macos-native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            liblua5.4-dev \
+            libssl-dev \
+            lua5.4 \
+            luarocks \
+            ninja-build \
+            unzip \
+            zlib1g-dev
+
+      - name: Download validated runtime artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tdlua-*-static
+          path: ${{ runner.temp }}/tdlua-artifacts
+          merge-multiple: true
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tdlua-*-package*
+          path: ${{ runner.temp }}/tdlua-platform
+          merge-multiple: true
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      # Everything consumed by this job must come from the exact commit under
+      # test: the validated artifacts were produced by the same run, and the
+      # source bundle is archived from HEAD. A tag build additionally proves
+      # that HEAD is the tagged commit, so no gate can refer to another SHA.
+      - name: Verify version, tag and runtime matrix
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' dist.info)"
+          test -n "$base_version"
+
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="v${base_version}"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+            test "$(git describe --exact-match --tags HEAD)" = "$tag"
+          fi
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+
+          artifacts="$RUNNER_TEMP/tdlua-artifacts"
+          count="$(find "$artifacts" -type f -name '*.so' | wc -l)"
+          test "$count" -eq 10
+          for pattern in \
+            'tdlua-5.2-*.so' \
+            'tdlua-5.3-*.so' \
+            'tdlua-5.4-*.so' \
+            'tdlua-5.5-*.so' \
+            'tdlua-luajit-*.so' \
+            'tdlua-5.2-native-*.so' \
+            'tdlua-5.3-native-*.so' \
+            'tdlua-5.4-native-*.so' \
+            'tdlua-5.5-native-*.so' \
+            'tdlua-luajit-native-*.so'; do
+            find "$artifacts" -type f -name "$pattern" -print -quit | grep -q .
+          done
+
+          # The six non-x86_64 packages complete the 16-variant matrix. A
+          # missing or renamed archive fails here rather than reaching
+          # SHA256SUMS as a smaller payload.
+          platform="$RUNNER_TEMP/tdlua-platform"
+          test "$(find "$platform" -maxdepth 1 -type f | wc -l)" -eq 6
+          for package in \
+            tdlua-5.4-aarch64-json.tar.gz \
+            tdlua-5.4-aarch64-native.tar.gz \
+            tdlua-5.4-macos-arm64-json.tar.gz \
+            tdlua-5.4-macos-arm64-native.tar.gz \
+            tdlua-5.4-win64-json.zip \
+            tdlua-5.4-win64-native.zip; do
+            test -f "$platform/$package"
+          done
+
+          printf 'release_tag=%s\nbase_version=%s\n' "$tag" "$base_version" >> "$GITHUB_ENV"
+
+      - name: Verify the platform packages
+        run: |
+          set -euo pipefail
+          platform="$RUNNER_TEMP/tdlua-platform"
+
+          verify_manifest() {
+            root="$1"
+            backend="$2"
+            platform_name="$3"
+            test -f "$root/MANIFEST.txt"
+            grep -qx "source_sha=${GITHUB_SHA}" "$root/MANIFEST.txt"
+            grep -qx "backend=${backend}" "$root/MANIFEST.txt"
+            grep -qx "lua_version=5.4" "$root/MANIFEST.txt"
+            grep -qx "platform=${platform_name}" "$root/MANIFEST.txt"
+            module="$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            test -n "$module"
+            test -f "$root/$module"
+            expected="$(sed -n 's/^module_sha256=//p' "$root/MANIFEST.txt")"
+            actual="$(sha256sum "$root/$module" | cut -d ' ' -f 1)"
+            test "$expected" = "$actual"
+            test -f "$root/share/licenses/tdlua/LICENSE"
+            test -f "$root/share/licenses/tdlua/TDLib-LICENSE_1_0.txt"
+          }
+
+          for spec in \
+            "tdlua-5.4-aarch64-json.tar.gz|json|linux-aarch64" \
+            "tdlua-5.4-aarch64-native.tar.gz|native|linux-aarch64" \
+            "tdlua-5.4-macos-arm64-json.tar.gz|json|macos-arm64" \
+            "tdlua-5.4-macos-arm64-native.tar.gz|native|macos-arm64"; do
+            IFS='|' read -r archive backend platform_name <<< "$spec"
+            dir="$(mktemp -d)"
+            tar -xzf "$platform/$archive" -C "$dir"
+            root="$dir/${archive%.tar.gz}"
+            verify_manifest "$root" "$backend" "$platform_name"
+            module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            if [ "$platform_name" = linux-aarch64 ]; then
+              readelf -h "$module" | grep 'Machine:.*AArch64' >/dev/null
+              # readelf is target-independent; nm on the x86_64 payload runner
+              # cannot read an AArch64 object without binutils-multiarch.
+              readelf -sW --dyn-syms "$module" | grep 'luaopen_tdlua$' >/dev/null
+              if readelf -sW --dyn-syms "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
+                echo "::error::${archive} exports test hooks"
+                exit 1
+              fi
+              # The manifest must state the dependencies the module actually
+              # imports, not a hand-written list.
+              expected_external="$(LC_ALL=C readelf -d "$module" \
+                | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
+                | grep -v -E '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux)' \
+                | paste -sd, -)"
+              test -n "$expected_external"
+              grep -qx "external_runtime=${expected_external}" "$root/MANIFEST.txt"
+            else
+              file "$module" | grep 'Mach-O 64-bit.*arm64' >/dev/null
+              if [ "$backend" = json ]; then
+                test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"
+              elif test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"; then
+                echo "::error::${archive} carries a TDLib dylib"
+                exit 1
+              fi
+            fi
+            if tar -tzf "$platform/$archive" | grep -E '(_test|\.pdb$|\.so\.debug)'; then
+              echo "::error::${archive} contains build-only files"
+              exit 1
+            fi
+          done
+
+          for spec in \
+            "tdlua-5.4-win64-json.zip|json" \
+            "tdlua-5.4-win64-native.zip|native"; do
+            IFS='|' read -r archive backend <<< "$spec"
+            dir="$(mktemp -d)"
+            unzip -q "$platform/$archive" -d "$dir"
+            root="$dir/tdlua"
+            verify_manifest "$root" "$backend" "windows-x64"
+            module="$root/$(sed -n 's/^module=//p' "$root/MANIFEST.txt")"
+            file "$module" | grep 'PE32+.*x86-64' >/dev/null
+            if [ "$backend" = json ]; then
+              test -f "$root/tdjson.dll"
+            else
+              test ! -f "$root/tdjson.dll"
+            fi
+            # The Lua DLL and the MSVC CRT stay with the host.
+            test ! -f "$root/lua54.dll"
+            if unzip -l "$platform/$archive" | grep -E '(_test|\.pdb)'; then
+              echo "::error::${archive} contains build-only files"
+              exit 1
+            fi
+          done
+
+          echo "platform packages verified:"
+          ls -l "$platform"
+
+      # The install takes the license from the pinned submodule, so the
+      # bundle must carry it; a payload with a module but no license is not
+      # distributable.
+      - name: Verify the TDLib license source
+        run: |
+          set -euo pipefail
+          test -f td/LICENSE_1_0.txt
+          grep -q 'Boost Software License' td/LICENSE_1_0.txt
+          sha256sum td/LICENSE_1_0.txt
+
+      - name: Create source bundle
+        run: |
+          set -euo pipefail
+          root="tdlua-${release_tag}"
+          mkdir -p "release/${root}"
+          git archive HEAD | tar -x -C "release/${root}"
+          for module in td base64; do
+            mkdir -p "release/${root}/${module}"
+            git -C "${module}" archive HEAD | tar -x -C "release/${root}/${module}"
+          done
+          tar -C release -czf "tdlua-${release_tag}-source.tar.gz" "${root}"
+
+      - name: Generate and verify release rockspecs
+        run: |
+          set -euo pipefail
+          mkdir -p release-meta
+          for package in tdlua tdlua-luajit; do
+            lua5.4 tools/release/generate-rockspec.lua \
+              --rockspec "${package}-scm-1.rockspec" \
+              --output-dir release-meta \
+              --base-version "$base_version" \
+              --tag "$release_tag"
+          done
+
+          for package in tdlua tdlua-luajit; do
+            rockspec="release-meta/${package}-${base_version}-1.rockspec"
+            test -f "$rockspec"
+            grep -qx "package = \"${package}\"" "$rockspec"
+            grep -qx "version = \"${base_version}-1\"" "$rockspec"
+            grep -q "url = \"https://github.com/giuseppeM99/tdlua/releases/download/${release_tag}/tdlua-${release_tag}-source.tar.gz\"" "$rockspec"
+            if grep -q 'branch = ' "$rockspec"; then
+              echo "::error file=${rockspec}::release rockspec must not pin a branch"
+              exit 1
+            fi
+            luarocks lint "$rockspec"
+          done
+          ls -l release-meta
+
+      # Install from the artifact users actually download, not from the
+      # checkout: the tarball is extracted, the generated rockspec builds it
+      # with the static TDLib package this run already validated.
+      - name: Install from the release source tarball
+        env:
+          TDLUA_BUNDLED_TDLIB: "OFF"
+          TDLUA_JSON_STATIC: "ON"
+          TDLUA_BACKEND: json
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/release-src"
+          tree="$RUNNER_TEMP/luarocks-tree"
+          rm -rf "$src" "$tree"
+          mkdir -p "$src"
+          tar -xzf "tdlua-${release_tag}-source.tar.gz" -C "$src"
+          root="$src/tdlua-${release_tag}"
+          test -f "$root/dist.info"
+          test -f "$root/td/CMakeLists.txt"
+          test -f "$root/base64/LICENSE"
+
+          export CMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib"
+          cd "$root"
+          luarocks --lua-version 5.4 --tree "$tree" make \
+            "$GITHUB_WORKSPACE/release-meta/tdlua-${base_version}-1.rockspec"
+
+          module="$tree/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          LUA_CPATH="$tree/lib/lua/5.4/?.so;;" LUA_PATH="" lua5.4 -e '
+            local tdlua = require("tdlua")
+            assert(type(tdlua.version) == "string", "missing version")
+            assert(type(tdlua.api_version) == "string", "missing api_version")
+            assert(type(tdlua.tdlib_version) == "string", "missing tdlib_version")
+            print("loaded tdlua " .. tdlua.version .. " (api " .. tdlua.api_version .. ", TDLib " .. tdlua.tdlib_version .. ")")
+          '
+
+          # The tarball carries the pinned submodule, so this install must ship
+          # the TDLib license; a module distributed without it is a regression.
+          installed_license="$(find "$tree" -name TDLib-LICENSE_1_0.txt -print -quit)"
+          test -n "$installed_license"
+          cmp "$installed_license" "$root/td/LICENSE_1_0.txt"
+
+      - name: Assemble payload and checksums
+        run: |
+          set -euo pipefail
+          payload="$GITHUB_WORKSPACE/payload"
+          rm -rf "$payload"
+          mkdir -p "$payload"
+          cp "tdlua-${release_tag}-source.tar.gz" "$payload/"
+          cp release-meta/*.rockspec "$payload/"
+          cp "$RUNNER_TEMP/tdlua-artifacts"/*.so "$payload/"
+          cp "$RUNNER_TEMP/tdlua-platform"/*.tar.gz "$payload/"
+          cp "$RUNNER_TEMP/tdlua-platform"/*.zip "$payload/"
+          cp LICENSE "$payload/"
+          cp td/LICENSE_1_0.txt "$payload/TDLib-LICENSE_1_0.txt"
+
+          cd "$payload"
+          sha256sum * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Verify payload contents
+        run: |
+          set -euo pipefail
+          cd payload
+
+          # Only artifacts built by this run and by the gates it called are
+          # published: 10 Linux x86_64 modules, 2 AArch64, 2 Windows, 2 macOS.
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          test -f "tdlua-${release_tag}-source.tar.gz"
+          test -f SHA256SUMS
+
+          # The declared matrix, verified by name and then counted. The ten
+          # Linux x86-64 modules are five Lua ABIs times two backends; the six
+          # platform archives are named explicitly. A renamed or duplicated
+          # artifact fails here, and the total is derived from the files that
+          # matched instead of being asserted as a constant.
+          # The TDLib version in the module names comes from the pinned
+          # submodule of this checkout, not from a second hardcoded copy.
+          tdlib_version="$(awk '/^project\(TDLib VERSION/ { print $3; exit }' "$GITHUB_WORKSPACE/td/CMakeLists.txt")"
+          test -n "$tdlib_version"
+          variants=0
+          for abi in 5.2 5.3 5.4 5.5 luajit; do
+            test -f "tdlua-${abi}-${base_version}-${tdlib_version}-linux-x86_64.so"
+            test -f "tdlua-${abi}-native-${base_version}-${tdlib_version}-linux-x86_64.so"
+            variants=$((variants + 2))
+          done
+          for archive in \
+            tdlua-5.4-aarch64-json.tar.gz \
+            tdlua-5.4-aarch64-native.tar.gz \
+            tdlua-5.4-macos-arm64-json.tar.gz \
+            tdlua-5.4-macos-arm64-native.tar.gz \
+            tdlua-5.4-win64-json.zip \
+            tdlua-5.4-win64-native.zip; do
+            test -f "$archive"
+            variants=$((variants + 1))
+          done
+          test "$variants" -eq 16
+          for file in LICENSE TDLib-LICENSE_1_0.txt; do
+            test -f "$file"
+          done
+
+          # Every published file must be covered by the manifest, not merely
+          # hash-checked by the files that happen to be listed.
+          for file in ./*.so ./*.tar.gz ./*.zip ./*.rockspec LICENSE TDLib-LICENSE_1_0.txt; do
+            grep -qx "[0-9a-f]*  ${file#./}" SHA256SUMS
+          done
+
+          # A production module must not export test hooks.
+          if nm -D --defined-only ./*.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::a release module exports test hooks"
+            exit 1
+          fi
+
+          # The source bundle comes from git archive only: no agent state, no
+          # build trees, no sessions or credentials. The trailing slash keeps
+          # files that merely start with "build" (td/example/build-*.sh) in.
+          tar -tzf "tdlua-${release_tag}-source.tar.gz" > "$RUNNER_TEMP/source-listing.txt"
+          if grep -E '(^|/)(\.agent|\.git|\.ci|build[^/]*)/' "$RUNNER_TEMP/source-listing.txt"; then
+            echo "::error::source bundle contains excluded paths"
+            exit 1
+          fi
+          if grep -Ei '\.session$|/tdata/|(^|/)\.netrc$|(^|/)\.env$|id_rsa|\.pem$' "$RUNNER_TEMP/source-listing.txt"; then
+            echo "::error::source bundle contains credentials or session data"
+            exit 1
+          fi
+          for required in \
+            "tdlua-${release_tag}/dist.info" \
+            "tdlua-${release_tag}/LICENSE" \
+            "tdlua-${release_tag}/td/LICENSE_1_0.txt" \
+            "tdlua-${release_tag}/base64/LICENSE"; do
+            grep -qx "$required" "$RUNNER_TEMP/source-listing.txt"
+          done
+
+          echo "payload verified:"
+          ls -l
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-release-package
+          path: payload/
+          if-no-files-found: error
+          retention-days: 7

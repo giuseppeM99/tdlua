@@ -1,0 +1,87 @@
+# Copyright (c) 2018-2026 Giuseppe Marino
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Non-publishing release validation.
+#
+# workflow_dispatch only exists on the default branch, so the dry run is also
+# reachable from a push to a packaging branch. It calls the same reusable
+# workflow as the real release and then re-downloads the published CI artifact
+# to prove the payload and its checksum manifest survived the round trip.
+#
+# This workflow has no write permission and no publish job: it cannot create a
+# release, a tag, a branch or an upload to luarocks.org.
+
+name: Release dry run
+
+on:
+  push:
+    branches:
+      # The consolidated branch is already validated by build.yml on push;
+      # running the dry run there would execute the whole matrix twice. The
+      # packaging and release-metadata branches are only validated here.
+      - "p71*-packaging*"
+      - "p72*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dry-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build and verify the release payload
+    uses: ./.github/workflows/release-package.yml
+    permissions:
+      contents: read
+
+  verify:
+    name: Verify the downloaded payload
+    needs: package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download payload artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlua-release-package
+          path: payload
+
+      - name: Verify checksum manifest and payload shape
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          cd payload
+          sha256sum -c SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*-source.tar.gz' | wc -l)" -eq 1
+          for archive in tdlua-5.4-aarch64-*.tar.gz tdlua-5.4-macos-arm64-*.tar.gz; do
+            tar -tzf "$archive" | grep '/lib/lua/5.4/tdlua.so$' >/dev/null
+          done
+          for archive in tdlua-5.4-win64-*.zip; do
+            unzip -l "$archive" | grep 'tdlua/tdlua.dll$' >/dev/null
+          done
+          for file in LICENSE TDLib-LICENSE_1_0.txt SHA256SUMS; do
+            test -f "$file"
+          done
+
+          {
+            echo "### Release dry run"
+            echo
+            echo "Commit: \`${RELEASE_SHA}\`"
+            echo "Ref: \`${RELEASE_REF}\`"
+            echo
+            echo "| File | SHA-256 |"
+            echo "|---|---|"
+            sed 's/^\([0-9a-f]*\)  \(.*\)$/| \2 | \1 |/' SHA256SUMS
+            echo
+            echo "Nothing was published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ls -l

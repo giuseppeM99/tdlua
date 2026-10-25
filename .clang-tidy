@@ -1,0 +1,13 @@
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier,
+  performance-*,
+  portability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|.*/)(src|include/tdlua)/.*'
+FormatStyle: file
+SystemHeaders: false

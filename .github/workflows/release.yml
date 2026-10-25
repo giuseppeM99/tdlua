@@ -1,6 +1,10 @@
 # Copyright (c) 2018-2026 Giuseppe Marino
 # SPDX-License-Identifier: BSD-3-Clause
 
+# Publishing path. Only a tag push reaches this workflow; the payload is built
+# and verified by release-package.yml, and only the final job can write to the
+# repository. Everything before it runs read-only.
+
 name: Release TDLua
 
 on:
@@ -9,90 +13,49 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  validate:
-    name: Validate all supported runtimes
-    uses: ./.github/workflows/build.yml
+  package:
+    name: Build and verify the release payload
+    uses: ./.github/workflows/release-package.yml
     permissions:
       contents: read
 
-  release:
-    name: Package and publish release artifacts
-    needs: validate
+  publish:
+    name: Publish GitHub release
+    needs: package
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # Defence in depth: a branch push can never reach the publishing job even
+    # if the trigger above is ever widened by mistake.
+    if: github.ref_type == 'tag'
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Download validated runtime artifacts
+      - name: Download verified payload
         uses: actions/download-artifact@v8
         with:
-          pattern: tdlua-*-static
-          path: ${{ runner.temp }}/tdlua-artifacts
-          merge-multiple: true
+          name: tdlua-release-package
+          path: payload
 
-      - name: Verify release version and runtime matrix
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          base_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' dist.info)"
-          test "${RELEASE_TAG#v}" = "$base_version"
-          count="$(find "$RUNNER_TEMP/tdlua-artifacts" -type f -name '*.so' | wc -l)"
-          test "$count" -eq 10
-          for pattern in \
-            'tdlua-5.2-*.so' \
-            'tdlua-5.3-*.so' \
-            'tdlua-5.4-*.so' \
-            'tdlua-5.5-*.so' \
-            'tdlua-luajit-*.so' \
-            'tdlua-5.2-native-*.so' \
-            'tdlua-5.3-native-*.so' \
-            'tdlua-5.4-native-*.so' \
-            'tdlua-5.5-native-*.so' \
-            'tdlua-luajit-native-*.so'; do
-            find "$RUNNER_TEMP/tdlua-artifacts" -type f -name "$pattern" -print -quit | grep -q .
-          done
-
-      - name: Create source bundle and release metadata
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Verify payload checksums before publishing
         run: |
           set -euo pipefail
-          base_version="$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' dist.info)"
-          root="tdlua-${RELEASE_TAG}"
-          source_url="https://github.com/giuseppeM99/tdlua/releases/download/${RELEASE_TAG}/tdlua-${RELEASE_TAG}-source.tar.gz"
-
-          mkdir -p "release/${root}" release-artifacts
-          git archive HEAD | tar -x -C "release/${root}"
-          for module in td base64; do
-            mkdir -p "release/${root}/${module}"
-            git -C "${module}" archive HEAD | tar -x -C "release/${root}/${module}"
-          done
-          tar -C release -czf "tdlua-${RELEASE_TAG}-source.tar.gz" "${root}"
-
-          for package in tdlua tdlua-luajit; do
-            rockspec="${package}-${RELEASE_TAG}.rockspec"
-            cp "${package}-scm-1.rockspec" "$rockspec"
-            sed -i \
-              -e "s/version = \"scm-1\"/version = \"${base_version}-1\"/" \
-              -e "s|url = \"git+https://github.com/giuseppeM99/tdlua.git\"|url = \"${source_url}\"|" \
-              -e '/branch = "master"/d' \
-              "$rockspec"
-          done
-
-          cp "$RUNNER_TEMP/tdlua-artifacts"/*.so release-artifacts/
+          cd payload
+          sha256sum -c SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          ls -l
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          files: |
-            tdlua-${{ github.ref_name }}-source.tar.gz
-            tdlua-${{ github.ref_name }}.rockspec
-            tdlua-luajit-${{ github.ref_name }}.rockspec
-            release-artifacts/*.so
+          files: payload/*

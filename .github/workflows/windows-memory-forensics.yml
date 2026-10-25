@@ -1,0 +1,35 @@
+name: Windows isolated memory forensics
+on:
+  push:
+    branches: [vnext-portability-clean, v0.5.1-consolidated]
+    paths:
+      - '.github/workflows/windows-memory-forensics.yml'
+      - 'tools/windows/memory-forensics.ps1'
+      - 'tests/managed_adapter_test.cpp'
+permissions:
+  contents: read
+jobs:
+  adapter:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Isolated Lua and adapter diagnostics without TDLib
+        run: ./tools/windows/memory-forensics.ps1
+      - name: Preserve text diagnostics and symbols, exclude process dumps
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-memory-forensics-${{ github.run_id }}
+          path: |
+            .ci/memory-forensics/**/*.log
+            .ci/memory-forensics/**/*.txt
+            .ci/memory-forensics/**/*.pdb
+          retention-days: 7
+          if-no-files-found: error

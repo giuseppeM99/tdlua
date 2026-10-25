@@ -5,6 +5,16 @@ name: Build TDLua
 
 on:
   push:
+    # A tag push is validated by release.yml, which calls this workflow. Running
+    # the standalone copy too would duplicate the whole matrix on every release.
+    tags-ignore:
+      - "v*"
+    # Packaging and release-metadata branches are validated by release-dry.yml,
+    # which calls this workflow for the same commit; the standalone run would
+    # duplicate the whole matrix.
+    branches-ignore:
+      - "p71*-packaging*"
+      - "p72*"
   pull_request:
   workflow_call:
 
@@ -16,8 +26,14 @@ env:
 
 jobs:
   tdlib:
-    name: Build static TDLib
+    name: Build pinned TDLib and static package
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-native-codegen-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -29,63 +45,578 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             gperf \
+            liblua5.4-dev \
+            lua5.4 \
             ninja-build \
             openssl \
             libssl-dev \
             zlib1g-dev
 
-      - name: Restore TDLib build cache
-        id: tdlib-cache
+      # Runs after the dependencies so that cmake and ccache can report their
+      # versions; the compiler version and the TDLib pin are part of the cache
+      # key below.
+      - name: Record toolchain and pinned TDLib provenance
+        id: toolchain
+        run: |
+          set -euo pipefail
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          td_commit="$(git -C td rev-parse HEAD)"
+          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+          printf 'td_commit=%s\n' "$td_commit" >> "$GITHUB_OUTPUT"
+          sha256sum td/td/generate/scheme/td_api.tl
+          cmake --version | head -n 1
+          ccache --version | head -n 1
+
+      - name: Restore pinned TDLib native codegen build
+        id: codegen-cache
         uses: actions/cache@v6
         with:
           path: |
-            td-build
-            .ci/tdlib
-            .ci/tdlib-static.tar.gz
-          key: tdlib-static-${{ runner.os }}-${{ hashFiles('td/**') }}
+            ${{ runner.temp }}/tdlua-native-bootstrap
+            ${{ runner.temp }}/tdlua-native-stage
+          # The restored tree holds generated TDLib sources and binaries, which
+          # are only valid for the pinned commit that produced them. Keep the
+          # commit in both the key and the fallback prefix so a pin bump cannot
+          # reuse a stale codegen build; v2 marks the first keyed generation.
+          key: tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v2-${{ steps.toolchain.outputs.td_commit }}-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
           restore-keys: |
-            tdlib-static-${{ runner.os }}-
+            tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v2-${{ steps.toolchain.outputs.td_commit }}-
 
-      - name: Configure static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Build pinned TDLib and native codec tools
+        if: steps.codegen-cache.outputs.cache-hit != 'true'
         run: |
-          cmake -S td -B td-build -G Ninja \
+          set -euo pipefail
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          # A restored prefix match (pin bump) may hold a partially stale tree;
+          # configure from a clean directory and let ccache supply the objects.
+          rm -rf "$bootstrap" "$stage"
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B "$bootstrap" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DTD_INSTALL_STATIC_LIBRARIES=ON \
-            -DTD_INSTALL_SHARED_LIBRARIES=OFF \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/tdlib"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$stage" \
+            -DCMAKE_PREFIX_PATH="$stage" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library"
+          # The native backend links Td::TdStatic, and TDLib's static install
+          # rules export tdjson_static and tdjson_private. Build that archive
+          # explicitly so the installed package is complete.
+          cmake --build "$bootstrap" --target tdlua tdjson_static --parallel 2
+          cmake --install "$bootstrap"
+          # TDLib's install rules do not install the generated JSON header that
+          # native tests require; generate it and place it in the package.
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
 
-      - name: Build static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        run: cmake --build td-build --target tdjson_static
+      - name: Report codegen compiler cache
+        if: steps.codegen-cache.outputs.cache-hit != 'true'
+        run: ccache --show-stats
 
-      - name: Install static TDLib
-        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+      - name: Verify pinned TDLib native codegen build
         run: |
-          cmake --install td-build
-          test -f "$GITHUB_WORKSPACE/.ci/tdlib/lib/libtdjson_static.a"
+          set -euo pipefail
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          test -f "$bootstrap/CMakeCache.txt"
+          grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$GITHUB_WORKSPACE" \
+            "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BACKEND:STRING=native$' "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BUNDLED_TDLIB:BOOL=ON$' "$bootstrap/CMakeCache.txt"
+          test -f "$bootstrap/td/tdtl/libtdtl.a"
+          test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
+          test -f "$bootstrap/td/tdutils/td/utils/config.h"
+          test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          grep -q 'Td::tdjson_private' "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          test -f "$stage/include/td/telegram/td_api_json.h"
+          test -f "$stage/lib/libtdjson_static.a"
+          test -z "$(git -C td status --porcelain)"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/td_api.tlo" td/td/generate/scheme/td_api.tl
+          test -s "$RUNNER_TEMP/td_api.tlo"
+          sha256sum "$bootstrap/td/tdtl/libtdtl.a" \
+            "$bootstrap/td/td/generate/tl-parser/tl-parser" \
+            "$stage/include/td/telegram/td_api_json.h" \
+            "$RUNNER_TEMP/td_api.tlo"
+
+      # The stage is also the prefix the native jobs use, so it carries TDLua's
+      # own install: the Lua module, its CMake package and the licences. The
+      # JSON jobs want the static TDLib package only, exactly what the
+      # standalone TDLib job used to publish, so those trees are left out and
+      # the result is checked instead of trusted.
+      - name: Package static TDLib package
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          test -f "$stage/lib/libtdjson_static.a"
           tdlib_version="$(sed -n 's/^project(TDLib VERSION \([^ ]*\).*/\1/p' td/CMakeLists.txt)"
           test -n "$tdlib_version"
-          printf '%s\n' "$tdlib_version" > "$GITHUB_WORKSPACE/.ci/tdlib/tdlib-version.txt"
-          tar -C "$GITHUB_WORKSPACE/.ci/tdlib" \
-            -czf "$GITHUB_WORKSPACE/.ci/tdlib-static.tar.gz" .
+          printf '%s\n' "$tdlib_version" > "$stage/tdlib-version.txt"
+          tar -C "$stage" -czf "$RUNNER_TEMP/tdlib-static.tar.gz" \
+            --exclude='./lib/lua' --exclude='./lib/lua/*' \
+            --exclude='./lib/cmake/tdlua' --exclude='./lib/cmake/tdlua/*' \
+            --exclude='./share' --exclude='./share/*' \
+            .
+          tar -tzf "$RUNNER_TEMP/tdlib-static.tar.gz" > "$RUNNER_TEMP/tdlib-static-members.txt"
+          if grep -qE '^\./(lib/lua|lib/cmake/tdlua|share)(/|$)' "$RUNNER_TEMP/tdlib-static-members.txt"; then
+            echo "the static TDLib package still carries TDLua's own install" >&2
+            exit 1
+          fi
+          for member in \
+            ./lib/libtdjson_static.a \
+            ./lib/cmake/Td/TdConfig.cmake \
+            ./include/td/telegram/td_api.h \
+            ./tdlib-version.txt; do
+            grep -qxF "$member" "$RUNNER_TEMP/tdlib-static-members.txt"
+          done
+          ls -l "$RUNNER_TEMP/tdlib-static.tar.gz"
+          sha256sum "$RUNNER_TEMP/tdlib-static.tar.gz"
 
-      - name: Verify static TDLib cache
+      - name: Package pinned TDLib native codegen build
         run: |
-          test -f .ci/tdlib/lib/libtdjson_static.a
-          test -f .ci/tdlib/tdlib-version.txt
-          test -f .ci/tdlib-static.tar.gz
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/tdlib-native-codegen.tar.gz" \
+            tdlua-native-stage tdlua-native-bootstrap
+          ls -l "$RUNNER_TEMP/tdlib-native-codegen.tar.gz"
+          sha256sum "$RUNNER_TEMP/tdlib-native-codegen.tar.gz"
+
+      - name: Upload pinned TDLib native codegen build
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload static TDLib package
         uses: actions/upload-artifact@v7
         with:
           name: tdlib-static
-          path: .ci/tdlib-static.tar.gz
+          path: ${{ runner.temp }}/tdlib-static.tar.gz
           if-no-files-found: error
           retention-days: 1
+
+  linux-aarch64:
+    name: Linux AArch64 / JSON and native / Lua 5.4
+    # AArch64 is a release gate: it must also run for the packaging and
+    # release-metadata branches and for a release tag, not only for the
+    # consolidated branches. A skipped gate is not a green gate, so the ref
+    # filter cannot hide the job.
+    if: github.ref == 'refs/heads/vnext-portability-clean' || github.ref == 'refs/heads/v0.5.1-consolidated' || startsWith(github.ref, 'refs/heads/p71') || startsWith(github.ref, 'refs/heads/p72') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && (github.base_ref == 'vnext-portability-clean' || github.base_ref == 'v0.5.1-consolidated'))
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+
+    steps:
+      - name: Checkout pinned source and submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Record runner and toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/aarch64-validation
+          {
+            date -u
+            uname -a
+            uname -m
+            cat /etc/os-release
+            ldd --version | head -n 1
+            lscpu
+            free -h
+            df -h .
+            gcc --version
+            g++ --version
+            printf 'gcc_version=%s\n' "$(gcc -dumpfullversion -dumpversion)"
+            printf 'gxx_version=%s\n' "$(g++ -dumpfullversion -dumpversion)"
+            cmake --version
+            ninja --version
+            ld --version | head -n 1
+          } | tee .ci/aarch64-validation/provenance.log
+          test "$(uname -m)" = aarch64
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          td_commit="$(git -C td rev-parse HEAD)"
+          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+          {
+            printf 'td_commit=%s\n' "$td_commit"
+            sha256sum td/td/generate/scheme/td_api.tl
+          } | tee .ci/aarch64-validation/tdlib-provenance.log
+
+      - name: Install AArch64 build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache \
+            cmake \
+            gperf \
+            liblua5.4-dev \
+            lua5.4 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            zlib1g-dev
+          ccache --version
+          ccache --zero-stats
+
+      - name: Restore AArch64 compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.68-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+
+      - name: Configure native backend with bundled pinned TDLib
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B build-aarch64-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/native-configure.log
+          grep -E 'CMAKE_CXX_COMPILER:|TDLUA_BACKEND:|TDLUA_BUNDLED_TDLIB:|TDLUA_LUA_VERSION:' \
+            build-aarch64-native/CMakeCache.txt | tee .ci/aarch64-validation/native-cache-summary.log
+
+      - name: Build native backend, TDLib, and regression tests
+        run: |
+          set -euo pipefail
+          cmake --build build-aarch64-native --parallel 2 \
+            2>&1 | tee .ci/aarch64-validation/native-build.log
+          file build-aarch64-native/tdlua.so \
+            build-aarch64-native/tdlua_native_generator \
+            build-aarch64-native/td/td/generate/tl-parser/tl-parser \
+            | tee .ci/aarch64-validation/native-architecture.log
+          readelf -h build-aarch64-native/tdlua.so | grep 'Machine:.*AArch64' \
+            | tee .ci/aarch64-validation/native-elf-header.log
+          readelf -d build-aarch64-native/tdlua.so | grep 'FLAGS_1.*NODELETE' \
+            | tee .ci/aarch64-validation/native-nodelete.log
+          nm -D --defined-only build-aarch64-native/tdlua.so | grep -E '[[:space:]]luaopen_tdlua$' \
+            | tee .ci/aarch64-validation/native-export.log
+          ccache --show-stats | tee .ci/aarch64-validation/ccache-after-native.log
+
+      - name: Record native CTest manifest
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --show-only -V \
+            2>&1 | tee .ci/aarch64-validation/native-ctest-manifest.log
+
+      - name: Run complete native CTest suite
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --output-on-failure --timeout 180 \
+            2>&1 | tee .ci/aarch64-validation/native-ctest.log
+
+      - name: Repeat native lifecycle and receiver tests
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-native --repeat until-fail:100 \
+            --output-on-failure --timeout 180 \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_receiver_lifecycle_ownership|tdlua_failure_cleanup_phases|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            2>&1 | tee .ci/aarch64-validation/native-repeat.log
+
+      - name: Install production native module and TDLib package
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          cmake -S . -B build-aarch64-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/native-production-configure.log
+          cmake --build build-aarch64-native --parallel 2 --target tdlua \
+            2>&1 | tee .ci/aarch64-validation/native-production-build.log
+          cmake --install build-aarch64-native \
+            2>&1 | tee .ci/aarch64-validation/native-install.log
+          module="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          readelf -h "$module" | grep 'Machine:.*AArch64'
+          readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
+            echo 'test-only TDLUA_TESTING symbols found in production native module'
+            exit 1
+          fi
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
+            lua5.4 -e '
+              local declared = assert(io.open("dist.info")):read("a"):match([[version = "([^"]+)"]])
+              local t = require("tdlua")
+              assert(t.api_version == declared, "api_version does not match dist.info")
+              assert(t.version == t.api_version .. "-" .. t.tdlib_version,
+                     "version is not api_version .. \"-\" .. tdlib_version")
+              print("installed native module", t.version)
+            ' \
+            2>&1 | tee .ci/aarch64-validation/native-installed-require.log
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4/?.so;;" \
+            lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4" \
+            2>&1 | tee .ci/aarch64-validation/native-installed-e2e.log
+
+      - name: Configure JSON backend against the same pinned TDLib build
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B build-aarch64-json -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-json-install" \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/json-configure.log
+          grep -E 'CMAKE_CXX_COMPILER:|TDLUA_BACKEND:|TDLUA_BUNDLED_TDLIB:|TDLUA_TD_STATIC:|TDLUA_LUA_VERSION:' \
+            build-aarch64-json/CMakeCache.txt | tee .ci/aarch64-validation/json-cache-summary.log
+
+      - name: Build JSON backend using installed TDLib archives
+        run: |
+          set -euo pipefail
+          cmake --build build-aarch64-json --parallel 2 \
+            2>&1 | tee .ci/aarch64-validation/json-build.log
+          file build-aarch64-json/tdlua.so \
+            | tee .ci/aarch64-validation/json-architecture.log
+          readelf -h build-aarch64-json/tdlua.so | grep 'Machine:.*AArch64' \
+            | tee .ci/aarch64-validation/json-elf-header.log
+          readelf -d build-aarch64-json/tdlua.so | grep 'FLAGS_1.*NODELETE' \
+            | tee .ci/aarch64-validation/json-nodelete.log
+          nm -D --defined-only build-aarch64-json/tdlua.so | grep -E '[[:space:]]luaopen_tdlua$' \
+            | tee .ci/aarch64-validation/json-export.log
+          if readelf -d build-aarch64-json/tdlua.so | grep -q 'libtdjson'; then
+            echo 'JSON module unexpectedly links a dynamic TDLib JSON library'
+            exit 1
+          fi
+
+      - name: Record JSON CTest manifest
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --show-only -V \
+            2>&1 | tee .ci/aarch64-validation/json-ctest-manifest.log
+
+      - name: Run complete JSON CTest suite
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --output-on-failure --timeout 180 \
+            2>&1 | tee .ci/aarch64-validation/json-ctest.log
+
+      - name: Repeat JSON lifecycle and receiver tests
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-aarch64-json --repeat until-fail:100 \
+            --output-on-failure --timeout 180 \
+            -R '^(tdlua_managed_driver_backend|tdlua_receiver_runtime|tdlua_receiver_lifecycle_ownership|tdlua_failure_cleanup_phases|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_release)$' \
+            2>&1 | tee .ci/aarch64-validation/json-repeat.log
+
+      - name: Install production JSON module and exercise it
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          cmake -S . -B build-aarch64-json-install -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.ci/aarch64-tdlib" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.ci/aarch64-json-install" \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library" \
+            2>&1 | tee .ci/aarch64-validation/json-production-configure.log
+          cmake --build build-aarch64-json-install --parallel 2 --target tdlua \
+            2>&1 | tee .ci/aarch64-validation/json-production-build.log
+          cmake --install build-aarch64-json-install \
+            2>&1 | tee .ci/aarch64-validation/json-install.log
+          module="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          readelf -h "$module" | grep 'Machine:.*AArch64'
+          readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
+            echo 'test-only TDLUA_TESTING symbols found in production JSON module'
+            exit 1
+          fi
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
+            lua5.4 -e '
+              local declared = assert(io.open("dist.info")):read("a"):match([[version = "([^"]+)"]])
+              local t = require("tdlua")
+              assert(t.api_version == declared, "api_version does not match dist.info")
+              assert(t.version == t.api_version .. "-" .. t.tdlib_version,
+                     "version is not api_version .. \"-\" .. tdlib_version")
+              print("installed JSON module", t.version)
+            ' \
+            2>&1 | tee .ci/aarch64-validation/json-installed-require.log
+          LUA_CPATH="$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4/?.so;;" \
+            lua5.4 tests/e2e_smoke.lua "$GITHUB_WORKSPACE/.ci/aarch64-json-install/lib/lua/5.4" \
+            2>&1 | tee .ci/aarch64-validation/json-installed-e2e.log
+
+      - name: Package AArch64 production modules
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tdlua-packages"
+          rm -rf "$out"
+          mkdir -p "$out"
+          version="$(cat build-aarch64-json-install/tdlua-version.txt)"
+          tdlib_version="$(sed -n 's/^set(PACKAGE_VERSION "\([^"]*\)")/\1/p' \
+            .ci/aarch64-tdlib/lib/cmake/Td/TdConfigVersion.cmake)"
+          test -n "$tdlib_version"
+
+          # A package is built from the install prefix, never from the build
+          # tree, so the archive cannot pick up uninstalled objects.
+          package() {
+            backend="$1"
+            stage="$2"
+            name="tdlua-5.4-aarch64-${backend}"
+            root="$RUNNER_TEMP/tdlua-packages/${name}"
+            rm -rf "$root"
+            mkdir -p "$root/lib/lua/5.4" "$root/share/licenses/tdlua"
+            install -m 755 "$stage/lib/lua/5.4/tdlua.so" \
+              "$root/lib/lua/5.4/tdlua.so"
+            for license in LICENSE TDLib-LICENSE_1_0.txt; do
+              test -f "$stage/share/licenses/tdlua/$license"
+              install -m 644 "$stage/share/licenses/tdlua/$license" \
+                "$root/share/licenses/tdlua/$license"
+            done
+            module_sha="$(sha256sum "$root/lib/lua/5.4/tdlua.so" | cut -d ' ' -f 1)"
+            # Runtime dependencies as the dynamic loader sees them. glibc and
+            # the ELF interpreter are part of the validated Ubuntu baseline, not
+            # package requirements, so they stay out of the manifest.
+            external_runtime="$(LC_ALL=C readelf -d "$root/lib/lua/5.4/tdlua.so" \
+              | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' \
+              | grep -v -E '^(libc\.so|libm\.so|libgcc_s\.so|ld-linux)' \
+              | paste -sd, -)"
+            test -n "$external_runtime"
+            {
+              echo "package=tdlua"
+              echo "version=${version}"
+              echo "platform=linux-aarch64"
+              echo "os=linux"
+              echo "arch=aarch64"
+              echo "lua_implementation=Lua"
+              echo "lua_version=5.4"
+              echo "backend=${backend}"
+              echo "tdlib_version=${tdlib_version}"
+              echo "source_sha=${GITHUB_SHA}"
+              echo "module=lib/lua/5.4/tdlua.so"
+              echo "module_sha256=${module_sha}"
+              echo "external_runtime=${external_runtime}"
+            } > "$root/MANIFEST.txt"
+            tar -C "$out" -czf "$out/${name}.tar.gz" "$name"
+          }
+
+          package json "$PWD/.ci/aarch64-json-install"
+          package native "$PWD/.ci/aarch64-tdlib"
+
+          # Verify every archive from a directory that is neither the build tree
+          # nor the install prefix: extraction, architecture, exported symbols,
+          # manifest provenance, licenses and a real require().
+          verify() {
+            backend="$1"
+            archive="$2"
+            dir="$RUNNER_TEMP/verify-aarch64-${backend}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            tar -xzf "$archive" -C "$dir"
+            root="$dir/tdlua-5.4-aarch64-${backend}"
+            module="$root/lib/lua/5.4/tdlua.so"
+            test -f "$module"
+            readelf -h "$module" | grep 'Machine:.*AArch64' >/dev/null
+            readelf -d "$module" | grep 'FLAGS_1.*NODELETE' >/dev/null
+            if readelf -d "$module" | grep 'libtdjson' >/dev/null; then
+              echo "::error::${backend} module links a dynamic TDLib JSON library"
+              exit 1
+            fi
+            nm -D --defined-only "$module" | grep '[[:space:]]luaopen_tdlua$' >/dev/null
+            if nm -D --defined-only "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
+              echo "::error::${backend} package exports test hooks"
+              exit 1
+            fi
+            grep -qx "source_sha=${GITHUB_SHA}" "$root/MANIFEST.txt"
+            grep -qx "backend=${backend}" "$root/MANIFEST.txt"
+            grep -qx "lua_version=5.4" "$root/MANIFEST.txt"
+            grep -qx "platform=linux-aarch64" "$root/MANIFEST.txt"
+            test -f "$root/share/licenses/tdlua/LICENSE"
+            test -f "$root/share/licenses/tdlua/TDLib-LICENSE_1_0.txt"
+            TDLIB_VERSION="$tdlib_version" \
+            LUA_CPATH="$root/lib/lua/5.4/?.so;;" lua5.4 -e '
+              local tdlua = require("tdlua")
+              assert(type(tdlua.version) == "string", "missing version")
+              assert(type(tdlua.api_version) == "string", "missing api_version")
+              assert(tdlua.tdlib_version == os.getenv("TDLIB_VERSION"),
+                "wrong TDLib version")
+              print("extracted package loaded: " .. tdlua.version)
+            '
+            {
+              echo "=== ${backend} package ==="
+              sha256sum "$archive"
+              tar -tzf "$archive"
+              readelf -d "$module"
+            } > "$RUNNER_TEMP/tdlua-packages/${backend}-verification.log"
+          }
+
+          verify json "$out/tdlua-5.4-aarch64-json.tar.gz"
+          verify native "$out/tdlua-5.4-aarch64-native.tar.gz"
+          ls -l "$out"
+
+      - name: Upload AArch64 release packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-linux-aarch64-packages
+          path: ${{ runner.temp }}/tdlua-packages/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload AArch64 build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-linux-aarch64-validation-${{ github.sha }}
+          path: .ci/aarch64-validation/
+          if-no-files-found: warn
+          retention-days: 30
 
   lua:
     name: Lua ${{ matrix.lua }} / static TDLib
@@ -174,6 +705,20 @@ jobs:
           cmake --install build-install --prefix "$RUNNER_TEMP/tdlua-install"
           test -f "$RUNNER_TEMP/tdlua-install/lib/lua/${{ matrix.lua }}/tdlua.so"
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare static Lua artifact
         id: artifact
         run: |
@@ -255,6 +800,20 @@ jobs:
         run: |
           "$RUNNER_TEMP/lua55/bin/luac" -p examples/luajit.lua
 
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
+
       - name: Prepare static Lua artifact
         id: artifact
         run: |
@@ -271,9 +830,41 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
+  legacy-number-precision:
+    name: Legacy Lua integer precision / binary64 long double
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Lua 5.2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblua5.2-dev lua5.2
+
+      - name: Build and run the codec test with binary64 long double
+        run: |
+          lua_library="$(find /usr/lib /lib -name 'liblua5.2.so' -print -quit)"
+          test -n "$lua_library"
+          # Lua 5.2 stores every number as lua_Number, so the int64 -> number
+          # conversion is the pre-5.3 branch. -mlong-double-64 reproduces the
+          # ABI of macOS arm64 and MSVC x64, where the former floating-point
+          # round-trip test was a tautology and rounded an unrepresentable
+          # int64 silently. It is confined to this isolated target and does not
+          # touch any other build.
+          g++ -std=c++11 -O2 -DNDEBUG -Wall -Wextra -Werror -mlong-double-64 \
+            -I include -I /usr/include/lua5.2 \
+            tests/codec_test.cpp src/common/lua_json.cpp \
+            -o "$RUNNER_TEMP/tdlua_codec_ld64" "$lua_library"
+          "$RUNNER_TEMP/tdlua_codec_ld64"
+          echo "binary64 long double: exact int64 values kept, unrepresentable ones use the decimal string"
+
   native:
     name: Native backend / C++23 / Lua 5.5
     runs-on: ubuntu-24.04
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -293,6 +884,20 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
+
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
+
       - name: Build Lua 5.5
         run: |
           curl -fsSL https://www.lua.org/ftp/lua-5.5.0.tar.gz | tar -xz
@@ -308,7 +913,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.5 \
             -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
@@ -318,6 +925,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.5 artifact
         id: artifact
@@ -337,6 +958,7 @@ jobs:
   native-lua53:
     name: Native backend / C++23 / Lua 5.3
     runs-on: ubuntu-24.04
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -357,6 +979,20 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
+
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.3.so -print -quit)"
@@ -365,7 +1001,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.3 \
             -DLUA_EXECUTABLE="$(command -v lua5.3)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.3 \
@@ -375,6 +1013,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.3 artifact
         id: artifact
@@ -394,6 +1046,7 @@ jobs:
   native-lua52:
     name: Native backend / C++23 / Lua 5.2
     runs-on: ubuntu-24.04
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -414,6 +1067,20 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
+
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.2.so -print -quit)"
@@ -422,7 +1089,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.2 \
             -DLUA_EXECUTABLE="$(command -v lua5.2)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.2 \
@@ -432,6 +1101,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.2 artifact
         id: artifact
@@ -451,6 +1134,7 @@ jobs:
   native-lua54:
     name: Native backend / C++23 / Lua 5.4
     runs-on: ubuntu-24.04
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -471,6 +1155,20 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
+
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
+
       - name: Configure native backend
         run: |
           lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
@@ -479,7 +1177,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_VERSION=5.4 \
             -DLUA_EXECUTABLE="$(command -v lua5.4)" \
             -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
@@ -489,6 +1189,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native Lua 5.4 artifact
         id: artifact
@@ -508,6 +1222,11 @@ jobs:
   native-sanitizers:
     name: Native backend / TDLua ASan + UBSan
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ci/tdlua-ccache
+      CCACHE_COMPRESS: 1
+      CCACHE_COMPRESSLEVEL: 6
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout repository
@@ -519,6 +1238,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ccache \
             cmake \
             curl \
             gperf \
@@ -526,6 +1246,23 @@ jobs:
             openssl \
             libssl-dev \
             zlib1g-dev
+
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+          ccache --version | head -n 1
+
+      - name: Restore native compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ci/tdlua-ccache
+          key: tdlua-native-debug-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-debug-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Build Lua 5.5
         run: |
@@ -540,6 +1277,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
             -DTDLUA_ENABLE_SANITIZERS=ON \
@@ -557,9 +1296,13 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
 
+      - name: Report native compiler cache
+        run: ccache --show-stats
+
   native-luajit:
     name: Native backend / C++23 / LuaJIT 2.1
     runs-on: ubuntu-24.04
+    needs: tdlib
 
     steps:
       - name: Checkout repository
@@ -580,6 +1323,20 @@ jobs:
             libssl-dev \
             zlib1g-dev
 
+      - name: Download pinned TDLib native codegen build
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-native-codegen
+          path: ${{ runner.temp }}/tdlib-native-codegen
+
+      - name: Extract pinned TDLib native codegen build
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/tdlib-native-codegen/tdlib-native-codegen.tar.gz" \
+            -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/tdlua-native-bootstrap/CMakeCache.txt"
+          test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
+
       - name: Configure native LuaJIT backend
         run: |
           luajit_library="$(find /usr/lib /lib -name libluajit-5.1.so -print -quit)"
@@ -588,7 +1345,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTDLUA_BACKEND=native \
             -DTDLUA_BUILD_TESTS=ON \
-            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
             -DTDLUA_LUA_IMPLEMENTATION=luajit \
             -DLUA_EXECUTABLE="$(command -v luajit)" \
             -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
@@ -598,6 +1357,20 @@ jobs:
         run: |
           cmake --build build
           ctest --test-dir build --output-on-failure -R '^tdlua_'
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
+            exit 1
+          fi
 
       - name: Prepare native LuaJIT artifact
         id: artifact
@@ -666,6 +1439,20 @@ jobs:
           ctest --test-dir build --output-on-failure -R '^tdlua_'
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"
+            exit 1
+          fi
+
+      # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
+      # TDLUA_TESTING hooks, and that build exports them from the module. The
+      # published artifact must not carry them, so rebuild the module with the
+      # instrumentation disabled and assert the export table is clean.
+      - name: Build production module
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DTDLUA_BUILD_TESTS=OFF
+          cmake --build build --target tdlua
+          if nm -D --defined-only build/tdlua.so | grep -E 'tdlua_[A-Za-z0-9_]*_test_'; then
+            echo "::error::production module exports test hooks"
             exit 1
           fi
 
@@ -744,11 +1531,112 @@ jobs:
           LUA_CPATH="$RUNNER_TEMP/rocks/lib/lua/5.3/?.so;$LUA_CPATH" \
             lua5.3 -e 'assert(require("tdlua"))'
 
+  static-analysis:
+    name: Diagnostic static analysis / JSON Lua 5.4
+    needs: tdlib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install analysis and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            clang-format \
+            clang-tidy \
+            clang-tools \
+            cmake \
+            gperf \
+            liblua5.4-dev \
+            lua5.4 \
+            ninja-build \
+            openssl \
+            libssl-dev \
+            python3 \
+            zlib1g-dev
+          clang --version
+          clang-tidy --version
+          clang-format --version
+          scan-build --help >/dev/null
+
+      - name: Download pinned static TDLib package
+        uses: actions/download-artifact@v8
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+          test -f "$RUNNER_TEMP/tdlib/tdlib-version.txt"
+
+      - name: Configure Clang JSON analysis build
+        run: |
+          lua_library="$(find /usr/lib /lib -name 'liblua5.4.so' -print -quit)"
+          test -n "$lua_library"
+          CC=clang CXX=clang++ cmake -S . -B build-analysis -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library"
+
+      - name: Run Clang Static Analyzer
+        run: tools/static-analysis/run-scan-build.sh build-analysis
+
+      - name: Run clang-tidy diagnostics
+        run: |
+          python3 tools/static-analysis/run-clang-tidy.py \
+            --build-dir build-analysis \
+            --expect-backend json \
+            --report build-analysis/clang-tidy-report.txt
+
+      - name: Check changed C++ formatting diagnostically
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base="$PR_BASE_SHA"
+          if [ -z "$base" ]; then base="$PUSH_BEFORE_SHA"; fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          python3 tools/static-analysis/check-clang-format.py \
+            --changed-from "$base" \
+            --diagnostic \
+            --report build-analysis/clang-format-report.txt
+
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-analysis-json-lua54
+          path: |
+            build-analysis/clang-tidy-report.txt
+            build-analysis/clang-format-report.txt
+            build-analysis/scan-build-reports
+          if-no-files-found: warn
+          retention-days: 14
+
   telegram:
     name: Telegram upload
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: [native, native-lua52, native-lua53, native-lua54, native-luajit]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -771,6 +1659,7 @@ jobs:
           merge-multiple: true
 
       - name: Upload static artifacts to Telegram in one session
+        timeout-minutes: 10
         env:
           TG_APP_ID: ${{ secrets.TG_APP_ID }}
           TG_APP_HASH: ${{ secrets.TG_APP_HASH }}

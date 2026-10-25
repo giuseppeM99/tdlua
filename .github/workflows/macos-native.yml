@@ -1,0 +1,547 @@
+name: macOS arm64 native portability
+
+on:
+  push:
+    # Packaging and release-metadata branches are built through
+    # release-dry.yml; a standalone run would duplicate the same commit on
+    # macOS. The branches filter also keeps this workflow off tag pushes, where
+    # release.yml calls it explicitly.
+    branches-ignore:
+      - "p71*-packaging*"
+      - "p72*"
+    paths:
+      - .github/workflows/macos-native.yml
+      - CMakeLists.txt
+      - cmake/**
+      - include/**
+      - src/**
+      - tests/**
+      - td
+  pull_request:
+    branches:
+      - master
+      - v0.5.1-consolidated
+    paths:
+      - .github/workflows/macos-native.yml
+      - CMakeLists.txt
+      - cmake/**
+      - include/**
+      - src/**
+      - tests/**
+      - td
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-arm64:
+    name: pinned static TDLib, native, Lua 5.4
+    runs-on: macos-26
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out pinned TDLib submodule
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Record runner, toolchain, and source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/tdlua-native-artifacts"
+          mkdir -p "$artifacts"
+          {
+            sw_vers
+            uname -a
+            test "$(uname -m)" = arm64
+            xcodebuild -version
+            xcode-select -p
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx clang++ --version
+            cmake --version
+            ninja --version
+            git rev-parse HEAD
+            git -C td rev-parse HEAD
+            git status --short
+            git -C td status --short
+            git ls-tree HEAD td
+            shasum -a 256 td/td/generate/scheme/td_api.tl
+          } 2>&1 | tee "$artifacts/provenance.log"
+          test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+
+      - name: Install macOS build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake gperf lua@5.4 ninja openssl@3
+          lua_prefix="$(brew --prefix lua@5.4)"
+          openssl_prefix="$(brew --prefix openssl@3)"
+          lua_header="$(find "$lua_prefix/include" -name lua.h -print -quit)"
+          lua_library="$(find "$lua_prefix/lib" -maxdepth 1 -name 'liblua*.dylib' -print -quit)"
+          lua_executable="$lua_prefix/bin/lua"
+          test -n "$lua_header" && test -n "$lua_library" && test -x "$lua_executable"
+          {
+            brew list --versions cmake gperf lua@5.4 ninja openssl@3
+            printf 'LUA_INCLUDE_DIR=%s\nLUA_LIBRARY=%s\nLUA_EXECUTABLE=%s\nOPENSSL_ROOT_DIR=%s\n' \
+              "$(dirname "$lua_header")" "$lua_library" "$lua_executable" "$openssl_prefix"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/dependencies.log"
+          echo "LUA_INCLUDE_DIR=$(dirname "$lua_header")" >> "$GITHUB_ENV"
+          echo "LUA_LIBRARY=$lua_library" >> "$GITHUB_ENV"
+          echo "LUA_EXECUTABLE=$lua_executable" >> "$GITHUB_ENV"
+          echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
+          # Explicit floor for the distributed module. It is part of the cache
+          # key: a cached TDLib built for the runner's default SDK (for example
+          # minos 26) must not be reused for a package declared as 13.0.
+          deployment_target="13.0"
+          echo "DEPLOYMENT_TARGET=$deployment_target" >> "$GITHUB_ENV"
+          cache_key="$( {
+            git -C td rev-parse HEAD
+            shasum -a 256 td/td/generate/scheme/td_api.tl
+            uname -m
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx clang++ --version
+            cmake --version
+            brew list --versions cmake gperf lua@5.4 ninja openssl@3
+            sw_vers -productVersion
+            printf 'deployment_target=%s\n' "$deployment_target"
+            printf '%s\n' 'Release;arm64;native;static;Lua54;parallel=3'
+          } | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "TDLIB_CACHE_KEY=tdlib-macos-native-v1-$cache_key" >> "$GITHUB_ENV"
+
+      - name: Restore pinned static TDLib and native codegen build
+        id: tdlib-cache
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ env.TDLIB_CACHE_KEY }}
+          path: |
+            ${{ runner.temp }}/tdlua-native-stage
+            ${{ runner.temp }}/tdlua-native-bootstrap
+
+      - name: Build and install TDLib static package and native tools
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          cmake -S . -B "$bootstrap" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_INSTALL_PREFIX="$stage" \
+            -DCMAKE_INSTALL_RPATH="@loader_path;@loader_path/../..;$OPENSSL_ROOT_DIR/lib" \
+            -DCMAKE_PREFIX_PATH="$stage" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUNDLED_TDLIB=ON \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_INCLUDE_DIR="$LUA_INCLUDE_DIR" \
+            -DLUA_LIBRARY="$LUA_LIBRARY" \
+            -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-configure.log"
+          # The native module builds Td::TdStatic, but TDLib's install rules
+          # also install tdjson_static when static libraries are enabled.
+          # Build that archive explicitly so the package install is complete.
+          cmake --build "$bootstrap" --target tdlua tdjson_static --parallel 3 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-build.log"
+          cmake --install "$bootstrap" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/bootstrap-install.log"
+          test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-json-header-generation.log"
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
+          printf 'TD_API_JSON_HEADER=%s\n' "$json_header" \
+            | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-api-json-header.log"
+          test -f "$bootstrap/td/tdtl/libtdtl.a"
+          test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
+          test -f "$bootstrap/td/tdutils/td/utils/config.h"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo" \
+            "$GITHUB_WORKSPACE/td/td/generate/scheme/td_api.tl"
+          {
+            grep '^TDLib_VERSION' "$bootstrap/td/CMakeCache.txt" || true
+            file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
+            find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
+            shasum -a 256 "$stage/include/td/telegram/td_api.h" \
+              "$stage/include/td/telegram/td_api_json.h"
+            shasum -a 256 td/td/generate/scheme/td_api.tl \
+              "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-static-provenance.log"
+
+      - name: Save verified TDLib and codegen cache
+        if: success() && steps.tdlib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ env.TDLIB_CACHE_KEY }}
+          path: |
+            ${{ runner.temp }}/tdlua-native-stage
+            ${{ runner.temp }}/tdlua-native-bootstrap
+
+      - name: Verify cached TDLib package and host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          bootstrap="$RUNNER_TEMP/tdlua-native-bootstrap"
+          cmake --build "$bootstrap" --target tl_generate_json --parallel 1 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-json-header-cache-refresh.log"
+          json_header="$(find "$bootstrap" "$GITHUB_WORKSPACE/td" \
+            -path '*/td/telegram/td_api_json.h' -type f -print -quit)"
+          test -n "$json_header"
+          mkdir -p "$stage/include/td/telegram"
+          cp "$json_header" "$stage/include/td/telegram/td_api_json.h"
+          printf 'TD_API_JSON_HEADER=%s\n' "$json_header" \
+            | tee "$RUNNER_TEMP/tdlua-native-artifacts/td-api-json-header.log"
+          test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
+          test -f "$stage/include/td/telegram/Client.h"
+          test -f "$stage/include/td/telegram/td_api_json.h"
+          grep -q 'set(PACKAGE_VERSION "1.8.68")' "$stage/lib/cmake/Td/TdConfigVersion.cmake"
+          test -f "$bootstrap/CMakeCache.txt"
+          test -f "$bootstrap/td/tdtl/libtdtl.a"
+          test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
+          test -f "$bootstrap/td/tdutils/td/utils/config.h"
+          grep -q '^CMAKE_OSX_ARCHITECTURES:STRING=arm64$' "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BACKEND:STRING=native$' "$bootstrap/CMakeCache.txt"
+          grep -q '^TDLUA_BUNDLED_TDLIB:BOOL=ON$' "$bootstrap/CMakeCache.txt"
+          git -C td status --short
+          test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test -z "$(git -C td status --porcelain)"
+          "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
+            "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo" \
+            "$GITHUB_WORKSPACE/td/td/generate/scheme/td_api.tl"
+          {
+            grep -E '^(CMAKE_CXX_COMPILER|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|TDLUA_BACKEND|TDLUA_BUNDLED_TDLIB):' \
+              "$bootstrap/CMakeCache.txt"
+            file "$bootstrap/td/tdtl/libtdtl.a" "$bootstrap/td/td/generate/tl-parser/tl-parser"
+            find "$stage/lib" -maxdepth 1 -name '*.a' -print -exec shasum -a 256 {} \;
+            shasum -a 256 "$stage/include/td/telegram/td_api.h" \
+              "$stage/include/td/telegram/td_api_json.h"
+            shasum -a 256 td/td/generate/scheme/td_api.tl \
+              "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/tdlib-cache-verification.log"
+
+      - name: Build and install native TDLua using the external static package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-native-stage"
+          install="$RUNNER_TEMP/tdlua-native-install"
+          cmake -S . -B "$RUNNER_TEMP/tdlua-native-package-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_INSTALL_PREFIX="$install" \
+            -DCMAKE_INSTALL_RPATH="@loader_path;@loader_path/../..;$OPENSSL_ROOT_DIR/lib" \
+            -DCMAKE_PREFIX_PATH="$stage" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_INCLUDE_DIR="$LUA_INCLUDE_DIR" \
+            -DLUA_LIBRARY="$LUA_LIBRARY" \
+            -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/package-configure.log"
+          cmake --build "$RUNNER_TEMP/tdlua-native-package-build" --target tdlua --parallel 3 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/package-build.log"
+          cmake --install "$RUNNER_TEMP/tdlua-native-package-build" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/install.log"
+          module="$install/lib/lua/5.4/tdlua.so"
+          test -f "$module"
+          {
+            file "$module"
+            lipo -archs "$module"
+            otool -L "$module"
+            otool -l "$module"
+            nm -gU "$module" > "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"
+            grep '_luaopen_tdlua$' "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"
+            if grep -E -q '_tdlua_(test_|json_test_)' "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"; then
+              echo 'test instrumentation leaked into the production module' >&2
+              exit 1
+            fi
+            if otool -L "$module" | grep -E 'libtd(client|core|api|mtproto|json|utils)|tdlua-native-(stage|bootstrap|test-build)'; then
+              echo 'native module has a dynamic TDLib or temporary-build dependency' >&2
+              exit 1
+            fi
+            if otool -l "$module" | sed '1d' | grep -F "$RUNNER_TEMP"; then
+              echo 'installed module run path contains a temporary build directory' >&2
+              exit 1
+            fi
+            shasum -a 256 "$module"
+          } 2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/installed-linking.log"
+          lipo -archs "$module" | grep -qx arm64
+          cat "$RUNNER_TEMP/tdlua-native-package-build/tdlua-version.txt"
+          cp "$module" "$RUNNER_TEMP/tdlua-native-artifacts/installed-tdlua.so"
+
+      - name: Exercise the installed native module with real TDLib clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          module_dir="$RUNNER_TEMP/tdlua-native-install/lib/lua/5.4"
+          export LUA_CPATH="$module_dir/?.so;;"
+          "$LUA_EXECUTABLE" -e 'local t = require("tdlua"); assert(type(t.version) == "string"); print("installed native require PASS", t.version)'
+          "$LUA_EXECUTABLE" tests/e2e_smoke.lua "$module_dir" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/installed-e2e.log"
+
+      - name: Package the macOS arm64 native module
+        shell: bash
+        run: |
+          set -euo pipefail
+          install="$RUNNER_TEMP/tdlua-native-install"
+          source_module="$install/lib/lua/5.4/tdlua.so"
+          test -f "$source_module"
+
+          version_le() {
+            awk -v a="$1" -v b="$2" 'BEGIN {
+              n = split(a, A, "."); m = split(b, B, ".");
+              for (i = 1; i <= 3; i++) {
+                ai = (i <= n ? A[i] : 0) + 0;
+                bi = (i <= m ? B[i] : 0) + 0;
+                if (ai < bi) exit 0;
+                if (ai > bi) exit 1;
+              }
+              exit 0
+            }'
+          }
+          minos() {
+            otool -l "$1" | awk '
+              /LC_BUILD_VERSION/ { seen = 1; next }
+              seen && $1 == "minos" && !printed { print $2; printed = 1 }'
+          }
+
+          name="tdlua-5.4-macos-arm64-native"
+          packages="$RUNNER_TEMP/tdlua-packages"
+          root="$packages/$name"
+          rm -rf "$root"
+          mkdir -p "$root/lib/lua/5.4" "$root/share/licenses/tdlua" "$packages"
+          cp "$source_module" "$root/lib/lua/5.4/tdlua.so"
+          for license in LICENSE TDLib-LICENSE_1_0.txt; do
+            test -f "$install/share/licenses/tdlua/$license"
+            cp "$install/share/licenses/tdlua/$license" \
+              "$root/share/licenses/tdlua/$license"
+          done
+
+          # TDLib is linked statically; the module must not import a TDLib
+          # dylib, and the archive must not carry one.
+          if otool -L "$root/lib/lua/5.4/tdlua.so" \
+              | grep -E 'libtd(client|core|api|mtproto|json|utils)|libtdjson'; then
+            echo '::error::native package dynamically links TDLib'
+            exit 1
+          fi
+
+          module="$root/lib/lua/5.4/tdlua.so"
+          lua_ref="$(otool -L "$module" | awk '/liblua/ && !found { print $1; found = 1 }')"
+          test -n "$lua_ref"
+          if [ "$lua_ref" != "@rpath/liblua.5.4.dylib" ]; then
+            # Same rule as the JSON package: the host supplies Lua 5.4, and
+            # the module resolves it through @rpath instead of a Homebrew
+            # absolute path.
+            install_name_tool -change "$lua_ref" "@rpath/liblua.5.4.dylib" "$module"
+            codesign --force --sign - "$module"
+          fi
+          if ! otool -l "$module" \
+              | awk '$1 == "path" && $2 == "@loader_path" { found = 1 } END { exit !found }'; then
+            install_name_tool -add_rpath "@loader_path" "$module"
+            codesign --force --sign - "$module"
+          fi
+
+          module_minos="$(minos "$module")"
+          test -n "$module_minos"
+          if ! version_le "$module_minos" "$DEPLOYMENT_TARGET"; then
+            echo "::error::module requires macOS $module_minos, target is $DEPLOYMENT_TARGET"
+            exit 1
+          fi
+
+          dependency_minos_max="$module_minos"
+          for dep in $(otool -L "$module" | tail -n +2 | awk '{print $1}'); do
+            case "$dep" in
+              @rpath/*) candidate="$root/lib/lua/5.4/${dep#@rpath/}" ;;
+              @loader_path/*) candidate="$root/lib/lua/5.4/${dep#@loader_path/}" ;;
+              /usr/lib/*|/System/*) continue ;;
+              *) candidate="$dep" ;;
+            esac
+            [ -f "$candidate" ] || continue
+            dep_minos="$(minos "$candidate")"
+            [ -n "$dep_minos" ] || continue
+            if version_le "$dependency_minos_max" "$dep_minos"; then
+              dependency_minos_max="$dep_minos"
+            fi
+          done
+
+          version="$(cat "$RUNNER_TEMP/tdlua-native-package-build/tdlua-version.txt")"
+          tdlib_version="$(sed -n 's/^set(PACKAGE_VERSION "\([^"]*\)")/\1/p' \
+            "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdConfigVersion.cmake")"
+          test -n "$tdlib_version"
+          module_sha="$(shasum -a 256 "$module" | cut -d ' ' -f 1)"
+          {
+            echo 'package=tdlua'
+            echo "version=$version"
+            echo 'platform=macos-arm64'
+            echo 'os=macos'
+            echo 'arch=arm64'
+            echo 'lua_implementation=Lua'
+            echo 'lua_version=5.4'
+            echo 'backend=native'
+            echo "tdlib_version=$tdlib_version"
+            echo "source_sha=$GITHUB_SHA"
+            echo 'module=lib/lua/5.4/tdlua.so'
+            echo "module_sha256=$module_sha"
+            echo "module_minos=$module_minos"
+            echo "dependency_minos_max=$dependency_minos_max"
+            echo 'external_runtime=lua5.4 (host), Homebrew openssl@3'
+            echo "openssl_prefix=$OPENSSL_ROOT_DIR"
+          } > "$root/MANIFEST.txt"
+
+          tar -C "$packages" -czf "$packages/$name.tar.gz" "$name"
+
+          extract="$RUNNER_TEMP/tdlua-pkg-verify-native"
+          rm -rf "$extract"
+          mkdir -p "$extract"
+          tar -xzf "$packages/$name.tar.gz" -C "$extract"
+          extracted="$extract/$name"
+          extracted_module="$extracted/lib/lua/5.4/tdlua.so"
+          test -f "$extracted_module"
+          if [ -e "$extracted/lib/libtdjson.dylib" ]; then
+            echo '::error::native package contains a TDLib dylib'
+            exit 1
+          fi
+          if otool -L "$extracted_module" | awk '{print $1}' | grep '^/.*liblua' >/dev/null; then
+            echo '::error::package still links an absolute Lua library'
+            exit 1
+          fi
+          lipo -archs "$extracted_module" | grep -x arm64 >/dev/null
+          nm -gU "$extracted_module" | grep '_luaopen_tdlua$' >/dev/null
+          if nm -gU "$extracted_module" | grep -E '_tdlua_(test_|json_test_)'; then
+            echo '::error::package exports test hooks'
+            exit 1
+          fi
+          cat "$LUA_LIBRARY" > "$extracted/lib/lua/5.4/liblua.5.4.dylib"
+          TDLIB_VERSION="$tdlib_version" \
+          LUA_CPATH="$extracted/lib/lua/5.4/?.so;;" "$LUA_EXECUTABLE" -e '
+            local tdlua = require("tdlua")
+            assert(type(tdlua.version) == "string", "missing version")
+            assert(type(tdlua.api_version) == "string", "missing api_version")
+            assert(tdlua.tdlib_version == os.getenv("TDLIB_VERSION"),
+              "wrong TDLib version")
+            print("extracted package", tdlua.version, tdlua.api_version,
+              tdlua.tdlib_version)
+          '
+          {
+            echo "archive=$packages/$name.tar.gz"
+            shasum -a 256 "$packages/$name.tar.gz"
+            tar -tzf "$packages/$name.tar.gz"
+            otool -L "$extracted_module"
+            otool -l "$extracted_module" | grep -A2 'LC_RPATH'
+          } | tee "$packages/native-verification.log"
+
+      - name: Configure native CTest build against staged TDLib
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B "$RUNNER_TEMP/tdlua-native-test-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlua-native-stage" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DTDLUA_BACKEND=native \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TDLIB_CODEGEN_BUILD_DIR="$RUNNER_TEMP/tdlua-native-bootstrap" \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_LUA_VERSION=5.4 \
+            -DLUA_INCLUDE_DIR="$LUA_INCLUDE_DIR" \
+            -DLUA_LIBRARY="$LUA_LIBRARY" \
+            -DLUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            -DTDLUA_LUA_EXECUTABLE="$LUA_EXECUTABLE" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/test-configure.log"
+          cp "$RUNNER_TEMP/tdlua-native-test-build/CMakeCache.txt" \
+            "$RUNNER_TEMP/tdlua-native-artifacts/test-CMakeCache.txt"
+          ctest --test-dir "$RUNNER_TEMP/tdlua-native-test-build" -N -V \
+            > "$RUNNER_TEMP/tdlua-native-artifacts/ctest-list.log" 2>&1
+          cat "$RUNNER_TEMP/tdlua-native-artifacts/ctest-list.log"
+
+      - name: Build native TDLua and tests without rebuilding TDLib
+        id: test-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/tdlua-native-test-build" --parallel 3 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/test-build.log"
+          module="$RUNNER_TEMP/tdlua-native-test-build/tdlua.so"
+          file "$module" | tee "$RUNNER_TEMP/tdlua-native-artifacts/test-module.log"
+          lipo -archs "$module" | tee -a "$RUNNER_TEMP/tdlua-native-artifacts/test-module.log" | grep -qx arm64
+          otool -L "$module" | tee -a "$RUNNER_TEMP/tdlua-native-artifacts/test-module.log"
+          shasum -a 256 "$module" | tee -a "$RUNNER_TEMP/tdlua-native-artifacts/test-module.log"
+
+      - name: Run complete native CTest suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/tdlua-native-test-build" --output-on-failure -j2 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/ctest.log"
+
+      - name: Repeat native receiver, lifecycle, release, and residency tests
+        if: always() && steps.test-build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/tdlua-native-test-build" --output-on-failure \
+            -R '^tdlua_receiver_runtime$' --repeat until-fail:100 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/receiver-repeat.log"
+          ctest --test-dir "$RUNNER_TEMP/tdlua-native-test-build" --output-on-failure -j2 \
+            -R '^(tdlua_release|tdlua_shutdown_admission|tdlua_lifecycle|tdlua_vm_threads|tdlua_macos_residency)$' \
+            --repeat until-fail:20 \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/lifetime-repeat.log"
+
+      - name: Verify installed module residency after handle release
+        if: always() && steps.test-build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/tdlua-native-test-build/tdlua_macos_residency_test" \
+            "$RUNNER_TEMP/tdlua-native-install/lib/lua/5.4/tdlua.so" \
+            2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/installed-residency.log"
+
+      - name: Preserve detailed CTest output
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/tdlua-native-test-build/Testing/Temporary/LastTest.log" ]; then
+            cp "$RUNNER_TEMP/tdlua-native-test-build/Testing/Temporary/LastTest.log" \
+              "$RUNNER_TEMP/tdlua-native-artifacts/LastTest.log"
+          fi
+
+      - name: Upload macOS native package
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdlua-macos-arm64-native-package
+          path: ${{ runner.temp }}/tdlua-packages/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload native build, install, and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-native-${{ github.run_id }}
+          path: ${{ runner.temp }}/tdlua-native-artifacts/
+          if-no-files-found: error
+          retention-days: 30
