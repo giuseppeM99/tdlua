@@ -1,4 +1,5 @@
 name: macOS arm64 JSON portability
+# REL-02 diagnostic trigger marker; not part of the curated candidate.
 
 on:
   push:

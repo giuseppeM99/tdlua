@@ -2,7 +2,7 @@ name: Windows MSVC JSON validation
 
 on:
   push:
-    branches: [vnext-portability-clean, v0.5.1-consolidated]
+    branches: [vnext-portability-clean, v0.5.1-consolidated, rel-02-ci-trigger]
     paths:
       - '.github/workflows/windows-msvc-json.yml'
       - 'CMakeLists.txt'
