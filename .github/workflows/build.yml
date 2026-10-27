@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -73,7 +73,7 @@ jobs:
 
       - name: Restore pinned TDLib native codegen build
         id: codegen-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/tdlua-native-bootstrap
@@ -199,7 +199,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/tdlib-native-codegen.tar.gz"
 
       - name: Upload pinned TDLib native codegen build
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen.tar.gz
@@ -207,7 +207,7 @@ jobs:
           retention-days: 1
 
       - name: Upload static TDLib package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-static.tar.gz
@@ -231,7 +231,7 @@ jobs:
 
     steps:
       - name: Checkout pinned source and submodules
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -285,7 +285,7 @@ jobs:
           ccache --zero-stats
 
       - name: Restore AArch64 compiler cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/tdlua-ccache
           key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.68-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
@@ -602,7 +602,7 @@ jobs:
           ls -l "$out"
 
       - name: Upload AArch64 release packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-linux-aarch64-packages
           path: ${{ runner.temp }}/tdlua-packages/*.tar.gz
@@ -611,7 +611,7 @@ jobs:
 
       - name: Upload AArch64 build and test evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-linux-aarch64-validation-${{ github.sha }}
           path: .ci/aarch64-validation/
@@ -629,7 +629,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -645,7 +645,7 @@ jobs:
             zlib1g-dev
 
       - name: Download static TDLib package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-artifact
@@ -729,7 +729,7 @@ jobs:
           echo "name=${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload static Lua artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-lua${{ matrix.lua }}-static
           path: ${{ steps.artifact.outputs.path }}
@@ -742,7 +742,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -771,7 +771,7 @@ jobs:
             INSTALL_TOP="$RUNNER_TEMP/lua55"
 
       - name: Download static TDLib package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-artifact
@@ -829,7 +829,7 @@ jobs:
           echo "name=${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload static Lua artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-lua5.5-static
           path: ${{ steps.artifact.outputs.path }}
@@ -842,7 +842,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Lua 5.2
         run: |
@@ -873,7 +873,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -890,7 +890,7 @@ jobs:
             zlib1g-dev
 
       - name: Download pinned TDLib native codegen build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen
@@ -959,7 +959,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload native Lua 5.5 artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-native-lua5.5-static
           path: ${{ steps.artifact.outputs.path }}
@@ -972,7 +972,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -990,7 +990,7 @@ jobs:
             zlib1g-dev
 
       - name: Download pinned TDLib native codegen build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen
@@ -1047,7 +1047,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload native Lua 5.3 artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-native-lua5.3-static
           path: ${{ steps.artifact.outputs.path }}
@@ -1060,7 +1060,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -1078,7 +1078,7 @@ jobs:
             zlib1g-dev
 
       - name: Download pinned TDLib native codegen build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen
@@ -1135,7 +1135,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload native Lua 5.2 artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-native-lua5.2-static
           path: ${{ steps.artifact.outputs.path }}
@@ -1148,7 +1148,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -1166,7 +1166,7 @@ jobs:
             zlib1g-dev
 
       - name: Download pinned TDLib native codegen build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen
@@ -1223,7 +1223,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload native Lua 5.4 artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-native-lua5.4-static
           path: ${{ steps.artifact.outputs.path }}
@@ -1240,7 +1240,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -1264,7 +1264,7 @@ jobs:
           ccache --version | head -n 1
 
       - name: Restore native compiler cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/tdlua-ccache
           key: tdlua-native-debug-ccache-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-v1-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
@@ -1321,7 +1321,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -1339,7 +1339,7 @@ jobs:
             zlib1g-dev
 
       - name: Download pinned TDLib native codegen build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-native-codegen
           path: ${{ runner.temp }}/tdlib-native-codegen
@@ -1396,7 +1396,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload native LuaJIT artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-native-luajit-static
           path: ${{ steps.artifact.outputs.path }}
@@ -1409,7 +1409,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -1425,7 +1425,7 @@ jobs:
             zlib1g-dev
 
       - name: Download static TDLib package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-artifact
@@ -1480,7 +1480,7 @@ jobs:
           echo "path=build/${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Upload static LuaJIT artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-luajit-static
           path: ${{ steps.artifact.outputs.path }}
@@ -1496,7 +1496,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -1513,7 +1513,7 @@ jobs:
             zlib1g-dev
 
       - name: Download static TDLib package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-artifact
@@ -1553,7 +1553,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           submodules: recursive
@@ -1581,7 +1581,7 @@ jobs:
           scan-build --help >/dev/null
 
       - name: Download pinned static TDLib package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlib-static
           path: ${{ runner.temp }}/tdlib-artifact
@@ -1636,7 +1636,7 @@ jobs:
 
       - name: Upload diagnostic reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: static-analysis-json-lua54
           path: |
@@ -1655,7 +1655,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install common dependencies
         run: |
@@ -1667,7 +1667,7 @@ jobs:
             zlib1g-dev
 
       - name: Download all native static Lua artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: tdlua-native-*-static
           path: ${{ runner.temp }}/tdlua-artifacts

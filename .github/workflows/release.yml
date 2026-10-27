@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Download verified payload
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tdlua-release-package
           path: payload
@@ -58,4 +58,50 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          body: |
+            ## Runtime prerequisites
+
+            **Linux x86_64**: one module per Lua ABI (5.2, 5.3, 5.4, 5.5 and
+            LuaJIT 2.1), each in a JSON and a native build.
+
+            - glibc providing symbols up to `GLIBC_2.38`
+            - libstdc++ providing `GLIBCXX_3.4.32` and `CXXABI_1.3.13`
+            - OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`) and zlib (`libz.so.1`)
+            - the Lua runtime matching the module you load (5.2, 5.3, 5.4, 5.5
+              or LuaJIT 2.1)
+            - TDLib is linked statically
+
+            **Linux aarch64**: Lua 5.4 only, JSON and native builds.
+
+            - the same glibc, libstdc++, OpenSSL 3 and zlib requirements as x86_64
+            - the Lua 5.4 runtime (`liblua5.4.so.0`)
+            - TDLib is linked statically
+
+            **Windows x64**: Lua 5.4, JSON and native builds.
+
+            - `lua54.dll` provided by the host
+            - Microsoft Visual C++ runtime provided by the host (`MSVCP140.dll`,
+              `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and the Universal CRT)
+            - OpenSSL 3 and zlib bundled in the archive
+            - the JSON archive also ships `tdjson.dll`; the native archive is
+              built with MSVC
+
+            **macOS arm64**: Lua 5.4, JSON and native builds.
+
+            - Lua 5.4 provided by the host
+            - OpenSSL 3 from Homebrew, expected under `/opt/homebrew/opt/openssl@3`
+            - `liblua.5.4.dylib` must be reachable by the dynamic loader, for
+              example next to `tdlua.so` or through `DYLD_LIBRARY_PATH`
+            - macOS arm64 binaries were validated on macOS 26. Earlier macOS
+              versions have not been validated.
+
+            **LuaRocks**
+
+            - `tdlua` builds from source against the Lua version LuaRocks is
+              configured for
+            - `tdlua-luajit` requires LuaJIT 2.1: point `LUA` at the LuaJIT
+              interpreter when configuring or installing with LuaRocks
+            - source builds compile the pinned TDLib and take several minutes
+
+            `SHA256SUMS` lists the checksum of every other release asset.
           files: payload/*

@@ -30,7 +30,6 @@ build = {
          -DCMAKE_BUILD_TYPE=Release \
          -DTDLUA_LUA_IMPLEMENTATION=luajit \
          -DCMAKE_INSTALL_PREFIX="$(PREFIX)" \
-         -DLUA_INCLUDE_DIR="$(LUA_INCDIR)" \
          -DCMAKE_PREFIX_PATH="$(LUA_DIR);${CMAKE_PREFIX_PATH:-}" \
          -DTDLUA_BUNDLED_TDLIB="${TDLUA_BUNDLED_TDLIB:-ON}" \
          -DTDLUA_BACKEND="${TDLUA_BACKEND:-json}" \

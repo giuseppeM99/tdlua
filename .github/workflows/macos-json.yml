@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Check out pinned TDLib submodule
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -117,7 +117,7 @@ jobs:
 
       - name: Restore the pinned TDLib installation
         id: tdlib-cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           key: ${{ env.TDLIB_CACHE_KEY }}
           path: |
@@ -181,7 +181,7 @@ jobs:
 
       - name: Save the verified TDLib installation
         if: steps.tdlib-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           key: ${{ env.TDLIB_CACHE_KEY }}
           path: |
@@ -438,7 +438,7 @@ jobs:
           fi
 
       - name: Upload macOS JSON package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-macos-arm64-json-package
           path: ${{ runner.temp }}/tdlua-packages/*.tar.gz
@@ -447,7 +447,7 @@ jobs:
 
       - name: Upload build, install, and test evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64-json-${{ github.run_id }}
           path: ${{ runner.temp }}/tdlua-artifacts/

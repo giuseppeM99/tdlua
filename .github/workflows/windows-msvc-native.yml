@@ -54,7 +54,7 @@ jobs:
         shell: pwsh
     steps:
       - name: Checkout pinned repository and TDLib
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -135,7 +135,7 @@ jobs:
 
       - name: Restore the pinned vcpkg binary cache
         id: vcpkg-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/vcpkg-archives
           key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
@@ -166,7 +166,7 @@ jobs:
 
       - name: Save the vcpkg binary cache
         if: steps.vcpkg-install.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/vcpkg-archives
           key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
@@ -188,7 +188,7 @@ jobs:
 
       - name: Restore the pinned static TDLib package and codegen tools
         id: tdlib-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/tdlua-native-stage
@@ -443,7 +443,7 @@ jobs:
       # use must never become what future runs restore.
       - name: Save the verified TDLib package and codegen tools
         if: success() && steps.tdlib-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/tdlua-native-stage
@@ -846,7 +846,7 @@ jobs:
             Tee-Object -FilePath .ci\windows-msvc-native\p5d3-gate-verdict.txt
 
       - name: Upload Windows native package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tdlua-windows-x64-native-package
           path: ${{ runner.temp }}/tdlua-5.4-win64-native.zip
@@ -855,7 +855,7 @@ jobs:
 
       - name: Upload native validation logs and manifests
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-msvc-native-${{ github.run_id }}
           path: .ci/windows-msvc-native/
