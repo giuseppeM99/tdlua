@@ -7,6 +7,20 @@
 -- descriptor is a number and uv.new_poll() is used. On Windows the readiness
 -- handle is a SOCKET exposed by readiness:socket(); it is passed unchanged to
 -- uv.new_socket_poll(). A light userdata SOCKET is never parsed or cast here.
+--
+-- Host-managed loops: the adapter never calls uv.stop(), uv.loop_close() or
+-- uv.run() unless the host calls adapter:run(). When the adapter retires it
+-- closes only its own poll/timer handles, so an application-owned uv loop keeps
+-- running. The application is told exactly once through on_stop(reason, detail):
+--
+--   "error"    driver tick raised, on_update raised, or the poll failed
+--   "stalled"  driver reported a fatal stall (stall_fatal = true)
+--   "closed"   the driver closed: last client removed, client closed, invalid
+--              owner. Reconnect by creating a new driver/adapter pair.
+--   "stopped"  adapter:stop() called by the host
+--
+-- on_stall(state) is called once per non-fatal stall episode; the loop keeps
+-- running and new events are still serviced.
 
 local M = {}
 
@@ -41,6 +55,12 @@ end
 function M.new(driver, options)
     options = options or {}
     local uv = options.uv or require("luv")
+    if options.on_stop ~= nil and type(options.on_stop) ~= "function" then
+        error("tdlua_eventloop: on_stop must be a function or nil", 2)
+    end
+    if options.on_stall ~= nil and type(options.on_stall) ~= "function" then
+        error("tdlua_eventloop: on_stall must be a function or nil", 2)
+    end
     local self = setmetatable({
         driver = driver,
         uv = uv,
@@ -55,6 +75,14 @@ function M.new(driver, options)
         ticks = 0,
         close_error = nil,
         options = options,
+        on_stop = options.on_stop,
+        on_stall = options.on_stall,
+        notified = false,
+        stop_reason = nil,
+        stop_detail = nil,
+        notify_error = nil,
+        stall_error = nil,
+        stalls = 0,
     }, Adapter)
 
     local previous_on_kick = driver.on_kick
@@ -82,8 +110,14 @@ function Adapter:_open()
     if type(fd) == "number" and fd >= 0 then
         poll, poll_err = call_handle(uv, "new_poll", fd)
         if not poll then
-            error("tdlua_eventloop: uv.new_poll failed: " ..
-                  tostring(poll_err), 2)
+            local message = "tdlua_eventloop: uv.new_poll failed: " ..
+                            tostring(poll_err)
+            if tostring(poll_err):match("EEXIST") then
+                message = message ..
+                    " (a poll handle for this descriptor may still be " ..
+                    "closing; build the new adapter on a later loop turn)"
+            end
+            error(message, 2)
         end
     elseif socket ~= nil then
         if type(uv.new_socket_poll) ~= "function" then
@@ -231,7 +265,7 @@ function Adapter:_tick()
     self.last_state = state
 
     if state.state == "closed" then
-        self:stop()
+        self:_finish("closed", state)
         return
     end
     if state.state == "error" then
@@ -240,15 +274,76 @@ function Adapter:_tick()
     end
     if state.state == "stalled" then
         self.stalled = state
-        self:stop()
+        self.stalls = self.stalls + 1
+        if state.fatal then
+            self:_finish("stalled", state)
+            return
+        end
+        -- A stall is a diagnostic: the host loop keeps running and the
+        -- driver keeps servicing new events. Notify once per episode.
+        self:_stall_notice(state)
+        if self.stopped then return end
+        self:_arm({state = "again", deadline = self:_retry_delay(),
+                   reliable = state.reliable})
         return
     end
     self:_arm(state)
 end
 
+function Adapter:_retry_delay()
+    local delay = self.driver and self.driver.retry_delay
+    if type(delay) ~= "number" or delay ~= delay or delay <= 0 then
+        delay = 0.01
+    end
+    return delay
+end
+
+function Adapter:_stall_notice(state)
+    if not self.on_stall then return end
+    local ok, err = pcall(self.on_stall, state, self)
+    if not ok then
+        -- Never raise into the loop: the host loop must stay operational.
+        -- The failure is kept for diagnostics instead of being lost.
+        self.stall_error = err
+    end
+end
+
+function Adapter:_notify(kind, detail)
+    if self.notified then return end
+    self.notified = true
+    local callback = self.on_stop
+    if callback == nil then return end
+    local ok, err = pcall(callback, kind, detail, self)
+    if not ok then
+        -- A raising terminal callback must not escape into the host loop and
+        -- must not be swallowed either: keep it for stats().
+        self.notify_error = err
+    end
+end
+
+-- Single terminal path. Teardown happens first, so the callback observes a
+-- fully detached adapter, cannot be called twice, and cannot deliver an update
+-- afterwards. A reentrant stop() from inside the callback is a no-op.
+function Adapter:_finish(kind, detail)
+    if self.stopped then return false end
+    self.stopped = true
+    self.stop_reason = kind
+    self.stop_detail = detail
+    -- Stop observing before releasing the readiness handle. The descriptor
+    -- belongs to the VM owner and is never closed here.
+    self:_close_handles()
+    if self.driver.on_kick == self._hook then
+        self.driver.on_kick = self.previous_on_kick
+        self.previous_on_kick = nil
+    end
+    pcall(self.driver.stop, self.driver)
+    self:_notify(kind, detail)
+    return true
+end
+
 function Adapter:_fail(err)
     self.error = err
-    self:stop()
+    self:_finish("error", err)
 end
 
 function Adapter:kick()
@@ -258,7 +353,7 @@ function Adapter:kick()
         local stopped_ok, driver_stopped =
             pcall(self.driver.is_stopped, self.driver)
         if stopped_ok and driver_stopped then
-            self:stop()
+            self:_finish("closed", nil)
             return false
         end
         self:_fail(err or "driver kick failed")
@@ -268,16 +363,7 @@ function Adapter:kick()
 end
 
 function Adapter:stop()
-    if self.stopped then return end
-    self.stopped = true
-    -- Stop observing before releasing the readiness handle. The descriptor
-    -- belongs to the VM owner and is never closed here.
-    self:_close_handles()
-    if self.driver.on_kick == self._hook then
-        self.driver.on_kick = self.previous_on_kick
-        self.previous_on_kick = nil
-    end
-    self.driver:stop()
+    self:_finish("stopped", nil)
 end
 
 function Adapter:is_stopped()
@@ -292,11 +378,19 @@ function Adapter:stats()
         stalled = self.stalled,
         last_state = self.last_state,
         close_error = self.close_error,
+        stop_reason = self.stop_reason,
+        stop_detail = self.stop_detail,
+        notified = self.notified,
+        notify_error = self.notify_error,
+        stalls = self.stalls,
+        stall_error = self.stall_error,
     }
 end
 
 -- Run the luv loop until the adapter stops. Raises a stored polling or driver
--- error; returns nil, "stalled" when the driver could not make progress.
+-- error; returns nil, "stalled" only when a fatal stall (stall_fatal = true) is
+-- the terminal cause. A non-fatal stall stays in stats().stalled and does not
+-- change the result.
 function Adapter:run()
     while not self.stopped and self.uv.loop_alive() do
         self.uv.run("once")
@@ -307,7 +401,7 @@ function Adapter:run()
     if self.error then
         error(self.error, 2)
     end
-    if self.stalled then
+    if self.stop_reason == "stalled" then
         return nil, "stalled"
     end
     return "ok"

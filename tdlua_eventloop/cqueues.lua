@@ -11,6 +11,31 @@
 -- attach to an application-owned cqueues controller. In the attached mode the
 -- adapter registers its driver coroutine on the existing controller and never
 -- calls cq:loop().
+--
+-- Host-managed loops: the adapter never stops, closes or steps the application
+-- controller when it retires. It releases only its own coroutine and kick
+-- socketpair, so an application-owned cq:loop() keeps running. The application
+-- is told exactly once through on_stop(reason, detail):
+--
+--   "error"    driver tick raised, on_update raised, kick failure, or
+--              controller_error() reported an application controller error
+--   "stalled"  driver reported a fatal stall (stall_fatal = true)
+--   "closed"   the driver closed: last client removed, client closed, invalid
+--              owner. Reconnect by creating a new driver/adapter pair.
+--   "stopped"  adapter:stop() called by the host
+--
+-- The callback runs only after the physical retirement (coroutine exit and
+-- socketpair close). When the stop is requested from outside a running
+-- controller, that retirement happens on the controller's next turn; when it
+-- is requested after a timed standalone run(), it happens in drain()/run().
+-- When the controller itself has failed there is no further turn to wait for:
+-- controller_error() (or the run() that observed the failure) releases the
+-- resources and notifies from that call, recording
+-- stats().registration_dead=false when the adapter coroutine could not be
+-- resumed.
+--
+-- on_stall(state) fires once per non-fatal stall episode; the controller keeps
+-- running and later events are still serviced.
 
 local M = {}
 
@@ -18,6 +43,7 @@ local Adapter = {}
 Adapter.__index = Adapter
 
 local FALLBACK_SECONDS = 0.1
+local MIN_DELAY = 0.001
 local INF = math.huge
 
 local function is_number(value)
@@ -34,6 +60,16 @@ local function finite_or_infinity(value)
     return value
 end
 
+-- A positive delay smaller than the controller resolution would be added to
+-- the monotonic clock and round to zero, turning a bounded retry into a busy
+-- loop. Zero stays zero: it is an explicit "run now" from a kick or a
+-- delivered update.
+local function usable_delay(delay)
+    if not is_number(delay) or delay <= 0 then return delay end
+    if delay < MIN_DELAY then return MIN_DELAY end
+    return delay
+end
+
 function M.new(driver, options)
     options = options or {}
     local cqueues = options.cqueues or require("cqueues")
@@ -43,6 +79,12 @@ function M.new(driver, options)
     if auxlib == nil then
         local ok, value = pcall(require, "cqueues.auxlib")
         if ok then auxlib = value end
+    end
+    if options.on_stop ~= nil and type(options.on_stop) ~= "function" then
+        error("tdlua_eventloop: on_stop must be a function or nil", 2)
+    end
+    if options.on_stall ~= nil and type(options.on_stall) ~= "function" then
+        error("tdlua_eventloop: on_stall must be a function or nil", 2)
     end
 
     local kick_read, kick_write = socket.pair()
@@ -97,6 +139,18 @@ function M.new(driver, options)
         wakeups = 0,
         ticks = 0,
         options = options,
+        on_stop = options.on_stop,
+        on_stall = options.on_stall,
+        notified = false,
+        released = false,
+        pending_notify = false,
+        retirement_scheduled = false,
+        registration_dead = nil,
+        stop_reason = nil,
+        stop_detail = nil,
+        notify_error = nil,
+        stall_error = nil,
+        stalls = 0,
     }, Adapter)
 
     self.ready_pollable = M.pollable(driver, self)
@@ -172,7 +226,7 @@ function Adapter:_note_state(state, now)
     if state.state == "again" then
         local delay = nonnegative(state.deadline, 0.01)
         if delay == INF then delay = 0.01 end
-        self.wake_at = now + delay
+        self.wake_at = now + usable_delay(delay)
     elseif state.state == "sleep" then
         if state.reliable == false then
             local delay = state.deadline
@@ -180,9 +234,11 @@ function Adapter:_note_state(state, now)
                delay > FALLBACK_SECONDS then
                 delay = FALLBACK_SECONDS
             end
-            self.wake_at = now + nonnegative(delay, FALLBACK_SECONDS)
+            self.wake_at = now + usable_delay(
+                nonnegative(delay, FALLBACK_SECONDS))
         elseif is_number(state.deadline) and state.deadline < INF then
-            self.wake_at = now + nonnegative(state.deadline, 0)
+            self.wake_at = now + usable_delay(
+                nonnegative(state.deadline, 0))
         end
     end
 end
@@ -194,6 +250,7 @@ function Adapter:_timeout()
     if self.wake_at then
         local delta = self.wake_at - self:_now()
         if delta <= 0 then return 0 end
+        if delta < MIN_DELAY then return MIN_DELAY end
         return delta
     end
     if self.last_state == nil then return 0 end
@@ -273,23 +330,158 @@ function Adapter:_start()
     self.cq:attach(self.co)
 end
 
-function Adapter:_abort(err)
+-- in_loop: the failure happened inside the adapter coroutine. _loop then
+-- releases and schedules the retirement turn, so the callback still runs after
+-- that coroutine has returned. Otherwise the controller has already failed or
+-- stopped, and this call is the last possible turn: release and notify now.
+function Adapter:_abort(err, in_loop)
     if err ~= nil and self.error == nil then
         self.error = "tdlua_eventloop: cqueues controller failed: " ..
                      tostring(err)
     end
+    if not self.stopped then
+        self:_finish("error", self.error or err, true)
+    end
+    if in_loop then return end
+    self:_release()
+    -- A hard failure retires the owned controller too, as before.
+    if self.owns_controller and self.cq and not self.running and
+       not self:_controller_running() then
+        pcall(self.cq.close, self.cq)
+    end
+    if self.notified then return end
+    self.registration_dead = self:_co_status() == "dead"
+    self:_notify(self.stop_reason, self.stop_detail)
+end
+
+function Adapter:_retry_delay()
+    local delay = self.driver and self.driver.retry_delay
+    if type(delay) ~= "number" or delay ~= delay or delay <= 0 then
+        delay = 0.01
+    end
+    return delay
+end
+
+function Adapter:_stall_notice(state)
+    if not self.on_stall then return end
+    local ok, err = pcall(self.on_stall, state, self)
+    if not ok then
+        -- Keep the host loop operational and the failure diagnosable.
+        self.stall_error = err
+    end
+end
+
+function Adapter:_notify(kind, detail)
+    if self.notified then return end
+    self.notified = true
+    local callback = self.on_stop
+    if callback == nil then return end
+    local ok, err = pcall(callback, kind, detail, self)
+    if not ok then
+        self.notify_error = err
+    end
+end
+
+-- Logical stop: record the cause, detach the hook and stop the driver. The
+-- resources are released by the adapter coroutine on its way out, and the
+-- notification follows the release on a later turn.
+function Adapter:_finish(kind, detail, hard)
+    if self.stopped then return false end
     self.stopped = true
-    self.loop_running = false
-    self:_close_kick()
+    self.stop_reason = kind
+    self.stop_detail = detail
+    pcall(self._signal_kick, self)
     if self.driver.on_kick == self._hook then
         self.driver.on_kick = self.previous_on_kick
         self.previous_on_kick = nil
     end
     pcall(self.driver.stop, self.driver)
+    if not self.started then
+        -- Nothing was ever attached: release and tell the host now.
+        self:_release()
+        self:_notify(kind, detail)
+    elseif self.owns_controller and not self:_controller_running() then
+        -- A timed run returned with the coroutine parked. Do not step the
+        -- controller and do not close sockets under the parked coroutine:
+        -- drain()/run() finish the retirement and deliver the notification.
+        -- A hard failure has nothing left to drain.
+        if not hard then self.drain_required = true end
+        self.pending_notify = true
+    elseif not self.owns_controller and not self.loop_running then
+        -- Attached, but the body never entered its poll loop: releasing the
+        -- socketpair now is safe; the notification waits for the coroutine.
+        self:_release()
+    end
+    return true
+end
+
+-- Physical release of the adapter resources. Safe only once the adapter
+-- coroutine no longer polls: the body calls it on exit, or _finish calls it
+-- when no coroutine was ever attached.
+function Adapter:_release()
+    -- Always clear the flag: a second call after the body entered its loop must
+    -- not leave loop_running true while the coroutine is dead.
+    self.loop_running = false
+    if self.released then return end
+    self.released = true
+    self:_close_kick()
     if self.owns_controller and self.cq and not self.running and
        not self:_controller_running() then
         pcall(self.cq.close, self.cq)
     end
+end
+
+function Adapter:_co_status()
+    if self.co == nil then return "dead" end
+    return coroutine.status(self.co)
+end
+
+-- The notification is never delivered from inside the adapter coroutine. It
+-- runs on a later controller turn, after that coroutine has returned; for an
+-- owned controller, run()/drain() deliver it after the loop returns.
+function Adapter:_schedule_retirement()
+    if self.notified then return end
+    if self.owns_controller then
+        self.pending_notify = true
+        return
+    end
+    if self.retirement_scheduled then return end
+    if not (self.cq and type(self.cq.wrap) == "function") then
+        self.registration_dead = self:_co_status() == "dead"
+        self:_notify(self.stop_reason, self.stop_detail)
+        return
+    end
+    self.retirement_scheduled = true
+    self.cq:wrap(function()
+        self.retirement_scheduled = false
+        self:_retirement_turn()
+    end)
+end
+
+function Adapter:_retirement_turn()
+    if self.notified then return end
+    if self:_co_status() == "dead" then
+        self.registration_dead = true
+        self:_notify(self.stop_reason, self.stop_detail)
+        return
+    end
+    self.retirement_attempts = (self.retirement_attempts or 0) + 1
+    if self.retirement_attempts > 8 then
+        -- The controller kept scheduling this turn before the adapter
+        -- coroutine returned; retire anyway and record it.
+        self.registration_dead = false
+        self:_notify(self.stop_reason, self.stop_detail)
+        return
+    end
+    self:_schedule_retirement()
+end
+
+function Adapter:_deliver_pending()
+    if not self.pending_notify or self.notified then return self.notified end
+    self.pending_notify = false
+    self.registration_dead = self:_co_status() == "dead"
+    self:_notify(self.stop_reason, self.stop_detail)
+    return self.notified
 end
 
 function Adapter:_loop()
@@ -303,7 +495,11 @@ function Adapter:_loop()
             ok, err = false, "cqueues.auxlib is unavailable"
         end
     end
-    if not ok then self:_abort(err) end
+    if not ok then self:_abort(err, true) end
+    -- The body never polls again: release here, then notify on a later turn so
+    -- this coroutine is dead before the host callback runs.
+    self:_release()
+    if self.stopped then self:_schedule_retirement() end
 end
 
 function Adapter:_loop_body()
@@ -312,25 +508,34 @@ function Adapter:_loop_body()
         local ok, state = pcall(self.driver.tick, self.driver)
         if not ok then
             self.error = state
-            self:stop()
+            self:_finish("error", state)
             break
         end
         self.ticks = self.ticks + 1
         self:_note_state(state, self:_now())
 
         if state.state == "closed" then
-            self:stop()
+            self:_finish("closed", state)
             break
         end
         if state.state == "error" then
-            self.error = state.error or "driver error"
-            self:stop()
+            self:_fail(state.error or "driver error")
             break
         end
         if state.state == "stalled" then
             self.stalled = state
-            self:stop()
-            break
+            self.stalls = self.stalls + 1
+            if state.fatal then
+                self:_finish("stalled", state)
+                break
+            end
+            -- Diagnostic only: tell the host once, keep the controller
+            -- coroutine alive, and retry at a bounded rate.
+            self:_stall_notice(state)
+            if self.stopped then break end
+            self:_note_state({state = "again",
+                              deadline = self:_retry_delay(),
+                              reliable = state.reliable}, self:_now())
         end
 
         local valid_ok, valid = pcall(self.driver.valid, self.driver)
@@ -348,8 +553,7 @@ function Adapter:_loop_body()
             self:_drain_kick()
         end
     end
-    self.loop_running = false
-    self:_close_kick()
+    self:_release()
 end
 
 function Adapter:wakeup()
@@ -362,9 +566,13 @@ function Adapter:run(timeout)
         -- coroutine parked. The stop kick is still pending; drain it so the
         -- coroutine can exit and release the socketpair. In attached mode the
         -- application owns the loop and must never be driven from here.
-        if self.drain_required then return self:drain(timeout) end
+        if self.drain_required then
+            self:drain(timeout)
+            if self.stop_reason == "stalled" then return nil, "stalled" end
+            return "ok"
+        end
         if self.error then error(self.error, 2) end
-        if self.stalled then return nil, "stalled" end
+        if self.stop_reason == "stalled" then return nil, "stalled" end
         return "ok"
     end
     if not self.owns_controller then
@@ -377,11 +585,11 @@ function Adapter:run(timeout)
     local ok, err = self.cq:loop(timeout)
     self.running = false
     if not ok then self:_abort(err) end
-    if self.stopped and not self.loop_running then self:_close_kick() end
+    self:_deliver_pending()
     if self.error then
         error(self.error, 2)
     end
-    if self.stalled then
+    if self.stop_reason == "stalled" then
         return nil, "stalled"
     end
     if not ok and err ~= nil then
@@ -394,7 +602,12 @@ end
 -- timed run. It drives the owned controller until the adapter coroutine exits;
 -- controller errors are stored and re-raised, not discarded.
 function Adapter:drain(timeout)
-    if not self.drain_required then return "ok" end
+    if not self.drain_required then
+        self:_deliver_pending()
+        if self.error then error(self.error, 2) end
+        if self.stop_reason == "stalled" then return nil, "stalled" end
+        return "ok"
+    end
     if not self.owns_controller then return "ok" end
     self.drain_required = false
     self.running = true
@@ -402,9 +615,10 @@ function Adapter:drain(timeout)
     self.running = false
     if not ok then
         self:_abort(err)
+        self:_deliver_pending()
         error(self.error, 2)
     end
-    if self.stopped and not self.loop_running then self:_close_kick() end
+    self:_deliver_pending()
     if self.error then error(self.error, 2) end
     if self.loop_running or self.kick_read ~= nil then
         self.error = self.error or
@@ -422,7 +636,7 @@ function Adapter:kick()
         local stopped_ok, driver_stopped =
             pcall(self.driver.is_stopped, self.driver)
         if stopped_ok and driver_stopped then
-            self:stop()
+            self:_finish("closed", nil)
             return false
         end
         self:_fail(err or "driver kick failed")
@@ -438,7 +652,7 @@ end
 
 function Adapter:_fail(err)
     self.error = err
-    self:stop()
+    self:_finish("error", err)
 end
 
 function Adapter:_controller_running()
@@ -447,32 +661,17 @@ function Adapter:_controller_running()
 end
 
 function Adapter:stop()
-    if self.stopped then return end
-    self.stopped = true
-    self:_signal_kick()
-    if not self.started then
-        self:_close_kick()
-    elseif not self:_controller_running() then
-        if self.owns_controller then
-            -- Do not step the standalone controller here: it may contain
-            -- application coroutines. drain()/run() is the explicit host path.
-            self.drain_required = true
-        else
-            self:_close_kick()
-        end
-    end
-    if self.driver.on_kick == self._hook then
-        self.driver.on_kick = self.previous_on_kick
-        self.previous_on_kick = nil
-    end
-    self.driver:stop()
+    self:_finish("stopped", nil)
 end
 
 -- Attached mode: the application owns cq:loop(). If that call returns
 -- false, err, the application must call this so the adapter releases the
 -- socketpair, detaches the hook and stops the driver.
 function Adapter:controller_error(err)
-    if not self.stopped or self.loop_running or
+    -- A pending notification is a cleanup obligation even when the socketpair
+    -- was already released by an earlier stop and no coroutine is running.
+    local pending = not self.notified
+    if pending or not self.stopped or self.loop_running or
        self.kick_read ~= nil or self.kick_write ~= nil then
         self:_abort(err or "application controller stopped with an error")
         return true
@@ -492,6 +691,14 @@ function Adapter:stats()
         stalled = self.stalled,
         last_state = self.last_state,
         owns_controller = self.owns_controller,
+        stop_reason = self.stop_reason,
+        stop_detail = self.stop_detail,
+        notified = self.notified,
+        notified_error = nil,
+        notify_error = self.notify_error,
+        registration_dead = self.registration_dead,
+        stalls = self.stalls,
+        stall_error = self.stall_error,
     }
 end
 

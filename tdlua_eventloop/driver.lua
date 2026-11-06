@@ -12,11 +12,30 @@
 --
 -- Adapters (luv, cqueues, ...) own the poller/timer and call Driver:tick().
 -- The driver never creates a Lua queue, a thread, or a second consumer.
+--
+-- Options:
+--   budget, slice     per-turn work limits
+--   retry_delay       bounded delay when work is visible but no raw update
+--                     was delivered (seconds, default 0.01)
+--   stall_after       consecutive no-progress rounds before a stall episode
+--                     is reported (default 64, math.huge disables detection)
+--   stall_fatal       opt-in: make a stall terminal for the adapter. Default
+--                     false: a stall is reported once, then the driver keeps
+--                     retrying with a bounded delay and services new events.
+--   single_owner      reject clients that belong to a different VM owner
+--   on_update, on_kick
+--
+-- A stall never stops the driver on its own. Host-managed applications are
+-- notified by the adapter (on_stall) and decide what to do.
 
 local Driver = {}
 Driver.__index = Driver
 
 local INF = math.huge
+
+-- 1 ms. A positive delay below this cannot be represented by the adapters:
+-- now + delay rounds to now and the turn becomes immediate.
+local MIN_RETRY_DELAY = 0.001
 
 local function is_nonnegative_integer(value)
     return type(value) == "number" and value == value and
@@ -80,6 +99,7 @@ function Driver.new(options)
     local slice = options.slice or 8
     local stall_after = options.stall_after or 64
     local retry_delay = options.retry_delay or 0.01
+    local stall_fatal = options.stall_fatal == true
 
     if not is_nonnegative_integer(budget) or budget < 1 then
         error("tdlua_eventloop: budget must be an integer >= 1", 2)
@@ -92,7 +112,16 @@ function Driver.new(options)
         error("tdlua_eventloop: stall_after must be an integer >= 1 or " ..
               "math.huge", 2)
     end
-    validate_number(retry_delay, "retry_delay", 2)
+    if type(retry_delay) ~= "number" or retry_delay ~= retry_delay or
+       retry_delay < MIN_RETRY_DELAY or retry_delay == math.huge then
+        error("tdlua_eventloop: retry_delay must be a finite number of " ..
+              "seconds >= " .. MIN_RETRY_DELAY .. " (a smaller delay is " ..
+              "not representable and would spin the host loop)", 2)
+    end
+    if type(options.stall_fatal) ~= "nil" and
+       type(options.stall_fatal) ~= "boolean" then
+        error("tdlua_eventloop: stall_fatal must be a boolean", 2)
+    end
 
     if options.on_update ~= nil and type(options.on_update) ~= "function" then
         error("tdlua_eventloop: on_update must be a function or nil", 2)
@@ -112,7 +141,10 @@ function Driver.new(options)
         budget = budget,
         slice = math.min(slice, budget),
         stall_after = stall_after,
+        stall_fatal = stall_fatal,
         retry_delay = retry_delay,
+        stalls = 0,
+        stall_reported = false,
         on_update = options.on_update,
         on_kick = options.on_kick,
         single_owner = options.single_owner ~= false,
@@ -239,6 +271,7 @@ function Driver:stop()
     self.by_client = {}
     self.cursor = 1
     self.owner_key = nil
+    self.stall_reported = false
     if self.on_kick then
         pcall(self.on_kick)
     end
@@ -326,6 +359,9 @@ function Driver:diagnostics()
         round_calls = self.round_calls,
         round_updates = self.round_updates,
         zero_rounds = self.zero_rounds,
+        stalls = self.stalls,
+        stall_reported = self.stall_reported,
+        stall_fatal = self.stall_fatal,
     }
 end
 
@@ -347,6 +383,38 @@ local function error_state(driver, err)
         updates = driver.counters.updates,
         deadline = 0,
     }
+end
+
+-- A stall is a diagnostic, not a terminal state, unless the driver is
+-- configured with stall_fatal = true. It is reported once per episode so that
+-- a host can log it without being flooded by a permanently asserted readiness.
+function Driver:_stall(deadline, reliable)
+    self.stalls = self.stalls + 1
+    self.stall_reported = true
+    local result = state(self, "stalled", deadline, reliable)
+    result.fatal = self.stall_fatal
+    result.stall = {
+        rounds = self.idle_rounds,
+        stalls = self.stalls,
+        fatal = self.stall_fatal,
+    }
+    return result
+end
+
+-- The terminal shape of an already-counted stall episode.
+function Driver:_stall_state(deadline, reliable)
+    local result = state(self, "stalled", deadline, reliable)
+    result.fatal = true
+    result.stall = {rounds = self.idle_rounds, stalls = self.stalls,
+                    fatal = true}
+    return result
+end
+
+-- Any observable advance (a delivered raw update or an explicit progress()
+-- call) starts a new stall episode. A kick or a topology change is not
+-- progress: it must not re-arm the notification on its own.
+function Driver:_progress_mark()
+    self.stall_reported = false
 end
 
 function Driver:_client_closed(client)
@@ -433,6 +501,14 @@ function Driver:_resolve_state()
         return state(self, "closed", INF, false)
     end
 
+    if self.counters.updates > 0 then
+        -- A turn that delivered at least one raw update is progress: it cannot
+        -- also be a stall, and it must clear the history before the kicked and
+        -- work branches below can observe it.
+        self.idle_rounds = 0
+        self:_progress_mark()
+    end
+
     local primary, primary_err = self:_primary()
     if not primary then
         if primary_err ~= nil then return error_state(self, primary_err) end
@@ -462,12 +538,32 @@ function Driver:_resolve_state()
     if work then
         self.zero_rounds = 0
         if self.idle_rounds >= self.stall_after then
-            return state(self, "stalled", deadline, reliable)
+            if not self.stall_reported then
+                return self:_stall(deadline, reliable)
+            end
+            if self.stall_fatal then
+                -- Opt-in fatal policy: keep the terminal state stable without
+                -- counting the same episode again.
+                return self:_stall_state(deadline, reliable)
+            end
+            -- Already reported this episode. The host was told; keep the
+            -- driver alive with a bounded retry instead of spinning. A later
+            -- legitimate event clears the episode and is still consumed.
+            return state(self, "again", self.retry_delay, reliable)
         end
 
         local delay = self.retry_delay
-        if self.counters.updates > 0 then delay = 0 end
-        if deadline < delay then delay = deadline end
+        if self.counters.updates > 0 then
+            delay = 0
+        elseif deadline > 0 and deadline < delay then
+            delay = deadline
+        end
+        -- A turn that left work visible but delivered no raw update keeps the
+        -- bounded retry_delay. An expired deadline of 0 is not a usable
+        -- scheduling signal when nothing was delivered: honouring it would
+        -- spin the host loop whenever the owner-wide readiness is asserted by
+        -- a client this driver cannot consume (or when stall detection is
+        -- disabled). See EVENTLOOP-HOST-INTEGRATION-HARDENING.
         return state(self, "again", delay, reliable)
     end
 
@@ -480,7 +576,15 @@ function Driver:_resolve_state()
         if self.counters.updates == 0 then
             self.zero_rounds = self.zero_rounds + 1
             if self.zero_rounds >= self.stall_after then
-                return state(self, "stalled", 0, reliable)
+                if not self.stall_reported then
+                    return self:_stall(0, reliable)
+                end
+                if self.stall_fatal then
+                    return self:_stall_state(0, reliable)
+                end
+                local delay = self.retry_delay
+                if delay <= 0 then delay = 0.001 end
+                return state(self, "again", delay, reliable)
             end
             local delay = self.retry_delay
             if delay == 0 then delay = 0.001 end
@@ -597,6 +701,11 @@ function Driver:tick()
     self.totals.ticks = self.totals.ticks + 1
     self.totals.calls = self.totals.calls + self.counters.calls
     self.totals.updates = self.totals.updates + self.counters.updates
+    if self.counters.updates > 0 then
+        -- A delivered update is progress even when the callback raised, when
+        -- the turn was kicked, or when the client's backlog is now empty.
+        self:_progress_mark()
+    end
 
     if not ok then
         self.last_error = result
@@ -631,6 +740,7 @@ function Driver:progress()
     self.idle_rounds = 0
     self.zero_rounds = 0
     self.round_progress = true
+    self:_progress_mark()
     return true
 end
 
