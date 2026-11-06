@@ -13,7 +13,32 @@ $archiveSha256 = '4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629
 
 New-Item -ItemType Directory -Force -Path $WorkDirectory, $InstallDirectory | Out-Null
 $archive = Join-Path $WorkDirectory $archiveName
-Invoke-WebRequest -Uri $archiveUrl -OutFile $archive
+# The lua.org download is the only external dependency of this script and it has
+# failed repeatedly with a connection timeout. Retry a few times, and reuse an
+# archive left in the work directory only when its checksum matches.
+$downloadAttempts = 5
+for ($attempt = 1; $attempt -le $downloadAttempts; $attempt++) {
+    if (Test-Path $archive) {
+        $existingHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+        if ($existingHash -eq $archiveSha256) { break }
+        Remove-Item -Force $archive -ErrorAction SilentlyContinue
+    }
+    try {
+        Invoke-WebRequest -Uri $archiveUrl -OutFile $archive -TimeoutSec 300
+        $downloadedHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+        if ($downloadedHash -eq $archiveSha256) { break }
+        Write-Warning "Lua source archive SHA-256 mismatch on attempt $attempt/$downloadAttempts"
+        Remove-Item -Force $archive -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "Lua source download attempt $attempt/$downloadAttempts failed: $($_.Exception.Message)"
+        Remove-Item -Force $archive -ErrorAction SilentlyContinue
+    }
+    if ($attempt -eq $downloadAttempts) {
+        throw "Could not download a verified Lua $luaVersion source archive from $archiveUrl"
+    }
+    Start-Sleep -Seconds (10 * $attempt)
+}
 $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actualHash -ne $archiveSha256) {
     throw "Lua source archive SHA-256 mismatch: $actualHash"

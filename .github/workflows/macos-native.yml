@@ -272,6 +272,35 @@ jobs:
             otool -l "$module"
             nm -gU "$module" > "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"
             grep '_luaopen_tdlua$' "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"
+            # The readiness C ABI is the supported host surface: its export set must
+            # match the documented 16 functions exactly. A count alone would accept a
+            # renamed or partially exported symbol, so compare the sorted name list.
+            readiness_symbols="$(nm -gU "$module" \
+              | awk '{print $NF}' | sed 's/^_//' \
+              | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+            expected_readiness="$(printf '%s\n' \
+              tdlua_readiness_abi_version \
+              tdlua_readiness_strerror \
+              tdlua_readiness_acquire \
+              tdlua_readiness_release \
+              tdlua_readiness_enable \
+              tdlua_readiness_disable \
+              tdlua_readiness_is_watching \
+              tdlua_readiness_has_work \
+              tdlua_readiness_has_work_client \
+              tdlua_readiness_next_deadline \
+              tdlua_readiness_native_handle \
+              tdlua_readiness_transport \
+              tdlua_readiness_clear \
+              tdlua_readiness_wait \
+              tdlua_readiness_client \
+              tdlua_readiness_owner | sort)"
+            if [ "$readiness_symbols" != "$expected_readiness" ]; then
+              echo 'readiness C ABI export set mismatch' >&2
+              printf 'expected:\n%s\nactual:\n%s\n' \
+                "$expected_readiness" "$readiness_symbols" >&2
+              exit 1
+            fi
             if grep -E -q '_tdlua_(test_|json_test_)' "$RUNNER_TEMP/tdlua-native-artifacts/production-exports.log"; then
               echo 'test instrumentation leaked into the production module' >&2
               exit 1
@@ -428,6 +457,35 @@ jobs:
           fi
           lipo -archs "$extracted_module" | grep -x arm64 >/dev/null
           nm -gU "$extracted_module" | grep '_luaopen_tdlua$' >/dev/null
+          # The readiness C ABI is the supported host surface: its export set must
+          # match the documented 16 functions exactly. A count alone would accept a
+          # renamed or partially exported symbol, so compare the sorted name list.
+          readiness_symbols="$(nm -gU "$extracted_module" \
+            | awk '{print $NF}' | sed 's/^_//' \
+            | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+          expected_readiness="$(printf '%s\n' \
+            tdlua_readiness_abi_version \
+            tdlua_readiness_strerror \
+            tdlua_readiness_acquire \
+            tdlua_readiness_release \
+            tdlua_readiness_enable \
+            tdlua_readiness_disable \
+            tdlua_readiness_is_watching \
+            tdlua_readiness_has_work \
+            tdlua_readiness_has_work_client \
+            tdlua_readiness_next_deadline \
+            tdlua_readiness_native_handle \
+            tdlua_readiness_transport \
+            tdlua_readiness_clear \
+            tdlua_readiness_wait \
+            tdlua_readiness_client \
+            tdlua_readiness_owner | sort)"
+          if [ "$readiness_symbols" != "$expected_readiness" ]; then
+            echo 'readiness C ABI export set mismatch' >&2
+            printf 'expected:\n%s\nactual:\n%s\n' \
+              "$expected_readiness" "$readiness_symbols" >&2
+            exit 1
+          fi
           if nm -gU "$extracted_module" | grep -E '_tdlua_(test_|json_test_)'; then
             echo '::error::package exports test hooks'
             exit 1

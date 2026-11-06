@@ -214,6 +214,35 @@ jobs:
               # readelf is target-independent; nm on the x86_64 payload runner
               # cannot read an AArch64 object without binutils-multiarch.
               readelf -sW --dyn-syms "$module" | grep 'luaopen_tdlua$' >/dev/null
+              # The readiness C ABI is the supported host surface: its export set must
+              # match the documented 16 functions exactly. A count alone would accept a
+              # renamed or partially exported symbol, so compare the sorted name list.
+              readiness_symbols="$(readelf -sW --dyn-syms "$module" \
+                | awk '$5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+                | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+              expected_readiness="$(printf '%s\n' \
+                tdlua_readiness_abi_version \
+                tdlua_readiness_strerror \
+                tdlua_readiness_acquire \
+                tdlua_readiness_release \
+                tdlua_readiness_enable \
+                tdlua_readiness_disable \
+                tdlua_readiness_is_watching \
+                tdlua_readiness_has_work \
+                tdlua_readiness_has_work_client \
+                tdlua_readiness_next_deadline \
+                tdlua_readiness_native_handle \
+                tdlua_readiness_transport \
+                tdlua_readiness_clear \
+                tdlua_readiness_wait \
+                tdlua_readiness_client \
+                tdlua_readiness_owner | sort)"
+              if [ "$readiness_symbols" != "$expected_readiness" ]; then
+                echo 'readiness C ABI export set mismatch' >&2
+                printf 'expected:\n%s\nactual:\n%s\n' \
+                  "$expected_readiness" "$readiness_symbols" >&2
+                exit 1
+              fi
               if readelf -sW --dyn-syms "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
                 echo "::error::${archive} exports test hooks"
                 exit 1
@@ -228,6 +257,9 @@ jobs:
               grep -qx "external_runtime=${expected_external}" "$root/MANIFEST.txt"
             else
               file "$module" | grep 'Mach-O 64-bit.*arm64' >/dev/null
+              # Mach-O exports are asserted on the macOS runners, where nm can
+              # read the object. This payload job runs on Linux and only checks
+              # the archive layout; readelf is target-independent for ELF.
               if [ "$backend" = json ]; then
                 test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"
               elif test -n "$(find "$root/lib" -maxdepth 1 -name 'libtdjson*.dylib' -print -quit)"; then
@@ -313,6 +345,26 @@ jobs:
             fi
             luarocks lint "$rockspec"
           done
+
+          # The optional event-loop package ships as its own rockspec asset, so
+          # a user can install it without extracting the source archive. It
+          # builds from the same source tarball; only the three Lua modules are
+          # installed and no adapter runtime is a hard dependency.
+          eventloop="tdlua_eventloop-${base_version}-1.rockspec"
+          test -f "$eventloop"
+          cp "$eventloop" "release-meta/$eventloop"
+          rockspec="release-meta/$eventloop"
+          grep -qx 'package = "tdlua_eventloop"' "$rockspec"
+          grep -qx "version = \"${base_version}-1\"" "$rockspec"
+          grep -q "url = \"https://github.com/giuseppeM99/tdlua/releases/download/${release_tag}/tdlua-${release_tag}-source.tar.gz\"" "$rockspec"
+          grep -q "dir = \"tdlua-${release_tag}\"" "$rockspec"
+          luarocks lint "$rockspec"
+
+          # The core rock must stay independent of the optional adapters.
+          if grep -Eq '"(luv|cqueues)"' "release-meta/tdlua-${base_version}-1.rockspec"; then
+            echo "::error::the core rock must not depend on luv or cqueues"
+            exit 1
+          fi
           ls -l release-meta
 
       # Install from the artifact users actually download, not from the
@@ -342,6 +394,12 @@ jobs:
 
           module="$tree/lib/lua/5.4/tdlua.so"
           test -f "$module"
+          # The C ABI is a supported host surface: its standalone header must
+          # reach a LuaRocks install built from the published source tarball.
+          header="$(find "$tree" -type f \
+            -path '*/include/tdlua/host/readiness_c.h' -print -quit)"
+          test -n "$header"
+          grep -q 'TDLUA_READINESS_ABI_VERSION 1u' "$header"
           LUA_CPATH="$tree/lib/lua/5.4/?.so;;" LUA_PATH="" lua5.4 -e '
             local tdlua = require("tdlua")
             assert(type(tdlua.version) == "string", "missing version")
@@ -384,7 +442,7 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
-          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
           test -f "tdlua-${release_tag}-source.tar.gz"
           test -f SHA256SUMS
 
@@ -445,6 +503,7 @@ jobs:
           for required in \
             "tdlua-${release_tag}/dist.info" \
             "tdlua-${release_tag}/LICENSE" \
+            "tdlua-${release_tag}/include/tdlua/host/readiness_c.h" \
             "tdlua-${release_tag}/td/LICENSE_1_0.txt" \
             "tdlua-${release_tag}/base64/LICENSE"; do
             grep -qx "$required" "$RUNNER_TEMP/source-listing.txt"

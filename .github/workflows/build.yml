@@ -214,6 +214,147 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  eventloop-deterministic:
+    name: Event loop adapters / deterministic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install deterministic test runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            liblua5.4-dev \
+            libreadline-dev \
+            lua5.1 lua5.2 lua5.3 lua5.4 \
+            luarocks \
+            luajit
+
+      - name: Build Lua 5.5
+        uses: ./.github/actions/lua55
+      - name: Run driver and luv mock on every supported interpreter
+        run: |
+          set -euo pipefail
+          for lua in lua5.1 lua5.2 lua5.3 lua5.4 luajit "$RUNNER_TEMP/lua55/bin/lua"; do
+            echo "=== driver: $lua ==="
+            LUA_PATH="./?.lua;./?/init.lua;;" "$lua" tests/eventloop_driver_test.lua
+            echo "=== luv mock: $lua ==="
+            LUA_PATH="./?.lua;./?/init.lua;;" "$lua" tests/eventloop_luv_test.lua
+          done
+
+      - name: Run cqueues mock with a pinned controller
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          luarocks --lua-version=5.4 --tree="$tree" install cqueues 20261006.54-0
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          LUA_PATH="./?.lua;./?/init.lua;$LUA_PATH" \
+            lua5.4 tests/eventloop_cqueues_test.lua
+
+  eventloop-runtime:
+    name: Event loop adapters / real runtime / Lua 5.4
+    needs: tdlib
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            liblua5.4-dev \
+            libssl-dev \
+            libuv1-dev \
+            lua5.4 \
+            luarocks \
+            ninja-build \
+            zlib1g-dev
+
+      - name: Install pinned luv and cqueues
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          luarocks --lua-version=5.4 --tree="$tree" install luv 1.53.0-1
+          luarocks --lua-version=5.4 --tree="$tree" install cqueues 20261006.54-0
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          lua5.4 -e 'local uv=require("luv"); local cq=require("cqueues"); print(uv.version_string, cq._VERSION)'
+
+      - name: Build TDLua JSON module against the pinned static TDLib
+        run: |
+          set -euo pipefail
+          lua_library="$(find /usr/lib /lib -name liblua5.4.so -print -quit)"
+          test -n "$lua_library"
+          cmake -S . -B build-eventloop -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTDLUA_BACKEND=json \
+            -DTDLUA_BUILD_TESTS=OFF \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DLUA_EXECUTABLE="$(command -v lua5.4)" \
+            -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+            -DLUA_LIBRARY="$lua_library"
+          cmake --build build-eventloop --target tdlua
+          if ldd build-eventloop/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
+            echo "tdlua.so unexpectedly depends on shared libtdjson" >&2
+            exit 1
+          fi
+
+      - name: Run real luv and cqueues runtime suites
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          export LUA_CPATH="$PWD/build-eventloop/?.so;$LUA_CPATH"
+          export LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;$LUA_PATH"
+          lua5.4 tests/eventloop_luv_runtime.lua
+          lua5.4 tests/eventloop_cqueues_runtime.lua
+          lua5.4 tests/eventloop_luv_windows.lua
+
+      - name: Run examples
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          export LUA_CPATH="$PWD/build-eventloop/?.so;$LUA_CPATH"
+          export LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;$LUA_PATH"
+          lua5.4 examples/eventloop_luv.lua
+          lua5.4 examples/eventloop_cqueues.lua
+          lua5.4 examples/eventloop_cqueues_external.lua
+
+      - name: Verify optional packaging payload
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/pack"
+          luarocks --lua-version=5.4 --tree="$tree" make \
+            tdlua_eventloop-0.6.0-1.rockspec --deps-mode=none
+          luarocks lint tdlua_eventloop-0.6.0-1.rockspec
+          # The release tarball has no internal agent notes. Guard against a
+          # checkout-path build shipping one through LuaRocks' default docs.
+          test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.0-1/doc/AGENTS.md"
+          LUA_CPATH="$tree/lib/lua/5.4/?.so" \
+          LUA_PATH="$tree/share/lua/5.4/?.lua;$tree/share/lua/5.4/?/init.lua" \
+            lua5.4 -e 'assert(type(require("tdlua_eventloop.driver")) == "table"); assert(type(require("tdlua_eventloop.luv")) == "table"); assert(type(require("tdlua_eventloop.cqueues")) == "table")'
+
   linux-aarch64:
     name: Linux AArch64 / JSON and native / Lua 5.4
     # AArch64 is a release gate: it must also run for the packaging and
@@ -371,6 +512,35 @@ jobs:
           test -f "$module"
           readelf -h "$module" | grep 'Machine:.*AArch64'
           readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          # The readiness C ABI is the supported host surface: its export set must
+          # match the documented 16 functions exactly. A count alone would accept a
+          # renamed or partially exported symbol, so compare the sorted name list.
+          readiness_symbols="$(readelf -sW --dyn-syms "$module" \
+            | awk '$5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+            | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+          expected_readiness="$(printf '%s\n' \
+            tdlua_readiness_abi_version \
+            tdlua_readiness_strerror \
+            tdlua_readiness_acquire \
+            tdlua_readiness_release \
+            tdlua_readiness_enable \
+            tdlua_readiness_disable \
+            tdlua_readiness_is_watching \
+            tdlua_readiness_has_work \
+            tdlua_readiness_has_work_client \
+            tdlua_readiness_next_deadline \
+            tdlua_readiness_native_handle \
+            tdlua_readiness_transport \
+            tdlua_readiness_clear \
+            tdlua_readiness_wait \
+            tdlua_readiness_client \
+            tdlua_readiness_owner | sort)"
+          if [ "$readiness_symbols" != "$expected_readiness" ]; then
+            echo 'readiness C ABI export set mismatch' >&2
+            printf 'expected:\n%s\nactual:\n%s\n' \
+              "$expected_readiness" "$readiness_symbols" >&2
+            exit 1
+          fi
           if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
             echo 'test-only TDLUA_TESTING symbols found in production native module'
             exit 1
@@ -475,6 +645,35 @@ jobs:
           test -f "$module"
           readelf -h "$module" | grep 'Machine:.*AArch64'
           readelf -d "$module" | grep 'FLAGS_1.*NODELETE'
+          # The readiness C ABI is the supported host surface: its export set must
+          # match the documented 16 functions exactly. A count alone would accept a
+          # renamed or partially exported symbol, so compare the sorted name list.
+          readiness_symbols="$(readelf -sW --dyn-syms "$module" \
+            | awk '$5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+            | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+          expected_readiness="$(printf '%s\n' \
+            tdlua_readiness_abi_version \
+            tdlua_readiness_strerror \
+            tdlua_readiness_acquire \
+            tdlua_readiness_release \
+            tdlua_readiness_enable \
+            tdlua_readiness_disable \
+            tdlua_readiness_is_watching \
+            tdlua_readiness_has_work \
+            tdlua_readiness_has_work_client \
+            tdlua_readiness_next_deadline \
+            tdlua_readiness_native_handle \
+            tdlua_readiness_transport \
+            tdlua_readiness_clear \
+            tdlua_readiness_wait \
+            tdlua_readiness_client \
+            tdlua_readiness_owner | sort)"
+          if [ "$readiness_symbols" != "$expected_readiness" ]; then
+            echo 'readiness C ABI export set mismatch' >&2
+            printf 'expected:\n%s\nactual:\n%s\n' \
+              "$expected_readiness" "$readiness_symbols" >&2
+            exit 1
+          fi
           if nm -D --defined-only "$module" | grep -q 'tdlua_.*_test_'; then
             echo 'test-only TDLUA_TESTING symbols found in production JSON module'
             exit 1
@@ -570,6 +769,35 @@ jobs:
               exit 1
             fi
             nm -D --defined-only "$module" | grep '[[:space:]]luaopen_tdlua$' >/dev/null
+            # The readiness C ABI is the supported host surface: its export set must
+            # match the documented 16 functions exactly. A count alone would accept a
+            # renamed or partially exported symbol, so compare the sorted name list.
+            readiness_symbols="$(readelf -sW --dyn-syms "$module" \
+              | awk '$5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+              | grep -E '^tdlua_readiness_[A-Za-z0-9_]+$' | sort -u || true)"
+            expected_readiness="$(printf '%s\n' \
+              tdlua_readiness_abi_version \
+              tdlua_readiness_strerror \
+              tdlua_readiness_acquire \
+              tdlua_readiness_release \
+              tdlua_readiness_enable \
+              tdlua_readiness_disable \
+              tdlua_readiness_is_watching \
+              tdlua_readiness_has_work \
+              tdlua_readiness_has_work_client \
+              tdlua_readiness_next_deadline \
+              tdlua_readiness_native_handle \
+              tdlua_readiness_transport \
+              tdlua_readiness_clear \
+              tdlua_readiness_wait \
+              tdlua_readiness_client \
+              tdlua_readiness_owner | sort)"
+            if [ "$readiness_symbols" != "$expected_readiness" ]; then
+              echo 'readiness C ABI export set mismatch' >&2
+              printf 'expected:\n%s\nactual:\n%s\n' \
+                "$expected_readiness" "$readiness_symbols" >&2
+              exit 1
+            fi
             if nm -D --defined-only "$module" | grep 'tdlua_[A-Za-z0-9_]*_test_' >/dev/null; then
               echo "::error::${backend} package exports test hooks"
               exit 1
@@ -600,6 +828,32 @@ jobs:
           verify json "$out/tdlua-5.4-aarch64-json.tar.gz"
           verify native "$out/tdlua-5.4-aarch64-native.tar.gz"
           ls -l "$out"
+
+      - name: Install the AArch64 event-loop adapter runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y libuv1-dev luarocks
+          rocks="$RUNNER_TEMP/eventloop-rocks"
+          test "$(luarocks --lua-version=5.4 config lua_version)" = "5.4"
+          luarocks --lua-version=5.4 --tree="$rocks" install luv 1.53.0-1 \
+            2>&1 | tee .ci/aarch64-validation/eventloop-luv-install.log
+          luarocks --lua-version=5.4 --tree="$rocks" list \
+            | tee -a .ci/aarch64-validation/eventloop-luv-install.log
+
+      - name: Run event-loop driver and luv adapter on AArch64
+        run: |
+          set -euo pipefail
+          module_dir="$GITHUB_WORKSPACE/.ci/aarch64-tdlib/lib/lua/5.4"
+          rocks="$RUNNER_TEMP/eventloop-rocks"
+          test -f "$module_dir/tdlua.so"
+          export LUA_PATH="./?.lua;./?/init.lua;$rocks/share/lua/5.4/?.lua;$rocks/share/lua/5.4/?/init.lua;;"
+          export LUA_CPATH="$module_dir/?.so;$rocks/lib/lua/5.4/?.so;;"
+          lua5.4 tests/eventloop_driver_test.lua \
+            2>&1 | tee .ci/aarch64-validation/eventloop-driver.log
+          lua5.4 tests/eventloop_luv_runtime.lua \
+            2>&1 | tee .ci/aarch64-validation/eventloop-luv-runtime.log
+          lua5.4 tests/eventloop_luv_windows.lua \
+            2>&1 | tee .ci/aarch64-validation/eventloop-luv-windows.log
 
       - name: Upload AArch64 release packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -751,25 +1005,14 @@ jobs:
             cmake \
             curl \
             gperf \
+            libreadline-dev \
             libssl-dev \
             ninja-build \
             openssl \
             zlib1g-dev
 
       - name: Build Lua 5.5
-        env:
-          LUA55_SHA256: 57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d
-        run: |
-          set -euo pipefail
-          curl -fsSLo lua-5.5.0.tar.gz https://www.lua.org/ftp/lua-5.5.0.tar.gz
-          printf '%s  %s\n' "$LUA55_SHA256" lua-5.5.0.tar.gz | sha256sum -c -
-          tar -xzf lua-5.5.0.tar.gz
-          make -C lua-5.5.0 linux \
-            MYCFLAGS="-fPIC" \
-            MYLDFLAGS="-fPIC"
-          make -C lua-5.5.0 install \
-            INSTALL_TOP="$RUNNER_TEMP/lua55"
-
+        uses: ./.github/actions/lua55
       - name: Download static TDLib package
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -884,6 +1127,7 @@ jobs:
             cmake \
             curl \
             gperf \
+            libreadline-dev \
             ninja-build \
             openssl \
             libssl-dev \
@@ -904,19 +1148,7 @@ jobs:
           test -f "$RUNNER_TEMP/tdlua-native-stage/lib/cmake/Td/TdStaticTargets.cmake"
 
       - name: Build Lua 5.5
-        env:
-          LUA55_SHA256: 57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d
-        run: |
-          set -euo pipefail
-          curl -fsSLo lua-5.5.0.tar.gz https://www.lua.org/ftp/lua-5.5.0.tar.gz
-          printf '%s  %s\n' "$LUA55_SHA256" lua-5.5.0.tar.gz | sha256sum -c -
-          tar -xzf lua-5.5.0.tar.gz
-          make -C lua-5.5.0 linux \
-            MYCFLAGS="-fPIC" \
-            MYLDFLAGS="-fPIC"
-          make -C lua-5.5.0 install \
-            INSTALL_TOP="$RUNNER_TEMP/lua55"
-
+        uses: ./.github/actions/lua55
       - name: Configure native backend
         run: |
           cmake -S . -B build -G Ninja \
@@ -1252,6 +1484,7 @@ jobs:
             cmake \
             curl \
             gperf \
+            libreadline-dev \
             ninja-build \
             openssl \
             libssl-dev \
@@ -1275,19 +1508,7 @@ jobs:
         run: ccache --zero-stats
 
       - name: Build Lua 5.5
-        env:
-          LUA55_SHA256: 57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d
-        run: |
-          set -euo pipefail
-          curl -fsSLo lua-5.5.0.tar.gz https://www.lua.org/ftp/lua-5.5.0.tar.gz
-          printf '%s  %s\n' "$LUA55_SHA256" lua-5.5.0.tar.gz | sha256sum -c -
-          tar -xzf lua-5.5.0.tar.gz
-          make -C lua-5.5.0 linux \
-            MYCFLAGS="-fPIC" \
-            MYLDFLAGS="-fPIC"
-          make -C lua-5.5.0 install \
-            INSTALL_TOP="$RUNNER_TEMP/lua55"
-
+        uses: ./.github/actions/lua55
       - name: Configure sanitized native backend
         run: |
           cmake -S . -B build -G Ninja \

@@ -171,20 +171,45 @@ jobs:
           path: ${{ github.workspace }}/.ci/vcpkg-archives
           key: vcpkg-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ steps.provenance.outputs.vcpkg }}-x64-windows-v1
 
+      - name: Restore the MSVC Lua 5.4.8 build
+        id: lua-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ci/windows-msvc-native/lua
+          # Same key shape as the JSON job: source checksum plus toolset. The
+          # two jobs keep separate prefixes, so they do not share an entry.
+          key: lua-msvc-5.4.8-native-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae-v1
+
       - name: Build Lua 5.4.8 with MSVC
+        if: steps.lua-cache.outputs.cache-hit != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
           & .\tools\windows\compile-lua-msvc.ps1 `
             -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
             -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua"
           if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+
+      - name: Verify the MSVC Lua 5.4.8 toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
           $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua"
           dumpbin.exe /headers "$lua\lua54.dll" | Select-String '8664 machine' | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Lua DLL is not PE x64' }
+          $versionOutput = & "$lua\lua.exe" -v 2>&1
+          if ($LASTEXITCODE -ne 0 -or "$versionOutput" -notmatch 'Lua 5\.4\.8') {
+            throw "Unexpected Lua interpreter result: $versionOutput"
+          }
           "LUA_INCLUDE_DIR=$lua" >> $env:GITHUB_ENV
           "LUA_LIBRARY=$lua\lua54.lib" >> $env:GITHUB_ENV
           "LUA_EXECUTABLE=$lua\lua.exe" >> $env:GITHUB_ENV
           "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Save the MSVC Lua 5.4.8 build
+        if: steps.lua-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ci/windows-msvc-native/lua
+          key: lua-msvc-5.4.8-native-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae-v1
 
       - name: Restore the pinned static TDLib package and codegen tools
         id: tdlib-cache
@@ -528,8 +553,8 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Windows registers 34 tests: the Linux native baseline plus the
-          # platform-specific tdlua_windows_residency.
+          # Native Windows registers 42 tests: the Linux native baseline plus the
+          # platform-specific tdlua_windows_residency and the readiness tests.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
             'tdlua_managed_metatable_oom', 'tdlua_json_push_oom',
@@ -545,13 +570,18 @@ jobs:
             'tdlua_failure_cleanup_phases',
             'tdlua_async', 'tdlua_backend_parity', 'tdlua_e2e_smoke',
             'tdlua_managed_driver_backend', 'tdlua_windows_residency',
-            'tdlua_failure_atomicity'
+            'tdlua_failure_atomicity',
+            'tdlua_readiness_watch', 'tdlua_readiness_watch_oom',
+            'tdlua_readiness_core', 'tdlua_readiness_buffering',
+            'tdlua_readiness_handler_only',
+            'tdlua_readiness_deadline', 'tdlua_backend_readiness',
+            'tdlua_readiness_c_abi'
           )
           $delta = Compare-Object @($expected | Sort-Object) @($testNames | Sort-Object)
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 34-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 42-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -578,8 +608,8 @@ jobs:
           # The manifest gate pins the registered set; this pins the executed
           # result, so a silently skipped test cannot pass as green.
           $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
-          if ($summary -notmatch '0 tests failed out of 34') {
-            throw 'The native CTest suite did not report 34/34: inspect ctest-full.log'
+          if ($summary -notmatch '0 tests failed out of 42') {
+            throw 'The native CTest suite did not report 42/42: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.
@@ -593,6 +623,8 @@ jobs:
             tdlua_lifecycle = 20
             tdlua_managed_driver_backend = 20
             tdlua_windows_residency = 20
+            tdlua_readiness_core = 20
+            tdlua_readiness_c_abi = 20
           }
           foreach ($name in $repeats.Keys) {
             $count = $repeats[$name]
@@ -625,6 +657,7 @@ jobs:
           $exports = dumpbin.exe /exports $module
           $exports | Tee-Object -FilePath .ci\windows-msvc-native\tdlua-exports-production.log
           if (($exports | Select-String 'luaopen_tdlua').Count -lt 1) { throw 'production luaopen_tdlua export missing' }
+          if (($exports | Select-String 'tdlua_readiness_acquire').Count -lt 1) { throw 'production readiness ABI export missing' }
           if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') {
             throw 'test-only accessor leaked into the production native DLL'
           }
@@ -798,6 +831,7 @@ jobs:
           if ($extractedSha -ne $moduleSha) { throw 'extracted module hash differs from manifest' }
           $exports = dumpbin.exe /exports $extractedModule
           if (($exports | Select-String 'luaopen_tdlua').Count -lt 1) { throw 'extracted package has no luaopen_tdlua export' }
+          if (($exports | Select-String 'tdlua_readiness_acquire').Count -lt 1) { throw 'extracted package has no readiness ABI export' }
           if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') { throw 'test accessor found in extracted package' }
           $env:PATH = "$extracted;$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;C:\Windows\system32;C:\Windows"
           $env:LUA_CPATH = "$extracted\?.dll"

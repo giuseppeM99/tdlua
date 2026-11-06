@@ -1,0 +1,81 @@
+name: Build Lua 5.5
+description: >-
+  Restore or build Lua 5.5 with a checksum-pinned source archive. The source
+  tarball and the installed prefix are cached across runs so a transient
+  lua.org download failure cannot fail the job.
+
+inputs:
+  version:
+    description: Lua version
+    required: false
+    default: "5.5.0"
+  sha256:
+    description: Expected SHA-256 of the source archive
+    required: false
+    default: "57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d"
+
+outputs:
+  prefix:
+    description: Installation prefix containing bin/lua
+    value: ${{ steps.paths.outputs.prefix }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve prefix
+      id: paths
+      shell: bash
+      run: echo "prefix=$RUNNER_TEMP/lua55" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Lua 5.5 source and prefix
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.temp }}/lua-5.5.0.tar.gz
+          ${{ runner.temp }}/lua55
+        key: lua55-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ inputs.sha256 }}-v1
+
+    - name: Download, verify and build Lua 5.5
+      shell: bash
+      run: |
+        set -euo pipefail
+        prefix="$RUNNER_TEMP/lua55"
+        archive="$RUNNER_TEMP/lua-5.5.0.tar.gz"
+        if [ -x "$prefix/bin/lua" ]; then
+          echo "restored Lua 5.5 prefix: $prefix"
+          "$prefix/bin/lua" -v
+          exit 0
+        fi
+        if [ ! -s "$archive" ]; then
+          url="https://www.lua.org/ftp/lua-${{ inputs.version }}.tar.gz"
+          for attempt in 1 2 3 4 5; do
+            echo "download attempt $attempt: $url"
+            if curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+                 --connect-timeout 20 --max-time 300 \
+                 -o "$archive" "$url"; then
+              break
+            fi
+            rm -f "$archive"
+            sleep $((attempt * 5))
+          done
+        fi
+        test -s "$archive"
+        printf '%s  %s\n' "${{ inputs.sha256 }}" "$archive" | sha256sum -c -
+        rm -rf "$RUNNER_TEMP/lua55-src" "$prefix"
+        mkdir -p "$RUNNER_TEMP/lua55-src"
+        tar -xzf "$archive" -C "$RUNNER_TEMP/lua55-src" --strip-components=1
+        make -C "$RUNNER_TEMP/lua55-src" linux \
+          MYCFLAGS="-fPIC" \
+          MYLDFLAGS="-fPIC"
+        make -C "$RUNNER_TEMP/lua55-src" install INSTALL_TOP="$prefix"
+        "$prefix/bin/lua" -v
+
+    - name: Save Lua 5.5 source and prefix
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.temp }}/lua-5.5.0.tar.gz
+          ${{ runner.temp }}/lua55
+        key: lua55-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ inputs.sha256 }}-v1

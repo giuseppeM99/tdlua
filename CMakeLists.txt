@@ -25,6 +25,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(TDLUA_BASE_VERSION "${PROJECT_VERSION}")
 option(TDLUA_BUILD_TESTS "Build TDLua regression tests" ON)
+option(TDLUA_BUILD_LIBUV_POC "Build the E1.4A libuv readiness proof of concept" OFF)
+option(TDLUA_BUILD_CQUEUES_TEST "Build the opt-in cqueues readiness adapter test" OFF)
+option(TDLUA_BUILD_BENCHMARK "Build the opt-in real-TDLib readiness benchmark" OFF)
+option(TDLUA_BUILD_CABI_REAL_HOST "Build the opt-in real-TDLib C ABI host test" OFF)
+set(TDLUA_CQUEUES_PREFIX "" CACHE STRING
+    "Install prefix containing cqueues for the cqueues readiness test")
 option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 set(TDLUA_TDLIB_CODEGEN_BUILD_DIR "" CACHE PATH
     "Existing bundled TDLua build containing TDLib native codec tools (required for native builds with TDLUA_BUNDLED_TDLIB=OFF)")
@@ -428,6 +434,8 @@ else()
   )
 endif()
 list(APPEND tdlua_srcs "src/common/module_residency.cpp")
+# Host C ABI: compiled once per backend, exports opaque readiness handles.
+list(APPEND tdlua_srcs "src/host/readiness_c.cpp")
 
 if(_tdlua_backend STREQUAL "native")
   if(NOT _tdlua_native_td_include_dirs)
@@ -529,6 +537,11 @@ if(_tdlua_backend STREQUAL "native")
   add_dependencies(tdlua tdlua_native_generated)
 endif()
 target_link_libraries(tdlua PRIVATE ${LUA_LIBRARIES})
+if(WIN32)
+    # WakeTarget uses Winsock in both test and production builds; keep the
+    # coupling outside TDLUA_BUILD_TESTS so the production module links too.
+    target_link_libraries(tdlua PRIVATE Ws2_32)
+endif()
 tdlua_enable_sanitizers(tdlua)
 if(_tdlua_backend STREQUAL "native")
   target_compile_features(tdlua PRIVATE cxx_std_23)
@@ -681,6 +694,12 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/tdluaConfigVersion.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/tdlua"
 )
+# The readiness C ABI is a supported external surface. Its header is standalone
+# (no Lua or TDLib includes) and ships with the module, so a C or C++ host can
+# compile against an installed package. The symbols stay inside the module:
+# there is no separate library to install or link.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/tdlua/host/readiness_c.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tdlua/host")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
 # TDLib ends up inside the module for both backends: statically from the bundle
@@ -806,6 +825,235 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_receiver_runtime COMMAND tdlua_receiver_runtime_test)
         add_test(NAME tdlua_receiver_generic_fifo_metadata
             COMMAND tdlua_receiver_runtime_test --generic-fifo-metadata-only)
+
+        add_executable(tdlua_readiness_watch_test tests/readiness_watch_test.cpp)
+        target_include_directories(tdlua_readiness_watch_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_watch_test PRIVATE Threads::Threads)
+        target_compile_definitions(tdlua_readiness_watch_test PRIVATE TDLUA_TESTING)
+        set_target_properties(tdlua_readiness_watch_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_readiness_watch_test)
+        add_test(NAME tdlua_readiness_watch COMMAND tdlua_readiness_watch_test)
+        set_tests_properties(tdlua_readiness_watch PROPERTIES TIMEOUT 60)
+
+        add_executable(tdlua_readiness_watch_oom_test
+            tests/readiness_watch_oom_test.cpp)
+        target_include_directories(tdlua_readiness_watch_oom_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_watch_oom_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_readiness_watch_oom_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_readiness_watch_oom_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        add_test(NAME tdlua_readiness_watch_oom
+            COMMAND tdlua_readiness_watch_oom_test)
+        set_tests_properties(tdlua_readiness_watch_oom PROPERTIES TIMEOUT 60)
+
+        add_executable(tdlua_readiness_core_test tests/readiness_core_test.cpp)
+        target_include_directories(tdlua_readiness_core_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_core_test PRIVATE Threads::Threads)
+        target_compile_definitions(tdlua_readiness_core_test PRIVATE TDLUA_TESTING)
+        set_target_properties(tdlua_readiness_core_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_readiness_core_test)
+        add_test(NAME tdlua_readiness_core COMMAND tdlua_readiness_core_test)
+        set_tests_properties(tdlua_readiness_core PROPERTIES TIMEOUT 300)
+
+        add_executable(tdlua_readiness_buffering_test
+            tests/readiness_buffering_test.cpp)
+        target_include_directories(tdlua_readiness_buffering_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_buffering_test PRIVATE Threads::Threads)
+        target_compile_definitions(tdlua_readiness_buffering_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_readiness_buffering_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_readiness_buffering_test)
+        add_test(NAME tdlua_readiness_buffering
+            COMMAND tdlua_readiness_buffering_test)
+        set_tests_properties(tdlua_readiness_buffering PROPERTIES TIMEOUT 120)
+
+        add_executable(tdlua_readiness_handler_only_test
+            tests/readiness_handler_only_test.cpp)
+        target_include_directories(tdlua_readiness_handler_only_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_handler_only_test PRIVATE
+            Threads::Threads)
+        target_compile_definitions(tdlua_readiness_handler_only_test PRIVATE
+            TDLUA_TESTING)
+        set_target_properties(tdlua_readiness_handler_only_test PROPERTIES
+            CXX_STANDARD 11
+            CXX_STANDARD_REQUIRED YES)
+        tdlua_enable_sanitizers(tdlua_readiness_handler_only_test)
+        add_test(NAME tdlua_readiness_handler_only
+            COMMAND tdlua_readiness_handler_only_test)
+        set_tests_properties(tdlua_readiness_handler_only PROPERTIES TIMEOUT 120)
+
+        add_executable(tdlua_readiness_deadline_test
+            tests/readiness_deadline_test.cpp)
+        target_include_directories(tdlua_readiness_deadline_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_readiness_deadline_test PRIVATE ${LUA_LIBRARIES})
+        target_compile_features(tdlua_readiness_deadline_test PRIVATE cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_readiness_deadline_test)
+        add_test(NAME tdlua_readiness_deadline
+            COMMAND tdlua_readiness_deadline_test)
+        set_tests_properties(tdlua_readiness_deadline PROPERTIES TIMEOUT 60)
+
+        add_executable(tdlua_backend_readiness_test tests/backend_readiness_test.cpp)
+        target_include_directories(tdlua_backend_readiness_test PRIVATE
+            ${LUA_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_backend_readiness_test PRIVATE
+            TDLUA_TESTING)
+        if(_tdlua_backend STREQUAL "json")
+            target_compile_definitions(tdlua_backend_readiness_test PRIVATE
+                TDLUA_TEST_BACKEND_JSON)
+        else()
+            target_compile_definitions(tdlua_backend_readiness_test PRIVATE
+                TDLUA_TEST_BACKEND_NATIVE)
+            target_include_directories(tdlua_backend_readiness_test PRIVATE
+                "${TDLUA_NATIVE_GENERATED_DIR}"
+                "${_tdlua_native_td_include_dirs}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/td")
+        endif()
+        target_link_libraries(tdlua_backend_readiness_test PRIVATE
+            tdlua ${LUA_LIBRARIES} Threads::Threads)
+        target_compile_features(tdlua_backend_readiness_test PRIVATE cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_backend_readiness_test)
+        add_test(NAME tdlua_backend_readiness
+            COMMAND tdlua_backend_readiness_test)
+        set_tests_properties(tdlua_backend_readiness PROPERTIES TIMEOUT 300)
+
+        # Pure C test: it includes only the host header, Lua and the test-only
+        # fake source hook, so it proves the ABI is usable without C++.
+        add_executable(tdlua_readiness_c_abi_test tests/readiness_c_abi_test.c)
+        target_include_directories(tdlua_readiness_c_abi_test PRIVATE
+            ${LUA_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        if(_tdlua_backend STREQUAL "json")
+            target_compile_definitions(tdlua_readiness_c_abi_test PRIVATE
+                TDLUA_TESTING TDLUA_TEST_BACKEND_JSON)
+        else()
+            target_compile_definitions(tdlua_readiness_c_abi_test PRIVATE
+                TDLUA_TESTING TDLUA_TEST_BACKEND_NATIVE)
+        endif()
+        target_link_libraries(tdlua_readiness_c_abi_test PRIVATE
+            tdlua ${LUA_LIBRARIES} Threads::Threads)
+        target_compile_features(tdlua_readiness_c_abi_test PRIVATE c_std_11)
+        tdlua_enable_sanitizers(tdlua_readiness_c_abi_test)
+        add_test(NAME tdlua_readiness_c_abi
+            COMMAND tdlua_readiness_c_abi_test)
+        set_tests_properties(tdlua_readiness_c_abi PROPERTIES TIMEOUT 300)
+
+        if(TDLUA_BUILD_LIBUV_POC)
+            find_package(PkgConfig REQUIRED)
+            pkg_check_modules(TDLUA_LIBUV REQUIRED IMPORTED_TARGET libuv)
+            add_executable(tdlua_libuv_readiness_poc
+                tests/libuv_readiness_poc.c)
+            target_include_directories(tdlua_libuv_readiness_poc PRIVATE
+                ${LUA_INCLUDE_DIRS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            if(_tdlua_backend STREQUAL "json")
+                target_compile_definitions(tdlua_libuv_readiness_poc PRIVATE
+                    TDLUA_TEST_BACKEND_JSON)
+            else()
+                target_compile_definitions(tdlua_libuv_readiness_poc PRIVATE
+                    TDLUA_TEST_BACKEND_NATIVE)
+            endif()
+            target_link_libraries(tdlua_libuv_readiness_poc PRIVATE
+                tdlua ${LUA_LIBRARIES} PkgConfig::TDLUA_LIBUV
+                Threads::Threads)
+            target_compile_features(tdlua_libuv_readiness_poc PRIVATE c_std_11)
+            tdlua_enable_sanitizers(tdlua_libuv_readiness_poc)
+            add_test(NAME tdlua_libuv_readiness_poc
+                COMMAND tdlua_libuv_readiness_poc)
+            set_tests_properties(tdlua_libuv_readiness_poc PROPERTIES TIMEOUT 60)
+        endif()
+
+        if(TDLUA_BUILD_BENCHMARK)
+            add_executable(tdlua_readiness_benchmark
+                tests/readiness_benchmark.cpp)
+            target_include_directories(tdlua_readiness_benchmark PRIVATE
+                ${LUA_INCLUDE_DIRS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_compile_definitions(tdlua_readiness_benchmark PRIVATE
+                TDLUA_TESTING)
+            target_link_libraries(tdlua_readiness_benchmark PRIVATE
+                tdlua ${LUA_LIBRARIES} Threads::Threads)
+            target_compile_features(tdlua_readiness_benchmark PRIVATE
+                cxx_std_11)
+        endif()
+
+        if(TDLUA_BUILD_CABI_REAL_HOST)
+            # Real TDLib through the C ABI, no FakeSource and no test hook.
+            add_executable(tdlua_cabi_real_host_test
+                tests/cabi_real_host_test.cpp)
+            target_include_directories(tdlua_cabi_real_host_test PRIVATE
+                ${LUA_INCLUDE_DIRS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            target_link_libraries(tdlua_cabi_real_host_test PRIVATE
+                tdlua ${LUA_LIBRARIES} Threads::Threads)
+            target_compile_features(tdlua_cabi_real_host_test PRIVATE
+                cxx_std_11)
+            tdlua_enable_sanitizers(tdlua_cabi_real_host_test)
+            add_test(NAME tdlua_cabi_real_host
+                COMMAND tdlua_cabi_real_host_test)
+            set_tests_properties(tdlua_cabi_real_host PROPERTIES TIMEOUT 30)
+        endif()
+
+        if(TDLUA_BUILD_CQUEUES_TEST)
+            # Opt-in: cqueues is not a production or default-test dependency.
+            # The launcher embeds Lua, registers the C ABI bridge and runs the
+            # pure-Lua pollable adapter scenarios.
+            add_executable(tdlua_cqueues_readiness_test
+                tests/cqueues_readiness_test.cpp)
+            target_include_directories(tdlua_cqueues_readiness_test PRIVATE
+                ${LUA_INCLUDE_DIRS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_link_libraries(tdlua_cqueues_readiness_test PRIVATE
+                ${LUA_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
+            target_compile_features(tdlua_cqueues_readiness_test PRIVATE
+                cxx_std_11)
+            tdlua_enable_sanitizers(tdlua_cqueues_readiness_test)
+            add_test(NAME tdlua_cqueues_readiness
+                COMMAND tdlua_cqueues_readiness_test
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/cqueues_readiness_adapter.lua"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/cqueues_readiness_test.lua")
+            if(TDLUA_CQUEUES_PREFIX)
+                set_tests_properties(tdlua_cqueues_readiness PROPERTIES
+                    ENVIRONMENT "TDLUA_CQUEUES_PREFIX=${TDLUA_CQUEUES_PREFIX}")
+            endif()
+            set_tests_properties(tdlua_cqueues_readiness PROPERTIES TIMEOUT 120)
+        endif()
+
+        if(WIN32)
+            # WakeTarget uses Winsock on Windows. The module and every test
+            # that instantiates the readiness view need Ws2_32 explicitly.
+            foreach(_tdlua_readiness_target
+                    tdlua
+                    tdlua_readiness_watch_test
+                    tdlua_readiness_watch_oom_test
+                    tdlua_readiness_core_test
+                    tdlua_readiness_buffering_test
+                    tdlua_readiness_handler_only_test
+                    tdlua_cqueues_readiness_test
+                    tdlua_backend_readiness_test)
+                if(TARGET ${_tdlua_readiness_target})
+                    target_link_libraries(${_tdlua_readiness_target} PRIVATE Ws2_32)
+                endif()
+            endforeach()
+        endif()
 
         add_executable(tdlua_receiver_lifecycle_ownership_test
             tests/receiver_lifecycle_ownership_test.cpp)
@@ -1316,6 +1564,7 @@ endif()
 foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test tdlua_lua51_managed_test tdlua_codec_test tdlua_managed_adapter_test tdlua_managed_cache_test
         tdlua_common_router_test
         tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
+        tdlua_readiness_deadline_test tdlua_backend_readiness_test
         tdlua_simple_bot_example_test tdlua_async_demo_test
         tdlua_native_codec_test tdlua_native_decoder_safety_test
         tdlua_model_benchmark)

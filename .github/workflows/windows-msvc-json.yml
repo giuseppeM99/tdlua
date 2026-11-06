@@ -300,22 +300,48 @@ jobs:
           path: .ci/windows-msvc/tdlib
           key: tdlib-msvc-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-${{ env.TDLIB_COMMIT }}-${{ steps.provenance.outputs.schema }}-${{ steps.provenance.outputs.vcpkg }}-release-shared-${{ hashFiles('td/CMakeLists.txt', '.github/workflows/windows-msvc-json.yml') }}
 
+      - name: Restore the MSVC Lua 5.4.8 build
+        id: lua-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ci/windows-msvc/lua
+          # The key pins the Lua source checksum and the toolset: a cached
+          # import library is only reused by the same compiler and SDK. No
+          # restore-keys, so a near miss rebuilds instead of mixing prefixes.
+          key: lua-msvc-5.4.8-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae-v1
+
       - name: Build Lua 5.4.8 with MSVC
+        if: steps.lua-cache.outputs.cache-hit != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
           & .\tools\windows\compile-lua-msvc.ps1 `
             -WorkDirectory "$env:RUNNER_TEMP\lua-msvc" `
             -InstallDirectory "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
           if ($LASTEXITCODE -ne 0) { throw "Lua build script failed: $LASTEXITCODE" }
+
+      - name: Verify the MSVC Lua 5.4.8 toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
           $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
           dumpbin.exe /headers "$lua\lua54.dll" | Tee-Object -FilePath .ci\windows-msvc\lua-headers.log
           dumpbin.exe /headers "$lua\lua54.dll" | Select-String '8664 machine' | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Lua DLL is not PE x64' }
           dumpbin.exe /dependents "$lua\lua54.dll" | Tee-Object -FilePath .ci\windows-msvc\lua-dependencies.log
+          $versionOutput = & "$lua\lua.exe" -v 2>&1
+          if ($LASTEXITCODE -ne 0 -or "$versionOutput" -notmatch 'Lua 5\.4\.8') {
+            throw "Unexpected Lua interpreter result: $versionOutput"
+          }
           "LUA_INCLUDE_DIR=$lua" >> $env:GITHUB_ENV
           "LUA_LIBRARY=$lua\lua54.lib" >> $env:GITHUB_ENV
           "LUA_EXECUTABLE=$lua\lua.exe" >> $env:GITHUB_ENV
           "PATH=$lua;$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Save the MSVC Lua 5.4.8 build
+        if: steps.lua-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ci/windows-msvc/lua
+          key: lua-msvc-5.4.8-${{ runner.os }}-${{ runner.arch }}-cl${{ steps.provenance.outputs.cl }}-sdk${{ steps.provenance.outputs.sdk }}-4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae-v1
 
       - name: Configure and build TDLua JSON MSVC
         id: tdlua-build
@@ -402,15 +428,20 @@ jobs:
             'tdlua_failure_cleanup_phases',
             'tdlua_async',
             'tdlua_backend_parity', 'tdlua_e2e_smoke', 'tdlua_managed_driver_backend',
-            'tdlua_windows_residency', 'tdlua_failure_atomicity'
+            'tdlua_windows_residency', 'tdlua_failure_atomicity',
+            'tdlua_readiness_watch', 'tdlua_readiness_watch_oom',
+            'tdlua_readiness_core', 'tdlua_readiness_buffering',
+            'tdlua_readiness_handler_only',
+            'tdlua_readiness_deadline', 'tdlua_backend_readiness',
+            'tdlua_readiness_c_abi'
           )
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the expected 40-test set; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the expected 48-test set; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
-          $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency')
+          $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency', 'tdlua_readiness_core', 'tdlua_backend_readiness')
           foreach ($requiredTest in $requiredTests) {
             if ($testNames -notcontains $requiredTest) { throw "Required MSVC regression test is not registered: $requiredTest" }
           }
@@ -424,6 +455,10 @@ jobs:
           dumpbin.exe /exports $module | Tee-Object -FilePath .ci\windows-msvc\tdlua-exports-test.log
           dumpbin.exe /exports $module | Select-String 'luaopen_tdlua' | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'luaopen_tdlua export missing' }
+          if ((Get-Content .ci\windows-msvc\tdlua-exports-test.log |
+                Select-String 'tdlua_readiness_acquire').Count -lt 1) {
+            throw 'tdlua_readiness_acquire export missing'
+          }
           dumpbin.exe /exports $module | Select-String 'tdlua_json_test_control' | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'test-only JSON hooks were not exported' }
           & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
@@ -483,7 +518,8 @@ jobs:
             @{ Name = 'managed-driver-backend'; Pattern = '^tdlua_managed_driver_backend$'; Count = 20 },
             @{ Name = 'managed-adapter'; Pattern = '^tdlua_managed_adapter$'; Count = 100 },
             @{ Name = 'managed-routing-oom'; Pattern = '^tdlua_managed_routing_oom$'; Count = 100 },
-            @{ Name = 'windows-residency'; Pattern = '^tdlua_windows_residency$'; Count = 20 }
+            @{ Name = 'windows-residency'; Pattern = '^tdlua_windows_residency$'; Count = 20 },
+            @{ Name = 'readiness-c-abi'; Pattern = '^tdlua_readiness_c_abi$'; Count = 20 }
           )
           foreach ($test in $tests) {
             $log = ".ci\windows-msvc\repeat-$($test.Name).log"
@@ -538,6 +574,8 @@ jobs:
           $exports = dumpbin.exe /exports $prodModule
           $exports | Tee-Object -FilePath .ci\windows-msvc\tdlua-exports-production.log
           if (($exports | Select-String 'luaopen_tdlua').Count -ne 1) { throw 'production luaopen export missing' }
+          if (($exports | Select-String 'tdlua_readiness_acquire').Count -ne 1) { throw 'production readiness ABI export missing' }
+          if (($exports | Select-String 'tdlua_readiness_abi_version').Count -ne 1) { throw 'production readiness ABI version export missing' }
           if ($exports | Select-String 'tdlua_.*_test_|tdlua_test_live_scheduler') { throw 'test-only accessor leaked into production DLL' }
           dumpbin.exe /dependents $prodModule | Tee-Object -FilePath .ci\windows-msvc\tdlua-dependencies-production.log
           $env:LUA_CPATH = "$install\lib\lua\5.4\?.dll"
@@ -545,6 +583,38 @@ jobs:
           & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
+
+      - name: Run real luv adapter on Windows x64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lua = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua"
+          $rocks = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\eventloop-rocks"
+          # LuaRocks expects a conventional prefix; the Lua build script
+          # installs flat, so expose bin/include/lib without touching the
+          # already-built module.
+          New-Item -ItemType Directory -Force "$lua\bin", "$lua\include", "$lua\lib" | Out-Null
+          Copy-Item "$lua\lua.exe" "$lua\bin\lua.exe" -Force
+          Copy-Item "$lua\lua54.lib" "$lua\lib\lua54.lib" -Force
+          foreach ($header in @('lua.h', 'luaconf.h', 'lualib.h', 'lauxlib.h')) {
+            Copy-Item "$lua\$header" "$lua\include\$header" -Force
+          }
+          $lrRoot = "$env:RUNNER_TEMP\luarocks"
+          $zip = "$env:RUNNER_TEMP\luarocks.zip"
+          Invoke-WebRequest -Uri 'https://luarocks.github.io/luarocks/releases/luarocks-3.13.0-windows-64.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $lrRoot -Force
+          $lr = Get-ChildItem $lrRoot -Filter luarocks.exe -Recurse | Select-Object -First 1
+          if (-not $lr) { throw 'luarocks.exe not found' }
+          $env:PATH = "$lua;$env:PATH"
+          & $lr.FullName --lua-version=5.4 --lua-dir="$lua" --tree="$rocks" install luv 1.53.0-1
+          if ($LASTEXITCODE -ne 0) { throw "luv install failed: $LASTEXITCODE" }
+          $install = "$env:RUNNER_TEMP\tdlua-msvc-install\lib\lua\5.4"
+          $env:LUA_CPATH = "$rocks\lib\lua\5.4\?.dll;$install\?.dll"
+          $env:LUA_PATH = "$rocks\share\lua\5.4\?.lua;$rocks\share\lua\5.4\?/init.lua;$env:GITHUB_WORKSPACE\?.lua;$env:GITHUB_WORKSPACE\?/init.lua"
+          $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$lua;$install;$env:PATH"
+          for ($i = 1; $i -le 20; $i++) {
+            & $env:LUA_EXECUTABLE tests\eventloop_luv_windows.lua
+            if ($LASTEXITCODE -ne 0) { throw "event loop probe failed at iteration $i" }
+          }
 
       - name: Package the Windows x64 JSON module
         run: |

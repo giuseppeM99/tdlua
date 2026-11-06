@@ -51,7 +51,7 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
-          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
           ls -l
 
       - name: Publish GitHub release
