@@ -243,17 +243,46 @@ do
     equal(driver.stopped, 1, "stop is idempotent")
 end
 
-print("B7  stalled state stops without a busy loop")
+print("B7  a non-fatal stall is diagnostic and keeps the adapter alive")
 do
     local uv = new_mock_uv()
-    local driver = FakeDriver.new({{state = "stalled", deadline = 0}})
-    local adapter = LuvAdapter.new(driver, {uv = uv})
+    local driver = FakeDriver.new({{state = "stalled", deadline = 0,
+                                    fatal = false}})
+    local stalls = {}
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stall = function(s)
+        stalls[#stalls + 1] = s
+    end})
     uv.last_timer().callback()
-    check(adapter:is_stopped(), "adapter stopped on stall")
-    check(adapter.stalled ~= nil, "stalled state retained")
-    check(uv.last_poll().closed and uv.last_timer().closed,
-          "handles closed")
+    check(not adapter:is_stopped(), "adapter keeps running on a stall")
+    equal(#stalls, 1, "stall notified once")
+    check(not uv.last_poll().closed, "poll still open")
+    local timer = uv.last_timer()
+    check(timer.active, "bounded retry armed")
+    equal(timer.delay, 10, "retry uses retry_delay, not zero")
+    equal(adapter:stats().stalls, 1, "stall counted in stats")
     adapter:stop()
+end
+
+print("B7b  a fatal stall stops and notifies on_stop")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "stalled", deadline = 0,
+                                    fatal = true}})
+    local events = {}
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function(r, d)
+        events[#events + 1] = {reason = r, detail = d}
+    end})
+    uv.last_timer().callback()
+    check(adapter:is_stopped(), "adapter stopped on a fatal stall")
+    check(adapter.stalled ~= nil, "stalled state retained")
+    check(uv.last_poll().closed and uv.last_timer().closed, "handles closed")
+    equal(#events, 1, "one notification")
+    equal(events[1].reason, "stalled", "reason is stalled")
+    local ok, err = adapter:run()
+    check(ok == nil and err == "stalled",
+          "run still reports a fatal stall (" .. tostring(ok) .. ")")
+    adapter:stop()
+    equal(#events, 1, "no second notification")
 end
 
 print("B8  stop closes handles before releasing readiness")
@@ -545,6 +574,192 @@ do
     check(timer.active, "add armed the timer")
     equal(timer.delay, 0, "add scheduled an immediate turn")
     adapter:stop()
+end
+
+-- H1: the terminal contract for host-managed loops.
+
+print("B28  a driver error notifies on_stop exactly once with the cause")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "error", error = "boom"}})
+    local events = {}
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function(r, d)
+        events[#events + 1] = {reason = r, detail = d}
+    end})
+    uv.last_timer().callback()
+    equal(#events, 1, "one notification")
+    equal(events[1].reason, "error", "reason is error")
+    equal(events[1].detail, "boom", "original cause preserved")
+    equal(adapter.error, "boom", "stats.error keeps the cause")
+    equal(adapter:stats().stop_reason, "error", "stats.stop_reason")
+    check(adapter:stats().notified, "stats.notified")
+end
+
+print("B29  driver closure notifies on_stop with reason closed")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "closed", deadline = math.huge}})
+    local events = {}
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function(r)
+        events[#events + 1] = r
+    end})
+    uv.last_timer().callback()
+    equal(#events, 1, "one notification")
+    equal(events[1], "closed", "reason is closed")
+end
+
+print("B30  a manual stop notifies once and repeated stop is silent")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({})
+    local events = {}
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function(r)
+        events[#events + 1] = r
+    end})
+    adapter:stop()
+    equal(#events, 1, "manual stop notified")
+    equal(events[1], "stopped", "reason is stopped")
+    adapter:stop()
+    adapter:stop()
+    equal(#events, 1, "repeated stop never re-notifies")
+    equal(adapter:stats().stop_reason, "stopped", "first cause wins")
+end
+
+print("B31  a raising terminal callback is captured, never propagated")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({})
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function()
+        error("notify exploded")
+    end})
+    local ok, err = pcall(adapter.stop, adapter)
+    check(ok, "stop did not raise: " .. tostring(err))
+    check(tostring(adapter:stats().notify_error):match("notify exploded"),
+          "callback error kept in stats")
+    check(adapter:is_stopped(), "adapter still stopped")
+end
+
+print("B32  no update is delivered after the terminal notification")
+do
+    local uv = new_mock_uv()
+    local client = fake_client(42, "a")
+    table.insert(client.queue, {id = 1})
+    local delivered = 0
+    local driver = Driver.new({on_update = function() delivered = delivered + 1 end})
+    driver:add(client)
+    local adapter = LuvAdapter.new(driver, {uv = uv})
+    adapter:stop()
+    uv.last_poll().callback(nil)
+    uv.last_timer().callback()
+    equal(delivered, 0, "stopped adapter delivered nothing")
+    adapter:stop()
+end
+
+print("B33  stop from inside on_stop is reentrant and silent")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "error", error = "boom"}})
+    local calls = 0
+    local adapter
+    adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function()
+        calls = calls + 1
+        adapter:stop()
+    end})
+    uv.last_timer().callback()
+    equal(calls, 1, "callback ran once")
+    check(adapter:is_stopped(), "adapter stopped")
+end
+
+print("B34  teardown happens before the notification")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "error", error = "boom"}})
+    local seen = {}
+    local adapter
+    adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function()
+        seen.poll_closed = uv.polls[1].closed
+        seen.timer_closed = uv.timers[1].closed
+        seen.driver_stopped = driver.stopped
+        seen.hook_removed = driver.on_kick == nil
+        seen.stopped = adapter:is_stopped()
+    end})
+    uv.last_timer().callback()
+    check(seen.poll_closed, "poll closed before the callback")
+    check(seen.timer_closed, "timer closed before the callback")
+    check(seen.driver_stopped and seen.driver_stopped > 0,
+          "driver stopped before the callback")
+    check(seen.hook_removed, "on_kick hook detached before the callback")
+    check(seen.stopped, "adapter already marked stopped")
+end
+
+print("B35  manual stop and a callback error in one turn: one notification")
+do
+    local uv = new_mock_uv()
+    local client = fake_client(42, "a")
+    table.insert(client.queue, {id = 1})
+    local events = {}
+    local adapter
+    local driver = Driver.new({on_update = function()
+        adapter:stop()
+        error("callback failed")
+    end})
+    driver:add(client)
+    adapter = LuvAdapter.new(driver, {uv = uv, on_stop = function(r, d)
+        events[#events + 1] = {reason = r, detail = d}
+    end})
+    uv.last_timer().callback()
+    equal(#events, 1, "exactly one notification")
+    equal(events[1].reason, "stopped", "the first cause wins")
+    check(tostring(adapter.error):match("callback failed"),
+          "the later error is still stored in stats")
+end
+
+print("B36  a non-fatal stall is not a terminal run() failure")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "stalled", deadline = 0,
+                                    fatal = false}})
+    local adapter = LuvAdapter.new(driver, {uv = uv, on_stall = function() end})
+    uv.last_timer().callback()
+    check(not adapter:is_stopped(), "still running after the stall")
+    adapter:stop()
+    local result, err = adapter:run()
+    equal(result, "ok", "run returns ok (" .. tostring(err) .. ")")
+    equal(adapter:stats().stop_reason, "stopped", "terminal cause preserved")
+    check(adapter:stats().stalled ~= nil, "stall history kept for diagnostics")
+end
+
+print("B37  closed and error results still follow the terminal cause")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "closed", deadline = math.huge}})
+    local adapter = LuvAdapter.new(driver, {uv = uv})
+    uv.last_timer().callback()
+    local result, err = adapter:run()
+    equal(result, "ok", "closed returns ok (" .. tostring(err) .. ")")
+
+    local uv2 = new_mock_uv()
+    local driver2 = FakeDriver.new({{state = "error", error = "boom"}})
+    local adapter2 = LuvAdapter.new(driver2, {uv = uv2})
+    uv2.last_timer().callback()
+    local ok, raised = pcall(adapter2.run, adapter2)
+    check(not ok and tostring(raised):match("boom"), "error still raises")
+end
+
+print("B38  a stop from on_stall leaves no synthetic error")
+do
+    local uv = new_mock_uv()
+    local driver = FakeDriver.new({{state = "stalled", deadline = 0,
+                                    fatal = false}})
+    local adapter
+    adapter = LuvAdapter.new(driver, {uv = uv, on_stall = function()
+        adapter:stop()
+    end})
+    uv.last_timer().callback()
+    check(adapter:is_stopped(), "adapter retired")
+    equal(adapter:stats().stop_reason, "stopped", "stop is the cause")
+    equal(adapter.error, nil, "no synthetic error")
+    equal(adapter:stats().notified, true, "notification delivered")
 end
 
 print(string.format("RESULT: %s (%d checks, %d failures)",

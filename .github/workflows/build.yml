@@ -329,6 +329,8 @@ jobs:
           lua5.4 tests/eventloop_luv_runtime.lua
           lua5.4 tests/eventloop_cqueues_runtime.lua
           lua5.4 tests/eventloop_luv_windows.lua
+          lua5.4 tests/eventloop_host_managed_runtime.lua
+          lua5.4 tests/eventloop_reconnect_runtime.lua
 
       - name: Run examples
         run: |
@@ -340,6 +342,7 @@ jobs:
           lua5.4 examples/eventloop_luv.lua
           lua5.4 examples/eventloop_cqueues.lua
           lua5.4 examples/eventloop_cqueues_external.lua
+          lua5.4 examples/eventloop_luv_reconnect.lua
 
       - name: Verify optional packaging payload
         run: |

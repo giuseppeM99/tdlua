@@ -152,6 +152,13 @@ local function new_driver(options)
     return Driver.new(options)
 end
 
+local function next_stall(driver, limit)
+    for _ = 1, limit do
+        if driver:tick().state == "stalled" then return true end
+    end
+    return false
+end
+
 print("A1  work queued before registration")
 do
     local source = Source.new()
@@ -943,6 +950,244 @@ do
     equal(#seen, 0, "no update is delivered after the stop")
     equal(a_calls, 1, "no further receive after the stop")
     equal(#source.queues.b, 1, "the second client queue is untouched")
+end
+
+-- H4: stalls are diagnostics, not a silent terminal state.
+
+print("A46  a default stall is diagnostic and the driver keeps running")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local updates = {}
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 3,
+                               on_update = function(_, update)
+        updates[#updates + 1] = update
+    end})
+    driver:add(client)
+    driver:tick(); driver:tick()
+    local stalled = driver:tick()
+    equal(stalled.state, "stalled", "stall reported")
+    equal(stalled.fatal, false, "not fatal by default")
+    check(not driver:is_stopped(), "driver is still alive")
+
+    local retry = driver:tick()
+    equal(retry.state, "again", "after the report the driver retries")
+    check(retry.deadline > 0, "retry is bounded, not a zero-delay spin")
+    equal(driver:diagnostics().stalls, 1, "one stall episode counted")
+
+    source.work = false
+    client:push({id = "late"})
+    local result = driver:tick()
+    equal(result.updates, 1, "a later legitimate event is still delivered")
+    equal(updates[1].id, "late", "same event identity")
+    driver:stop()
+end
+
+print("A47  stall_fatal keeps the old terminal behaviour, opt-in")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               stall_fatal = true,
+                               on_update = function() end})
+    driver:add(client)
+    driver:tick()
+    local result = driver:tick()
+    equal(result.state, "stalled", "stalled")
+    equal(result.fatal, true, "fatal is set")
+    local again = driver:tick()
+    equal(again.state, "stalled", "the terminal state is stable")
+    equal(driver:diagnostics().stalls, 1, "the episode is counted once")
+    driver:stop()
+end
+
+print("A48  a stall is reported once per episode")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               on_update = function() end})
+    driver:add(client)
+    local states = {}
+    for index = 1, 6 do states[index] = driver:tick().state end
+    equal(states[1], "again", "turn 1")
+    equal(states[2], "stalled", "turn 2 reports")
+    equal(states[3], "again", "turn 3 retries without repeating")
+    equal(states[6], "again", "still retrying")
+    equal(driver:diagnostics().stalls, 1, "single episode")
+    driver:stop()
+end
+
+print("A49  progress() starts a new episode; kick() and churn do not")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               on_update = function() end})
+    local function next_stall(limit)
+        for _ = 1, limit do
+            if driver:tick().state == "stalled" then return true end
+        end
+        return false
+    end
+    driver:add(client)
+    check(next_stall(10), "first episode reported")
+    driver:kick()
+    check(not next_stall(6), "a kick does not re-notify the same episode")
+    equal(driver:diagnostics().stalls, 1, "still one episode")
+    driver:progress()
+    check(next_stall(10), "progress() starts a new episode")
+    equal(driver:diagnostics().stalls, 2, "two episodes")
+    local extra = Client.new(source, "b")
+    driver:add(extra)
+    driver:remove(extra)
+    check(not next_stall(6), "churn does not re-notify either")
+    equal(driver:diagnostics().stalls, 2, "still two episodes")
+    check(not driver:is_stopped(), "driver still alive")
+    driver:stop()
+end
+
+print("A50  an expired deadline with no progress is bounded, not fatal")
+do
+    local source = Source.new({deadline = 0})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               retry_delay = 0.01,
+                               on_update = function() end})
+    driver:add(client)
+    driver:tick()
+    local stalled = driver:tick()
+    equal(stalled.state, "stalled", "reported")
+    equal(stalled.fatal, false, "diagnostic by default")
+    local retry = driver:tick()
+    equal(retry.state, "again", "keeps retrying")
+    check(retry.deadline > 0, "with a non-zero delay")
+    check(not driver:is_stopped(), "driver still usable")
+    driver:stop()
+end
+
+print("A51  a delivered update resets the episode even when work drains")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local updates = {}
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               on_update = function(_, update)
+        updates[#updates + 1] = update
+    end})
+    driver:add(client)
+    driver:tick()
+    equal(driver:tick().state, "stalled", "first episode reported")
+    equal(driver:diagnostics().stalls, 1, "one episode")
+
+    -- The update drains the backlog, so the turn ends with work = false.
+    source.work = false
+    client:push({id = "drain"})
+    local turn = driver:tick()
+    equal(turn.updates, 1, "update delivered")
+    equal(turn.state, "sleep", "backlog is empty")
+    check(not driver:diagnostics().stall_reported,
+          "delivery reset the episode even without visible work left")
+
+    -- A new episode must be reportable again.
+    source.work = true
+    check(next_stall(driver, 10), "second episode reported")
+    equal(driver:diagnostics().stalls, 2, "two episodes")
+    driver:stop()
+end
+
+print("A52  a kicked turn that delivers an update also resets the episode")
+do
+    local source = Source.new({work = true})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               on_update = function() end})
+    driver:add(client)
+    driver:tick()
+    equal(driver:tick().state, "stalled", "first episode reported")
+    source.work = false
+    client:push({id = "kicked"})
+    driver:kick()
+    local turn = driver:tick()
+    equal(turn.updates, 1, "kicked turn delivered the update")
+    check(not driver:diagnostics().stall_reported, "episode reset")
+    driver:stop()
+end
+
+print("A52b a partial round that delivered updates is not also a stall")
+do
+    local source = Source.new({work = true})
+    local a = Client.new(source, "a")
+    local b = Client.new(source, "b")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 5,
+                               on_update = function() end})
+    driver:add(a); driver:add(b)
+    -- Two full rounds without progress build the stall history.
+    for _ = 1, 4 do driver:tick() end
+    equal(driver.idle_rounds, 2, "two idle rounds recorded")
+    a:push({id = "progress"})
+    local result = driver:tick()
+    equal(result.updates, 1, "partial round delivered an update")
+    equal(result.state, "again", "a delivering turn is not a stall")
+    equal(driver.idle_rounds, 0, "delivery reset the round history")
+    driver:stop()
+end
+
+print("A54  a kicked delivery clears stale idle history before the stall test")
+do
+    local source = Source.new({work = true})
+    local a = Client.new(source, "a")
+    local b = Client.new(source, "b")
+    local driver = new_driver({budget = 1, slice = 1, stall_after = 2,
+                               on_update = function() end})
+    driver:add(a); driver:add(b)
+    for _ = 1, 4 do driver:tick() end
+    equal(driver.idle_rounds, 2, "history built")
+    check(driver:diagnostics().stalls >= 1, "an episode was reported")
+
+    a:push({id = "kicked"})
+    driver:kick()
+    local turn = driver:tick()
+    equal(turn.updates, 1, "the kicked turn delivered")
+    equal(driver.idle_rounds, 0, "delivery cleared the stale history")
+    check(turn.state ~= "stalled",
+          "the delivering turn is not also a stall (" .. turn.state .. ")")
+    check(not driver:diagnostics().stall_reported, "episode closed")
+    driver:stop()
+end
+
+print("A55  work plus an unserviceable zero deadline is still bounded")
+do
+    local source = Source.new({work = true, deadline = 0})
+    local client = Client.new(source, "a")
+    local driver = new_driver({budget = 1, slice = 1,
+                               stall_after = math.huge,
+                               retry_delay = 0.01,
+                               on_update = function() end})
+    driver:add(client)
+    for index = 1, 5 do
+        local turn = driver:tick()
+        equal(turn.state, "again", "turn " .. index .. " is bounded")
+        check(turn.deadline > 0,
+              "turn " .. index .. " does not schedule zero delay")
+    end
+    driver:stop()
+end
+
+print("A53  retry_delay must be positive and finite")
+do
+    check(not pcall(Driver.new, {retry_delay = 0}),
+          "zero retry_delay is rejected")
+    check(not pcall(Driver.new, {retry_delay = -1}),
+          "negative retry_delay is rejected")
+    check(not pcall(Driver.new, {retry_delay = math.huge}),
+          "infinite retry_delay is rejected")
+    check(not pcall(Driver.new, {retry_delay = 1e-300}),
+          "an unrepresentable positive retry_delay is rejected")
+    check(not pcall(Driver.new, {retry_delay = 0.0005}),
+          "a sub-millisecond retry_delay is rejected")
+    check(pcall(Driver.new, {retry_delay = 0.001}),
+          "the documented minimum retry_delay is accepted")
 end
 
 print(string.format("RESULT: %s (%d checks, %d failures)",

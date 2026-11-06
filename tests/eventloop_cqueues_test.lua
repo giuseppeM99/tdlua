@@ -224,11 +224,11 @@ do
     driver:close_pair()
 end
 
-print("C6  stalled driver returns a diagnostic")
+print("C6  a fatal stalled driver returns a diagnostic")
 do
     local driver = FakeDriver.new({
         tick_fn = function()
-            return {state = "stalled", deadline = 0}
+            return {state = "stalled", deadline = 0, fatal = true}
         end,
     })
     local adapter = CqueuesAdapter.new(driver)
@@ -236,6 +236,31 @@ do
     equal(ok, nil, "run returns nil")
     equal(err, "stalled", "stalled diagnostic")
     check(adapter:is_stopped(), "adapter stopped")
+    driver:close_pair()
+end
+
+print("C6b  a non-fatal stall is notified once and keeps the controller alive")
+do
+    local stalls = 0
+    local tick = 0
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            tick = tick + 1
+            if tick == 1 then
+                return {state = "stalled", deadline = 0, fatal = false}
+            end
+            return {state = "closed", deadline = math.huge}
+        end,
+    })
+    local events = {}
+    local adapter = CqueuesAdapter.new(driver, {
+        on_stall = function() stalls = stalls + 1 end,
+        on_stop = function(reason) events[#events + 1] = reason end,
+    })
+    adapter:run()
+    equal(stalls, 1, "one stall notification")
+    equal(tick, 2, "the controller kept turning after the stall")
+    equal(events[1], "closed", "the later closure is the terminal cause")
     driver:close_pair()
 end
 
@@ -678,6 +703,345 @@ do
     driver:stop()
     pcall(pair.read.close, pair.read)
     pcall(pair.write.close, pair.write)
+end
+
+-- H1: terminal contract for application-owned controllers.
+
+print("C27  a driver error notifies on_stop once with the original cause")
+do
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            return {state = "error", error = "boom"}
+        end,
+    })
+    local events = {}
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        on_stop = function(r, d)
+            events[#events + 1] = {reason = r, detail = d,
+                                   kick_read = adapter.kick_read,
+                                   loop_running = adapter.loop_running}
+        end})
+    local ok, err = pcall(adapter.run, adapter)
+    check(not ok and tostring(err):match("boom"), "run still raises")
+    equal(#events, 1, "one notification")
+    equal(events[1].reason, "error", "reason is error")
+    equal(events[1].detail, "boom", "detail preserves the cause")
+    equal(adapter:stats().stop_reason, "error", "stats.stop_reason")
+    check(adapter:stats().notified, "stats.notified")
+    check(events[1].kick_read == nil,
+          "kick socketpair released before the callback")
+    equal(events[1].loop_running, false, "coroutine retired before the callback")
+    driver:close_pair()
+end
+
+print("C28  an attached controller error notifies the host")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local events = {}
+    local adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(r, d) events[#events + 1] = {reason = r, detail = d} end,
+    })
+    cq:wrap(function()
+        cqueues.sleep(0.01)
+        error("application controller failed", 0)
+    end)
+    local ok, err = cq:loop()
+    check(not ok and tostring(err):match("application controller"),
+          "controller reported the error")
+    check(adapter:controller_error(err), "host cleanup path accepted")
+    equal(#events, 1, "one notification")
+    equal(events[1].reason, "error", "reason is error")
+    check(tostring(events[1].detail):match("application controller"),
+          "detail carries the controller error")
+    driver:close_pair()
+end
+
+print("C29  stop then controller error never notifies twice")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local events = {}
+    local adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(r) events[#events + 1] = r end,
+    })
+    cq:wrap(function()
+        cqueues.sleep(0.01)
+        adapter:stop()
+        error("late controller failure", 0)
+    end)
+    local ok, err = cq:loop()
+    check(not ok and tostring(err):match("late controller"),
+          "the application coroutine failed")
+    equal(#events, 0, "no notification before the retirement completed")
+    check(adapter:controller_error(err), "cleanup accepted")
+    equal(#events, 1, "stop notified once, at retirement")
+    equal(events[1], "stopped", "manual stop is the terminal cause")
+    adapter:controller_error("late controller failure")
+    equal(#events, 1, "controller cleanup did not re-notify")
+    check(tostring(adapter.error):match("late controller failure"),
+          "the later cause is still diagnosable in stats")
+    driver:close_pair()
+end
+
+print("C30  a raising terminal callback is captured, never propagated")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function() error("notify exploded") end,
+    })
+    local ok = pcall(adapter.stop, adapter)
+    check(ok, "stop did not raise")
+    check(not adapter:stats().notified,
+          "an attached stop waits for a controller turn")
+    cq:loop()
+    check(tostring(adapter:stats().notify_error):match("notify exploded"),
+          "callback failure kept in stats")
+    driver:close_pair()
+end
+
+print("C31  stop from inside on_stop is reentrant and silent")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local calls = 0
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function() calls = calls + 1; adapter:stop() end,
+    })
+    adapter:stop()
+    equal(calls, 0, "no callback before the controller runs")
+    cq:loop()
+    equal(calls, 1, "callback ran once")
+    driver:close_pair()
+end
+
+print("C32  no update is delivered after the terminal notification")
+do
+    local pair = new_fd_pair()
+    local delivered = 0
+    local client = fake_client(pair.fd, "a")
+    table.insert(client.queue, {id = 1})
+    local driver = Driver.new({on_update = function() delivered = delivered + 1 end})
+    driver:add(client)
+    local adapter = CqueuesAdapter.new(driver, {on_stop = function() end})
+    adapter:stop()
+    adapter:controller_error(nil)
+    equal(delivered, 0, "stopped adapter delivered nothing")
+    pcall(pair.read.close, pair.read)
+    pcall(pair.write.close, pair.write)
+end
+
+print("C33  a manual stop from an application coroutine notifies after cleanup")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local seen = {}
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(reason)
+            seen.reason = reason
+            seen.kick_read = adapter.kick_read
+            seen.kick_write = adapter.kick_write
+            seen.loop_running = adapter.loop_running
+        end,
+    })
+    cq:wrap(function()
+        cqueues.sleep(0.01)
+        adapter:stop()
+        -- The notification must not have happened yet: the adapter coroutine
+        -- is still alive and the socketpair is still open.
+        seen.early = true
+    end)
+    cq:loop()
+    equal(seen.reason, "stopped", "reason is stopped")
+    check(seen.early, "the application coroutine ran")
+    check(seen.kick_read == nil and seen.kick_write == nil,
+          "socketpair released before the callback")
+    equal(seen.loop_running, false, "coroutine retired before the callback")
+    check(adapter:stats().notified, "exactly one notification")
+    driver:close_pair()
+end
+
+print("C34  a non-fatal stall is not a terminal run() failure")
+do
+    local tick = 0
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            tick = tick + 1
+            if tick == 1 then
+                return {state = "stalled", deadline = 0, fatal = false}
+            end
+            return {state = "sleep", deadline = math.huge}
+        end,
+    })
+    local adapter = CqueuesAdapter.new(driver, {on_stall = function() end})
+    local result, err = adapter:run(0.02)
+    equal(result, "ok", "a non-fatal stall does not fail run() (" ..
+          tostring(err) .. ")")
+    check(adapter:stats().stalled ~= nil, "stall history kept")
+    adapter:stop()
+    driver:close_pair()
+end
+
+print("C35  the notification runs after the adapter coroutine has exited")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local seen = {}
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(reason)
+            seen.reason = reason
+            seen.status = adapter.co and coroutine.status(adapter.co) or "dead"
+            seen.released = adapter.released
+            seen.kick_read = adapter.kick_read
+        end,
+    })
+    adapter:stop()
+    equal(seen.reason, nil, "no callback before a controller turn")
+    cq:loop()
+    equal(seen.reason, "stopped", "callback delivered on the controller turn")
+    equal(seen.status, "dead", "the adapter coroutine had exited")
+    equal(seen.released, true, "resources released before the callback")
+    check(seen.kick_read == nil, "socketpair already closed")
+    check(adapter:stats().registration_dead, "registration reported dead")
+    driver:close_pair()
+end
+
+print("C36  a natural driver error notifies after the coroutine exits")
+do
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            return {state = "error", error = "boom"}
+        end,
+    })
+    local seen = {}
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        on_stop = function(reason)
+            seen.reason = reason
+            seen.status = adapter.co and coroutine.status(adapter.co) or "dead"
+        end,
+    })
+    local ok, err = pcall(adapter.run, adapter)
+    check(not ok and tostring(err):match("boom"), "run raised")
+    equal(seen.reason, "error", "notification delivered")
+    equal(seen.status, "dead", "the adapter coroutine had exited")
+    check(adapter:stats().registration_dead, "registration reported dead")
+    driver:close_pair()
+end
+
+print("C37  a stop from on_stall is not turned into a synthetic error")
+do
+    local tick = 0
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            tick = tick + 1
+            if tick == 1 then
+                return {state = "stalled", deadline = 0, fatal = false}
+            end
+            return {state = "sleep", deadline = math.huge}
+        end,
+    })
+    local adapter
+    adapter = CqueuesAdapter.new(driver, {
+        on_stall = function() adapter:stop() end,
+    })
+    local ok, err = adapter:run()
+    check(ok, "run returned ok (" .. tostring(err) .. ")")
+    equal(adapter:stats().stop_reason, "stopped", "stop is the terminal cause")
+    equal(adapter.error, nil, "no synthetic readiness error")
+    check(adapter:is_stopped(), "adapter retired")
+    driver:close_pair()
+end
+
+print("C38  drain with nothing pending keeps the terminal result")
+do
+    local driver = FakeDriver.new({
+        tick_fn = function()
+            return {state = "stalled", deadline = 0, fatal = true}
+        end,
+    })
+    local adapter = CqueuesAdapter.new(driver)
+    local ok, err = adapter:run()
+    equal(ok, nil, "run reports the fatal stall")
+    equal(err, "stalled", "run cause")
+    local drained, drain_err = adapter:drain()
+    equal(drained, nil, "drain keeps the terminal result")
+    equal(drain_err, "stalled", "drain cause")
+    driver:close_pair()
+end
+
+print("C39  controller_error delivers a stop that was still pending")
+do
+    local driver = FakeDriver.new()
+    local cq = cqueues.new()
+    local events = {}
+    local adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(reason) events[#events + 1] = reason end,
+    })
+    adapter:stop()
+    equal(#events, 0, "the stop waits for a controller turn")
+    check(adapter.released, "the socketpair was already released")
+    check(adapter:controller_error("host failure before the first turn"),
+          "failure cleanup accepted with a pending notification")
+    equal(#events, 1, "the pending notification is delivered")
+    equal(events[1], "stopped", "the original terminal cause is preserved")
+    check(tostring(adapter:stats().error):match("host failure"),
+          "the controller error is stored separately")
+    equal(adapter:stats().registration_dead, false,
+          "the abandoned registration is reported")
+    driver:close_pair()
+end
+
+print("C40  a sub-resolution positive deadline is clamped, not spun")
+do
+    local driver = FakeDriver.new()
+    local adapter = CqueuesAdapter.new(driver)
+    adapter:_note_state({state = "again", deadline = 1e-12}, adapter:_now())
+    local delay = adapter:_timeout()
+    check(delay >= 0.0005, "tiny again deadline clamped (" ..
+          tostring(delay) .. ")")
+    adapter:_note_state({state = "sleep", deadline = 1e-12,
+                         reliable = true}, adapter:_now())
+    local sleep_delay = adapter:_timeout()
+    check(sleep_delay >= 0.0005, "tiny sleep deadline clamped (" ..
+          tostring(sleep_delay) .. ")")
+    adapter:stop()
+    driver:close_pair()
+end
+
+print("C41  a late controller_error after full retirement is a no-op")
+do
+    local driver = FakeDriver.new({on_kick = function() end})
+    local cq = cqueues.new()
+    local events = {}
+    local adapter = CqueuesAdapter.new(driver, {
+        cqueues = cqueues, controller = cq,
+        on_stop = function(reason) events[#events + 1] = reason end,
+    })
+    adapter:stop()
+    cq:loop()
+    equal(#events, 1, "one notification")
+    equal(events[1], "stopped", "original cause")
+    equal(adapter.loop_running, false, "no stale loop_running flag")
+    check(not adapter:controller_error("late host failure"),
+          "a fully retired adapter rejects late cleanup")
+    check(not adapter:controller_error("another late failure"),
+          "repeated late cleanup is still a no-op")
+    equal(#events, 1, "no second notification")
+    equal(adapter:stats().error, nil, "no late error recorded")
+    driver:close_pair()
 end
 
 print(string.format("RESULT: %s (%d checks, %d failures)",
