@@ -3,6 +3,131 @@
 
 # Changelog
 
+## 0.6.0
+
+### Host event-loop readiness
+
+- Added a host-facing readiness layer for external event loops. It observes
+  work without becoming a second consumer: updates are still delivered by the
+  existing `receive`, `poll`, `loop` and managed API on the Lua owner thread.
+- Persistent **watch demand** keeps the TDLib worker reading while no Lua call
+  is blocked. Watch demand is separate from consumer interest and does not by
+  itself retain unsolicited updates.
+- Readiness is tracked per Lua VM through the owner generation. After
+  `forget`, detach or `lua_close` the view reports the empty state without
+  dereferencing a dead Lua state.
+- Added a POSIX doorbell (`eventfd`, `socketpair` or pipe) and a Windows
+  `SOCKET` doorbell. The doorbell is a coalesced notification, not a counter;
+  the mailbox remains the source of truth.
+- Added an owner-local deadline: the minimum scheduler deadline across the
+  VM's clients, with `+inf` when no waiter has a deadline and `0` when one has
+  already expired. No timer thread is added; the host uses the value as its own
+  loop timeout.
+- `clear` must be followed by a `has_work` re-check before parking. The
+  readiness layer never consumes envelopes and never calls Lua from the
+  worker.
+
+### Lua readiness userdata
+
+- Added `client:readiness([bool | {generic = boolean}])`, a minimal
+  owner-thread userdata for pure-Lua event-loop adapters. It exposes `fd`,
+  `socket`, `has_work`, `clear`, `next_deadline`, `reliable`, `valid` and
+  `close`; it adds no event-loop dependency, no Lua queue and no second
+  mailbox consumer.
+- The handle acquires a persistent watch plus subscription interest on
+  creation. `generic = true` (default) retains unsolicited updates;
+  `generic = false` is handler-only. `close()` and `__gc` release both,
+  idempotently; the owner descriptor is never closed by the handle.
+- `has_work()` is owner-wide across every client of the VM. The POSIX `fd` and
+  the Windows `SOCKET` are exposed without unsafe narrowing; the
+  `clear()`/`has_work()` recheck protocol and the relative
+  `next_deadline()` are part of the userdata contract.
+- The userdata validates its payload by type, size and a 64-bit magic before
+  any dereference, so a metatable attached to a foreign userdata with
+  `debug.setmetatable` is rejected. The metatable is per handle and is not
+  stored in the Lua registry. `debug.setmetatable(r, {})` can still strip a
+  genuine handle's methods and `__gc`; the handle's C++ allocation then leaks
+  for the process lifetime. Owner detach clears that owner's watch demand (the
+  shared worker stops only with the last owner) but does not reclaim that
+  allocation. Do not expose `debug` to untrusted Lua.
+- The API is additive: `receive`, `poll`, `loop`, `on` and the managed
+  Future/Task API keep their v0.5.1 behavior.
+
+### Host readiness C ABI
+
+- Added the opaque C ABI `tdlua_readiness_*`, revision **1**, as the supported
+  external host surface. It exposes 16 functions with an opaque `uint64_t`
+  handle, explicit thread rules, status codes and a version query.
+- The ABI covers acquire/release, enable/disable, watch state, level-triggered
+  work observation, owner deadline, POSIX descriptor / Windows `SOCKET`,
+  transport reliability, doorbell clear, wait, and the captured client/owner
+  identifiers.
+- Handles are registry ids, not pointers: stale and double release are
+  rejected without touching freed memory. Release does not cancel an in-flight
+  wait; detach wakes it.
+- The standalone header
+  `include/tdlua/host/readiness_c.h` is installed with the module. The symbols
+  live in the module: there is no separate library and no new runtime
+  dependency.
+- The C ABI does not add a Lua API of its own and does not change the behavior
+  of `receive`, `poll`, `loop`, `on`, the managed Future/Task API or the
+  `SchedulerCore`; the separate `client:readiness()` userdata is described
+  above.
+
+### Subscriptions and buffering
+
+- Added subscription interest, separate from traditional consumer interest.
+  It applies only when the client has no traditional consumer; otherwise the
+  traditional retention policy wins.
+- Subscription-retained updates use the existing bounded ticket policy
+  (capacity 1024, TTL 120 seconds, drop-oldest) with separate
+  `dropped_subscription_overflow` and `dropped_subscription_expired` metrics.
+  The ticket count is not a total memory cap.
+- Handler-only subscriptions retain only registered handler types. The
+  `setHandlerRegistered` path is refcounted and delivers raw updates without a
+  Lua callback.
+- The traditional `receive`/`poll`/`loop`/`on` retention and the v0.5.1
+  behavior are unchanged when no readiness subscription is active.
+
+### Backends, runtimes and packaging
+
+- JSON and native backends expose the same readiness contract.
+- Supported Lua runtimes remain Lua 5.1–5.5 and LuaJIT 2.1. Stock Lua 5.1
+  uses Managed Explicit; Lua 5.2–5.5 and LuaJIT use Full Managed.
+- The C ABI is built and installed for both backends. Production modules export
+  the 16 `tdlua_readiness_*` symbols plus `luaopen_tdlua` and no test-only
+  hooks.
+- The release source package assembles the pinned `td` and `base64`
+  submodules; the TDLib pin is unchanged (`1.8.68`).
+
+### Experimental adapters
+
+- The libuv integration is a proof of concept, verified on Linux with a
+  deterministic test source. It is not an official multi-platform adapter and
+  is not a production dependency.
+- The cqueues adapter is an experimental, POSIX-only pollable object. It
+  requires a bridge that exposes the C ABI to Lua; the bridge is not
+  distributed in 0.6.0, so the adapter is not plug-and-play for standard Lua.
+- The real-TDLib C ABI host test is an opt-in validation test that uses no
+  Telegram credentials. It is not a supported example or a benchmark.
+- libuv and cqueues are not public Lua APIs and are not production
+  dependencies.
+
+### Performance and accepted limits
+
+- The watch-only worker timeout remains **100 ms**. The D2 benchmark measured
+  idle CPU and empty TDLib calls; its synthetic injection latency is an upper
+  bound of the test source, **not** Telegram end-to-end latency.
+- Real Telegram latency, throughput, fairness and buffering under load were
+  not measured; no authorized session was available.
+- One active poller per owner. Two pollers on the same descriptor are not
+  supported.
+- Platform binary packages do not ship headers; the source package and a
+  LuaRocks install do.
+- TSan is not run on the TDLib-linked C ABI test (TDLib is not instrumented by
+  project rule). The allocation-failure path of the ABI uses a deterministic
+  test hook rather than a global OOM.
+
 ## 0.5.0
 
 ### Threaded receive and lifecycle

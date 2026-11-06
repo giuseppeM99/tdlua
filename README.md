@@ -4,7 +4,7 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-TDLua 0.5.1 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
+TDLua 0.6.0 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
 arm64. The Linux packages require glibc. Dynamic unloading is unsupported.
 
 ## Installation
@@ -35,9 +35,10 @@ cmake --install build --prefix /usr/local
 
 The default destination is `lib/lua/<lua-version>/`; change it with
 `-DTDLUA_LUA_MODULE_DIR=...`. Builds with `TDLUA_BUILD_TESTS=ON` include
-diagnostic methods and cannot be installed.
+diagnostic methods and cannot be installed. The install also places the
+standalone readiness header at `include/tdlua/host/readiness_c.h`.
 
-Prebuilt 0.5.1 packages are available for these platforms. Linux x86-64 modules
+Prebuilt 0.6.0 packages are available for these platforms. Linux x86-64 modules
 cover Lua 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64, Windows and macOS use
 Lua 5.4. Choose the package that matches your Lua ABI and backend. Linux and
 native packages link TDLib statically; Windows and macOS JSON packages include a
@@ -167,3 +168,32 @@ end
 
 `examples/simple_bot.lua` shows a bot that authorizes, handles updates and calls
 `loop()`. `examples/async_demo.lua` shows callbacks and overlapping requests.
+
+## Host readiness (v0.6)
+
+The v0.6 readiness layer lets external event loops observe work without
+becoming a second consumer. It preserves the existing delivery API: `receive`,
+`poll`, `loop` and the managed API remain the only delivery paths.
+
+For Lua adapters there is a small owner-thread userdata:
+
+```lua
+local r = client:readiness()          -- generic retention; {generic=false} for handler-only
+local fd = r:fd()                     -- POSIX; socket() is the Windows SOCKET
+r:clear()                             -- then consume and re-check has_work()
+local timeout = r:next_deadline()     -- relative seconds, +inf when none
+```
+
+For non-Lua hosts the same primitives are available through the C ABI:
+
+```c
+#include "tdlua/host/readiness_c.h"
+```
+
+The C ABI header `include/tdlua/host/readiness_c.h` is the reference for
+non-Lua hosts; the Lua surface is summarized above.
+
+The C ABI is the only supported surface for non-Lua hosts; Lua hosts use
+`client:readiness()`. The libuv proof of concept and the cqueues adapter are
+experimental: cqueues additionally needs a bridge that is not distributed in
+v0.6, so it is not plug-and-play for standard Lua.
