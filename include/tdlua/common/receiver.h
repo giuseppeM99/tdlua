@@ -757,12 +757,43 @@ template <class Value> class Runtime {
         changed_.notify_all();
         return true;
     }
+    // True when retention for this client can be decided by a handler type,
+    // so a backend must classify an unsolicited envelope before publishing it.
+    //
+    // A handler-only consumer or a handler subscription selects by type; a
+    // generic consumer or a generic subscription alone preserves everything.
+    // The decision ignores the other interests on purpose: classification
+    // runs before publication and takes the runtime mutex at a different
+    // time, so a generic interest that disappears in between must not cost
+    // the envelope its type. The price is one extra classification when
+    // another interest would have preserved the envelope anyway: the object
+    // is formatted, and a matching handler update beside a generic consumer
+    // then follows the existing selected-handler retention rule instead of
+    // taking a generic capacity/TTL ticket.
     bool needsHandlerType(int id) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto found = entries_.find(id);
-        return found != entries_.end() && found->second.handler_only_consumers != 0 &&
-               found->second.consumer_interests == 0;
+        if (found == entries_.end()) return false;
+        const auto& entry = found->second;
+        return entry.handler_only_consumers != 0 ||
+               entry.subscription_handlers != 0;
+    }
+
+    // Classifies an unsolicited envelope through describe() when the
+    // retention policy above needs the type. describe() must return the same
+    // textual shape the handler registry uses ("updateFoo ...": the first
+    // token before a space, brace or newline). It is not called when the
+    // type is not needed, so the common path does not format the object.
+    template<class Describe>
+    void classifyForRetention(int id, Envelope<Value> &item, Describe &&describe)
+    {
+        if (!item.event_type.empty() || item.request_id != 0 || item.terminal)
+            return;
+        if (!needsHandlerType(id)) return;
+        const std::string description = describe();
+        const auto delimiter = description.find_first_of(" {\n");
+        item.event_type = description.substr(0, delimiter);
     }
     bool requestOneShot(int id)
     {

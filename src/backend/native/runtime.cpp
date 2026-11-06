@@ -130,12 +130,10 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
         item.client = response.client_id;
         item.terminal = isTerminal(response);
         item.request_id = response.request_id;
-        if (response.request_id == 0 && engine &&
-            engine->needsHandlerType(response.client_id)) {
-            const auto description = td::td_api::to_string(response.object);
-            const auto delimiter = description.find_first_of(" {\n");
-            item.event_type = description.substr(0, delimiter);
-        }
+        if (response.request_id == 0 && engine)
+            engine->classifyForRetention(response.client_id, item, [&response] {
+                return td::td_api::to_string(response.object);
+            });
         // This public terminal is synthesized after ClientManager retires its
         // actor/callback. Inspect scalars before the sole object_ptr move.
         ledger_->observe(item.client, item.terminal);
