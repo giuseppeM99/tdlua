@@ -3,9 +3,11 @@
 
 #include "tdlua/binding/lua_binding.h"
 #include "tdlua/binding/lua_binding_common.h"
+#include "tdlua/binding/readiness_lua.h"
 
 #include "tdlua/common/lua_json.h"
 #include "tdlua/backend/native/client.h"
+#include "tdlua/backend/native/runtime.h"
 
 #include <td/telegram/Log.h>
 
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -45,6 +48,14 @@ void tdlua_native_retain_vm(lua_State *L, int client)
     tdlua_binding::retainVm(L, client);
 }
 
+int tdlua_native_vm_thread_state(lua_State *L)
+{
+    tdlua_binding::VmToken *token =
+        tdlua_binding::getVmToken(L, "tdlua.native.vm");
+    if (!token || !token->live) return -1;
+    return token->thread == std::this_thread::get_id() ? 1 : 0;
+}
+
 static NativeTDLua *getTD(lua_State *L)
 {
     return static_cast<NativeTDLua *>(tdlua_binding::get_client(L));
@@ -72,15 +83,17 @@ static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
                       const char *type, int callback_index, bool concurrent)
 {
     auto *td = static_cast<NativeTDLua *>(client);
-    if (!td->setHandlerRegistered(type, true))
+    const bool had_lua_handler = td->dispatcher().hasHandler(type);
+    if (!had_lua_handler && !td->setHandlerRegistered(type, true))
         throw std::runtime_error("tdlua: client handler registry unavailable");
     try {
         td->dispatcher().on(L, type, callback_index, concurrent);
     } catch (...) {
         // onEvent is failure-atomic: a failed replacement leaves the previous
-        // scheduler handler published. Keep the receiver prefilter in sync with
-        // the handler that actually survived.
-        td->setHandlerRegistered(type, td->dispatcher().hasHandler(type));
+        // scheduler handler published. Only a newly added Lua registration
+        // needs its receiver interest rolled back.
+        if (!had_lua_handler)
+            td->setHandlerRegistered(type, false);
         throw;
     }
 }
@@ -88,6 +101,8 @@ static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
 static void native_off(tdlua_binding::ClientHandle client, const char *type)
 {
     auto *td = static_cast<NativeTDLua *>(client);
+    if (!td->dispatcher().hasHandler(type))
+        return;
     td->dispatcher().off(type);
     td->setHandlerRegistered(type, false);
 }
@@ -724,6 +739,26 @@ static int tdclient_setlogverbosity(lua_State *L)
     return 1;
 }
 
+// Owner-thread readiness userdata. It exposes the generic ReadinessView
+// primitives only; external event-loop adapters stay outside the module.
+static int tdclient_readiness(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        auto *td = static_cast<NativeTDLua *>(
+            tdlua_binding::get_client_at(L, 1));
+        if (!td) throw std::runtime_error("invalid tdlua client");
+        const int thread_state = tdlua_native_vm_thread_state(L);
+        if (thread_state < 0)
+            throw std::runtime_error("tdlua: VM owner unavailable");
+        if (thread_state == 0)
+            throw std::runtime_error(
+                "tdlua: readiness requires the VM owner thread");
+        const bool generic = tdlua_binding::readinessGenericArgument(L, 2);
+        return tdlua_binding::pushReadiness<NativeResponse>(
+            L, [td]() { return td->readiness(); }, generic);
+    });
+}
+
 static const tdlua_binding::ClientOperations native_operations = {
     createNativeTDLua,
     initializeNativeTDLua,
@@ -740,6 +775,7 @@ static const tdlua_binding::ClientOperations native_operations = {
     native_unload,
     native_closed,
     native_consumer_interest,
+    tdclient_readiness,
 #ifdef TDLUA_TESTING
     tdclient_pending_count,
 #endif

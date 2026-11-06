@@ -136,6 +136,9 @@ struct ClientOperations final {
     void (*unload)(ClientHandle);
     bool (*closed)(ClientHandle);
     void (*consumer_interest)(ClientHandle, bool, bool);
+    // Owner-thread readiness userdata factory. It exposes only the generic
+    // ReadinessView primitives; no event-loop dependency lives here.
+    lua_CFunction readiness;
 #ifdef TDLUA_TESTING
     lua_CFunction pending_count;
 #endif
@@ -201,6 +204,18 @@ inline ClientHandle get_client(lua_State *L)
         return nullptr;
     }
     ClientHandle *client = static_cast<ClientHandle *>(lua_touserdata(L, 1));
+    return client ? *client : nullptr;
+}
+
+// Same layout as get_client(), but for an arbitrary stack index and with the
+// tdclient metatable checked. Used only by the host C ABI, so the hot paths
+// keep the original cheap check.
+inline ClientHandle get_client_at(lua_State *L, int index)
+{
+    if (!luaL_testudata(L, index, "tdclient")) {
+        return nullptr;
+    }
+    ClientHandle *client = static_cast<ClientHandle *>(lua_touserdata(L, index));
     return client ? *client : nullptr;
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 #include "tdlua/common/failure_cleanup.h"
+#include "tdlua/common/readiness.h"
 #include "tdlua/common/receiver.h"
 #include <nlohmann/json.hpp>
 
@@ -53,12 +54,18 @@ class JsonRuntime {
     {
         return engine_.stats();
     }
+    Engine &engine() { return engine_; }
+    const std::shared_ptr<tdlua::receiver::ReadinessHub<nlohmann::json>> &hub() const
+    {
+        return hub_;
+    }
 
   private:
     JsonRuntime();
     std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle_;
     std::shared_ptr<tdlua::receiver::Source<nlohmann::json>> source_;
     Engine engine_;
+    std::shared_ptr<tdlua::receiver::ReadinessHub<nlohmann::json>> hub_;
     std::mutex mutex_;
     std::map<int, std::shared_ptr<Box>> clients_;
 };
@@ -67,6 +74,9 @@ class JsonRuntime {
 void tdlua_json_initialize_vm(lua_State *L);
 void tdlua_json_retain_vm(lua_State *L, int client);
 std::uint64_t tdlua_json_vm_owner(lua_State *L);
+// 1: live token owned by the calling thread, 0: live token from another
+// thread, -1: no live VM token (module not loaded or VM already closed).
+int tdlua_json_vm_thread_state(lua_State *L);
 
 #ifdef TDLUA_TESTING
 void tdlua_json_test_creation_stage(int stage);

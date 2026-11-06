@@ -4,6 +4,7 @@
 #pragma once
 
 #include "tdlua/backend/native/dispatcher.h"
+#include "tdlua/common/readiness_view.h"
 #include "tdlua/common/transport.h"
 
 #include <td/telegram/td_api.h>
@@ -32,6 +33,8 @@ public:
     bool hasUndispatchedPumpItem(bool discard_unobserved_raw);
     bool tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result);
 #ifdef TDLUA_TESTING
+    int clientIdForTesting() const { return client_id_; }
+    void setEventPublicationFailureForTesting(bool fail);
     std::size_t queuedPumpItemsForTesting() const { return updates_.size(); }
     std::size_t genericPumpItemsForTesting() const
     {
@@ -88,10 +91,16 @@ public:
     bool empty();
     void pushResponse(lua_State *L, const NativeResponse &response) const;
 
+    // Owner-side readiness view for embedded hosts. No Lua API is exposed.
+    // Must be used and destroyed on the owner thread; nextDeadlineSeconds()
+    // is invalid after lua_close().
+    tdlua::receiver::ReadinessView<NativeResponse> readiness();
+
     std::uint64_t nextRequestId();
 
 private:
     lua_State *lua_;
+    std::uint64_t owner_ = 0;
     td::ClientManager::ClientId client_id_;
     std::deque<NativeResponse> updates_;
     bool ready_;

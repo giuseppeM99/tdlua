@@ -9,13 +9,28 @@
 #include "tdlua/common/client_pump.h"
 
 #include <chrono>
+#include <new>
 #include <utility>
 
 namespace {
 
 #ifdef TDLUA_TESTING
 NativeTDLua *client_with_injected_drain_failure = nullptr;
+
+void fail_event_publication(const std::string &)
+{
+    throw std::bad_alloc();
+}
 #endif
+
+// Owner-local deadline source for the readiness view.
+struct VmDeadline {
+    lua_State *state;
+    double operator()() const
+    {
+        return tdlua::nextDeadlineSecondsForVm(state);
+    }
+};
 
 void native_transport_send(
     void *context, std::uint64_t request_id,
@@ -69,10 +84,11 @@ const NativeTDLua::Transport::Operations native_transport_operations = {
 }
 
 NativeTDLua::NativeTDLua(lua_State *lua)
-    : lua_(tdlua_lua_main_thread(lua)), client_id_((tdlua_native_vm_owner(lua), 0)), updates_(),
-      ready_(false), closing_(false), closed_(false), dispatcher_(lua)
+    : lua_(tdlua_lua_main_thread(lua)), owner_(tdlua_native_vm_owner(lua)),
+      client_id_(0), updates_(), ready_(false), closing_(false), closed_(false),
+      dispatcher_(lua)
 {
-    client_id_ = NativeRuntime::instance().create_client(tdlua_native_vm_owner(lua));
+    client_id_ = NativeRuntime::instance().create_client(owner_);
     dispatcher_.setManagedPump(this, native_transport_pump);
 }
 
@@ -180,6 +196,14 @@ bool NativeTDLua::setHandlerRegistered(const std::string &type, bool active)
         return true;
     return NativeRuntime::instance().setHandlerRegistered(client_id_, type, active);
 }
+
+#ifdef TDLUA_TESTING
+void NativeTDLua::setEventPublicationFailureForTesting(bool fail)
+{
+    tdlua::setEventPublicationHookForTesting(
+        fail ? &fail_event_publication : nullptr);
+}
+#endif
 
 bool NativeTDLua::hasUndispatchedPumpItem()
 {
@@ -384,6 +408,13 @@ void NativeTDLua::pushResponse(lua_State *L, const NativeResponse &response) con
     dispatcher_.pushResponse(L, response);
 }
 
+tdlua::receiver::ReadinessView<NativeResponse> NativeTDLua::readiness()
+{
+    NativeRuntime &runtime = NativeRuntime::instance();
+    return tdlua::receiver::ReadinessView<NativeResponse>(
+        runtime.hub(), &runtime.engine(), owner_, client_id_, VmDeadline{lua_});
+}
+
 std::uint64_t NativeTDLua::nextRequestId()
 {
     return dispatcher_.nextRequestId();
@@ -501,6 +532,18 @@ bool NativeTDLua::ready() const
 }
 
 #ifdef TDLUA_TESTING
+// Test-only hook: build a terminal response inside the module so a Windows test
+// executable does not need TDLib constructor symbols across the DLL boundary.
+extern "C" void tdlua_native_test_mark_closed(NativeTDLua *client)
+{
+    if (!client) return;
+    NativeResponse response;
+    response.client_id = client->clientIdForTesting();
+    response.object = td::td_api::make_object<td::td_api::updateAuthorizationState>(
+        td::td_api::make_object<td::td_api::authorizationStateClosed>());
+    client->checkAuthState(response);
+}
+
 void NativeTDLua::failNextDrainForTesting() noexcept
 {
     client_with_injected_drain_failure = this;

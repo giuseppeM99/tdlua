@@ -16,6 +16,19 @@ using json = nlohmann::json;
 
 #ifdef TDLUA_TESTING
 TDLua *client_with_injected_drain_failure = nullptr;
+#endif
+
+// Owner-local deadline source for the readiness view. It captures the VM main
+// state; the view never calls it after detach/lua_close.
+struct VmDeadline {
+    lua_State *state;
+    double operator()() const
+    {
+        return tdlua::nextDeadlineSecondsForVm(state);
+    }
+};
+
+#ifdef TDLUA_TESTING
 
 void fail_event_publication(const std::string &)
 {
@@ -75,14 +88,15 @@ TDLua::TDLua(lua_State *lua)
 #else
           lua
 #endif
-      )
+      ),
+      lua_(tdlua_lua_main_thread(lua)), owner_(tdlua_json_vm_owner(lua))
 {
     dispatcher_.setManagedPump(this, json_transport_pump);
 #ifdef TDLUA_TESTING
     tdlua_json_test_creation_stage(6);
 #endif
     // All other members and pump setup are complete before reserving an ID.
-    client_id = JsonRuntime::instance().createClient(tdlua_json_vm_owner(lua));
+    client_id = JsonRuntime::instance().createClient(owner_);
 }
 
 TDLua::~TDLua()
@@ -489,6 +503,13 @@ tdlua::RouteKind TDLua::dispatch(nlohmann::json &update, bool managed_receive,
 bool TDLua::ready() const
 {
     return _ready;
+}
+
+tdlua::receiver::ReadinessView<nlohmann::json> TDLua::readiness()
+{
+    JsonRuntime &runtime = JsonRuntime::instance();
+    return tdlua::receiver::ReadinessView<nlohmann::json>(
+        runtime.hub(), &runtime.engine(), owner_, client_id, VmDeadline{lua_});
 }
 
 #ifdef TDLUA_TESTING

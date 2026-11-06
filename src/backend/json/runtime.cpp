@@ -184,25 +184,54 @@ JsonRuntime &JsonRuntime::instance()
     static JsonRuntime *runtime = new JsonRuntime();
     return *runtime;
 }
+namespace {
+std::chrono::milliseconds workerTimeout()
+{
+#ifdef TDLUA_TESTING
+    // Benchmark-only override. Production builds always use 100 ms and the
+    // environment variable is not compiled.
+    if (const char *value = std::getenv("TDLUA_TEST_WORKER_TIMEOUT_MS")) {
+        try {
+            const int milliseconds = std::stoi(value);
+            if (milliseconds > 0)
+                return std::chrono::milliseconds(milliseconds);
+        } catch (...) {
+        }
+    }
+#endif
+    return std::chrono::milliseconds(100);
+}
+} // namespace
+
 JsonRuntime::JsonRuntime()
     : lifecycle_(std::make_shared<tdlua::receiver::FailureCleanup>()),
       source_(std::make_shared<JsonSource>(lifecycle_)),
-      engine_(source_, std::chrono::milliseconds(100)
+      engine_(source_, workerTimeout()
 #ifdef TDLUA_TESTING
                            ,
               testHooks()
 #endif
-      )
+      ),
+      hub_(std::make_shared<tdlua::receiver::ReadinessHub<json>>())
 {
+    engine_.setReadinessSink(hub_);
     static_cast<JsonSource *>(source_.get())->engine = &engine_;
 }
 std::uint64_t JsonRuntime::attachVm()
 {
-    return engine_.attachOwner();
+    const std::uint64_t owner = engine_.attachOwner();
+    try {
+        hub_->attachOwner(owner);
+    } catch (...) {
+        engine_.detachOwner(owner);
+        throw;
+    }
+    return owner;
 }
 void JsonRuntime::detachVm(std::uint64_t owner)
 {
     engine_.detachOwner(owner);
+    hub_->detachOwner(owner);
 }
 
 std::int32_t JsonRuntime::createClient(std::uint64_t owner)
@@ -226,6 +255,10 @@ std::int32_t JsonRuntime::createClient(std::uint64_t owner)
 #ifdef TDLUA_TESTING
         tdlua_json_test_creation_stage(3);
 #endif
+        // Bind before publishing the facade. On failure the catch below
+        // retires the reserved identity, so the receiver never keeps a client
+        // without backend state.
+        hub_->bindClient(owner, registration.first, registration.second);
         std::lock_guard<std::mutex> lock(mutex_);
         clients_.emplace(registration.first, registration.second);
         return registration.first;
@@ -343,6 +376,25 @@ void JsonRuntime::forget(std::int32_t client, bool timed_out)
     engine_.forget(client, timed_out);
 }
 #ifdef TDLUA_TESTING
+// C-callable fake source for the host C ABI test and the external event-loop
+// proof of concept. Mirrors tdlua_native_test_inject: the update is built
+// inside the module so a C host never constructs C++ values.
+extern "C" void tdlua_json_test_inject(int client, int value, int terminal)
+{
+    nlohmann::json update;
+    if (terminal) {
+        update = {{"@type", "updateAuthorizationState"},
+                  {"authorization_state",
+                   {{"@type", "authorizationStateClosed"}}}};
+    } else {
+        update = {{"@type", "updateOption"},
+                  {"name", "tdlua_probe"},
+                  {"value",
+                   {{"@type", "optionValueString"},
+                    {"value", std::to_string(value)}}}};
+    }
+    JsonRuntime::instance().injectReceivedForTesting(client, std::move(update));
+}
 extern "C" tdlua::receiver::RuntimeStats tdlua_json_test_stats()
 {
     return JsonRuntime::instance().stats();

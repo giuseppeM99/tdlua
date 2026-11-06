@@ -153,6 +153,14 @@ template <class Value> class Mailbox {
         std::lock_guard<std::mutex> lock(mutex_);
         return failure_;
     }
+    // Level state, read-only observation. A terminal mailbox is still work: the
+    // owner must observe the terminal once before the client is forgotten.
+    // Named terminalState() because terminal() is the state transition.
+    bool terminalState() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return terminal_;
+    }
     void publish(Envelope<Value> item)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -259,8 +267,35 @@ struct RuntimeStats {
     std::size_t active_demands = 0, pending_one_shots = 0;
     std::size_t driver_demands = 0, request_demands = 0;
     std::size_t lifecycle_demands = 0, one_shot_demands = 0;
+    std::size_t watch_demands = 0, watch_leases = 0;
     std::size_t consumer_interests = 0;
     std::size_t handler_only_consumers = 0;
+    std::size_t subscription_interests = 0;
+    std::uint64_t dropped_subscription_overflow = 0;
+    std::uint64_t dropped_subscription_expired = 0;
+    std::uint64_t watch_receive_calls = 0, empty_receive_calls = 0;
+};
+
+// Cross-thread readiness notification. Implementations are called from the
+// receiver worker or a lifecycle coordinator, never while the receiver mutex is
+// held. A sink must be non-blocking, noexcept, free of locks that can lead back
+// into Runtime, and must never call Lua. A null sink disables notification and
+// leaves every observable behaviour of v0.5.1 unchanged.
+class ReadinessSink {
+  public:
+    virtual ~ReadinessSink()
+    {
+    }
+    // A client of this owner has new observable work.
+    virtual void ringClient(int) noexcept = 0;
+    // The owner is stopping or detaching; wake a parked host.
+    virtual void ringOwner(std::uint64_t) noexcept = 0;
+    // The runtime failed: every owner is affected.
+    virtual void broadcast() noexcept = 0;
+    // The client/owner can no longer be observed. Called after the receiver lock
+    // is released; implementations must drop their mailbox references.
+    virtual void unbindClient(int) noexcept = 0;
+    virtual void unbindOwner(std::uint64_t) noexcept = 0;
 };
 
 // Payload and Source have no Lua dependency. Registry -> mailbox is the
@@ -305,6 +340,46 @@ template <class Value> class Runtime {
         Runtime *runtime_;
         std::uint64_t token_;
     };
+    // Persistent transport demand, independent of driver/one-shot/lifecycle
+    // demand. It keeps the worker reading the source while no owner call is
+    // blocked. It is retention-neutral: it never counts as a driver in
+    // publish(), so it cannot preserve unsolicited updates by itself.
+    class WatchLease {
+      public:
+        WatchLease() noexcept : runtime_(nullptr), token_(0) {}
+        WatchLease(Runtime *runtime, std::uint64_t token) noexcept
+            : runtime_(runtime), token_(token) {}
+        WatchLease(WatchLease &&other) noexcept
+            : runtime_(other.runtime_), token_(other.token_)
+        {
+            other.runtime_ = nullptr;
+            other.token_ = 0;
+        }
+        WatchLease &operator=(WatchLease &&other) noexcept
+        {
+            if (this != &other) {
+                release();
+                runtime_ = other.runtime_;
+                token_ = other.token_;
+                other.runtime_ = nullptr;
+                other.token_ = 0;
+            }
+            return *this;
+        }
+        ~WatchLease() { release(); }
+        WatchLease(const WatchLease &) = delete;
+        WatchLease &operator=(const WatchLease &) = delete;
+        explicit operator bool() const noexcept { return runtime_ != nullptr; }
+        void release() noexcept
+        {
+            if (runtime_) runtime_->releaseWatch(token_);
+            runtime_ = nullptr;
+            token_ = 0;
+        }
+      private:
+        Runtime *runtime_;
+        std::uint64_t token_;
+    };
     struct Hooks {
         std::function<void(const Envelope<Value> &)> before_publish;
         std::function<void()> after_publish;
@@ -316,7 +391,8 @@ template <class Value> class Runtime {
                      std::chrono::seconds generic_ttl = std::chrono::seconds(120))
         : source_(std::move(source)), timeout_(timeout), hooks_(std::move(hooks)),
           generic_capacity_(generic_capacity), generic_ttl_(generic_ttl),
-          generic_metrics_(std::make_shared<GenericBufferMetrics>())
+          generic_metrics_(std::make_shared<GenericBufferMetrics>()),
+          subscription_metrics_(std::make_shared<GenericBufferMetrics>())
     {
         if (!source_ || timeout_.count() <= 0 || generic_capacity_ == 0 ||
             generic_ttl_.count() <= 0)
@@ -358,7 +434,9 @@ template <class Value> class Runtime {
     }
     void detachOwner(std::uint64_t owner)
     {
+        std::shared_ptr<ReadinessSink> sink;
         std::unique_lock<std::mutex> lock(mutex_);
+        sink = sink_;
         owners_.erase(owner);
         const bool another_owner_can_finish_lifecycle =
             !owners_.empty() && state_ != State::Failed;
@@ -374,6 +452,8 @@ template <class Value> class Runtime {
                     entry.consumer_interests = 0;
                     entry.handler_only_consumers = 0;
                     entry.handler_types.clear();
+                    entry.subscription_generic = 0;
+                    entry.subscription_handlers = 0;
                     entry.pending_requests.clear();
                     for (auto request = entry.protected_requests.begin();
                          request != entry.protected_requests.end();) {
@@ -400,6 +480,13 @@ template <class Value> class Runtime {
         if (owners_.empty())
             requestStopLocked();
         reapLocked(lock);
+        // The receiver lock is released: a parked host is woken before its
+        // owner mapping disappears, then the sink drops every reference.
+        lock.unlock();
+        if (sink) {
+            sink->ringOwner(owner);
+            sink->unbindOwner(owner);
+        }
     }
     std::pair<int, std::shared_ptr<Box>> createClient(std::uint64_t owner,
                                                       const std::function<int()> &create_id)
@@ -428,7 +515,9 @@ template <class Value> class Runtime {
     }
     void forget(int id, bool timed_out = false)
     {
+        std::shared_ptr<ReadinessSink> sink;
         std::unique_lock<std::mutex> lock(mutex_);
+        sink = sink_;
         auto found = entries_.find(id);
         if (found != entries_.end() && !found->second.orphan) {
             Entry &entry = found->second;
@@ -440,6 +529,8 @@ template <class Value> class Runtime {
                 entry.consumer_interests = 0;
                 entry.handler_only_consumers = 0;
                 entry.handler_types.clear();
+                entry.subscription_generic = 0;
+                entry.subscription_handlers = 0;
             }
             entry.box->abandon();
             if (timed_out && !entry.terminal)
@@ -453,6 +544,8 @@ template <class Value> class Runtime {
         // Keep it asynchronous while VM owners exist; last-owner detach joins.
         if (state_ != State::Failed || owners_.empty())
             reapLocked(lock);
+        lock.unlock();
+        if (sink) sink->unbindClient(id);
     }
     bool clientTerminal(int id) const
     {
@@ -460,11 +553,27 @@ template <class Value> class Runtime {
         const auto found = entries_.find(id);
         return found == entries_.end() || found->second.terminal;
     }
+    // True while the client is still part of this runtime (not forgotten or
+    // retired). Readiness uses it to invalidate a view after a client is
+    // garbage-collected without touching the VM Lua state.
+    bool clientKnown(int id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(id);
+        return found != entries_.end() && !found->second.orphan;
+    }
     void stopAndJoin()
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        requestStopLocked();
-        reapLocked(lock);
+        std::shared_ptr<ReadinessSink> sink;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            sink = sink_;
+            requestStopLocked();
+            reapLocked(lock);
+        }
+        // Shutdown is a readiness transition too: a parked host must be able to
+        // observe Stopped without waiting for its idle timeout.
+        if (sink) sink->broadcast();
     }
     void coordinate()
     {
@@ -553,6 +662,37 @@ template <class Value> class Runtime {
         changed_.notify_all();
         return DemandLease(this, token);
     }
+    // Persistent transport demand, balanced by WatchLease. It returns an empty
+    // lease when the client is unknown, terminal, orphaned, or the runtime is
+    // stopping/failed; callers must test it. It never changes retention.
+    WatchLease acquireWatch(int id)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failure_ != Failure::None || state_ == State::Stopping ||
+            state_ == State::Failed)
+            return WatchLease();
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal ||
+            found->second.orphan)
+            return WatchLease();
+        // Only a previous generation that has not been joined is unusable; a
+        // running generation is naturally joinable at shutdown.
+        if (state_ != State::Running && (worker_.joinable() || joining_))
+            return WatchLease();
+        startLocked();
+        const std::uint64_t token = ++next_watch_token_;
+        watch_tokens_.emplace(token, id);
+        ++found->second.watch_demands;
+        ++generation_;
+        changed_.notify_all();
+        return WatchLease(this, token);
+    }
+    // Optional cross-thread notification. A null sink is the v0.5.1 behaviour.
+    void setReadinessSink(std::shared_ptr<ReadinessSink> sink)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink_ = std::move(sink);
+    }
     // Application interest affects retention only. It deliberately does not
     // start the shared receiver or count as transport demand.
     bool setConsumerInterest(int id, bool active)
@@ -574,13 +714,45 @@ template <class Value> class Runtime {
         changed_.notify_all();
         return true;
     }
+    // Retention interest for an embedded subscription. It creates no transport
+    // demand: acquireWatch() does. Traditional consumers always win; when this
+    // is the only interest on the client, unsolicited updates are bounded by the
+    // existing GenericTicket capacity/TTL with a separate overflow metric.
+    bool setSubscriptionInterest(int id, bool active, bool generic)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal ||
+            found->second.orphan)
+            return false;
+        std::size_t &count = generic ? found->second.subscription_generic
+                                     : found->second.subscription_handlers;
+        if (active) {
+            ++count;
+        } else if (count) {
+            --count;
+        }
+        ++generation_;
+        changed_.notify_all();
+        return true;
+    }
     bool setHandlerRegistered(int id, const std::string &type, bool active)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto found = entries_.find(id);
         if (found == entries_.end() || found->second.terminal) return false;
-        if (active) found->second.handler_types.insert(type);
-        else found->second.handler_types.erase(type);
+        if (active) {
+            // Refcounted: two independent views (or a Lua handler plus a
+            // C++ host) may register the same type and unsubscribe
+            // independently.
+            ++found->second.handler_types[type];
+        } else {
+            auto registration = found->second.handler_types.find(type);
+            if (registration != found->second.handler_types.end()) {
+                if (registration->second > 1) --registration->second;
+                else found->second.handler_types.erase(registration);
+            }
+        }
         ++generation_;
         changed_.notify_all();
         return true;
@@ -713,6 +885,7 @@ template <class Value> class Runtime {
         }
         result.identities = known_ids_.identities();
         result.identity_blocks = known_ids_.blocks();
+        result.watch_leases = watch_tokens_.size();
         result.joinable = joining_ || worker_.joinable();
         result.active_demands = demandCountLocked();
         result.pending_one_shots = oneShotCountLocked();
@@ -723,6 +896,9 @@ template <class Value> class Runtime {
             result.consumer_interests += entry.consumer_interests;
             result.handler_only_consumers += entry.handler_only_consumers;
             result.lifecycle_demands += entry.lifecycle_demands;
+            result.watch_demands += entry.watch_demands;
+            result.subscription_interests +=
+                entry.subscription_generic + entry.subscription_handlers;
             result.one_shot_demands += entry.one_shot_pending ? 1 : 0;
             result.one_shot_demands += entry.one_shot_in_flight ? 1 : 0;
             for (const auto &request : entry.pending_requests)
@@ -733,6 +909,12 @@ template <class Value> class Runtime {
             std::memory_order_relaxed);
         result.dropped_expired = generic_metrics_->dropped_expired.load(
             std::memory_order_relaxed);
+        result.dropped_subscription_overflow =
+            subscription_metrics_->dropped_overflow.load(
+                std::memory_order_relaxed);
+        result.dropped_subscription_expired =
+            subscription_metrics_->dropped_expired.load(
+                std::memory_order_relaxed);
         return result;
     }
 
@@ -742,9 +924,12 @@ template <class Value> class Runtime {
         std::shared_ptr<Box> box;
         bool orphan = false, terminal = false;
         std::size_t active_drivers = 0, lifecycle_demands = 0;
+        std::size_t watch_demands = 0;
         std::size_t consumer_interests = 0;
         std::size_t handler_only_consumers = 0;
-        std::set<std::string> handler_types;
+        std::size_t subscription_generic = 0;
+        std::size_t subscription_handlers = 0;
+        std::map<std::string, unsigned> handler_types;
         bool one_shot_pending = false, one_shot_in_flight = false;
         std::map<std::uint64_t, std::size_t> pending_requests;
         std::map<std::uint64_t, ResponseClass> protected_requests;
@@ -763,6 +948,7 @@ template <class Value> class Runtime {
         for (const auto &pair : entries_) {
             const Entry &entry = pair.second;
             count += entry.active_drivers + entry.lifecycle_demands;
+            count += entry.watch_demands;
             count += entry.one_shot_pending ? 1 : 0;
             count += entry.one_shot_in_flight ? 1 : 0;
             for (const auto &request : entry.pending_requests)
@@ -782,10 +968,23 @@ template <class Value> class Runtime {
         for (const auto &pair : entries_) {
             const Entry &entry = pair.second;
             if (entry.active_drivers || entry.lifecycle_demands ||
-                !entry.pending_requests.empty())
+                entry.watch_demands || !entry.pending_requests.empty())
                 return true;
         }
         return false;
+    }
+    bool onlyWatchDemandLocked() const
+    {
+        bool watch = false;
+        for (const auto &pair : entries_) {
+            const Entry &entry = pair.second;
+            if (entry.active_drivers || entry.lifecycle_demands ||
+                entry.one_shot_pending || entry.one_shot_in_flight ||
+                !entry.pending_requests.empty())
+                return false;
+            if (entry.watch_demands) watch = true;
+        }
+        return watch;
     }
     void clearDemandLocked(int id, Entry &entry) noexcept
     {
@@ -796,6 +995,8 @@ template <class Value> class Runtime {
         entry.consumer_interests = 0;
         entry.handler_only_consumers = 0;
         entry.handler_types.clear();
+        entry.subscription_generic = 0;
+        entry.subscription_handlers = 0;
         ++generation_;
         changed_.notify_all();
     }
@@ -804,8 +1005,13 @@ template <class Value> class Runtime {
         entry.active_drivers = 0;
         entry.one_shot_pending = false;
         entry.one_shot_in_flight = false;
+        entry.watch_demands = 0;
         for (auto token = driver_tokens_.begin(); token != driver_tokens_.end();) {
             if (token->second == id) token = driver_tokens_.erase(token);
+            else ++token;
+        }
+        for (auto token = watch_tokens_.begin(); token != watch_tokens_.end();) {
+            if (token->second == id) token = watch_tokens_.erase(token);
             else ++token;
         }
         ++generation_;
@@ -828,6 +1034,20 @@ template <class Value> class Runtime {
         if (entry != entries_.end() && entry->second.active_drivers)
             --entry->second.active_drivers;
         driver_tokens_.erase(lease);
+        ++generation_;
+        changed_.notify_all();
+    }
+    // Idempotent: forget/terminal/detach erase the token, so a later release
+    // cannot underflow the demand count.
+    void releaseWatch(std::uint64_t token) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto lease = watch_tokens_.find(token);
+        if (lease == watch_tokens_.end()) return;
+        auto entry = entries_.find(lease->second);
+        if (entry != entries_.end() && entry->second.watch_demands)
+            --entry->second.watch_demands;
+        watch_tokens_.erase(lease);
         ++generation_;
         changed_.notify_all();
     }
@@ -878,7 +1098,8 @@ template <class Value> class Runtime {
         entry.generic_fifo.erase(output, entry.generic_fifo.end());
     }
     void addGenericLocked(Entry &entry, Envelope<Value> &item,
-                          std::chrono::steady_clock::time_point current)
+                          std::chrono::steady_clock::time_point current,
+                          const std::shared_ptr<GenericBufferMetrics> &metrics)
     {
         pruneGenericLocked(entry, current);
         if (entry.generic_pending->load(std::memory_order_relaxed) >= generic_capacity_) {
@@ -895,7 +1116,7 @@ template <class Value> class Runtime {
             }
         }
         item.generic_ticket = std::make_shared<GenericTicket>(
-            item.acquired_at, generic_ttl_, generic_metrics_, entry.generic_pending);
+            item.acquired_at, generic_ttl_, metrics, entry.generic_pending);
         entry.generic_fifo.push_back(item.generic_ticket);
     }
     static Runtime *&activeWorkerRuntime() noexcept
@@ -921,6 +1142,11 @@ template <class Value> class Runtime {
         stop_.store(true);
         if (state_ == State::Running)
             state_ = State::Stopping;
+        // A stopped generation cannot service persistent demand: drop every
+        // watch lease so no residual demand or statistic survives shutdown.
+        watch_tokens_.clear();
+        for (auto &pair : entries_)
+            pair.second.watch_demands = 0;
         changed_.notify_all();
     }
     void reapLocked(std::unique_lock<std::mutex> &lock)
@@ -981,8 +1207,10 @@ template <class Value> class Runtime {
         if (hooks_.before_publish)
             hooks_.before_publish(item);
         bool published = false;
+        std::shared_ptr<ReadinessSink> sink;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            sink = sink_;
             // Retention linearizes with demand changes under mutex_. Publish
             // uses the documented registry -> mailbox lock order so a release
             // cannot slip between this decision and queue ownership transfer.
@@ -1018,15 +1246,32 @@ template <class Value> class Runtime {
                     (!entry.orphan &&
                      generic_interests_at_receive_start.count(id) != 0);
                 const bool handler_consumer = entry.handler_only_consumers != 0;
-                const bool selected_handler_update = handler_consumer &&
-                    entry.handler_types.count(item.event_type) != 0;
-                const bool handler_filter = handler_consumer && !generic_consumer &&
+                const bool subscription_generic = entry.subscription_generic != 0;
+                const bool subscription_handler = entry.subscription_handlers != 0;
+                const bool handler_registered =
+                    entry.handler_types.find(item.event_type) !=
+                    entry.handler_types.end();
+                const bool selected_handler_update =
+                    (handler_consumer || subscription_handler) && handler_registered;
+                // A traditional consumer (receive/poll/loop/on) always keeps its
+                // v0.5.1 retention. Subscription policy applies only when it is
+                // the sole interest on this client.
+                const bool traditional = driver_active || generic_consumer ||
+                    handler_consumer || entry.lifecycle_demands != 0;
+                const bool subscription_only = !traditional &&
+                    (subscription_generic || subscription_handler);
+                const bool unsolicited = request_id == 0 && !terminal;
+                const bool handler_filter =
+                    (handler_consumer ||
+                     (subscription_only && subscription_handler && !subscription_generic)) &&
+                    !generic_consumer && !subscription_generic &&
                     !item.event_type.empty() && !selected_handler_update &&
                     !request_id && !terminal &&
                     entry.lifecycle_demands == 0;
                 const bool preserve = request_id != 0 || terminal ||
                     entry.lifecycle_demands != 0 || driver_active ||
-                    generic_consumer || selected_handler_update;
+                    generic_consumer || selected_handler_update ||
+                    (subscription_only && subscription_generic && unsolicited);
                 if (handler_filter) {
                     ++stats_.dropped_unsolicited;
                     ++stats_.dropped_by_handler_filter;
@@ -1037,12 +1282,18 @@ template <class Value> class Runtime {
                         entry.lifecycle_demands == 0 &&
                         (generic_consumer || (driver_active && !handler_consumer)) &&
                         !selected_handler_update;
+                    const bool subscription_update = subscription_only &&
+                        unsolicited &&
+                        (subscription_generic ||
+                         (subscription_handler && handler_registered));
                     const bool generic_raw = request_id != 0 &&
                         response_class == ResponseClass::GenericRaw;
-                    if (generic_update || generic_raw) {
+                    if (generic_update || subscription_update || generic_raw) {
                         if (item.acquired_at == std::chrono::steady_clock::time_point())
                             item.acquired_at = now();
-                        addGenericLocked(entry, item, now());
+                        addGenericLocked(entry, item, now(),
+                            subscription_update ? subscription_metrics_
+                                                : generic_metrics_);
                     }
                     box = entry.box;
                     box->publish(std::move(item));
@@ -1066,23 +1317,37 @@ template <class Value> class Runtime {
             ++generation_;
             changed_.notify_all();
         }
+        // State first, ring after the lock: the sink never runs under mutex_.
+        if (published && sink) sink->ringClient(id);
         if (published && hooks_.after_publish)
             hooks_.after_publish();
     }
     void fail(Failure failure) noexcept
     {
         // No strings, envelope allocations or user callbacks on this path.
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (failure_ == Failure::None) {
-            failure_ = failure;
-            ++stats_.failures;
+        std::shared_ptr<ReadinessSink> sink;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sink = sink_;
+            if (failure_ == Failure::None) {
+                failure_ = failure;
+                ++stats_.failures;
+            }
+            state_ = State::Failed;
+            stop_.store(true);
+            receiving_ = false;
+            // Failure is terminal for every lease; later releases become no-ops.
+            watch_tokens_.clear();
+            for (auto &pair : entries_) {
+                pair.second.watch_demands = 0;
+                pair.second.subscription_generic = 0;
+                pair.second.subscription_handlers = 0;
+                pair.second.box->fail(failure_);
+            }
+            changed_.notify_all();
         }
-        state_ = State::Failed;
-        stop_.store(true);
-        receiving_ = false;
-        for (auto &pair : entries_)
-            pair.second.box->fail(failure_);
-        changed_.notify_all();
+        // Every owner is affected: state is already visible to a re-check.
+        if (sink) sink->broadcast();
     }
     void run() noexcept
     {
@@ -1120,6 +1385,8 @@ template <class Value> class Runtime {
                             break;
                         }
                     }
+                    if (onlyWatchDemandLocked())
+                        ++stats_.watch_receive_calls;
                     receiving_ = true;
                     ++stats_.receive_calls;
                 }
@@ -1127,6 +1394,7 @@ template <class Value> class Runtime {
                 const bool received = source_->receive(receive_timeout, item);
                 if (!received) {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    ++stats_.empty_receive_calls;
                     receiving_ = false;
                     if (one_shot_claimed)
                         completeOneShotLocked(one_shot_client);
@@ -1171,10 +1439,13 @@ template <class Value> class Runtime {
     const std::size_t generic_capacity_;
     const std::chrono::seconds generic_ttl_;
     std::shared_ptr<GenericBufferMetrics> generic_metrics_;
+    std::shared_ptr<GenericBufferMetrics> subscription_metrics_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::map<int, Entry> entries_;
     std::map<std::uint64_t, int> driver_tokens_;
+    std::map<std::uint64_t, int> watch_tokens_;
+    std::shared_ptr<ReadinessSink> sink_;
     IdentityHistory known_ids_;
     std::set<std::uint64_t> owners_;
     std::thread worker_;
@@ -1183,6 +1454,7 @@ template <class Value> class Runtime {
     State state_ = State::Stopped;
     Failure failure_ = Failure::None;
     std::uint64_t next_owner_ = 0, sequence_ = 0, generation_ = 0, next_demand_token_ = 0;
+    std::uint64_t next_watch_token_ = 0;
     bool receiving_ = false;
     RuntimeStats stats_;
 };

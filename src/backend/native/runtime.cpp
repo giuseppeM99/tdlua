@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <string>
 #include <utility>
 
 NativeResponse::NativeResponse()
@@ -64,6 +65,13 @@ NativeRuntime::Engine::Hooks testHooks()
     return hooks;
 }
 #endif
+bool isTerminalObject(const td::td_api::Object &object)
+{
+    return object.get_id() == td::td_api::updateAuthorizationState::ID &&
+           static_cast<const td::td_api::updateAuthorizationState &>(object)
+                   .authorization_state_->get_id() ==
+               td::td_api::authorizationStateClosed::ID;
+}
 bool isTerminal(const td::ClientManager::Response &response)
 {
     return response.request_id == 0 && response.object &&
@@ -100,6 +108,13 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
                 test_changed.notify_all();
                 test_changed.wait(lock, [] { return !test_paused; });
                 test_entered = false;
+            }
+            if (!injected_.empty()) {
+                item = std::move(injected_.front());
+                injected_.pop_front();
+                lock.unlock();
+                ledger_->observe(item.client, item.terminal);
+                return true;
             }
         }
         testNotify(); // receive_calls was incremented before the source call
@@ -155,6 +170,15 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
         }
     }
 
+#ifdef TDLUA_TESTING
+    void inject(Envelope item)
+    {
+        std::lock_guard<std::mutex> lock(test_mutex);
+        injected_.push_back(std::move(item));
+        test_changed.notify_all();
+    }
+#endif
+
   private:
     void close(int id) override
     {
@@ -179,6 +203,7 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
     std::shared_ptr<Ledger> ledger_;
 #ifdef TDLUA_TESTING
     std::deque<Envelope> held_;
+    std::deque<Envelope> injected_;
 #endif
 };
 } // namespace
@@ -197,17 +222,27 @@ NativeRuntime::NativeRuntime()
                            ,
               testHooks()
 #endif
-      )
+      ),
+      hub_(std::make_shared<tdlua::receiver::ReadinessHub<NativeResponse>>())
 {
+    engine_.setReadinessSink(hub_);
     static_cast<NativeSource *>(source_.get())->engine = &engine_;
 }
 std::uint64_t NativeRuntime::attachVm()
 {
-    return engine_.attachOwner();
+    const std::uint64_t owner = engine_.attachOwner();
+    try {
+        hub_->attachOwner(owner);
+    } catch (...) {
+        engine_.detachOwner(owner);
+        throw;
+    }
+    return owner;
 }
 void NativeRuntime::detachVm(std::uint64_t owner)
 {
     engine_.detachOwner(owner);
+    hub_->detachOwner(owner);
 }
 td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner)
 {
@@ -222,6 +257,10 @@ td::ClientManager::ClientId NativeRuntime::create_client(std::uint64_t owner)
 #endif
             return reserved;
         });
+        // Bind before publishing the facade. The catch below retires the
+        // reserved identity, so the receiver never keeps a client without
+        // backend state.
+        hub_->bindClient(owner, registration.first, registration.second);
         std::lock_guard<std::mutex> lock(mutex_);
         clients_.emplace(registration.first, registration.second);
         return registration.first;
@@ -352,6 +391,36 @@ int NativeRuntime::concurrentOfflineSend()
     for (auto &producer : producers)
         producer.join();
     return errors ? 0 : static_cast<int>(clients.size());
+}
+void NativeRuntime::injectReceivedForTesting(
+    td::ClientManager::ClientId client_id,
+    td::td_api::object_ptr<td::td_api::Object> object)
+{
+    Envelope item;
+    item.client = client_id;
+    item.terminal = object && isTerminalObject(*object);
+    if (object) {
+        const auto description = td::td_api::to_string(object);
+        const auto delimiter = description.find_first_of(" {\n");
+        item.event_type = description.substr(0, delimiter);
+    }
+    item.value.client_id = client_id;
+    item.value.object = std::move(object);
+    static_cast<NativeSource *>(source_.get())->inject(std::move(item));
+}
+extern "C" void tdlua_native_test_inject(int client, int value, int terminal)
+{
+    td::td_api::object_ptr<td::td_api::Object> object;
+    if (terminal) {
+        object = td::td_api::make_object<td::td_api::updateAuthorizationState>(
+            td::td_api::make_object<td::td_api::authorizationStateClosed>());
+    } else {
+        object = td::td_api::make_object<td::td_api::updateOption>(
+            "tdlua_probe",
+            td::td_api::make_object<td::td_api::optionValueString>(
+                std::to_string(value)));
+    }
+    NativeRuntime::instance().injectReceivedForTesting(client, std::move(object));
 }
 extern "C" int tdlua_native_test_parallel()
 {

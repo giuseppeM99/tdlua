@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -1867,6 +1868,13 @@ public:
         return wait;
     }
 
+    // Owner-thread read-only deadline view. +inf when no waiter has a deadline;
+    // 0 when the nearest deadline has already expired.
+    double nextDeadlineSeconds() const
+    {
+        return deadlineBound(std::numeric_limits<double>::infinity());
+    }
+
     std::vector<std::shared_ptr<SchedulerCore>>
     crossClientDependencies() const
     {
@@ -2800,6 +2808,63 @@ public:
     }
 };
 
+// Thread-local registry of live SchedulerCore instances, keyed by the VM main
+// state. It holds only weak references and never extends a core or coroutine
+// lifetime. nextDeadlineSecondsForVm() computes the minimum across every client
+// of the same VM, on the owner thread (SchedulerCore is not thread-safe).
+inline std::map<lua_State *, std::vector<std::weak_ptr<SchedulerCore>>> &vmCores()
+{
+    static thread_local std::map<lua_State *, std::vector<std::weak_ptr<SchedulerCore>>> cores;
+    return cores;
+}
+
+inline void pruneExpiredVmCores()
+{
+    auto &registry = vmCores();
+    for (auto entry = registry.begin(); entry != registry.end();) {
+        auto &list = entry->second;
+        list.erase(std::remove_if(list.begin(), list.end(),
+            [](const std::weak_ptr<SchedulerCore> &core) { return core.expired(); }),
+            list.end());
+        if (list.empty()) entry = registry.erase(entry);
+        else ++entry;
+    }
+}
+
+inline void registerVmCore(lua_State *L, const std::shared_ptr<SchedulerCore> &core)
+{
+    // A long-lived owner thread may see many short-lived VMs. Prune every
+    // expired key before adding a new one so dead VM addresses cannot
+    // accumulate. The per-key list is also pruned here, not only after 32
+    // entries.
+    pruneExpiredVmCores();
+    lua_State *main = tdlua_lua_main_thread(L);
+    vmCores()[main].push_back(core);
+}
+
+inline double nextDeadlineSecondsForVm(lua_State *L)
+{
+    const double none = std::numeric_limits<double>::infinity();
+    if (!L) return none;
+    lua_State *main = tdlua_lua_main_thread(L);
+    auto &registry = vmCores();
+    const auto found = registry.find(main);
+    if (found == registry.end()) return none;
+    double best = none;
+    auto &list = found->second;
+    for (auto entry = list.begin(); entry != list.end();) {
+        const auto core = entry->lock();
+        if (!core) {
+            entry = list.erase(entry);
+            continue;
+        }
+        best = core->deadlineBound(best);
+        ++entry;
+    }
+    if (list.empty()) registry.erase(found);
+    return best;
+}
+
 #ifdef TDLUA_TESTING
 inline std::size_t &coreAnchorFinalizerCountForTesting()
 {
@@ -2813,6 +2878,10 @@ inline int coreAnchorGc(lua_State *L)
     ++coreAnchorFinalizerCountForTesting();
 #endif
     static_cast<CoreAnchor *>(lua_touserdata(L, 1))->~CoreAnchor();
+    // The VM is closing or the anchor became unreachable. Remove keys whose
+    // cores are no longer owned by anyone so VM churn does not grow the
+    // thread-local registry forever.
+    pruneExpiredVmCores();
     return 0;
 }
 inline int continuationGc(lua_State *L)
@@ -2851,6 +2920,7 @@ public:
             },
             this);
         core_.reset(new SchedulerCore(L));
+        registerVmCore(L, core_);
         protectedLua(
             L,
             [](lua_State *L, void *context) {
@@ -2886,6 +2956,8 @@ public:
         // Covers a factory that throws before publishing its C++ client.
         // This owner-thread fallback releases Lua storage, never runs work.
         disposeStorage();
+        core_.reset();
+        pruneExpiredVmCores();
     }
 
     // Explicit owner-thread disposal. Protected Lua calls contain Lua errors,
@@ -2939,6 +3011,7 @@ public:
     std::uint64_t nextRequestId() { return core_->nextRequestId(); }
     void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }
     std::size_t pendingCount() const { return core_->pendingCount(); }
+    double nextDeadlineSeconds() const { return core_->nextDeadlineSeconds(); }
     ResponseClass responseClass(std::uint64_t id) const
     { return core_->responseClass(id); }
 #ifdef TDLUA_TESTING

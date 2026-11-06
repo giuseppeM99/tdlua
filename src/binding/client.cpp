@@ -234,6 +234,18 @@ static int tdclient_isclosed(lua_State *L)
     return tdlua_binding::is_closed(L, client(L), operations());
 }
 
+// Owner-thread readiness userdata. The backend owns the templated view; this
+// facade only routes the call so the shared metatable stays backend-agnostic.
+static int tdclient_readiness(lua_State *L)
+{
+    // The backend already runs under a single protected_call boundary. Do not
+    // wrap it again: on LuaJIT the inner lua_error unwind would be caught by
+    // an outer C++ catch and reported as an unknown C++ exception.
+    if (!operations().readiness)
+        return luaL_error(L, "tdlua: readiness is unavailable");
+    return operations().readiness(L);
+}
+
 static int tdclient_unload(lua_State *L)
 {
     return tdlua_binding::unload(L, client(L), operations());
@@ -270,6 +282,7 @@ static luaL_Reg methods[] = {
     {"receive", tdclient_receive},
     {"poll", tdclient_poll},
     {"loop", tdclient_loop},
+    {"readiness", tdclient_readiness},
     {"send", tdclient_send},
     {"execute", tdclient_execute},
     {"_execute", tdclient_rawexecute},

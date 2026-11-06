@@ -5,6 +5,7 @@
 
 #include "tdlua/backend/native/codec.h"
 #include "tdlua/common/failure_cleanup.h"
+#include "tdlua/common/readiness.h"
 #include "tdlua/common/receiver.h"
 
 #include <td/telegram/Client.h>
@@ -62,6 +63,11 @@ public:
     bool setHandlerRegistered(td::ClientManager::ClientId client_id,
                               const std::string &type, bool active)
     { return engine_.setHandlerRegistered(client_id, type, active); }
+    Engine &engine() { return engine_; }
+    const std::shared_ptr<tdlua::receiver::ReadinessHub<NativeResponse>> &hub() const
+    {
+        return hub_;
+    }
     tdlua::receiver::RuntimeStats stats() const
     {
         return engine_.stats();
@@ -77,6 +83,8 @@ public:
     }
     void replaceWithFake(td::ClientManager::ClientId client_id);
     int concurrentOfflineSend();
+    void injectReceivedForTesting(td::ClientManager::ClientId client_id,
+                                  td::td_api::object_ptr<td::td_api::Object> object);
 #endif
 
   private:
@@ -86,6 +94,7 @@ public:
     std::shared_ptr<tdlua::receiver::FailureCleanup> lifecycle_;
     std::shared_ptr<tdlua::receiver::Source<NativeResponse>> source_;
     Engine engine_;
+    std::shared_ptr<tdlua::receiver::ReadinessHub<NativeResponse>> hub_;
     std::mutex mutex_;
     std::map<int, std::shared_ptr<Box>> clients_;
 };
@@ -93,3 +102,6 @@ public:
 void tdlua_native_initialize_vm(lua_State *L);
 void tdlua_native_retain_vm(lua_State *L, int client);
 std::uint64_t tdlua_native_vm_owner(lua_State *L);
+// 1: live token owned by the calling thread, 0: live token from another
+// thread, -1: no live VM token (module not loaded or VM already closed).
+int tdlua_native_vm_thread_state(lua_State *L);

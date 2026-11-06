@@ -11,6 +11,7 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include "tdlua/backend/json/dispatcher.h"
+#include "tdlua/common/readiness_view.h"
 #include "tdlua/common/receiver.h"
 #include "tdlua/common/transport.h"
 
@@ -58,6 +59,8 @@ private:
     std::shared_ptr<tdlua::receiver::GenericTicket> receive_ticket_;
     std::shared_ptr<tdlua::receiver::GenericTicket> pump_ticket_;
     LuaDispatcher dispatcher_;
+    lua_State *lua_ = nullptr;
+    std::uint64_t owner_ = 0;
     tdlua::Transport<nlohmann::json, nlohmann::json> injected_transport_ = {nullptr, nullptr};
 #ifdef TDLUA_TESTING
     std::size_t test_generic_interest_depth_ = 0;
@@ -165,5 +168,10 @@ public:
                               bool discard_unobserved_raw);
 
     bool ready() const;
+
+    // Owner-side readiness view for embedded hosts. No Lua API is exposed.
+    // Must be used and destroyed on the owner thread; nextDeadlineSeconds()
+    // is invalid after lua_close().
+    tdlua::receiver::ReadinessView<nlohmann::json> readiness();
 
 };
