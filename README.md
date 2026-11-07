@@ -44,6 +44,50 @@ Lua 5.4. Choose the package that matches your Lua ABI and backend. Linux and
 native packages link TDLib statically; Windows and macOS JSON packages include a
 TDLib shared library.
 
+### Prebuilt Linux x86_64 dependencies
+
+The prebuilt Linux x86_64 modules are built on Ubuntu 24.04. Their Lua
+dependency is the shared-library SONAME of that build, not a generic "Lua
+5.4" promise:
+
+| Module ABI | Required shared library |
+| --- | --- |
+| Lua 5.2 | `liblua5.2.so.0` |
+| Lua 5.3 | `liblua5.3.so.0` |
+| Lua 5.4 | `liblua5.4.so.0` |
+| LuaJIT 2.1 | `libluajit-5.1.so.2` |
+| Lua 5.5 | no host `liblua`; Lua 5.5.0 is linked statically |
+
+The modules also require glibc symbols up to `GLIBC_2.38`, libstdc++
+`GLIBCXX_3.4.32`/`CXXABI_1.3.13`, OpenSSL 3 (`libssl.so.3`,
+`libcrypto.so.3`) and zlib (`libz.so.1`).
+
+These are requirements of the prebuilt binaries. They are not a promise of
+binary portability across all Linux distributions. A distribution that does
+not provide the exact SONAME (for example, one that names Lua 5.4
+`liblua5.4.so.5.4`) must build from source with LuaRocks or CMake; do not
+rename or symlink an ABI library.
+
+The Lua 5.5 modules statically link the pinned Lua 5.5.0 runtime and therefore
+do not need `liblua5.5.so`. Because they contain a substantial portion of Lua,
+the Lua 5.5.0 license notice is reproduced in `third-party/Lua-5.5.txt` and is
+shipped with the release as `Lua-5.5-LICENSE.txt`; redistributors must include
+it with the 5.5 binaries. The 5.5 modules also carry the Lua 5.5.0 API symbols
+(99 `lua_*` and 47 `luaL_*` functions). This is a consequence of the static
+link, not a change to the module's own surface: the 16 `tdlua_readiness_*`
+exports remain public. Do not add a symbol-visibility change without preserving
+those exports.
+
+### Other prebuilt platforms
+
+- **Linux AArch64:** Lua 5.4 only; requires `liblua5.4.so.0` plus the glibc,
+  libstdc++, OpenSSL 3 and zlib baseline.
+- **Windows x64:** Lua 5.4 only; requires `lua54.dll` and the MSVC runtime.
+  OpenSSL 3 and zlib are bundled. The JSON archive also ships `tdjson.dll`.
+- **macOS arm64:** Lua 5.4 only; requires a host `liblua.5.4.dylib` and
+  Homebrew OpenSSL 3 at `/opt/homebrew/opt/openssl@3`. The module deployment
+  target is macOS 13.0; the dependency set was validated on macOS 26.
+
 ## Runtime profiles
 
 | Runtime | API profile |
@@ -194,6 +238,10 @@ The C ABI header `include/tdlua/host/readiness_c.h` is the reference for
 non-Lua hosts; the Lua surface is summarized above.
 
 The C ABI is the only supported surface for non-Lua hosts; Lua hosts use
-`client:readiness()`. The libuv proof of concept and the cqueues adapter are
-experimental: cqueues additionally needs a bridge that is not distributed in
-v0.6, so it is not plug-and-play for standard Lua.
+`client:readiness()`. The libuv integration remains a proof of concept.
+`tdlua_eventloop.cqueues` is the official optional pure-Lua adapter: it uses
+the public `client:readiness()` and `receive(0)` APIs, requires the cqueues
+runtime, and is POSIX-only with runtime validation on Lua 5.4. It does not
+require the older C ABI bridge. That earlier experiment, which needed an
+undistributed bridge, is a separate component and is not a prerequisite for
+the adapter package. The documented cqueues and platform limits still apply.

@@ -99,19 +99,27 @@
   hooks.
 - The release source package assembles the pinned `td` and `base64`
   submodules; the TDLib pin is unchanged (`1.8.68`).
+- Linux x86_64 prebuilt modules require the distribution Lua shared-library
+  SONAMEs: `liblua5.2.so.0`, `liblua5.3.so.0`, `liblua5.4.so.0` and
+  `libluajit-5.1.so.2`. The Lua 5.5 modules statically link Lua 5.5.0 and ship
+  its notice in `third-party/Lua-5.5.txt`. These are prebuilt-binary requirements,
+  not a promise of binary portability across distributions; incompatible
+  distributions build from source.
 
-### Experimental adapters
+### Adapters and experimental integrations
 
 - The libuv integration is a proof of concept, verified on Linux with a
   deterministic test source. It is not an official multi-platform adapter and
   is not a production dependency.
-- The cqueues adapter is an experimental, POSIX-only pollable object. It
-  requires a bridge that exposes the C ABI to Lua; the bridge is not
-  distributed in 0.6.0, so the adapter is not plug-and-play for standard Lua.
+- `tdlua_eventloop.cqueues` is the official optional pure-Lua adapter. It uses
+  the public `client:readiness()` and `receive(0)` APIs, is POSIX-only, and is
+  runtime-validated on Lua 5.4. It does not require the older C ABI bridge.
+- The earlier C ABI cqueues experiment, which needed an undistributed bridge,
+  is a separate component and is not part of the optional package.
 - The real-TDLib C ABI host test is an opt-in validation test that uses no
   Telegram credentials. It is not a supported example or a benchmark.
-- libuv and cqueues are not public Lua APIs and are not production
-  dependencies.
+- `luv` and `cqueues` are optional third-party runtimes; the core module does
+  not depend on either.
 
 ### Performance and accepted limits
 
