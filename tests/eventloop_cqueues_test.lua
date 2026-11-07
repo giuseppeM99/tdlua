@@ -125,7 +125,7 @@ do
     check(retry ~= nil and retry > 0.005 and retry <= 0.02,
           "retry_delay deadline is honoured even with visible work")
     driver.valid_value = false
-    equal(adapter.ready_pollable:pollfd(), -1,
+    equal(adapter.ready_pollable:pollfd(), nil,
           "no descriptor for an invalid owner")
     adapter:stop()
     driver:close_pair()

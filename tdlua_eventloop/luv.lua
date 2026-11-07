@@ -66,6 +66,9 @@ function M.new(driver, options)
         uv = uv,
         stopped = false,
         poll = nil,
+        poll_kind = nil,
+        poll_value = nil,
+        poll_active = false,
         timer = nil,
         timer_active = false,
         last_state = nil,
@@ -100,68 +103,169 @@ function M.new(driver, options)
     return self
 end
 
-function Adapter:_open()
-    local driver = self.driver
-    local uv = self.uv
-    local fd = driver:fd()
-    local socket = driver:socket()
-    local poll, poll_err
+function Adapter:_descriptor()
+    local fd_ok, fd = pcall(self.driver.fd, self.driver)
+    if fd_ok and type(fd) == "number" and fd >= 0 then
+        return "fd", fd
+    end
+    local socket_ok, socket = pcall(self.driver.socket, self.driver)
+    if socket_ok and socket ~= nil then
+        return "socket", socket
+    end
+    return nil
+end
 
-    if type(fd) == "number" and fd >= 0 then
-        poll, poll_err = call_handle(uv, "new_poll", fd)
+function Adapter:_poll_callback(err)
+    if self.stopped then return end
+    if err then
+        self:_fail(err)
+        return
+    end
+    self.wakeups = self.wakeups + 1
+    self:_tick()
+end
+
+function Adapter:_new_poll(kind, value)
+    local poll, err
+    if kind == "fd" then
+        poll, err = call_handle(self.uv, "new_poll", value)
         if not poll then
-            local message = "tdlua_eventloop: uv.new_poll failed: " ..
-                            tostring(poll_err)
-            if tostring(poll_err):match("EEXIST") then
-                message = message ..
-                    " (a poll handle for this descriptor may still be " ..
-                    "closing; build the new adapter on a later loop turn)"
-            end
-            error(message, 2)
-        end
-    elseif socket ~= nil then
-        if type(uv.new_socket_poll) ~= "function" then
-            error("tdlua_eventloop: this luv build has no " ..
-                  "uv.new_socket_poll; the readiness SOCKET cannot be " ..
-                  "polled", 2)
-        end
-        poll, poll_err = call_handle(uv, "new_socket_poll", socket)
-        if not poll then
-            error("tdlua_eventloop: uv.new_socket_poll failed for the " ..
-                  "readiness SOCKET: " .. tostring(poll_err), 2)
+            return nil, "uv.new_poll failed: " .. tostring(err)
         end
     else
+        if type(self.uv.new_socket_poll) ~= "function" then
+            return nil, "tdlua_eventloop: this luv build has no " ..
+                        "uv.new_socket_poll; the readiness SOCKET cannot " ..
+                        "be polled"
+        end
+        poll, err = call_handle(self.uv, "new_socket_poll", value)
+        if not poll then
+            return nil, "uv.new_socket_poll failed for the readiness " ..
+                        "SOCKET: " .. tostring(err)
+        end
+    end
+    if not poll then return nil, err end
+    return poll
+end
+
+function Adapter:_start_poll_handle(poll)
+    local ok, started, start_err = pcall(poll.start, poll, "r",
+        function(e) self:_poll_callback(e) end)
+    if not ok then return nil, started end
+    if started == nil or started == false then
+        return nil, start_err or "uv poll start failed"
+    end
+    self.poll = poll
+    self.poll_active = true
+    return true
+end
+
+function Adapter:_start_poll(kind, value)
+    local poll, err = self:_new_poll(kind, value)
+    if not poll then return nil, err end
+    self.poll_kind = kind
+    self.poll_value = value
+    local ok, start_err = self:_start_poll_handle(poll)
+    if not ok then
+        pcall(poll.close, poll)
+        self.poll = nil
+        self.poll_kind = nil
+        self.poll_value = nil
+        self.poll_active = false
+        return nil, start_err
+    end
+    return true
+end
+
+function Adapter:_stop_poll()
+    if not self.poll or not self.poll_active then return true end
+    local ok, result, err = pcall(self.poll.stop, self.poll)
+    if not ok then return nil, result end
+    if result == nil or result == false then
+        return nil, err or "uv poll stop failed"
+    end
+    self.poll_active = false
+    return true
+end
+
+function Adapter:_close_poll()
+    if not self.poll then return true end
+    local first_error
+    if self.poll_active then
+        local ok, result, err = pcall(self.poll.stop, self.poll)
+        if not ok then
+            first_error = result
+        elseif result == nil or result == false then
+            first_error = err or "uv poll stop failed"
+        end
+    end
+    -- luv's poll:close() returns no values on success; only a raised error is
+    -- a close failure.
+    local ok, err = pcall(self.poll.close, self.poll)
+    if not ok and not first_error then first_error = err end
+    self.poll = nil
+    self.poll_kind = nil
+    self.poll_value = nil
+    self.poll_active = false
+    if first_error then return nil, first_error end
+    return true
+end
+
+function Adapter:_ensure_poll()
+    local kind, value = self:_descriptor()
+    if not kind then
+        -- A reliable turn without a descriptor would otherwise leave the
+        -- adapter believing it is armed while nothing can wake it.
+        return nil, "tdlua_eventloop: no readiness descriptor available"
+    end
+    if self.poll and self.poll_kind == kind and self.poll_value == value then
+        if self.poll_active then return true end
+        local ok, started, err = pcall(self.poll.start, self.poll, "r",
+            function(e) self:_poll_callback(e) end)
+        if not ok then return nil, started end
+        if started == nil or started == false then
+            return nil, err or "uv poll start failed"
+        end
+        self.poll_active = true
+        return true
+    end
+    local closed, close_err = self:_close_poll()
+    if not closed then return nil, close_err end
+    return self:_start_poll(kind, value)
+end
+
+function Adapter:_open()
+    local kind, value = self:_descriptor()
+    if not kind then
         error("tdlua_eventloop: no readiness descriptor " ..
               "(POSIX fd or Windows SOCKET) available", 2)
     end
 
-    local timer, timer_err = call_handle(uv, "new_timer")
+    local poll, poll_err = self:_new_poll(kind, value)
+    if not poll then
+        local message = "tdlua_eventloop: " .. tostring(poll_err)
+        if tostring(poll_err):match("EEXIST") then
+            message = message ..
+                " (a poll handle for this descriptor may still be " ..
+                "closing; build the new adapter on a later loop turn)"
+        end
+        error(message, 2)
+    end
+
+    local timer, timer_err = call_handle(self.uv, "new_timer")
     if not timer then
-        pcall(poll.stop, poll)
         pcall(poll.close, poll)
         error("tdlua_eventloop: uv.new_timer failed: " ..
               tostring(timer_err), 2)
     end
-
     self.poll = poll
+    self.poll_kind = kind
+    self.poll_value = value
+    self.poll_active = false
     self.timer = timer
 
-    local ok, started, start_err = pcall(poll.start, poll, "r",
-        function(err)
-            if self.stopped then return end
-            if err then
-                self:_fail(err)
-                return
-            end
-            self.wakeups = self.wakeups + 1
-            self:_tick()
-        end)
-    if not ok then
-        self:_close_handles()
-        error("tdlua_eventloop: uv poll start failed: " ..
-              tostring(started), 2)
-    end
-    if started == nil or started == false then
+    local started, start_err = self:_start_poll_handle(poll)
+    if not started then
         self:_close_handles()
         error("tdlua_eventloop: uv poll start failed: " ..
               tostring(start_err), 2)
@@ -179,13 +283,8 @@ end
 
 function Adapter:_close_handles()
     local first_error
-    if self.poll then
-        local ok, err = pcall(self.poll.stop, self.poll)
-        if not ok and not first_error then first_error = err end
-        ok, err = pcall(self.poll.close, self.poll)
-        if not ok and not first_error then first_error = err end
-        self.poll = nil
-    end
+    local closed, close_err = self:_close_poll()
+    if not closed and not first_error then first_error = close_err end
     if self.timer then
         local ok, err = pcall(self.timer.stop, self.timer)
         if not ok and not first_error then first_error = err end
@@ -226,6 +325,11 @@ end
 function Adapter:_arm(state)
     local deadline = state.deadline
     if state.state == "again" then
+        -- The driver asked for a delayed retry. The descriptor is often still
+        -- level-readable (hidden work, managed work), so polling it here would
+        -- bypass retry_delay and spin. Use the timer only for this turn.
+        local stopped, stop_err = self:_stop_poll()
+        if not stopped then self:_fail(stop_err) return end
         local ok, err = self:_schedule(seconds_to_ms(deadline))
         if not ok then self:_fail(err) end
         return
@@ -234,6 +338,10 @@ function Adapter:_arm(state)
     if state.state ~= "sleep" then return end
 
     if state.reliable == false then
+        -- The wake transport is dead. Never keep polling the descriptor: an
+        -- EOF-readable descriptor fires forever and bypasses the timer.
+        local stopped, stop_err = self:_stop_poll()
+        if not stopped then self:_fail(stop_err) return end
         local fallback = deadline
         if fallback == nil or fallback == math.huge or
            fallback > FALLBACK_SECONDS then
@@ -243,6 +351,9 @@ function Adapter:_arm(state)
         if not ok then self:_fail(err) end
         return
     end
+
+    local ensured, ensure_err = self:_ensure_poll()
+    if not ensured then self:_fail(ensure_err) return end
 
     if deadline == nil or deadline == math.huge then
         pcall(self.timer.stop, self.timer)

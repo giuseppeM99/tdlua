@@ -122,6 +122,12 @@ timeout:
   no periodic re-check: descriptor readiness and `kick()` are the only wake
   sources.
 
+When a turn reports `reliable = false`, the descriptor can no longer be
+trusted. Both adapters stop observing it (luv stops the poll handle; cqueues
+returns `nil` from `pollfd()`) and use a finite 100 ms fallback, or a nearer
+`deadline` if one is present. The descriptor is re-armed on the first reliable
+turn; a new descriptor creates a new luv poll handle.
+
 A new Future, an earlier deadline, or a cancelled deadline may not ring the
 doorbell. Call `driver:kick()` after such a change. The adapter's `on_kick`
 re-arms the timer or wakes the controller; no message queue is involved.
@@ -415,8 +421,11 @@ after a kick or a delivered update, otherwise `retry_delay` or a nearer positive
 readiness deadline); for `sleep`, the remaining finite deadline; and no timeout
 at all for a reliable infinite park.
 Unreliable transport and an already-invalid owner use a 0.1 s fallback.
-`retry_delay` is therefore honoured instead of being replaced by a
-zero-timeout spin.
+While the descriptor is suspended (unreliable transport, a delayed retry or a
+stalled state) `pollfd()` returns `nil`, which removes the readiness
+descriptor from that cqueues poll registration; the local kick socketpair and
+the finite timeout remain. `retry_delay` is therefore honoured instead of
+being replaced by a zero-timeout spin.
 
 A reliable infinite park is genuinely indefinite: the controller sleeps until
 the readiness descriptor or the kick socketpair is readable. Every driver-level
@@ -486,6 +495,9 @@ controller error itself is stored in `stats().error`, and
 - `tests/eventloop_luv_runtime.lua`: real luv + real TDLua, no credentials.
 - `tests/eventloop_cqueues_test.lua`: deterministic cqueues adapter tests.
 - `tests/eventloop_cqueues_runtime.lua`: real cqueues + real TDLua.
+- `tests/eventloop_def01_regressions.lua`: unreliable-transport fallback,
+  recovery, deadlines, kick, lifecycle and host-managed operation with real
+  descriptors (R1-R5).
 - `tests/eventloop_host_managed_runtime.lua`: real luv loop and real cqueues
   controller owned by the application; terminal notification, reconnection and
   non-fatal stall; no TDLib required.

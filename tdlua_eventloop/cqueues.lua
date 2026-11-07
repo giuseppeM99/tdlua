@@ -70,6 +70,12 @@ local function usable_delay(delay)
     return delay
 end
 
+local function usable_fd(driver)
+    local ok, fd = pcall(driver.fd, driver)
+    if ok and type(fd) == "number" and fd >= 0 then return true, fd end
+    return false, nil
+end
+
 function M.new(driver, options)
     options = options or {}
     local cqueues = options.cqueues or require("cqueues")
@@ -134,6 +140,7 @@ function M.new(driver, options)
         loop_running = false,
         last_state = nil,
         wake_at = nil,
+        poll_suspended = false,
         error = nil,
         stalled = nil,
         wakeups = 0,
@@ -201,20 +208,42 @@ end
 function M.pollable(driver, adapter)
     return {
         pollfd = function()
-            if adapter and adapter.stopped then return -1 end
-            if not driver:valid() then return -1 end
-            local fd = driver:fd()
-            if type(fd) ~= "number" or fd < 0 then return -1 end
+            if adapter and adapter.stopped then return nil end
+            -- A delayed retry (again/stalled) or an unreliable transport
+            -- means the level-readable descriptor must not be polled: it
+            -- would bypass the timer and spin. nil removes the descriptor
+            -- from this cqueues poll registration.
+            if adapter and adapter.poll_suspended then return nil end
+            local valid_ok, valid = pcall(driver.valid, driver)
+            if not valid_ok or valid == false then return nil end
+            local reliable_ok, reliable = pcall(driver.reliable, driver)
+            if not reliable_ok or reliable == false then return nil end
+            local fd_ok, fd = usable_fd(driver)
+            if not fd_ok then return nil end
             return fd
         end,
         events = function() return "r" end,
         timeout = function()
             if adapter then return adapter:_timeout() end
-            if not driver:valid() then return FALLBACK_SECONDS end
-            if driver:has_work() then return 0 end
-            local deadline = finite_or_infinity(driver:next_deadline())
-            if deadline ~= INF then return deadline end
-            if not driver:reliable() then return FALLBACK_SECONDS end
+            local valid_ok, valid = pcall(driver.valid, driver)
+            if not valid_ok or valid == false then return FALLBACK_SECONDS end
+            local work_ok, work = pcall(driver.has_work, driver)
+            if work_ok and work then return 0 end
+            local fd_ok = usable_fd(driver)
+            local deadline_ok, deadline = pcall(driver.next_deadline, driver)
+            local reliable_ok, reliable = pcall(driver.reliable, driver)
+            local unreliable = not reliable_ok or reliable == false
+            if deadline_ok and is_number(deadline) and deadline ~= INF then
+                -- A nearer deadline still wins when the descriptor is gone or
+                -- the transport is unreliable; a farther one is bounded.
+                if deadline > FALLBACK_SECONDS and (not fd_ok or unreliable) then
+                    return FALLBACK_SECONDS
+                end
+                return deadline
+            end
+            -- A missing descriptor cannot be observed. Do not park forever.
+            if not fd_ok then return FALLBACK_SECONDS end
+            if unreliable then return FALLBACK_SECONDS end
             return nil
         end,
     }
@@ -223,12 +252,18 @@ end
 function Adapter:_note_state(state, now)
     self.last_state = state
     self.wake_at = nil
+    self.poll_suspended = false
     if state.state == "again" then
+        self.poll_suspended = true
         local delay = nonnegative(state.deadline, 0.01)
         if delay == INF then delay = 0.01 end
         self.wake_at = now + usable_delay(delay)
+    elseif state.state == "stalled" and state.fatal ~= true then
+        self.poll_suspended = true
+        self.wake_at = now + usable_delay(self:_retry_delay())
     elseif state.state == "sleep" then
         if state.reliable == false then
+            self.poll_suspended = true
             local delay = state.deadline
             if not is_number(delay) or delay == INF or
                delay > FALLBACK_SECONDS then
@@ -247,12 +282,16 @@ function Adapter:_timeout()
     if self.stopped then return FALLBACK_SECONDS end
     local valid_ok, valid = pcall(self.driver.valid, self.driver)
     if not valid_ok or valid == false then return FALLBACK_SECONDS end
+    -- A nearer deadline or retry delay wins over the unreliable fallback:
+    -- _note_state already bounds it by FALLBACK_SECONDS when necessary.
     if self.wake_at then
         local delta = self.wake_at - self:_now()
         if delta <= 0 then return 0 end
         if delta < MIN_DELAY then return MIN_DELAY end
         return delta
     end
+    local reliable_ok, reliable = pcall(self.driver.reliable, self.driver)
+    if not reliable_ok or reliable == false then return FALLBACK_SECONDS end
     if self.last_state == nil then return 0 end
     if self.last_state.state == "sleep" and
        self.last_state.reliable ~= false then
@@ -541,6 +580,15 @@ function Adapter:_loop_body()
         local valid_ok, valid = pcall(self.driver.valid, self.driver)
         if not valid_ok or valid == false then
             self:_fail("tdlua_eventloop: readiness owner became invalid")
+            break
+        end
+
+        -- A reliable turn with no descriptor would leave only the kick pair
+        -- and no timeout: a silent indefinite park. Surface it as a terminal
+        -- error, as the luv adapter does. Suspended states legitimately hide
+        -- the descriptor and are not checked here.
+        if not self.poll_suspended and not usable_fd(self.driver) then
+            self:_fail("tdlua_eventloop: no readiness descriptor available")
             break
         end
 

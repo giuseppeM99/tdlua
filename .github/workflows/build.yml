@@ -289,14 +289,15 @@ jobs:
             ninja-build \
             zlib1g-dev
 
-      - name: Install pinned luv and cqueues
+      - name: Install pinned luv, cqueues and LuaSocket
         run: |
           set -euo pipefail
           tree="$RUNNER_TEMP/rocks"
           luarocks --lua-version=5.4 --tree="$tree" install luv 1.53.0-1
           luarocks --lua-version=5.4 --tree="$tree" install cqueues 20261006.54-0
+          luarocks --lua-version=5.4 --tree="$tree" install luasocket 3.1.0-1
           eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
-          lua5.4 -e 'local uv=require("luv"); local cq=require("cqueues"); print(uv.version_string, cq._VERSION)'
+          lua5.4 -e 'local uv=require("luv"); local cq=require("cqueues"); local s=require("socket"); print(uv.version_string, cq._VERSION, s._VERSION)'
 
       - name: Build TDLua JSON module against the pinned static TDLib
         run: |
@@ -331,6 +332,15 @@ jobs:
           lua5.4 tests/eventloop_luv_windows.lua
           lua5.4 tests/eventloop_host_managed_runtime.lua
           lua5.4 tests/eventloop_reconnect_runtime.lua
+
+      - name: Run DEF-01 unreliable-transport regressions
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          export LUA_CPATH="$PWD/build-eventloop/?.so;$LUA_CPATH"
+          export LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;$LUA_PATH"
+          lua5.4 tests/eventloop_def01_regressions.lua
 
       - name: Run examples
         run: |
