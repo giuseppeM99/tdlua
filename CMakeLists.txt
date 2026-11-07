@@ -728,6 +728,12 @@ else()
     "external Td with TDLUA_BUNDLED_TDLIB=OFF.")
 endif()
 
+# The Linux x86_64 Lua 5.5 modules link the pinned Lua 5.5.0 runtime
+# statically, so the Lua notice must travel with the module. Installing it for
+# every build is harmless and keeps a source/LuaRocks install compliant.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/third-party/Lua-5.5.txt"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tdlua")
+
 if(TDLUA_BUILD_TESTS)
     enable_testing()
     add_executable(tdlua_core_anchor_ownership_test "tests/core_anchor_ownership_test.cpp")

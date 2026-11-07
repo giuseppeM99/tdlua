@@ -140,6 +140,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
 
+          # The release payload must carry the Lua 5.5 notice and the notes that
+          # the publish job will use. A missing, empty or incomplete file stops
+          # the payload. The shared script validates both files.
+          notes="release-notes/${tag}.md"
+          "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" "$notes" third-party/Lua-5.5.txt
+
           artifacts="$RUNNER_TEMP/tdlua-artifacts"
           count="$(find "$artifacts" -type f -name '*.so' | wc -l)"
           test "$count" -eq 10
@@ -414,6 +420,12 @@ jobs:
           test -n "$installed_license"
           cmp "$installed_license" "$root/td/LICENSE_1_0.txt"
 
+          # The pinned Lua 5.5 notice must survive the source-archive install,
+          # because the Linux x86_64 Lua 5.5 module embeds that runtime.
+          installed_lua_license="$(find "$tree" -name 'Lua-5.5.txt' -print -quit)"
+          test -n "$installed_lua_license"
+          cmp "$installed_lua_license" "$root/third-party/Lua-5.5.txt"
+
       - name: Assemble payload and checksums
         run: |
           set -euo pipefail
@@ -427,6 +439,8 @@ jobs:
           cp "$RUNNER_TEMP/tdlua-platform"/*.zip "$payload/"
           cp LICENSE "$payload/"
           cp td/LICENSE_1_0.txt "$payload/TDLib-LICENSE_1_0.txt"
+          cp third-party/Lua-5.5.txt "$payload/Lua-5.5-LICENSE.txt"
+          cmp third-party/Lua-5.5.txt "$payload/Lua-5.5-LICENSE.txt"
 
           cd "$payload"
           sha256sum * > SHA256SUMS
@@ -445,6 +459,13 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
           test -f "tdlua-${release_tag}-source.tar.gz"
           test -f SHA256SUMS
+          test -f Lua-5.5-LICENSE.txt
+          cmp Lua-5.5-LICENSE.txt "$GITHUB_WORKSPACE/third-party/Lua-5.5.txt"
+          "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" \
+            "$GITHUB_WORKSPACE/release-notes/${release_tag}.md" \
+            Lua-5.5-LICENSE.txt
+          test "$(grep -c '  ' SHA256SUMS)" -eq 23
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 24
 
           # The declared matrix, verified by name and then counted. The ten
           # Linux x86-64 modules are five Lua ABIs times two backends; the six
@@ -472,13 +493,13 @@ jobs:
             variants=$((variants + 1))
           done
           test "$variants" -eq 16
-          for file in LICENSE TDLib-LICENSE_1_0.txt; do
+          for file in LICENSE TDLib-LICENSE_1_0.txt Lua-5.5-LICENSE.txt; do
             test -f "$file"
           done
 
           # Every published file must be covered by the manifest, not merely
           # hash-checked by the files that happen to be listed.
-          for file in ./*.so ./*.tar.gz ./*.zip ./*.rockspec LICENSE TDLib-LICENSE_1_0.txt; do
+          for file in ./*.so ./*.tar.gz ./*.zip ./*.rockspec LICENSE TDLib-LICENSE_1_0.txt Lua-5.5-LICENSE.txt; do
             grep -qx "[0-9a-f]*  ${file#./}" SHA256SUMS
           done
 
@@ -503,6 +524,8 @@ jobs:
           for required in \
             "tdlua-${release_tag}/dist.info" \
             "tdlua-${release_tag}/LICENSE" \
+            "tdlua-${release_tag}/third-party/Lua-5.5.txt" \
+            "tdlua-${release_tag}/release-notes/${release_tag}.md" \
             "tdlua-${release_tag}/include/tdlua/host/readiness_c.h" \
             "tdlua-${release_tag}/td/LICENSE_1_0.txt" \
             "tdlua-${release_tag}/base64/LICENSE"; do

@@ -42,6 +42,21 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Verify release notes and Lua notice
+        run: |
+          set -euo pipefail
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' dist.info)"
+          test -n "$base_version"
+          notes="release-notes/v${base_version}.md"
+          test -s "$notes"
+          grep -q "^# TDLua ${base_version}" "$notes"
+          "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" "$notes" third-party/Lua-5.5.txt
+
       - name: Download payload artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -61,13 +76,20 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
           test "$(find . -maxdepth 1 -name '*-source.tar.gz' | wc -l)" -eq 1
+          test -f Lua-5.5-LICENSE.txt
+          cmp Lua-5.5-LICENSE.txt ../third-party/Lua-5.5.txt
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' ../dist.info)"
+          "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" \
+            "../release-notes/v${base_version}.md" Lua-5.5-LICENSE.txt
+          test "$(grep -c '  ' SHA256SUMS)" -eq 23
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 24
           for archive in tdlua-5.4-aarch64-*.tar.gz tdlua-5.4-macos-arm64-*.tar.gz; do
             tar -tzf "$archive" | grep '/lib/lua/5.4/tdlua.so$' >/dev/null
           done
           for archive in tdlua-5.4-win64-*.zip; do
             unzip -l "$archive" | grep 'tdlua/tdlua.dll$' >/dev/null
           done
-          for file in LICENSE TDLib-LICENSE_1_0.txt SHA256SUMS; do
+          for file in LICENSE TDLib-LICENSE_1_0.txt Lua-5.5-LICENSE.txt SHA256SUMS; do
             test -f "$file"
           done
 
