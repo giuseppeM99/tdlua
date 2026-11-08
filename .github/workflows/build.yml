@@ -440,7 +440,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-${{ steps.toolchain.outputs.td_commit }}-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
 
       - name: Configure native backend with bundled pinned TDLib
         run: |
