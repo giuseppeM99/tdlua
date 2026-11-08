@@ -73,7 +73,7 @@ jobs:
             git ls-tree HEAD td
             shasum -a 256 td/td/generate/scheme/td_api.tl
           } 2>&1 | tee "$artifacts/provenance.log"
-          test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test "$(git -C td rev-parse HEAD)" = 23383aef218a3123f02b744bfa91bde21056a814
           test -z "$(git -C td status --porcelain)"
 
       - name: Install macOS build dependencies
@@ -209,7 +209,7 @@ jobs:
           test -f "$stage/lib/cmake/Td/TdStaticTargets.cmake"
           test -f "$stage/include/td/telegram/Client.h"
           test -f "$stage/include/td/telegram/td_api_json.h"
-          grep -q 'set(PACKAGE_VERSION "1.8.68")' "$stage/lib/cmake/Td/TdConfigVersion.cmake"
+          grep -q 'set(PACKAGE_VERSION "1.8.70")' "$stage/lib/cmake/Td/TdConfigVersion.cmake"
           test -f "$bootstrap/CMakeCache.txt"
           test -f "$bootstrap/td/tdtl/libtdtl.a"
           test -x "$bootstrap/td/td/generate/tl-parser/tl-parser"
@@ -218,7 +218,7 @@ jobs:
           grep -q '^TDLUA_BACKEND:STRING=native$' "$bootstrap/CMakeCache.txt"
           grep -q '^TDLUA_BUNDLED_TDLIB:BOOL=ON$' "$bootstrap/CMakeCache.txt"
           git -C td status --short
-          test "$(git -C td rev-parse HEAD)" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test "$(git -C td rev-parse HEAD)" = 23383aef218a3123f02b744bfa91bde21056a814
           test -z "$(git -C td status --porcelain)"
           "$bootstrap/td/td/generate/tl-parser/tl-parser" -e \
             "$RUNNER_TEMP/tdlua-native-artifacts/td_api.tlo" \

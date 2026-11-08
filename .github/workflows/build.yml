@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
           td_commit="$(git -C td rev-parse HEAD)"
-          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test "$td_commit" = 23383aef218a3123f02b744bfa91bde21056a814
           test -z "$(git -C td status --porcelain)"
           printf 'td_commit=%s\n' "$td_commit" >> "$GITHUB_OUTPUT"
           sha256sum td/td/generate/scheme/td_api.tl
@@ -414,7 +414,7 @@ jobs:
           test "$(uname -m)" = aarch64
           printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
           td_commit="$(git -C td rev-parse HEAD)"
-          test "$td_commit" = c15d3f5a5de6e3ba5839822c451152e5e18bb700
+          test "$td_commit" = 23383aef218a3123f02b744bfa91bde21056a814
           test -z "$(git -C td status --porcelain)"
           {
             printf 'td_commit=%s\n' "$td_commit"
@@ -442,7 +442,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ci/tdlua-ccache
-          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.68-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          key: tdlua-aarch64-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-gcc-${{ steps.toolchain.outputs.gcc }}-tdlib-1.8.70-cxx23-static-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
 
       - name: Configure native backend with bundled pinned TDLib
         run: |

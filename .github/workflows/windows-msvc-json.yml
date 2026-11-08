@@ -32,7 +32,7 @@ permissions:
   contents: read
 
 env:
-  TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
+  TDLIB_COMMIT: 23383aef218a3123f02b744bfa91bde21056a814
   CMAKE_BUILD_PARALLEL_LEVEL: 2
   # vcpkg's default binary cache lives under %LOCALAPPDATA% on the runner, so it
   # is empty at the start of every job and OpenSSL, zlib and gperf are compiled
@@ -217,7 +217,7 @@ jobs:
               Tee-Object -FilePath .ci\windows-msvc\tdlib-cache-decision.log
           }
 
-      - name: Build TDLib 1.8.68 shared JSON package
+      - name: Build TDLib 1.8.70 shared JSON package
         if: steps.tdlib-package-check.outputs.valid != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
@@ -461,7 +461,7 @@ jobs:
           }
           dumpbin.exe /exports $module | Select-String 'tdlua_json_test_control' | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'test-only JSON hooks were not exported' }
-          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.70"); print(t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from the build directory' }
           ctest --test-dir $build --output-on-failure -C Release 2>&1 | Tee-Object -FilePath .ci\windows-msvc\ctest-full.log
           $ctestExit = $LASTEXITCODE
@@ -580,7 +580,7 @@ jobs:
           dumpbin.exe /dependents $prodModule | Tee-Object -FilePath .ci\windows-msvc\tdlua-dependencies-production.log
           $env:LUA_CPATH = "$install\lib\lua\5.4\?.dll"
           $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$install\lib\lua\5.4;$env:GITHUB_WORKSPACE\.ci\windows-msvc\lua;$env:PATH"
-          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print(t.version, t.api_version, t.tdlib_version)'
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.70"); print(t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
 

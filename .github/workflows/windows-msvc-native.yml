@@ -36,7 +36,7 @@ permissions:
   contents: read
 
 env:
-  TDLIB_COMMIT: c15d3f5a5de6e3ba5839822c451152e5e18bb700
+  TDLIB_COMMIT: 23383aef218a3123f02b744bfa91bde21056a814
   CMAKE_BUILD_PARALLEL_LEVEL: 4
   # vcpkg's default binary cache lives under %LOCALAPPDATA% on the runner, so it
   # is empty at the start of every job and OpenSSL, zlib and gperf are compiled
@@ -241,7 +241,7 @@ jobs:
                 -Bootstrap "$env:RUNNER_TEMP\tdlua-native-bootstrap" `
                 -SchemaPath 'td\td\generate\scheme\td_api.tl' `
                 -SchemaHash '${{ steps.provenance.outputs.schema }}' `
-                -Version '1.8.68' `
+                -Version '1.8.70' `
                 -SourceDirectory $env:GITHUB_WORKSPACE `
                 -Compiler (Get-Command cl.exe).Source `
                 -Mode check 2>&1 |
@@ -338,7 +338,7 @@ jobs:
             -Bootstrap $bootstrap `
             -SchemaPath 'td\td\generate\scheme\td_api.tl' `
             -SchemaHash '${{ steps.provenance.outputs.schema }}' `
-            -Version '1.8.68' `
+            -Version '1.8.70' `
             -SourceDirectory $env:GITHUB_WORKSPACE `
             -Compiler (Get-Command cl.exe).Source `
             -Mode write 2>&1 |
@@ -691,7 +691,7 @@ jobs:
           # PATH; the build tree is deliberately absent.
           $env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:GITHUB_WORKSPACE\.ci\windows-msvc-native\lua;$env:PATH"
           $env:LUA_CPATH = "$moduleDir\?.dll"
-          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.68"); print("installed native module", t.version, t.api_version, t.tdlib_version)'
+          & $env:LUA_EXECUTABLE -e 'local t=require("tdlua"); assert(t.version and t.api_version and t.tdlib_version=="1.8.70"); print("installed native module", t.version, t.api_version, t.tdlib_version)'
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed for the installed production module' }
           @(
             "installed_module=$installedModule"
