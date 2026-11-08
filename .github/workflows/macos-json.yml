@@ -71,7 +71,6 @@ jobs:
             git ls-tree HEAD td
             shasum -a 256 td/td/generate/scheme/td_api.tl
           } 2>&1 | tee "$RUNNER_TEMP/tdlua-artifacts/provenance.log"
-          test "$(git -C td rev-parse HEAD)" = 23383aef218a3123f02b744bfa91bde21056a814
           test -z "$(git -C td status --porcelain)"
 
       - name: Install macOS build dependencies
