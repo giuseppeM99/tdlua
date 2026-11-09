@@ -426,6 +426,45 @@ jobs:
           test -n "$installed_lua_license"
           cmp "$installed_lua_license" "$root/third-party/Lua-5.5.txt"
 
+      # The optional event-loop package ships as its own rockspec and points at
+      # this same source tarball, so the archive a user downloads must really
+      # contain all six pure-Lua modules. Installing from the extracted archive
+      # (not from the checkout) proves the published payload is the one tested.
+      - name: Install the optional eventloop rock from the source tarball
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/release-src/tdlua-${release_tag}"
+          tree="$RUNNER_TEMP/eventloop-tree"
+          rm -rf "$tree"
+          eventloop="tdlua_eventloop-${base_version}-1.rockspec"
+          test -f "$GITHUB_WORKSPACE/release-meta/$eventloop"
+          (
+            cd "$root"
+            luarocks --lua-version 5.4 --tree "$tree" make \
+              "$GITHUB_WORKSPACE/release-meta/$eventloop" --deps-mode=none
+          )
+          installed="$tree/share/lua/5.4/tdlua_eventloop"
+          test "$(find "$installed" -maxdepth 1 -name '*.lua' | wc -l)" -eq 6
+          for module in driver luv cqueues copas copas_socket copas_bridge; do
+            test -f "$installed/$module.lua"
+          done
+          # Same guard as the core install: the published archive must not carry
+          # internal agent notes into the LuaRocks documentation directory.
+          test ! -e \
+            "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/${base_version}-1/doc/AGENTS.md"
+          LUA_PATH="$tree/share/lua/5.4/?.lua;$tree/share/lua/5.4/?/init.lua;;" \
+            lua5.4 -e '
+              assert(type(require("tdlua_eventloop.driver")) == "table")
+              local copas = require("tdlua_eventloop.copas")
+              local bridge = require("tdlua_eventloop.copas_bridge")
+              assert(type(copas.new) == "function")
+              assert(type(copas.is_supported_platform) == "function")
+              assert(type(bridge.new) == "function")
+              assert(package.loaded["copas"] == nil)
+              assert(package.loaded["socket"] == nil)
+              print("eventloop rock: 6 modules, no optional runtime loaded")
+            '
+
       - name: Assemble payload and checksums
         run: |
           set -euo pipefail

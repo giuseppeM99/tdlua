@@ -358,14 +358,33 @@ jobs:
           set -euo pipefail
           tree="$RUNNER_TEMP/pack"
           luarocks --lua-version=5.4 --tree="$tree" make \
-            tdlua_eventloop-0.6.0-1.rockspec --deps-mode=none
-          luarocks lint tdlua_eventloop-0.6.0-1.rockspec
+            tdlua_eventloop-0.6.1-1.rockspec --deps-mode=none
+          luarocks lint tdlua_eventloop-0.6.1-1.rockspec
           # The release tarball has no internal agent notes. Guard against a
           # checkout-path build shipping one through LuaRocks' default docs.
-          test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.0-1/doc/AGENTS.md"
+          test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.1-1/doc/AGENTS.md"
+          # All six modules must reach the installed rock: the three original
+          # adapters plus the Copas adapter, its private socket proxy and the
+          # bridge. A rockspec that forgets one would still lint and build.
+          installed="$tree/share/lua/5.4/tdlua_eventloop"
+          test "$(find "$installed" -maxdepth 1 -name '*.lua' | wc -l)" -eq 6
+          for module in driver luv cqueues copas copas_socket copas_bridge; do
+            test -f "$installed/$module.lua"
+          done
           LUA_CPATH="$tree/lib/lua/5.4/?.so" \
           LUA_PATH="$tree/share/lua/5.4/?.lua;$tree/share/lua/5.4/?/init.lua" \
-            lua5.4 -e 'assert(type(require("tdlua_eventloop.driver")) == "table"); assert(type(require("tdlua_eventloop.luv")) == "table"); assert(type(require("tdlua_eventloop.cqueues")) == "table")'
+            lua5.4 -e '
+              assert(type(require("tdlua_eventloop.driver")) == "table")
+              assert(type(require("tdlua_eventloop.luv")) == "table")
+              assert(type(require("tdlua_eventloop.cqueues")) == "table")
+              local copas = require("tdlua_eventloop.copas")
+              local bridge = require("tdlua_eventloop.copas_bridge")
+              assert(type(copas.new) == "function")
+              assert(type(copas.is_supported_platform) == "function")
+              assert(type(bridge.new) == "function")
+              assert(package.loaded["copas"] == nil)
+              assert(package.loaded["socket"] == nil)
+            '
 
   eventloop-copas:
     name: Event loop adapters / Copas / all runtimes
