@@ -3,6 +3,54 @@
 
 # Changelog
 
+## 0.6.1
+
+### Optional Copas adapter
+
+- Added `tdlua_eventloop.copas`, a pure-Lua optional adapter that drives one
+  Copas coroutine over the existing readiness surface. Copas and LuaSocket are
+  loaded only inside `Copas.new()`; the core module and the luv/cqueues
+  adapters never load them.
+- Standalone mode (`adapter:run()`) and host-managed mode
+  (`adapter:start()`/`adapter:step()`) are both supported, with
+  `kick()`, `stop()`, `is_running()`, `is_stopped()` and `stats()`.
+- `on_stop(reason, detail, adapter)` runs exactly once; `on_stall(state,
+  adapter)` reports a non-fatal episode once and is contained in the stats.
+- `max_park` and `hard_fallback` bound one park and the unreliable-descriptor
+  retry.
+- Windows is rejected before Copas is loaded. luv remains the Windows adapter.
+- Added `tdlua_eventloop.copas_socket`, a private socket-like proxy that never
+  closes or duplicates the owner descriptor.
+
+### Copas coroutine bridge
+
+- Added `tdlua_eventloop.copas_bridge`, which owns waiters rather than TDLib
+  requests: `waiter()`, `waiter:callback()`, `poll()`, `await_handle()`,
+  `await_poll()`, `destroy()`, and the single-use waiter lifecycle
+  (`complete`, `fail`, `cancel`, `is_done`, `wait`).
+- Completion is exactly-once and preserves multiple values and `nil`. A
+  terminal waiter drops its coroutine reference.
+- TDLua never resumes a Copas coroutine. Calling `Future:wait()` or
+  `Task:wait()` on a pending handle from a Copas coroutine is an unsupported
+  ownership violation; use the bridge.
+- `waiter:cancel()` cancels the host wait only, not the TDLib request.
+
+### Driver and platform
+
+- Added the additive `driver:clear()` method, which drains the owner doorbell
+  without consuming an update or closing the descriptor.
+- TDLib moves from 1.8.68 to 1.8.70 (commit
+  `23383aef218a3123f02b744bfa91bde21056a814`); the module version string is
+  `0.6.1-1.8.70`.
+- The core C++, the readiness C ABI revision 1, the backends, the managed
+  `Future`/`Task` API and the luv/cqueues adapters are unchanged.
+
+### Tests
+
+- Added pinned Copas interoperability coverage: 56 rows and 2,070 assertions
+  across Lua 5.1–5.5 and LuaJIT with the JIT on and off, including real TDLib
+  workers, negative ownership cases and package staging.
+
 ## 0.6.0
 
 ### Host event-loop readiness

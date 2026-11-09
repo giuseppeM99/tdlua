@@ -4,7 +4,7 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-TDLua 0.6.0 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
+TDLua 0.6.1 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
 arm64. The Linux packages require glibc. Dynamic unloading is unsupported.
 
 ## Installation
@@ -38,7 +38,7 @@ The default destination is `lib/lua/<lua-version>/`; change it with
 diagnostic methods and cannot be installed. The install also places the
 standalone readiness header at `include/tdlua/host/readiness_c.h`.
 
-Prebuilt 0.6.0 packages are available for these platforms. Linux x86-64 modules
+Prebuilt 0.6.1 packages are available for these platforms. Linux x86-64 modules
 cover Lua 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64, Windows and macOS use
 Lua 5.4. Choose the package that matches your Lua ABI and backend. Linux and
 native packages link TDLib statically; Windows and macOS JSON packages include a
@@ -245,3 +245,13 @@ runtime, and is POSIX-only with runtime validation on Lua 5.4. It does not
 require the older C ABI bridge. That earlier experiment, which needed an
 undistributed bridge, is a separate component and is not a prerequisite for
 the adapter package. The documented cqueues and platform limits still apply.
+
+`tdlua_eventloop.copas` is the official optional Copas adapter. It drives one
+Copas coroutine over the same readiness surface, in standalone or host-managed
+mode, and loads Copas and LuaSocket only inside `Copas.new()`. It is POSIX-only
+and rejects Windows; luv remains the Windows adapter. `Driver:clear()` drains
+the doorbell without consuming an update. `tdlua_eventloop.copas_bridge` lets a
+Copas coroutine await a managed handle; TDLua never resumes a Copas coroutine.
+Do not call `Future:wait()` or `Task:wait()` on a pending handle from a Copas
+coroutine. Waiter cancellation cancels the host wait only, not the TDLib
+request. See `tdlua_eventloop/README.md` for the ownership rules.
