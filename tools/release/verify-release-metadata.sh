@@ -24,7 +24,9 @@ fail() {
 grep -q '^# TDLua ' "$notes" || fail "release notes have no TDLua title"
 
 # The public body must contain the sections and limits that the release
-# contract promises. Keep these in sync with release-notes/v0.6.0.md.
+# contract promises. The first list is inherited from the 0.6.0 contract and
+# must keep holding; the second records the optional Copas surface added in
+# 0.6.1. Keep both in sync with release-notes/v0.6.1.md.
 for section in \
     '## Highlights' \
     '## What is new' \
@@ -50,6 +52,19 @@ for section in \
     'Authenticated Telegram' \
     'LuaSocket' \
     'No application migration'; do
+    grep -qF "$section" "$notes" || fail "release notes missing: $section"
+done
+
+# 0.6.1 adds the optional Copas adapter and bridge. The public body must name
+# the new modules and keep the ownership limits that make them safe to use.
+for section in \
+    'tdlua_eventloop.copas' \
+    'tdlua_eventloop.copas_bridge' \
+    'Driver:clear()' \
+    'Future:wait()' \
+    'waiter:cancel()' \
+    'Copas 4.12.0' \
+    'TDLib 1.8.70'; do
     grep -qF "$section" "$notes" || fail "release notes missing: $section"
 done
 
