@@ -504,6 +504,37 @@ jobs:
           tree="$RUNNER_TEMP/eventloop-rocks"
           luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
             install luv 1.53.0-1
+          # Pinned Copas 4.12.0 plus the same LuaSocket/runtime deps as the
+          # Linux gate, for a real POSIX-descriptor smoke on macOS.
+          copas_commit="f4dd9fad5b6b65806c090fadc18488f6a7cc3145"
+          copas_sha="dfcca9aa204caa26157cc96de54ab9b1e1f83babbec2eb8f478223f093fbf81d"
+          copas_entry="c6fd3823a86b74e73f2b5258e1173ed82c6f8f0aac5908e8bdb8d356232c9696"
+          copas_tar="$RUNNER_TEMP/copas-$copas_commit.tar.gz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 --max-time 300 \
+            -o "$copas_tar" \
+            "https://github.com/lunarmodules/copas/archive/$copas_commit.tar.gz"
+          test "$(shasum -a 256 "$copas_tar" | awk '{print $1}')" = "$copas_sha"
+          copas_src="$RUNNER_TEMP/copas-src"
+          rm -rf "$copas_src"
+          mkdir -p "$copas_src"
+          tar -xzf "$copas_tar" -C "$copas_src" --strip-components=1
+          luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
+            install luasocket 3.1.0-1
+          luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
+            install coxpcall 1.17.0-1
+          luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
+            install binaryheap 0.4-1
+          luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
+            install timerwheel 1.0.2-2
+          (
+            cd "$copas_src"
+            luarocks --lua-version=5.4 --lua-dir="$lua_prefix" \
+              --tree="$tree" make rockspec/copas-4.12.0-1.rockspec \
+              --deps-mode=none
+          )
+          test "$(shasum -a 256 "$tree/share/lua/5.4/copas.lua" |
+            awk '{print $1}')" = "$copas_entry"
           cqueues_ok=0
           if OPENSSL_DIR="$openssl_prefix" CRYPTO_DIR="$openssl_prefix" \
              luarocks --lua-version=5.4 --lua-dir="$lua_prefix" --tree="$tree" \
@@ -521,6 +552,8 @@ jobs:
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/tdlua-stage/lib:${DYLD_LIBRARY_PATH:-}"
           "$LUA_EXECUTABLE" tests/eventloop_luv_runtime.lua
           "$LUA_EXECUTABLE" tests/eventloop_luv_windows.lua
+          "$LUA_EXECUTABLE" tests/eventloop_copas_test.lua
+          "$LUA_EXECUTABLE" tests/eventloop_copas_runtime.lua
           if [ "$cqueues_ok" = 1 ]; then
             "$LUA_EXECUTABLE" tests/eventloop_cqueues_runtime.lua
           fi

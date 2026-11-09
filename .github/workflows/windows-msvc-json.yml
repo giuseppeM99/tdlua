@@ -615,6 +615,12 @@ jobs:
           $env:LUA_CPATH = "$rocks\lib\lua\5.4\?.dll;$install\?.dll"
           $env:LUA_PATH = "$rocks\share\lua\5.4\?.lua;$rocks\share\lua\5.4\?/init.lua;$env:GITHUB_WORKSPACE\?.lua;$env:GITHUB_WORKSPACE\?/init.lua"
           $env:PATH = "$env:GITHUB_WORKSPACE\.ci\windows-msvc\tdlib\bin;$lua;$install;$env:PATH"
+          # The Copas adapter must fail fast and load no event loop on
+          # Windows; the luv adapter remains the supported path.
+          $luaCode = "local C=require('tdlua_eventloop.copas'); assert(C.is_supported_platform()==false); local ok,err=pcall(C.new,{}); assert(not ok); err=tostring(err); assert(err:find('Windows',1,true)); assert(err:find('uv.new_socket_poll',1,true)); assert(package.loaded['copas']==nil); assert(package.loaded['socket']==nil); local uv=require('luv'); assert(type(uv.new_socket_poll)=='function'); print('copas-windows-reject: '..err)"
+          $reject = & $env:LUA_EXECUTABLE -e $luaCode 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Copas Windows rejection failed: $reject" }
+          $reject | Tee-Object -FilePath .ci\windows-msvc\copas-windows-reject.log
           for ($i = 1; $i -le 20; $i++) {
             & $env:LUA_EXECUTABLE tests\eventloop_luv_windows.lua
             if ($LASTEXITCODE -ne 0) { throw "event loop probe failed at iteration $i" }

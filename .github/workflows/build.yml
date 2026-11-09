@@ -367,6 +367,288 @@ jobs:
           LUA_PATH="$tree/share/lua/5.4/?.lua;$tree/share/lua/5.4/?/init.lua" \
             lua5.4 -e 'assert(type(require("tdlua_eventloop.driver")) == "table"); assert(type(require("tdlua_eventloop.luv")) == "table"); assert(type(require("tdlua_eventloop.cqueues")) == "table")'
 
+  eventloop-copas:
+    name: Event loop adapters / Copas / all runtimes
+    needs: tdlib
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Pinned Copas source and the exact files the local P1 matrix used.
+      COPAS_COMMIT: f4dd9fad5b6b65806c090fadc18488f6a7cc3145
+      COPAS_TARBALL_SHA256: dfcca9aa204caa26157cc96de54ab9b1e1f83babbec2eb8f478223f093fbf81d
+      COPAS_ENTRY_SHA256: c6fd3823a86b74e73f2b5258e1173ed82c6f8f0aac5908e8bdb8d356232c9696
+      # LuaRocks is built from a checksum-pinned release so Lua 5.5 has a
+      # supported CLI; the runner's distro package predates it.
+      LUAROCKS_VERSION: "3.13.0"
+      LUAROCKS_SHA256: 245bf6ec560c042cb8948e3d661189292587c5949104677f1eecddc54dbe7e37
+      COPAS_ENV: ${{ runner.temp }}/copas-env
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Copas test runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            gperf \
+            liblua5.1-0-dev \
+            liblua5.2-dev \
+            liblua5.3-dev \
+            liblua5.4-dev \
+            libluajit-5.1-dev \
+            libreadline-dev \
+            libssl-dev \
+            lua5.1 lua5.2 lua5.3 lua5.4 \
+            luajit \
+            ninja-build \
+            openssl \
+            zlib1g-dev
+
+      - name: Build Lua 5.5
+        uses: ./.github/actions/lua55
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      - name: Build the compiled module for every Copas runtime
+        run: |
+          set -euo pipefail
+          common=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DTDLUA_BACKEND=json
+            -DTDLUA_BUILD_TESTS=OFF
+            -DTDLUA_BUNDLED_TDLIB=OFF
+            -DTDLUA_TD_STATIC=ON
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib"
+          )
+          for v in 5.1 5.2 5.3 5.4; do
+            lib="$(find /usr/lib /lib -name "liblua$v.so" -print -quit)"
+            test -n "$lib"
+            cmake -S . -B "build-copas-$v" "${common[@]}" \
+              -DTDLUA_LUA_VERSION="$v" \
+              -DLUA_EXECUTABLE="$(command -v "lua$v")" \
+              -DLUA_INCLUDE_DIR="/usr/include/lua$v" \
+              -DLUA_LIBRARY="$lib"
+            cmake --build "build-copas-$v" --target tdlua
+            test -f "build-copas-$v/tdlua.so"
+            if ldd "build-copas-$v/tdlua.so" | grep -q 'libtdjson'; then
+              echo "::error::build-copas-$v/tdlua.so depends on shared libtdjson"
+              exit 1
+            fi
+          done
+          cmake -S . -B build-copas-5.5 "${common[@]}" \
+            -DTDLUA_LUA_VERSION=5.5 \
+            -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
+            -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
+            -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
+          cmake --build build-copas-5.5 --target tdlua
+          test -f build-copas-5.5/tdlua.so
+          luajit_library="$(find /usr/lib /lib -name 'libluajit-5.1.so' -print -quit)"
+          test -n "$luajit_library"
+          cmake -S . -B build-copas-luajit "${common[@]}" \
+            -DTDLUA_LUA_IMPLEMENTATION=luajit \
+            -DLUA_EXECUTABLE="$(command -v luajit)" \
+            -DLUA_INCLUDE_DIR=/usr/include/luajit-2.1 \
+            -DLUA_LIBRARY="$luajit_library"
+          cmake --build build-copas-luajit --target tdlua
+          test -f build-copas-luajit/tdlua.so
+          for build in build-copas-5.1 build-copas-5.2 build-copas-5.3 \
+                       build-copas-5.4 build-copas-5.5 build-copas-luajit; do
+            if ldd "$build/tdlua.so" | grep -q 'libtdjson'; then
+              echo "::error::$build/tdlua.so depends on shared libtdjson"
+              exit 1
+            fi
+          done
+
+      - name: Install checksum-pinned LuaRocks
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/luarocks-$LUAROCKS_VERSION.tar.gz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 --max-time 300 \
+            -o "$archive" \
+            "https://luarocks.org/releases/luarocks-$LUAROCKS_VERSION.tar.gz"
+          printf '%s  %s\n' "$LUAROCKS_SHA256" "$archive" | sha256sum -c -
+          src="$RUNNER_TEMP/luarocks-$LUAROCKS_VERSION-src"
+          rm -rf "$src" "$RUNNER_TEMP/luarocks"
+          mkdir -p "$src"
+          tar -xzf "$archive" -C "$src" --strip-components=1
+          (
+            cd "$src"
+            ./configure --prefix="$RUNNER_TEMP/luarocks" \
+              --with-lua="$RUNNER_TEMP/lua55" \
+              --with-lua-include="$RUNNER_TEMP/lua55/include" \
+              --with-lua-lib="$RUNNER_TEMP/lua55/lib"
+            make
+            make install
+          )
+          echo "$RUNNER_TEMP/luarocks/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/luarocks/bin/luarocks" --version
+
+      - name: Install pinned Copas in isolated trees
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/copas-$COPAS_COMMIT.tar.gz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 --max-time 300 \
+            -o "$tarball" \
+            "https://github.com/lunarmodules/copas/archive/$COPAS_COMMIT.tar.gz"
+          printf '%s  %s\n' "$COPAS_TARBALL_SHA256" "$tarball" | sha256sum -c -
+          src="$RUNNER_TEMP/copas-src"
+          rm -rf "$src"
+          mkdir -p "$src"
+          tar -xzf "$tarball" -C "$src" --strip-components=1
+          for v in 5.1 5.2 5.3 5.4 5.5; do
+            tree="$COPAS_ENV/rocks-$v"
+            rm -rf "$tree"
+            mkdir -p "$tree"
+            lr=(luarocks --lua-version="$v" --tree="$tree")
+            vars=()
+            if [ "$v" = 5.5 ]; then
+              lr+=(--lua-dir="$RUNNER_TEMP/lua55")
+              vars=(
+                LUA_INCDIR="$RUNNER_TEMP/lua55/include"
+                LUA_LIBDIR="$RUNNER_TEMP/lua55/lib"
+              )
+            fi
+            "${lr[@]}" install luasocket 3.1.0-1 "${vars[@]}"
+            "${lr[@]}" install coxpcall 1.17.0-1
+            "${lr[@]}" install binaryheap 0.4-1
+            "${lr[@]}" install timerwheel 1.0.2-2
+            (
+              cd "$src"
+              "${lr[@]}" make rockspec/copas-4.12.0-1.rockspec \
+                --deps-mode=none "${vars[@]}"
+            )
+            printf '%s  %s\n' "$COPAS_ENTRY_SHA256" \
+              "$tree/share/lua/$v/copas.lua" | sha256sum -c -
+          done
+
+      - name: Run the 7-runtime Copas matrix
+        run: |
+          set -euo pipefail
+          export LUA55_BIN="$RUNNER_TEMP/lua55/bin/lua"
+          export EVIDENCE_DIR="$PWD/.ci/copas-evidence"
+          bash tools/ci/run-copas-matrix.sh 2>&1 | tee .ci/copas-matrix.log
+
+      - name: Upload Copas matrix evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eventloop-copas-evidence
+          path: |
+            .ci/copas-evidence
+            .ci/copas-matrix.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  eventloop-copas-packaging:
+    name: Copas package / 0.6.1 staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Lua 5.4 and LuaRocks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblua5.4-dev lua5.4 luarocks
+
+      - name: Stage and verify the non-publishing 0.6.1 payload
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/tdlua-v0.6.1"
+          rm -rf "$stage"
+          mkdir -p "$stage/tdlua_eventloop"
+          cp tdlua_eventloop/driver.lua \
+             tdlua_eventloop/luv.lua \
+             tdlua_eventloop/cqueues.lua \
+             tdlua_eventloop/copas.lua \
+             tdlua_eventloop/copas_socket.lua \
+             tdlua_eventloop/copas_bridge.lua \
+             tdlua_eventloop/README.md "$stage/tdlua_eventloop/"
+          cp tdlua_eventloop-0.6.1-1.rockspec "$stage/"
+          archive="$RUNNER_TEMP/tdlua-v0.6.1-source.tar.gz"
+          tar -czf "$archive" -C "$RUNNER_TEMP" tdlua-v0.6.1
+          listing="$RUNNER_TEMP/tdlua-v0.6.1-listing.txt"
+          tar -tzf "$archive" | sort > "$listing"
+          cat "$listing"
+          if grep -q 'env/rocks' "$listing"; then
+            echo "::error::staged payload contains an isolated LuaRocks tree"
+            exit 1
+          fi
+          if grep -Eq '(^|/)(\.agent|docs)/' "$listing"; then
+            echo "::error::staged payload contains internal notes"
+            exit 1
+          fi
+          for module in driver luv cqueues copas copas_socket copas_bridge; do
+            grep -qx "tdlua-v0.6.1/tdlua_eventloop/$module.lua" "$listing"
+          done
+          # The core rock and the C++ build never gain an event-loop
+          # dependency. This is a content check so it also holds on branches
+          # where the P1 commits are already merged.
+          core_deps="$(sed -n '/^dependencies = {/,/^}/p' tdlua-scm-1.rockspec)"
+          printf '%s\n' "$core_deps"
+          if grep -Eiq 'copas|luasocket|luv|cqueues' <<<"$core_deps"; then
+            echo "::error::core rockspec gained an event-loop dependency"
+            exit 1
+          fi
+          if grep -Eiq 'copas|luasocket' CMakeLists.txt; then
+            echo "::error::CMake build gained an event-loop dependency"
+            exit 1
+          fi
+          tree="$RUNNER_TEMP/rock"
+          rm -rf "$tree"
+          (
+            cd "$stage"
+            luarocks --lua-version=5.4 --tree="$tree" make \
+              tdlua_eventloop-0.6.1-1.rockspec --deps-mode=none
+          )
+          luarocks lint tdlua_eventloop-0.6.1-1.rockspec
+          installed="$tree/share/lua/5.4/tdlua_eventloop"
+          test "$(find "$installed" -maxdepth 1 -name '*.lua' | wc -l)" -eq 6
+          if [ -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.1-1/doc/AGENTS.md" ]; then
+            echo "::error::optional rock ships AGENTS.md"
+            exit 1
+          fi
+          LUA_PATH="$tree/share/lua/5.4/?.lua;$tree/share/lua/5.4/?/init.lua;;" \
+            lua5.4 -e '
+              local d = require("tdlua_eventloop.driver")
+              local c = require("tdlua_eventloop.copas")
+              local b = require("tdlua_eventloop.copas_bridge")
+              assert(type(d.new) == "function")
+              assert(type(c.new) == "function")
+              assert(type(b.new) == "function")
+              assert(package.loaded["copas"] == nil)
+              assert(package.loaded["socket"] == nil)
+              print("copas-0.6.1-staging: Copas modules load without optional runtimes")
+            '
+
+      - name: Upload Copas packaging evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eventloop-copas-packaging
+          path: |
+            ${{ runner.temp }}/tdlua-v0.6.1-listing.txt
+            ${{ runner.temp }}/tdlua-v0.6.1-source.tar.gz
+          if-no-files-found: warn
+          retention-days: 7
+
   linux-aarch64:
     name: Linux AArch64 / JSON and native / Lua 5.4
     # AArch64 is a release gate: it must also run for the packaging and
