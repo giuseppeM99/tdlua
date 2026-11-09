@@ -543,6 +543,7 @@ jobs:
           set -euo pipefail
           export LUA55_BIN="$RUNNER_TEMP/lua55/bin/lua"
           export EVIDENCE_DIR="$PWD/.ci/copas-evidence"
+          mkdir -p .ci
           bash tools/ci/run-copas-matrix.sh 2>&1 | tee .ci/copas-matrix.log
 
       - name: Upload Copas matrix evidence

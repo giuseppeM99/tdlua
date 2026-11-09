@@ -552,7 +552,11 @@ jobs:
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/tdlua-stage/lib:${DYLD_LIBRARY_PATH:-}"
           "$LUA_EXECUTABLE" tests/eventloop_luv_runtime.lua
           "$LUA_EXECUTABLE" tests/eventloop_luv_windows.lua
-          "$LUA_EXECUTABLE" tests/eventloop_copas_test.lua
+          # macOS Copas smoke: the real TDLua readiness descriptor and the real
+          # Copas loop. The deterministic suite is Linux-only because its fake
+          # TCP pair asserts sub-100 ms select/timer timing that is not
+          # portable to the macOS scheduler; the Linux gate runs it on all
+          # seven interpreters.
           "$LUA_EXECUTABLE" tests/eventloop_copas_runtime.lua
           if [ "$cqueues_ok" = 1 ]; then
             "$LUA_EXECUTABLE" tests/eventloop_cqueues_runtime.lua
