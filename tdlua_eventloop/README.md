@@ -21,9 +21,13 @@ added to TDLua.
 | `tdlua_eventloop.driver` | Generic owner-thread driver: clients, owner-wide readiness, round-robin, call budget, deadlines, terminal/stalled, `kick()`, `progress()` |
 | `tdlua_eventloop.luv` | luv adapter: `uv.new_poll` on POSIX, `uv.new_socket_poll` on Windows, one timer |
 | `tdlua_eventloop.cqueues` | cqueues adapter: pollable object + controller coroutine + local kick socketpair; standalone or application-owned controller |
+| `tdlua_eventloop.copas` | Copas adapter: readiness proxy + a Copas-owned coroutine; standalone or host-managed loop; POSIX only |
+| `tdlua_eventloop.copas_socket` | Private Copas readiness proxy (`getfd`/`dirty`/`receive`/`settimeout`/`close`); not an application API |
+| `tdlua_eventloop.copas_bridge` | Optional bridge for Copas-owned waiter coroutines: callback Tasks and terminal-handle polling |
 
-`luv` and `cqueues` are optional runtime dependencies of the adapters. The
-generic driver has none.
+`luv`, `cqueues`, Copas and LuaSocket are optional runtime dependencies of the
+adapters. The generic driver has none, and the core `tdlua` module never loads
+any of them.
 
 ## Driver
 
@@ -50,6 +54,11 @@ driver:add(client, {generic = false})  -- readiness options are forwarded
 driver:add(other_client)               -- wakes a parked adapter
 local state = driver:tick()
 ```
+
+`driver:clear()` drains the owner doorbell through the current primary
+readiness handle and returns `true`, or `nil, err`. It is additive, does not
+consume a client update, and is used by the Copas proxy. Adapters that already
+call `tick()` do not need it.
 
 ### `tick()` states
 
@@ -467,6 +476,186 @@ delivers the pending notification with the original terminal cause; the
 controller error itself is stored in `stats().error`, and
 `stats().registration_dead` records whether the coroutine had already exited.
 
+## Copas adapter
+
+Copas is optional. The adapter loads it only in `Copas.new()`, and it loads
+LuaSocket only through the private proxy. Supported and exercised:
+
+| Component | Tested |
+|---|---|
+| Copas | 4.12.0 (commit `f4dd9fad5b6b65806c090fadc18488f6a7cc3145`) |
+| LuaSocket | 3.0.0; the `getfd`/`dirty` duck typing used here is also present in 3.1.x |
+| Lua | 5.1, 5.2, 5.3, 5.4, 5.5 |
+| LuaJIT | 2.1, JIT on and JIT off |
+
+Copas has no public “watch this descriptor” call. The adapter registers the
+readiness descriptor through `copas.receive(proxy)`, where `proxy` is the
+private socket-like object in `tdlua_eventloop.copas_socket`. LuaSocket's
+`select` accepts a table whose `getfd()` returns a number; that is a LuaSocket
+duck-typing contract, not a TDLua extension point. The proxy never closes or
+duplicates the owner descriptor. `copas.close(proxy)` is used only to make a
+parked select return the proxy; `proxy:close()` is deliberately a no-op.
+
+### Standalone mode
+
+```lua
+local copas = require("copas")
+local Driver = require("tdlua_eventloop.driver")
+local Copas = require("tdlua_eventloop.copas")
+
+local driver = Driver.new({on_update = function(client, update)
+  -- normal raw-update handling
+end})
+driver:add(client)
+
+local adapter = Copas.new(driver, {
+  copas = copas,          -- optional; default is require("copas")
+  max_park = 0.25,        -- seconds; math.huge disables the periodic bound
+  hard_fallback = 0.1,    -- unreliable transport retry bound
+  on_stop = function(reason, detail, adapter)
+    -- exactly once, on the owner thread, after teardown
+  end,
+  on_stall = function(state, adapter)
+    -- once per non-fatal stall episode
+  end,
+})
+
+adapter:run()             -- owns the Copas loop until retirement
+```
+
+`run()` returns `"ok"` on `closed`/`stopped`, `nil, "stalled"` on a fatal
+stall, and raises a stored error otherwise.
+
+### Host-managed mode
+
+The application owns the Copas loop and calls `adapter:step()` (or
+`copas.step()` directly). The adapter never calls `copas.loop()` in this mode
+and never stops the application loop.
+
+```lua
+local adapter = Copas.new(driver, {max_park = 0.25})
+adapter:start()
+
+while not adapter:is_stopped() do
+  adapter:step(0.05)      -- one Copas turn; same true/false/nil,err as copas.step
+end
+```
+
+A `stop()` requested between steps retires the parked adapter coroutine on the
+next `step()`; that is when `on_stop` is delivered. Do not call `run()` and
+`step()` concurrently.
+
+### Waiting on a Future or Task from Copas
+
+A Fibre/Task created by TDLua is owned by TDLua. A Copas coroutine must never
+call `future:wait()` or `task:wait()` while the handle is pending: TDLua would
+resume the Copas coroutine from its own scheduler. This is a documented
+ownership violation, demonstrated by
+`tests/eventloop_copas_negative.lua`.
+
+Use the bridge. It parks the Copas coroutine and is woken with
+`copas.wakeup()`; it never calls `coroutine.resume()`.
+
+```lua
+local Bridge = require("tdlua_eventloop.copas_bridge")
+local bridge = Bridge.new({scheduler = copas})
+local adapter = Copas.new(driver, {bridge = bridge})
+
+-- Callback Task: true completion notification, no polling.
+copas.addthread(function()
+  local waiter = bridge:waiter("getOption")
+  client:getOption({name = "version"}, waiter:callback())
+  local response = waiter:wait(5)          -- value(s), or raises on failure
+end)
+
+-- Existing typed Future: the adapter polls ready() after each driver turn.
+copas.addthread(function()
+  local future = client:getOption({name = "version"})
+  local response = bridge:await_handle(future, 5)
+end)
+```
+
+`bridge:poll()` is called by the adapter after every `driver:tick()`. If no
+adapter is used, call it yourself or use `bridge:await_poll(handle, timeout,
+interval)`. A terminal handle is read with `handle:wait()`, which does not
+yield; a pending handle is never waited on.
+
+`Bridge.new({scheduler = copas})` accepts a scheduler object exposing
+`gettime`, `pause`, `pauseforever` and `wakeup`; Copas 4.12.0 provides all
+four. The bridge never calls `coroutine.resume()`.
+
+Waiter semantics:
+
+- exactly-once completion; completion-before-arm is preserved;
+- `waiter:complete(...)`, `waiter:fail(err)`, `waiter:cancel([reason])`;
+- `cancel()` is idempotent and terminal; a late completion is ignored;
+- a timeout returns `nil, "timeout", elapsed` and is terminal;
+- multiple values and `nil` are preserved;
+- a failure raises the same error from `wait()`;
+- a completed/timed-out/cancelled waiter drops its coroutine reference and is
+  removed from the bridge; `destroy()` releases every remaining waiter;
+- `waiter:callback()` never yields and returns its arguments unchanged.
+
+`waiter:cancel()` cancels the **host wait**, not the TDLib request. The request
+remains pending until its response or the client closes; per-request
+cancellation is not part of 0.6.x.
+
+Pass `owns_bridge = true` to let the adapter call `bridge:destroy()` during its
+teardown. Without it, the host owns the bridge life cycle.
+
+### Scheduling and `max_park`
+
+- A descriptor event wakes the loop directly; update latency does not depend
+  on `max_park`.
+- A finite readiness deadline is used as the Copas receive timeout, capped by
+  `max_park`.
+- `max_park` bounds a single park. With a finite value the loop has a timer at
+  most every `max_park` even when idle. That timer bounds stop/kick latency and
+  recovers from a missed doorbell; it is **not** a periodic poll of TDLib
+  state. Set `max_park = math.huge` for a fully event-driven indefinite park.
+- `hard_fallback` (default 0.1 s) is used when `readiness:reliable()` is false
+  or no numeric descriptor is available. It is bounded by a nearer deadline.
+- A reliable idle park still performs no zero-delay retry; a delivered update
+  can request an immediate `again` turn, which is a real progress signal.
+
+### Stop, reconnect and errors
+
+`on_stop(reason, detail, adapter)` is exactly-once after the proxy is detached,
+the hook is restored and the driver is stopped. Reasons match the other
+adapters: `"error"`, `"stalled"` (fatal stall only), `"closed"` and
+`"stopped"`. A raising `on_stop` or `on_stall` is contained in
+`stats().notify_error` / `stats().stall_error`.
+
+The adapter is single-use. Reconnect by building a new client/driver/adapter
+pair on a later Copas turn. A retired adapter rejects `start()`; a retired
+driver rejects `add()`.
+
+`stats()` exposes `ticks`, `wakeups`, `control_wakes`, `kicks`, `signals`,
+`parks`, `park_time`, `timeouts`, `errors`, `stalls`, `select_errors`,
+`readable_events`, `clears`, `stop_reason`, `stop_detail`, `notified`,
+`notify_error`, `stall_error`, `bridge_error`, `wake_error`,
+`kick_hook_error`, `error`, `error_traceback`, `last_state`, `running`,
+`started`, `max_park` and `hard_fallback`.
+
+### Differences from luv and cqueues
+
+- **Proxy dependency.** Copas has no arbitrary-fd registration API. The adapter
+  depends on LuaSocket's `getfd`/`dirty` duck typing and on `copas.receive`
+  accepting a non-LuaSocket object. Pin Copas and LuaSocket and run the
+  adapter tests when upgrading either.
+- **POSIX only.** On Windows the readiness handle is a SOCKET, and TDLua's
+  public Lua surface does not guarantee a numeric value that LuaSocket's
+  `select` can watch. `Copas.new()` rejects Windows explicitly instead of
+  parking forever; use the luv adapter with `uv.new_socket_poll`.
+- **FD_SETSIZE.** `socket.select` rejects descriptors at or above
+  `FD_SETSIZE` (1024 on the glibc build used here). The proxy turns that into a
+  terminal error instead of spinning. The luv adapter uses `uv.new_poll` and
+  does not have this limit.
+- **No kernel kick socketpair.** `kick()`/`stop()` use `copas.close(proxy)` and
+  `copas.wakeup()`; the readiness descriptor stays open.
+- **One adapter per driver and one Copas coroutine.** Do not run two adapters
+  on the same driver, and do not call `copas.loop()` from inside `run()`.
+
 ## Operational rules
 
 1. One poller/controller per VM owner. One adapter per driver.
@@ -495,6 +684,20 @@ controller error itself is stored in `stats().error`, and
 - `tests/eventloop_luv_runtime.lua`: real luv + real TDLua, no credentials.
 - `tests/eventloop_cqueues_test.lua`: deterministic cqueues adapter tests.
 - `tests/eventloop_cqueues_runtime.lua`: real cqueues + real TDLua.
+- `tests/eventloop_copas_test.lua`: deterministic Copas adapter and bridge
+  tests (fake owner with a real descriptor, real Copas).
+- `tests/eventloop_copas_runtime.lua`: real Copas + real TDLua; local
+  `getOption`, callback Tasks, host-managed `step`.
+- `tests/eventloop_copas_concurrent.lua`: out-of-order completion, two clients
+  on one VM, cancel/timeout races, release.
+- `tests/eventloop_copas_reconnect.lua`: full generation retirement and a new
+  generation on a later turn.
+- `tests/eventloop_copas_unreliable.lua`: unreliable transport, EOF,
+  descriptor replacement and the `FD_SETSIZE` failure path.
+- `tests/eventloop_copas_negative.lua`: real-TDLua negative ownership probes
+  (`direct`, `supplied`, `await` modes; one process per mode).
+- `tests/eventloop_copas_matrix.sh`: runs all Copas suites on Lua 5.1–5.5 and
+  LuaJIT JIT-on/JIT-off.
 - `tests/eventloop_def01_regressions.lua`: unreliable-transport fallback,
   recovery, deadlines, kick, lifecycle and host-managed operation with real
   descriptors (R1-R5).
@@ -511,7 +714,10 @@ authenticated end-to-end integration.
 
 ## Packaging
 
-`tdlua_eventloop-scm-1.rockspec` is a proposal for a separate optional rock.
-It contains the driver and both adapters, but does not depend on `luv` or
-`cqueues`. Each adapter loads only its own event loop, in `M.new()`. The core
-`tdlua` rock is unchanged.
+`tdlua_eventloop-scm-1.rockspec` is the development rockspec for the separate
+optional rock. `tdlua_eventloop-0.6.1-1.rockspec` is the versioned candidate for
+the v0.6.1 source archive. Both install the driver, the luv and cqueues
+adapters, the Copas adapter and its private proxy/bridge. Neither adds `luv`,
+`cqueues`, `copas` or `luasocket` to the rock's dependencies: each adapter
+loads only its own event loop, in `M.new()`. The core `tdlua` rock is unchanged
+and has no event-loop dependency.

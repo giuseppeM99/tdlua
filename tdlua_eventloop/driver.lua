@@ -326,6 +326,21 @@ function Driver:has_work()
     return ok and work == true
 end
 
+-- Drain the owner doorbell through the current primary readiness handle.
+-- Additive host primitive: adapters that need a socket-like source can use the
+-- driver itself instead of acquiring a second readiness handle. The descriptor
+-- is never closed here and no client consumption happens.
+function Driver:clear()
+    local entry = self:_primary()
+    if not entry then return false end
+    local ok, err = pcall(entry.readiness.clear, entry.readiness)
+    if not ok then
+        self.last_error = err
+        return nil, err
+    end
+    return true
+end
+
 function Driver:next_deadline()
     local entry = self:_primary()
     if not entry then return INF end
