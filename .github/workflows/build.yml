@@ -381,7 +381,6 @@ jobs:
       # supported CLI; the runner's distro package predates it.
       LUAROCKS_VERSION: "3.13.0"
       LUAROCKS_SHA256: 245bf6ec560c042cb8948e3d661189292587c5949104677f1eecddc54dbe7e37
-      COPAS_ENV: ${{ runner.temp }}/copas-env
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -501,6 +500,8 @@ jobs:
       - name: Install pinned Copas in isolated trees
         run: |
           set -euo pipefail
+          export COPAS_ENV="$RUNNER_TEMP/copas-env"
+          echo "COPAS_ENV=$COPAS_ENV" >> "$GITHUB_ENV"
           tarball="$RUNNER_TEMP/copas-$COPAS_COMMIT.tar.gz"
           curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
             --connect-timeout 20 --max-time 300 \
