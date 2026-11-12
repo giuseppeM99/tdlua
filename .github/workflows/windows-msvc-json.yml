@@ -596,6 +596,92 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'require(tdlua) failed from clean install prefix' }
           Get-FileHash -Algorithm SHA256 $prodModule | Tee-Object -FilePath .ci\windows-msvc\installed-module-sha256.log
 
+      - name: Verify the on_complete frame isolation in the production module
+        # Runs after the production rebuild on purpose: the module under test is
+        # the one built with TDLUA_BUILD_TESTS=OFF, never the test-hook build.
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'tdlua-msvc-production'
+          $logDir = Join-Path $env:GITHUB_WORKSPACE '.ci\windows-msvc\on-complete'
+          New-Item -ItemType Directory -Force $logDir | Out-Null
+
+          $owner = 'prepareManagedOnComplete'
+          $managed = 'managedOnComplete'
+          $family = @($managed, 'futureOnComplete', 'taskOnComplete',
+                      'emitManagedOnCompleteFailure')
+          $cppxdata = [regex]::Escape('$cppxdata$?')
+          $ip2state = [regex]::Escape('$ip2state$?')
+          $defined = 'SECT[0-9A-F]+\s+notype \(\)\s+External\s+\|\s+'
+
+          $moduleDir = Join-Path $build 'CMakeFiles\tdlua.dir'
+          if (-not (Test-Path $moduleDir)) {
+            throw "the production module object tree was not found: $moduleDir"
+          }
+          $objects = @(Get-ChildItem -Path $moduleDir -Recurse -Filter '*.obj')
+          if ($objects.Count -eq 0) { throw 'the production module has no objects' }
+
+          $owners = 0
+          $manageds = 0
+          $futures = 0
+          $tasks = 0
+          foreach ($object in $objects) {
+            $raw = (dumpbin /symbols $object.FullName) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /symbols failed on $($object.FullName)" }
+            $name = Split-Path $object.FullName -Leaf
+
+            # The property we forbid is the EH state itself, so it is checked
+            # from the metadata symbols even when the body pattern does not
+            # match: an unrecognized COMDAT must not slip through.
+            foreach ($function in $family) {
+              if ($raw -match ($cppxdata + [regex]::Escape($function) + '@')) {
+                throw "$name`: $function has EH funclet metadata"
+              }
+              if ($raw -match ($ip2state + [regex]::Escape($function) + '@')) {
+                throw "$name`: $function has an ip-to-state map"
+              }
+            }
+            if ($raw -match ($defined + [regex]::Escape('?' + $owner + '@'))) {
+              $owners++
+              if ($raw -notmatch ($cppxdata + [regex]::Escape($owner) + '@')) {
+                throw "$name`: $owner has no EH metadata"
+              }
+              if ($raw -notmatch ($ip2state + [regex]::Escape($owner) + '@')) {
+                throw "$name`: $owner has no ip-to-state map"
+              }
+            }
+            if ($raw -match ($defined + [regex]::Escape('?' + $managed + '@'))) {
+              $manageds++
+              $disasm = @(dumpbin /disasm:nobytes $object.FullName)
+              if ($LASTEXITCODE -ne 0) { throw "dumpbin /disasm failed on $($object.FullName)" }
+              $start = 0
+              for ($i = 0; $i -lt $disasm.Count; $i++) {
+                if ($disasm[$i] -match '^\?managedOnComplete@') { $start = $i + 1; break }
+              }
+              if ($start -eq 0) { throw "$name`: the managedOnComplete body is absent" }
+              $lines = @()
+              for ($i = $start; $i -lt $disasm.Count -and $lines.Count -lt 400; $i++) {
+                if ($lines.Count -gt 0 -and $disasm[$i] -match '^\?') { break }
+                $lines += $disasm[$i]
+              }
+              "object=$($object.FullName)" |
+                Set-Content (Join-Path $logDir "module-managedOnComplete-$name.disasm.log")
+              $lines | Add-Content (Join-Path $logDir "module-managedOnComplete-$name.disasm.log")
+              if (-not ($lines -match 'call\s+\?prepareManagedOnComplete@')) {
+                throw "$name`: the module managedOnComplete does not call the preparer"
+              }
+            }
+            if ($raw -match ($defined + [regex]::Escape('?futureOnComplete@'))) { $futures++ }
+            if ($raw -match ($defined + [regex]::Escape('?taskOnComplete@'))) { $tasks++ }
+            "$($object.FullName)" | Add-Content (Join-Path $logDir 'module-objects.log')
+          }
+          if ($owners -eq 0) { throw 'no production object defines the preparer' }
+          if ($manageds -eq 0) { throw 'no production object defines managedOnComplete' }
+          if ($futures -eq 0) { throw 'no production object defines futureOnComplete' }
+          if ($tasks -eq 0) { throw 'no production object defines taskOnComplete' }
+          "on_complete frame isolation: $owners owner copy(ies), $manageds managed copy(ies), $futures future copy(ies), $tasks task copy(ies)" |
+            Set-Content (Join-Path $logDir 'module-frame-verdict.txt')
+
       - name: Run real luv adapter on Windows x64
         run: |
           $ErrorActionPreference = 'Stop'
