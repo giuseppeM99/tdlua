@@ -626,4 +626,37 @@ do
     H.equal(stops, 1, "on_stop once")
 end
 
+print("B32  adapter chains and restores the bridge hook")
+do
+    local calls = 0
+    local custom = function() calls = calls + 1 end
+    local bridge = Bridge.new({on_watch = custom})
+    local d = H.FakeDriver.new({
+        states = {{state = "sleep", deadline = 0.05, reliable = true}},
+        deadline = INF,
+    })
+    local a = Copas.new(d, {bridge = bridge, max_park = 0.05})
+    H.check(bridge.on_watch ~= custom, "adapter installed its hook")
+    bridge:_request_turn()
+    H.check(calls >= 1, "previous hook chained")
+    a:stop()
+    H.check(bridge.on_watch == custom, "previous hook restored")
+end
+
+print("B33  adapter stops on a fatal bridge wakeup")
+do
+    local d = H.FakeDriver.new({
+        states = {{state = "sleep", deadline = 0.05, reliable = true}},
+        deadline = INF,
+    })
+    local bridge = Bridge.new()
+    local a = Copas.new(d, {bridge = bridge, max_park = 0.05})
+    bridge.wake_fatal = true
+    bridge.last_wake_error = "bridge wake boom"
+    local ok, err = pcall(a.run, a)
+    H.check(not ok, "run surfaced the error")
+    H.check(tostring(err):match("bridge wake boom"), "wake error propagated")
+    H.equal(a.stop_reason, "error", "error reason")
+end
+
 H.summary("copas-unit")

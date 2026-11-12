@@ -91,7 +91,7 @@ do
     close_session(s)
 end
 
-print("R02  existing Future is completed by adapter-polled bridge")
+print("R02  existing Future is completed by the bridge")
 do
     local s = session()
     local outcome
@@ -106,7 +106,14 @@ do
     H.check(ok, "run returned (" .. tostring(err) .. ")")
     H.equal(outcome and outcome.value, VERSION, "Future value")
     H.equal(outcome and outcome.err, nil, "no Future error")
-    H.check(s.bridge.polls >= 1, "bridge polled after a driver turn")
+    local stats = s.bridge:stats()
+    if stats.modern then
+        H.check(stats.registrations >= 1, "observer registered")
+        H.check(stats.polls == 0, "no polling in notify mode")
+        H.check(stats.poll_scans == 0, "no handle scan in notify mode")
+    else
+        H.check(stats.polls >= 1, "bridge polled after a driver turn")
+    end
     close_session(s)
 end
 

@@ -10,7 +10,7 @@
 #   LUA55_BIN         optional; defaults to lua5.5 in PATH
 #   EVIDENCE_DIR      optional; defaults to .ci/copas-evidence
 #
-# Runtimes: 5.1 5.2 5.3 5.4 5.5 luajit luajit-off (8 runs each, 56 rows).
+# Runtimes: 5.1 5.2 5.3 5.4 5.5 luajit luajit-off (11 runs each, 77 rows).
 # The script installs nothing and fails closed: a missing module, a skip, a
 # non-zero exit, a wrong row count or a wrong assertion count is an error.
 
@@ -32,12 +32,15 @@ if [ ! -d "$COPAS_ENV" ]; then
 fi
 
 mkdir -p "$EVIDENCE_DIR"
+# Stale logs from a previous run must not satisfy the skip/FAIL greps when this
+# run produced fewer cases.
+rm -f "$EVIDENCE_DIR"/*.log
 : > "$EVIDENCE_DIR/summary.tsv"
 : > "$EVIDENCE_DIR/environment.tsv"
 
 RUNTIMES=(5.1 5.2 5.3 5.4 5.5 luajit luajit-off)
-EXPECTED_ROWS=56
-EXPECTED_CHECKS=2070
+EXPECTED_ROWS=77
+EXPECTED_CHECKS=3239
 
 binary_for() {
   case "$1" in
@@ -80,6 +83,7 @@ run_case() {
   [ -f "$module/tdlua.so" ] ||
     fail "missing compiled module $module/tdlua.so for $runtime"
   [ -d "$tree" ] || fail "missing rocks tree $tree for $runtime"
+  [ -f "$ROOT/tests/$script" ] || fail "missing test $ROOT/tests/$script"
 
   local -a cmd
   if [ "$runtime" = "luajit-off" ]; then
@@ -139,6 +143,11 @@ end
 local path = searchpath("tdlua", package.cpath)
 assert(path ~= nil, "tdlua module is not on package.cpath")
 local tdlua = require("tdlua")
+assert(type(tdlua.capabilities) == "table", "missing capabilities table")
+assert(tdlua.capabilities.on_complete == true,
+  "missing capabilities.on_complete")
+assert(tdlua.capabilities.managed_observers == nil,
+  "unexpected capabilities.managed_observers")
 local socket = require("socket")
 local client = tdlua()
 local future = assert(client:getOption({name = "version"}))
@@ -156,8 +165,9 @@ local closed = socket.gettime() + 5
 while not client:isClosed() and socket.gettime() < closed do
   client:receive(0.01)
 end
-print(string.format("%s\t%s\t%s\t%s",
-  path, tostring(value), socket._VERSION, copas._VERSION or "4.12.0"))
+print(string.format("%s\t%s\t%s\t%s\t%s",
+  path, tostring(value), socket._VERSION, copas._VERSION or "4.12.0",
+  "on_complete"))
 LUA
   pre_cmd=()
   if [ "$runtime" = "luajit-off" ]; then
@@ -177,7 +187,10 @@ LUA
   run_case "$runtime" deterministic eventloop_copas_concurrent.lua
   run_case "$runtime" deterministic eventloop_copas_reconnect.lua
   run_case "$runtime" deterministic eventloop_copas_unreliable.lua
+  run_case "$runtime" deterministic eventloop_copas_completion_test.lua
+  run_case "$runtime" deterministic eventloop_copas_completion_fallback.lua
   run_case "$runtime" runtime eventloop_copas_runtime.lua
+  run_case "$runtime" runtime eventloop_copas_completion_runtime.lua
   run_case "$runtime" negative eventloop_copas_negative.lua direct
   run_case "$runtime" negative eventloop_copas_negative.lua supplied
   run_case "$runtime" negative eventloop_copas_negative.lua await
@@ -190,12 +203,24 @@ rows="$(wc -l <"$EVIDENCE_DIR/summary.tsv")"
 for runtime in "${RUNTIMES[@]}"; do
   n="$(awk -F'\t' -v r="$runtime" '$2 == r' "$EVIDENCE_DIR/summary.tsv" |
     wc -l)"
-  [ "$n" -eq 8 ] || fail "expected 8 rows for $runtime, got $n"
+  [ "$n" -eq 11 ] || fail "expected 11 rows for $runtime, got $n"
 done
 
 non_zero="$(awk -F'\t' '$1 != 0' "$EVIDENCE_DIR/summary.tsv")"
 [ -z "$non_zero" ] || fail "non-zero suite exits:
 $non_zero"
+
+missing="$(awk -F'\t' '$5 == "no summary"' "$EVIDENCE_DIR/summary.tsv")"
+[ -z "$missing" ] || fail "suite did not print SUMMARY:
+$missing"
+
+# A missing or malformed `failures=` field must not be read as zero by the
+# aggregators below. Require both counters on every row.
+bad_summary="$(awk -F'\t' \
+  '$5 !~ /^SUMMARY [^[:space:]].* checks=[0-9][0-9]* failures=[0-9][0-9]*([[:space:]]|$)/ {print}' \
+  "$EVIDENCE_DIR/summary.tsv")"
+[ -z "$bad_summary" ] || fail "malformed SUMMARY line:
+$bad_summary"
 
 skips="$(grep -hE '^[[:space:]]*skip' "$EVIDENCE_DIR"/*.log || true)"
 [ -z "$skips" ] || fail "suite reported a skip:
