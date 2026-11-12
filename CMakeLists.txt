@@ -1277,6 +1277,10 @@ if(TDLUA_BUILD_TESTS)
         list(REMOVE_ITEM _tdlua_p21_probes second_longjmp_probe)
     endif()
     list(APPEND _tdlua_p21_probes second_longjmp_hook_probe)
+    # R12-B: deterministic fault injection for the token publication.
+    # The hook is compiled only under TDLUA_TESTING and is never installed
+    # in a production build.
+    list(APPEND _tdlua_p21_probes completion_token_phase_probe)
     foreach(_tdlua_p21_probe IN LISTS _tdlua_p21_probes)
         add_executable(tdlua_p21_${_tdlua_p21_probe}
             "tests/p21/${_tdlua_p21_probe}.cpp")

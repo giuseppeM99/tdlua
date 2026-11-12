@@ -3778,15 +3778,61 @@ inline void ensureCompletionTokenMetatable(lua_State *L)
     lua_setfield(L, LUA_REGISTRYINDEX, "tdlua.completion_token");
 }
 
+// Deterministic fault injection for the token publication. A hook can throw a
+// C++ exception or raise a Lua error (luaL_error); both must be contained by
+// the protected frame that publishes the token, and both must leave the
+// caller able to roll the registration back. Test-only: the hook is never
+// installed in a production build.
+enum class CompletionTokenPhase {
+    Metatable,
+    Userdata,
+    MetatableBind,
+    Anchor,
+    Uservalue
+};
+#ifdef TDLUA_TESTING
+using CompletionTokenPhaseHook = void (*)(lua_State *, CompletionTokenPhase);
+inline CompletionTokenPhaseHook &completionTokenPhaseHook()
+{
+    static thread_local CompletionTokenPhaseHook hook = nullptr;
+    return hook;
+}
+inline void setCompletionTokenPhaseHookForTesting(CompletionTokenPhaseHook hook)
+{
+    completionTokenPhaseHook() = hook;
+}
+inline void runCompletionTokenPhaseHook(lua_State *L, CompletionTokenPhase phase)
+{
+    if (completionTokenPhaseHook()) completionTokenPhaseHook()(L, phase);
+}
+#else
+inline void runCompletionTokenPhaseHook(lua_State *, CompletionTokenPhase) {}
+#endif
+
 inline void pushCompletionToken(
     lua_State *L, SchedulerCore *core,
     const std::shared_ptr<CompletionObserver> &observer)
 {
+#ifdef TDLUA_TESTING
+    runCompletionTokenPhaseHook(L, CompletionTokenPhase::Metatable);
+#endif
     ensureCompletionTokenMetatable(L);
+#ifdef TDLUA_TESTING
+    runCompletionTokenPhaseHook(L, CompletionTokenPhase::Userdata);
+#endif
     new (lua_newuserdata(L, sizeof(CompletionToken)))
         CompletionToken{observer};
+#ifdef TDLUA_TESTING
+    runCompletionTokenPhaseHook(L, CompletionTokenPhase::MetatableBind);
+#endif
     luaL_setmetatable(L, "tdlua.completion_token");
+#ifdef TDLUA_TESTING
+    runCompletionTokenPhaseHook(L, CompletionTokenPhase::Anchor);
+#endif
     pushCoreAnchor(L, core);
+#ifdef TDLUA_TESTING
+    runCompletionTokenPhaseHook(L, CompletionTokenPhase::Uservalue);
+#endif
     tdlua_lua_set_value_uservalue(L, -2);
 }
 
@@ -3859,26 +3905,58 @@ inline int completionTokenIndex(lua_State *L)
     return 1;
 }
 
-inline int managedOnComplete(lua_State *L, const char *type)
+// A completion registration is a two-phase operation (R12-A).
+//
+// Phase 1, prepareManagedOnComplete(), owns the scheduler lease and the
+// observer, performs the registration and the token publication, and releases
+// everything before it returns. Phase 2, emitManagedOnCompleteFailure(), is the
+// only frame that calls a Lua function able to longjmp, and it owns nothing:
+// a trivially destructible value crosses the boundary.
+//
+// The split is not cosmetic. Under /EHsc MSVC gives a function with a
+// try/catch and non-trivial automatics an EH cleanup funclet; Lua's longjmp
+// runs that funclet through RtlUnwind even after the owning scopes have ended,
+// and the funclet then destroys objects the frame no longer owns (P5C.3, R12).
+// An inner scope, an explicit reset() and noinline on the function that still
+// owns the objects are all insufficient: the frame that calls lua_error must
+// have no EH state of its own. Keeping the ownership in a caller that has
+// already returned removes the funclet from every frame the longjmp crosses.
+struct ManagedOnCompleteAttempt
 {
-    ManagedHandle *handle = checkManagedHandle(L, 1, type);
-    if (lua_gettop(L) != 2) {
-        return luaL_error(L, "tdlua: on_complete expects one callback");
-    }
-    if (lua_type(L, 2) != LUA_TFUNCTION) {
-        return luaL_error(L, "tdlua: on_complete callback must be a function");
-    }
+    // 0 success, 1 Lua error already on the stack, 2 message, 3 generic
+    // failure, 4 scheduler storage unavailable.
+    int failure = 0;
+    int results = 1;
+    char message[256] = {0};
+};
+static_assert(std::is_trivially_destructible<ManagedOnCompleteAttempt>::value,
+              "the on_complete attempt must cross the emission frame by value");
+
+#if defined(_MSC_VER)
+#define TDLUA_ON_COMPLETE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TDLUA_ON_COMPLETE_NOINLINE __attribute__((noinline))
+#else
+#define TDLUA_ON_COMPLETE_NOINLINE
+#endif
+
+// Phase 1. The attribute keeps the ownership in this frame: if the compiler
+// folded it into the caller, the caller would again own a shared_ptr while it
+// calls into Lua.
+TDLUA_ON_COMPLETE_NOINLINE inline ManagedOnCompleteAttempt
+prepareManagedOnComplete(lua_State *L, ManagedHandle *handle)
+{
+    ManagedOnCompleteAttempt attempt;
     auto core = handle->state->core.lock();
     if (!core) {
-        return luaL_error(L, "tdlua: scheduler storage unavailable");
+        attempt.failure = 4;
+        return attempt;
     }
-    // Leave the C++ handlers before any Lua call that can longjmp. A longjmp
-    // out of a catch block would skip the exception object's destructor, so the
-    // failure is recorded in plain data first and the owners are released after
-    // the try/catch has completed.
+    // Every C++ handler ends here, before the frame returns. The caller emits
+    // the Lua error, so no exception object and no owner is alive at that
+    // point.
     enum class Failure { None, LuaRaised, Message, Generic } failure =
         Failure::None;
-    char message[256] = {0};
     try {
 #ifdef TDLUA_TESTING
         if (completionRegistrationHook()) completionRegistrationHook()();
@@ -3893,26 +3971,73 @@ inline int managedOnComplete(lua_State *L, const char *type)
             core->cancelObserver(observer);
             throw;
         }
-        return 1;
+        return attempt;
     } catch (const TDLuaLuaError &) {
         failure = Failure::LuaRaised;
     } catch (const std::exception &error) {
-        std::snprintf(message, sizeof message, "%s", error.what());
+        std::snprintf(attempt.message, sizeof attempt.message, "%s",
+                      error.what());
         failure = Failure::Message;
     } catch (...) {
         failure = Failure::Generic;
     }
     core.reset();
     switch (failure) {
-        case Failure::LuaRaised: return lua_error(L);
+        case Failure::LuaRaised:
+            attempt.failure = 1;
+            break;
         case Failure::Message:
-            lua_pushstring(L, message);
-            return lua_error(L);
+            attempt.failure = 2;
+            break;
         case Failure::Generic:
+        default:
+            attempt.failure = 3;
+            break;
+    }
+    return attempt;
+}
+
+#undef TDLUA_ON_COMPLETE_NOINLINE
+
+// Phase 2. Only trivial automatics live here, and there is no try/catch, so
+// this frame has no EH cleanup funclet of its own. A longjmp from
+// lua_pushstring/lua_error therefore crosses no frame that owns anything.
+inline int emitManagedOnCompleteFailure(lua_State *L,
+                                        const ManagedOnCompleteAttempt &attempt)
+{
+    switch (attempt.failure) {
+        case 1:
+            return lua_error(L);
+        case 2:
+            lua_pushstring(L, attempt.message);
+            return lua_error(L);
+        case 3:
         default:
             lua_pushliteral(L, "tdlua: on_complete failed");
             return lua_error(L);
     }
+}
+
+inline int managedOnComplete(lua_State *L, const char *type)
+{
+    ManagedHandle *handle = checkManagedHandle(L, 1, type);
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "tdlua: on_complete expects one callback");
+    }
+    if (lua_type(L, 2) != LUA_TFUNCTION) {
+        return luaL_error(L, "tdlua: on_complete callback must be a function");
+    }
+    const ManagedOnCompleteAttempt attempt =
+        prepareManagedOnComplete(L, handle);
+    if (attempt.failure == 0) return attempt.results;
+    if (attempt.failure == 4) {
+        // Kept here so the emitter only ever raises lua_error. The file:line
+        // prefix produced by luaL_error depends on the Lua-visible call level
+        // (luaL_where(L, 1)), not on the C++ helper frame: moving this call
+        // into an out-of-line emitter would keep the same prefix.
+        return luaL_error(L, "tdlua: scheduler storage unavailable");
+    }
+    return emitManagedOnCompleteFailure(L, attempt);
 }
 
 inline int futureOnComplete(lua_State *L)
