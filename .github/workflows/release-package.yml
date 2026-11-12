@@ -333,7 +333,7 @@ jobs:
           mkdir -p release-meta
           for package in tdlua tdlua-luajit; do
             lua5.4 tools/release/generate-rockspec.lua \
-              --rockspec "${package}-scm-1.rockspec" \
+              --rockspec "rockspecs/${package}-scm-1.rockspec" \
               --output-dir release-meta \
               --base-version "$base_version" \
               --tag "$release_tag"
@@ -356,9 +356,10 @@ jobs:
           # a user can install it without extracting the source archive. It
           # builds from the same source tarball; only the three Lua modules are
           # installed and no adapter runtime is a hard dependency.
+          eventloop_source="rockspecs/tdlua_eventloop-${base_version}-1.rockspec"
+          test -f "$eventloop_source"
           eventloop="tdlua_eventloop-${base_version}-1.rockspec"
-          test -f "$eventloop"
-          cp "$eventloop" "release-meta/$eventloop"
+          cp "$eventloop_source" "release-meta/$eventloop"
           rockspec="release-meta/$eventloop"
           grep -qx 'package = "tdlua_eventloop"' "$rockspec"
           grep -qx "version = \"${base_version}-1\"" "$rockspec"

@@ -5,11 +5,14 @@
 -- module rockspec and does not add luv/cqueues to TDLua's mandatory
 -- dependencies.
 
+rockspec_format = "3.0"
+
 package = "tdlua_eventloop"
 version = "scm-1"
 
 source = {
    url = "git+https://github.com/giuseppeM99/tdlua.git",
+   branch = "master",
 }
 
 description = {

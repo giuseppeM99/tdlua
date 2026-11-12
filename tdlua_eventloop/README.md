@@ -714,8 +714,8 @@ authenticated end-to-end integration.
 
 ## Packaging
 
-`tdlua_eventloop-scm-1.rockspec` is the development rockspec for the separate
-optional rock. `tdlua_eventloop-0.6.1-1.rockspec` is the versioned candidate for
+`rockspecs/tdlua_eventloop-scm-1.rockspec` is the development rockspec for the separate
+optional rock. `rockspecs/tdlua_eventloop-0.6.1-1.rockspec` is the versioned candidate for
 the v0.6.1 source archive. Both install the driver, the luv and cqueues
 adapters, the Copas adapter and its private proxy/bridge. Neither adds `luv`,
 `cqueues`, `copas` or `luasocket` to the rock's dependencies: each adapter

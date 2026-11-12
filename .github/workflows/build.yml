@@ -358,8 +358,8 @@ jobs:
           set -euo pipefail
           tree="$RUNNER_TEMP/pack"
           luarocks --lua-version=5.4 --tree="$tree" make \
-            tdlua_eventloop-0.6.1-1.rockspec --deps-mode=none
-          luarocks lint tdlua_eventloop-0.6.1-1.rockspec
+            rockspecs/tdlua_eventloop-0.6.1-1.rockspec --deps-mode=none
+          luarocks lint rockspecs/tdlua_eventloop-0.6.1-1.rockspec
           # The release tarball has no internal agent notes. Guard against a
           # checkout-path build shipping one through LuaRocks' default docs.
           test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.1-1/doc/AGENTS.md"
@@ -602,7 +602,7 @@ jobs:
              tdlua_eventloop/copas_socket.lua \
              tdlua_eventloop/copas_bridge.lua \
              tdlua_eventloop/README.md "$stage/tdlua_eventloop/"
-          cp tdlua_eventloop-0.6.1-1.rockspec "$stage/"
+          cp rockspecs/tdlua_eventloop-0.6.1-1.rockspec "$stage/"
           archive="$RUNNER_TEMP/tdlua-v0.6.1-source.tar.gz"
           tar -czf "$archive" -C "$RUNNER_TEMP" tdlua-v0.6.1
           listing="$RUNNER_TEMP/tdlua-v0.6.1-listing.txt"
@@ -622,7 +622,7 @@ jobs:
           # The core rock and the C++ build never gain an event-loop
           # dependency. This is a content check so it also holds on branches
           # where the P1 commits are already merged.
-          core_deps="$(sed -n '/^dependencies = {/,/^}/p' tdlua-scm-1.rockspec)"
+          core_deps="$(sed -n '/^dependencies = {/,/^}/p' rockspecs/tdlua-scm-1.rockspec)"
           printf '%s\n' "$core_deps"
           if grep -Eiq 'copas|luasocket|luv|cqueues' <<<"$core_deps"; then
             echo "::error::core rockspec gained an event-loop dependency"
@@ -639,7 +639,7 @@ jobs:
             luarocks --lua-version=5.4 --tree="$tree" make \
               tdlua_eventloop-0.6.1-1.rockspec --deps-mode=none
           )
-          luarocks lint tdlua_eventloop-0.6.1-1.rockspec
+          luarocks lint rockspecs/tdlua_eventloop-0.6.1-1.rockspec
           installed="$tree/share/lua/5.4/tdlua_eventloop"
           test "$(find "$installed" -maxdepth 1 -name '*.lua' | wc -l)" -eq 6
           if [ -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.1-1/doc/AGENTS.md" ]; then
@@ -2061,8 +2061,8 @@ jobs:
 
       - name: Validate rockspec
         run: |
-          luarocks --lua-version=5.3 lint tdlua-scm-1.rockspec
-          luarocks --lua-version=5.3 lint tdlua-luajit-scm-1.rockspec
+          luarocks --lua-version=5.3 lint rockspecs/tdlua-scm-1.rockspec
+          luarocks --lua-version=5.3 lint rockspecs/tdlua-luajit-scm-1.rockspec
 
       - name: Build and install rock
         env:
@@ -2073,7 +2073,7 @@ jobs:
         run: |
           luarocks --lua-version=5.3 \
             --tree="$RUNNER_TEMP/rocks" \
-            make --no-doc tdlua-scm-1.rockspec
+            make --no-doc rockspecs/tdlua-scm-1.rockspec
 
       - name: Load installed module
         run: |
