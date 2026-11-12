@@ -367,6 +367,13 @@ TDLUA_MODULE_API int luaopen_tdlua(lua_State *L)
     lua_setfield(L, -2, "api_version");
     lua_pushstring(L, TDLUA_TDLIB_VERSION);
     lua_setfield(L, -2, "tdlib_version");
+    // Capabilities describe the binding, not an adapter or a backend. The
+    // bridge uses this table to choose its completion path without probing a
+    // handle, which on an older binding would fall through managedIndex.
+    lua_newtable(L);
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "on_complete");
+    lua_setfield(L, -2, "capabilities");
     luaL_setmetatable(L, "tdlua");
     if (created_metatable) lua_remove(L, base + 1);
     ops.initialize_logging();
