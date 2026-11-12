@@ -112,7 +112,8 @@ inline void pushManagedContinuationCache(lua_State *L)
             end
             if field_index then
                 return function(self, key)
-                    if key == 'wait' or key == 'ready' or key == '_request_id' then
+                    if key == 'wait' or key == 'ready' or key == '_request_id'
+                       or key == 'on_complete' then
                         return prepare(self, key)
                     end
                     return dispatch(prepare(self, key))

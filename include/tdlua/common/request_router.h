@@ -8,13 +8,17 @@
 #include "tdlua/common/transport.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -28,6 +32,7 @@ class SchedulerCore;
 class RequestRouter;
 struct EventRegistration;
 struct LoopObserver;
+struct CompletionObserver;
 
 enum class RequestKind {
     Raw,
@@ -110,15 +115,40 @@ struct ManagedState {
     bool discard_raw_response = false;
     std::size_t handle_count = 0;
     std::size_t waiter_count = 0;
+    std::size_t observer_count = 0;
+    bool completion_notified = false;
+    std::vector<std::shared_ptr<CompletionObserver>> observers;
     std::shared_ptr<EventRegistration> event_registration;
     std::weak_ptr<LoopObserver> loop_observer;
 };
 
 using ManagedStatePtr = std::shared_ptr<ManagedState>;
 
+// One completion observer. It owns a Lua registry reference to its callback
+// and keeps the managed state observable until the callback is delivered or
+// the observer is cancelled. It never owns Lua code execution: only the owner
+// thread's scheduler drain invokes the callback.
+struct CompletionObserver {
+    ManagedStatePtr state;
+    int callback_ref = LUA_NOREF;
+    bool active = true;
+    bool cancelled = false;
+    bool counted = true;
+    // True while the observer's callback is on the stack. A cancel from that
+    // callback reports false: delivery has already started.
+    bool delivering = false;
+};
+
 struct ManagedHandle {
     ManagedStatePtr state;
 };
+
+struct CompletionToken {
+    std::shared_ptr<CompletionObserver> observer;
+};
+
+inline void pushManagedHandle(lua_State *L, const ManagedStatePtr &state,
+                              const char *type);
 
 struct CoreAnchor {
     std::shared_ptr<SchedulerCore> core;
@@ -282,6 +312,55 @@ inline void setReadyCreationHookForTesting(ReadyCreationHook hook)
     readyCreationHook() = hook;
 }
 
+// Diagnostic seam for the completion-delivery error path. It makes the
+// observer-error publication fail at the exact allocation-like point.
+using ObserverErrorHook = void (*)();
+inline ObserverErrorHook &observerErrorHook()
+{
+    static thread_local ObserverErrorHook hook = nullptr;
+    return hook;
+}
+inline void setObserverErrorHookForTesting(ObserverErrorHook hook)
+{
+    observerErrorHook() = hook;
+}
+
+using ObserverEnqueueHook = void (*)();
+inline ObserverEnqueueHook &observerEnqueueHook()
+{
+    static thread_local ObserverEnqueueHook hook = nullptr;
+    return hook;
+}
+inline void setObserverEnqueueHookForTesting(ObserverEnqueueHook hook)
+{
+    observerEnqueueHook() = hook;
+}
+
+using ObserverPromoteHook = void (*)();
+inline ObserverPromoteHook &observerPromoteHook()
+{
+    static thread_local ObserverPromoteHook hook = nullptr;
+    return hook;
+}
+inline void setObserverPromoteHookForTesting(ObserverPromoteHook hook)
+{
+    observerPromoteHook() = hook;
+}
+
+// Makes the transport-detach step of disposeStorage fail exactly once, so a
+// test can prove that observer roots are released by the separate protected
+// frame even when detach cannot complete.
+using DisposeDetachHook = void (*)();
+inline DisposeDetachHook &disposeDetachHook()
+{
+    static thread_local DisposeDetachHook hook = nullptr;
+    return hook;
+}
+inline void setDisposeDetachHookForTesting(DisposeDetachHook hook)
+{
+    disposeDetachHook() = hook;
+}
+
 // Allows the binding-level regression to fail the publication after the new
 // registration and its Lua reference exist, using the same catch path as a
 // real std::bad_alloc.
@@ -398,6 +477,23 @@ inline bool pushCoreAnchor(lua_State *L, const SchedulerCore *core)
     lua_remove(L, -2);
     return !lua_isnil(L, -1);
 }
+#ifdef TDLUA_TESTING
+// Drops the weak-table entry that ties a core to its Lua anchor without
+// touching the anchor userdata already held by handles or tokens. The next
+// releaseLuaReference must therefore take the no-anchor path.
+inline bool removeCoreAnchorForTesting(lua_State *L, const SchedulerCore *core)
+{
+    pushCoreAnchors(L);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return false;
+    }
+    lua_pushnil(L);
+    lua_rawsetp(L, -2, core);
+    lua_pop(L, 1);
+    return true;
+}
+#endif
 inline bool pushCoreReferences(lua_State *L, const SchedulerCore *core)
 {
     if (!pushCoreAnchor(L, core)) { lua_pop(L, 1); return false; }
@@ -487,6 +583,16 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     // strongly owned by live_states_ while it has active scheduler work.
     std::map<lua_State *, State> running_tasks_;
     std::deque<State> ready_;
+
+    // Completion observers are delivered only from a scheduler drain on the
+    // owner thread. completion_queue_ belongs to the current tick; deferred_
+    // holds registrations that must wait for a later tick (a handle that was
+    // already terminal, or a registration made from inside a callback).
+    std::deque<std::shared_ptr<CompletionObserver>> completion_queue_;
+    std::deque<std::shared_ptr<CompletionObserver>> deferred_completions_;
+    std::deque<std::string> observer_errors_;
+    bool dispatching_completions_ = false;
+    bool observer_delivery_oom_ = false;
 
     // The pump belongs to the backend facade and can be detached independently
     // of the SchedulerCore lifetime.
@@ -669,7 +775,8 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
 
     void retireState(const State &state)
     {
-        if (isTerminalState(state) && !state->handle_count && !state->waiter_count) {
+        if (isTerminalState(state) && !state->handle_count && !state->waiter_count &&
+            !state->observer_count) {
             // Retained handles own failures until wait() observes them or GC
             // releases the last handle. Transfer abandoned failures once, on
             // the task's owner core, including cross-client continuations.
@@ -692,6 +799,221 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
         }
     }
 
+    // ----- Completion observers -----
+
+public:
+    // Drop one observer's Lua root and let the state retire if this was the
+    // last external owner. Safe to call more than once; only the first call
+    // has side effects.
+    void settleObserver(const std::shared_ptr<CompletionObserver> &observer) noexcept
+    {
+        if (!observer || !observer->active) return;
+        observer->active = false;
+        observer->delivering = false;
+        const State state = observer->state;
+        try {
+            releaseLuaReference(observer->callback_ref);
+            if (observer->counted) {
+                observer->counted = false;
+                if (state && state->observer_count) --state->observer_count;
+            }
+            if (state) retireState(state);
+        } catch (...) {
+            observer_delivery_oom_ = true;
+        }
+        observer->state.reset();
+    }
+
+    std::shared_ptr<CompletionObserver> watchCompletion(lua_State *L,
+                                                        const State &state,
+                                                        int callback_index)
+    {
+        std::shared_ptr<CompletionObserver> observer(new CompletionObserver());
+        observer->state = state;
+        observer->callback_ref = createLuaReference(L, callback_index);
+        ++state->observer_count;
+        try {
+            if (isTerminalState(state) || state->completion_notified) {
+                deferred_completions_.push_back(observer);
+            } else {
+                state->observers.push_back(observer);
+            }
+        } catch (...) {
+            settleObserver(observer);
+            throw;
+        }
+        return observer;
+    }
+
+    bool cancelObserver(const std::shared_ptr<CompletionObserver> &observer) noexcept
+    {
+        if (!observer || !observer->active) return false;
+        if (observer->delivering) return false;
+        observer->cancelled = true;
+        const State state = observer->state;
+        if (state) {
+            auto &list = state->observers;
+            list.erase(std::remove(list.begin(), list.end(), observer), list.end());
+        }
+        settleObserver(observer);
+        return true;
+    }
+
+    void enqueueCompletionObservers(const State &state, bool deferred)
+    {
+        if (state->observers.empty()) return;
+        std::vector<std::shared_ptr<CompletionObserver>> observers;
+        observers.swap(state->observers);
+        for (auto &observer : observers) {
+            if (!observer->active) continue;
+            try {
+#ifdef TDLUA_TESTING
+                if (observerEnqueueHook()) observerEnqueueHook()();
+#endif
+                if (deferred) deferred_completions_.push_back(observer);
+                else completion_queue_.push_back(observer);
+            } catch (...) {
+                observer_delivery_oom_ = true;
+                observer->cancelled = true;
+                settleObserver(observer);
+            }
+        }
+    }
+
+    // A terminal transition enqueues the observers registered so far. Future
+    // watchers are delivered by the current tick, after waiters resume; a
+    // teardown path that cannot run Lua uses deferred delivery.
+    void notifyCompletionObservers(const State &state, bool deferred = false)
+    {
+        state->completion_notified = true;
+        enqueueCompletionObservers(state, deferred);
+    }
+
+    // The managed request is being rolled back without a terminal state. There
+    // is no completion to report, so observers are cancelled and released.
+    void discardCompletionObservers(const State &state)
+    {
+        std::vector<std::shared_ptr<CompletionObserver>> observers;
+        observers.swap(state->observers);
+        for (auto &observer : observers) {
+            observer->cancelled = true;
+            settleObserver(observer);
+        }
+    }
+
+    // Recording an observer error must not escape the delivery loop. A
+    // failure here is remembered without allocation and reported by the next
+    // public tick.
+    void recordObserverError(const char *message) noexcept
+    {
+        try {
+#ifdef TDLUA_TESTING
+            if (observerErrorHook()) observerErrorHook()();
+#endif
+            observer_errors_.push_back(
+                message ? message : "tdlua: completion observer failed");
+        } catch (...) {
+            observer_delivery_oom_ = true;
+        }
+    }
+
+    void invokeCompletionObserver(
+        const std::shared_ptr<CompletionObserver> &observer)
+    {
+        const State state = observer->state;
+        if (!state || observer->cancelled || !observer->active) {
+            settleObserver(observer);
+            return;
+        }
+        observer->delivering = true;
+        struct Call {
+            SchedulerCore *core;
+            int callback_ref;
+            ManagedStatePtr state;
+        } call = {this, observer->callback_ref, state};
+        const int base = lua_gettop(lua_owner_);
+        try {
+            protectedLua(lua_owner_, [](lua_State *L, void *context) {
+                auto *call = static_cast<Call *>(context);
+                call->core->pushLuaReference(L, call->callback_ref);
+                pushManagedHandle(L, call->state,
+                                  (call->state->kind == RequestKind::Task ||
+                                   isUpdateCallbackTask(call->state->kind) ||
+                                   call->state->kind == RequestKind::LegacyRequest)
+                                      ? "tdlua.task" : "tdlua.future");
+                lua_call(L, 1, 0);
+            }, &call);
+        } catch (const TDLuaLuaError &) {
+            const char *message = lua_tostring(lua_owner_, -1);
+            recordObserverError(message);
+            lua_settop(lua_owner_, base);
+        } catch (const std::exception &error) {
+            lua_settop(lua_owner_, base);
+            recordObserverError(error.what());
+        } catch (...) {
+            lua_settop(lua_owner_, base);
+            recordObserverError(nullptr);
+        }
+        try {
+            settleObserver(observer);
+        } catch (...) {
+            observer_delivery_oom_ = true;
+        }
+    }
+
+    // A callback never runs recursively from its own notification: a new
+    // observer registered while this flag is set goes to deferred_completions_
+    // and is delivered by a later tick.
+    void drainCompletionQueue()
+    {
+        if (dispatching_completions_) return;
+        struct DispatchFlag {
+            bool &flag;
+            explicit DispatchFlag(bool &value) : flag(value) { flag = true; }
+            ~DispatchFlag() { flag = false; }
+        } guard(dispatching_completions_);
+        while (!completion_queue_.empty()) {
+            std::shared_ptr<CompletionObserver> observer =
+                completion_queue_.front();
+            completion_queue_.pop_front();
+            if (!observer || !observer->active) continue;
+            invokeCompletionObserver(observer);
+        }
+    }
+
+    void promoteDeferredCompletions()
+    {
+        while (!deferred_completions_.empty()) {
+#ifdef TDLUA_TESTING
+            if (observerPromoteHook()) observerPromoteHook()();
+#endif
+            completion_queue_.push_back(
+                std::move(deferred_completions_.front()));
+            deferred_completions_.pop_front();
+        }
+    }
+
+    // Finalization must not start user callbacks. Release every pending root
+    // without invoking Lua code, then let normal retirement report failures.
+    void discardPendingCompletions()
+    {
+        while (!completion_queue_.empty()) {
+            std::shared_ptr<CompletionObserver> observer =
+                completion_queue_.front();
+            completion_queue_.pop_front();
+            observer->cancelled = true;
+            settleObserver(observer);
+        }
+        while (!deferred_completions_.empty()) {
+            std::shared_ptr<CompletionObserver> observer =
+                deferred_completions_.front();
+            deferred_completions_.pop_front();
+            observer->cancelled = true;
+            settleObserver(observer);
+        }
+    }
+
+private:
     State createState(RequestKind kind)
     {
         State state(new ManagedState());
@@ -1458,6 +1780,7 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
 
     void wake(const State &state)
     {
+        notifyCompletionObservers(state);
         std::vector<lua_State *> threads;
         for (const auto &entry : waiters_)
             if (entry.second.dependency == state) threads.push_back(entry.first);
@@ -1822,9 +2145,135 @@ public:
     {
         ++liveSchedulerCores();
     }
+    // A state with observers forms ManagedState -> CompletionObserver ->
+    // ManagedState. A teardown that never reaches a tick must break that cycle
+    // without Lua. Every observable state is still reachable from one of these
+    // containers, so clearing the observer edges is enough.
+    void breakObserverCycles() noexcept
+    {
+        auto release = [](const State &state) {
+            if (!state) return;
+            for (const auto &observer : state->observers) {
+                if (observer) {
+                    observer->active = false;
+                    observer->cancelled = true;
+                    observer->delivering = false;
+                    observer->state.reset();
+                }
+            }
+            state->observers.clear();
+            state->observer_count = 0;
+        };
+        for (const auto &entry : pending_) release(entry.second);
+        for (const auto &entry : live_states_) release(entry.second);
+        for (const auto &state : ready_) release(state);
+        for (const auto &entry : running_tasks_) release(entry.second);
+        for (const auto &state : event_states_) release(state);
+        for (const auto &observer : completion_queue_)
+            if (observer) observer->state.reset();
+        for (const auto &observer : deferred_completions_)
+            if (observer) observer->state.reset();
+        completion_queue_.clear();
+        deferred_completions_.clear();
+    }
+
+
+    // Test-only enumeration of every state container. It proves the
+    // reachability invariant that discardObserversForTeardown relies on and
+    // fails if a future container is added without updating the cleanup.
+#ifdef TDLUA_TESTING
+    // Kept as a member template instead of a generic lambda: the core header
+    // must still compile under -std=c++11.
+    template<class Queue>
+    static bool queuedObserversReachableForTesting(
+        const Queue &queue, const std::set<const ManagedState *> &reachable)
+    {
+        for (const auto &observer : queue) {
+            if (!observer || !observer->active) continue;
+            if (!observer->state ||
+                !reachable.count(observer->state.get())) return false;
+        }
+        return true;
+    }
+
+    bool observersReachableForTesting() const
+    {
+        std::set<const ManagedState *> reachable;
+        auto add = [&reachable](const State &state) {
+            if (state) reachable.insert(state.get());
+        };
+        for (const auto &entry : pending_) add(entry.second);
+        for (const auto &entry : live_states_) add(entry.second);
+        for (const auto &state : ready_) add(state);
+        for (const auto &entry : running_tasks_) add(entry.second);
+        for (const auto &state : event_states_) add(state);
+        if (!queuedObserversReachableForTesting(completion_queue_, reachable))
+            return false;
+        if (!queuedObserversReachableForTesting(deferred_completions_,
+                                                reachable))
+            return false;
+        for (const auto *state : reachable) {
+            for (const auto &observer : state->observers) {
+                if (!observer || !observer->active) continue;
+                if (!observer->state || observer->state.get() != state)
+                    return false;
+            }
+        }
+        return true;
+    }
+#endif
+
+    // Owner-thread teardown: release Lua roots for observers that can no
+    // longer be delivered. This runs inside a protected frame and never
+    // invokes a callback.
+    void discardObserversForTeardown()
+    {
+#ifdef TDLUA_TESTING
+        assert(observersReachableForTesting());
+#endif
+        auto release = [this](const std::shared_ptr<CompletionObserver> &observer) {
+            if (!observer) return;
+            const State state = observer->state;
+            if (observer->active) {
+                releaseLuaReference(observer->callback_ref);
+                observer->active = false;
+            }
+            observer->cancelled = true;
+            observer->delivering = false;
+            if (observer->counted) {
+                observer->counted = false;
+                if (state && state->observer_count) --state->observer_count;
+            }
+            observer->state.reset();
+        };
+        auto release_state = [&release](const State &state) {
+            if (!state) return;
+            std::vector<std::shared_ptr<CompletionObserver>> observers;
+            observers.swap(state->observers);
+            for (const auto &observer : observers) release(observer);
+            state->observer_count = 0;
+        };
+        for (const auto &entry : pending_) release_state(entry.second);
+        for (const auto &entry : live_states_) release_state(entry.second);
+        for (const auto &state : ready_) release_state(state);
+        for (const auto &entry : running_tasks_) release_state(entry.second);
+        for (const auto &state : event_states_) release_state(state);
+        while (!completion_queue_.empty()) {
+            auto observer = completion_queue_.front();
+            completion_queue_.pop_front();
+            release(observer);
+        }
+        while (!deferred_completions_.empty()) {
+            auto observer = deferred_completions_.front();
+            deferred_completions_.pop_front();
+            release(observer);
+        }
+    }
+
     ~SchedulerCore()
     {
         // No Lua calls, no registry unrefs and no callbacks during destruction.
+        breakObserverCycles();
         for (const auto &entry : running_tasks_) taskBindings().erase(entry.first);
         for (const auto &entry : waiters_) waitBindings().erase(entry.first);
         for (const auto &entry : notifications_) waitBindings().erase(entry.first);
@@ -2185,8 +2634,15 @@ public:
 
     bool hasGracefulDrainWork() const
     {
-        return !ready_.empty() || !running_tasks_.empty();
+        return !ready_.empty() || !running_tasks_.empty() ||
+               !completion_queue_.empty() || !deferred_completions_.empty();
     }
+#ifdef TDLUA_TESTING
+    bool dispatchingCompletionsForTesting() const
+    {
+        return dispatching_completions_;
+    }
+#endif
 
     void runLoop(lua_State *L, int callback, bool concurrent)
     {
@@ -2382,6 +2838,7 @@ public:
         const auto found = pending_.find(id);
         if (found == pending_.end()) return;
         untrackPendingRequest(found->second);
+        discardCompletionObservers(found->second);
         releaseLuaReferences(found->second);
         pending_.erase(found);
         live_states_.erase(id);
@@ -2643,6 +3100,7 @@ public:
         if (task_core && continuation->task) {
             task_core->removeRunningTask(continuation->coroutine);
             task_core->failState(continuation->task, "tdlua: managed coroutine abandoned");
+            task_core->notifyCompletionObservers(continuation->task, true);
             task_core->retireState(continuation->task);
         }
     }
@@ -2766,9 +3224,20 @@ public:
         if (draining_) return;
         draining_ = true;
         try {
-            while (!ready_.empty() || !deferred_events_.empty() || detach_after_drain_) {
+            if (delivery == ErrorDelivery::Finalizer) {
+                discardPendingCompletions();
+            } else {
+                promoteDeferredCompletions();
+            }
+            while (!ready_.empty() || !deferred_events_.empty() ||
+                   detach_after_drain_ || !completion_queue_.empty()) {
                 drainReadyStates();
                 drainDeferredEvents();
+                if (delivery == ErrorDelivery::Finalizer) {
+                    discardPendingCompletions();
+                } else {
+                    drainCompletionQueue();
+                }
                 if (ready_.empty() && deferred_events_.empty() && detach_after_drain_) {
                     const bool preserve = detach_after_drain_preserve_selected_;
                     detach_after_drain_preserve_selected_ = false;
@@ -2795,6 +3264,16 @@ public:
             scheduler_errors_.pop_front();
             try { failStrandedTasks(); } catch (...) {}
             throw std::runtime_error(error);
+        }
+        if (delivery == ErrorDelivery::PublicCall && !observer_errors_.empty()) {
+            const std::string error = observer_errors_.front();
+            observer_errors_.pop_front();
+            throw std::runtime_error(error);
+        }
+        if (delivery == ErrorDelivery::PublicCall && observer_delivery_oom_) {
+            observer_delivery_oom_ = false;
+            throw std::runtime_error(
+                "tdlua: completion observer delivery allocation failed");
         }
     }
 
@@ -2974,10 +3453,24 @@ public:
         try {
             protectedLua(lua_owner_, [](lua_State *, void *context) {
                 auto *router = static_cast<RequestRouter *>(context);
+#ifdef TDLUA_TESTING
+                if (disposeDetachHook()) disposeDetachHook()();
+#endif
                 router->core_->detachTransport();
             }, this);
             complete = true;
         } catch (...) { /* preserve the original construction/finalization error */ }
+        // Observer roots are independent of transport detachment. Release them
+        // in their own protected frame so a detach allocation failure cannot
+        // retain user closures until the VM or an unrelated handle dies.
+        try {
+            protectedLua(lua_owner_, [](lua_State *, void *context) {
+                auto *router = static_cast<RequestRouter *>(context);
+                router->core_->discardObserversForTeardown();
+            }, this);
+        } catch (...) {
+            complete = false;
+        }
         lua_settop(lua_owner_, top);
         if (anchor_reference_ != LUA_NOREF) {
             // The constructor prepared free-list headers for both the registry
@@ -3218,6 +3711,196 @@ inline int managedGc(lua_State *L)
     handle->~ManagedHandle();
     return 0;
 }
+
+inline int completionTokenIndex(lua_State *L);
+inline int completionTokenGc(lua_State *L);
+
+inline void ensureCompletionTokenMetatable(lua_State *L)
+{
+    // Publish the metatable only after every field exists, and repair a table
+    // left partial by an older OOM. luaL_newmetatable publishes first, so an
+    // allocation failure there can leave a token without __gc.
+    lua_getfield(L, LUA_REGISTRYINDEX, "tdlua.completion_token");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "__index");
+        const bool has_index = lua_isfunction(L, -1);
+        lua_pop(L, 1);
+        if (!has_index) {
+            lua_pushcfunction(L, completionTokenIndex);
+            lua_setfield(L, -2, "__index");
+        }
+        lua_getfield(L, -1, "__gc");
+        const bool has_gc = lua_isfunction(L, -1);
+        lua_pop(L, 1);
+        if (!has_gc) {
+            lua_pushcfunction(L, completionTokenGc);
+            lua_setfield(L, -2, "__gc");
+        }
+        lua_getfield(L, -1, "__name");
+        const bool has_name = lua_isstring(L, -1);
+        lua_pop(L, 1);
+        if (!has_name) {
+            lua_pushstring(L, "tdlua.completion_token");
+            lua_setfield(L, -2, "__name");
+        }
+        lua_pop(L, 1);
+        return;
+    }
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushcfunction(L, completionTokenIndex);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, completionTokenGc);
+    lua_setfield(L, -2, "__gc");
+    lua_pushstring(L, "tdlua.completion_token");
+    lua_setfield(L, -2, "__name");
+    lua_setfield(L, LUA_REGISTRYINDEX, "tdlua.completion_token");
+}
+
+inline void pushCompletionToken(
+    lua_State *L, SchedulerCore *core,
+    const std::shared_ptr<CompletionObserver> &observer)
+{
+    ensureCompletionTokenMetatable(L);
+    new (lua_newuserdata(L, sizeof(CompletionToken)))
+        CompletionToken{observer};
+    luaL_setmetatable(L, "tdlua.completion_token");
+    pushCoreAnchor(L, core);
+    tdlua_lua_set_value_uservalue(L, -2);
+}
+
+// Lua allocation can longjmp past C++ destructors. Publish the token inside a
+// protected frame so the caller's shared_ptr owner is unwound by a C++
+// exception instead of being skipped by Lua's longjmp.
+struct CompletionTokenPush {
+    SchedulerCore *core;
+    const std::shared_ptr<CompletionObserver> *observer;
+};
+
+inline void pushCompletionTokenProtected(
+    lua_State *L, SchedulerCore *core,
+    const std::shared_ptr<CompletionObserver> &observer)
+{
+    CompletionTokenPush push = {core, &observer};
+    protectedLua(L, [](lua_State *L, void *context) {
+        auto *push = static_cast<CompletionTokenPush *>(context);
+        pushCompletionToken(L, push->core, *push->observer);
+    }, &push, 0, 1);
+}
+
+inline int completionTokenCancel(lua_State *L)
+{
+    auto *token = static_cast<CompletionToken *>(
+        luaL_checkudata(L, 1, "tdlua.completion_token"));
+    bool cancelled = false;
+    if (token->observer) {
+        const auto state = token->observer->state;
+        const auto core = state ? state->core.lock() : nullptr;
+        if (core) {
+            cancelled = core->cancelObserver(token->observer);
+        } else {
+            // Defensive path: the token's CoreAnchor should keep the core
+            // alive, but a manually built or partially finalized token can
+            // outlive it. There is no owner-thread Lua frame here that could
+            // safely unref callback_ref, so only the C++ edge is closed.
+            token->observer->active = false;
+            token->observer->cancelled = true;
+            token->observer->delivering = false;
+            token->observer->state.reset();
+        }
+        token->observer.reset();
+    }
+    lua_pushboolean(L, cancelled);
+    return 1;
+}
+
+inline int completionTokenGc(lua_State *L)
+{
+    auto *token = static_cast<CompletionToken *>(lua_touserdata(L, 1));
+    // Dropping the token only drops the cancel capability. The observer stays
+    // registered until delivery, explicit cancel or client teardown; otherwise
+    // `handle:on_complete(cb)` without keeping the token would silently stop
+    // observing at the next GC step.
+    token->observer.reset();
+    token->~CompletionToken();
+    return 0;
+}
+
+inline int completionTokenIndex(lua_State *L)
+{
+    luaL_checkudata(L, 1, "tdlua.completion_token");
+    const char *key = luaL_checkstring(L, 2);
+    if (std::strcmp(key, "cancel") == 0) {
+        lua_pushcfunction(L, completionTokenCancel);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+inline int managedOnComplete(lua_State *L, const char *type)
+{
+    ManagedHandle *handle = checkManagedHandle(L, 1, type);
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "tdlua: on_complete expects one callback");
+    }
+    if (lua_type(L, 2) != LUA_TFUNCTION) {
+        return luaL_error(L, "tdlua: on_complete callback must be a function");
+    }
+    auto core = handle->state->core.lock();
+    if (!core) {
+        return luaL_error(L, "tdlua: scheduler storage unavailable");
+    }
+    // Leave the C++ handlers before any Lua call that can longjmp. A longjmp
+    // out of a catch block would skip the exception object's destructor, so the
+    // failure is recorded in plain data first and the owners are released after
+    // the try/catch has completed.
+    enum class Failure { None, LuaRaised, Message, Generic } failure =
+        Failure::None;
+    char message[256] = {0};
+    try {
+        const auto observer = core->watchCompletion(L, handle->state, 2);
+        try {
+            pushCompletionTokenProtected(L, core.get(), observer);
+        } catch (...) {
+            // Registration and token publication are one operation: a failed
+            // token allocation must not leave a live observer without a
+            // cancel handle.
+            core->cancelObserver(observer);
+            throw;
+        }
+        return 1;
+    } catch (const TDLuaLuaError &) {
+        failure = Failure::LuaRaised;
+    } catch (const std::exception &error) {
+        std::snprintf(message, sizeof message, "%s", error.what());
+        failure = Failure::Message;
+    } catch (...) {
+        failure = Failure::Generic;
+    }
+    core.reset();
+    switch (failure) {
+        case Failure::LuaRaised: return lua_error(L);
+        case Failure::Message:
+            lua_pushstring(L, message);
+            return lua_error(L);
+        case Failure::Generic:
+        default:
+            lua_pushliteral(L, "tdlua: on_complete failed");
+            return lua_error(L);
+    }
+}
+
+inline int futureOnComplete(lua_State *L)
+{
+    return managedOnComplete(L, "tdlua.future");
+}
+
+inline int taskOnComplete(lua_State *L)
+{
+    return managedOnComplete(L, "tdlua.task");
+}
+
 inline int futureReady(lua_State *L)
 {
     if (lua_gettop(L) != 1) {
@@ -3336,15 +4019,19 @@ inline int managedIndex(lua_State *L, const char *type, bool task)
 {
     ManagedHandle *handle = checkManagedHandle(L, 1, type);
     const char *key = luaL_checkstring(L, 2);
-    if (std::string(key) == "wait") {
+    if (std::strcmp(key, "wait") == 0) {
         pushManagedFunction(L, task ? taskWait : futureWait, completeManagedTrampoline);
         return 1;
     }
-    if (std::string(key) == "ready") {
+    if (std::strcmp(key, "ready") == 0) {
         lua_pushcfunction(L, task ? taskReady : futureReady);
         return 1;
     }
-    if (std::string(key) == "_request_id") {
+    if (std::strcmp(key, "on_complete") == 0) {
+        lua_pushcfunction(L, task ? taskOnComplete : futureOnComplete);
+        return 1;
+    }
+    if (std::strcmp(key, "_request_id") == 0) {
         if (!handle->state->request_id) {
             lua_pushnil(L);
             return 1;

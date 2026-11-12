@@ -1208,6 +1208,90 @@ if(TDLUA_BUILD_TESTS)
         )
     endif()
 
+    # P2.1 completion observers: production regressions and the R2
+    # diagnostic probes. All probes use only TDLUA_TESTING seams.
+    add_executable(tdlua_p21_completion_test
+        "tests/p21/p21_completion_test.cpp")
+    target_include_directories(tdlua_p21_completion_test PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_p21_completion_test PRIVATE ${LUA_LIBRARIES})
+    target_compile_features(tdlua_p21_completion_test PRIVATE cxx_std_11)
+    target_compile_definitions(tdlua_p21_completion_test PRIVATE TDLUA_TESTING)
+    if(TDLUA_USE_LUA51_CONTINUATION)
+        target_compile_definitions(tdlua_p21_completion_test PRIVATE
+            TDLUA_USE_LUA51_CONTINUATION)
+    endif()
+    if(TDLUA_USE_LUAJIT_CONTINUATION)
+        target_compile_definitions(tdlua_p21_completion_test PRIVATE
+            TDLUA_USE_LUAJIT_CONTINUATION)
+    endif()
+    tdlua_enable_sanitizers(tdlua_p21_completion_test)
+    add_test(NAME tdlua_p21_completion COMMAND tdlua_p21_completion_test)
+
+    add_executable(tdlua_p21_lua_close_sentinel
+        "tests/p21/lua_close_sentinel.cpp")
+    target_include_directories(tdlua_p21_lua_close_sentinel PRIVATE
+        ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(tdlua_p21_lua_close_sentinel PRIVATE
+        tdlua ${LUA_LIBRARIES})
+    target_compile_features(tdlua_p21_lua_close_sentinel PRIVATE cxx_std_11)
+    target_compile_definitions(tdlua_p21_lua_close_sentinel PRIVATE TDLUA_TESTING)
+    if(TDLUA_USE_LUA51_CONTINUATION)
+        target_compile_definitions(tdlua_p21_lua_close_sentinel PRIVATE
+            TDLUA_USE_LUA51_CONTINUATION)
+    endif()
+    if(TDLUA_USE_LUAJIT_CONTINUATION)
+        target_compile_definitions(tdlua_p21_lua_close_sentinel PRIVATE
+            TDLUA_USE_LUAJIT_CONTINUATION)
+    endif()
+    tdlua_enable_sanitizers(tdlua_p21_lua_close_sentinel)
+    add_test(NAME tdlua_p21_lua_close_sentinel
+        COMMAND tdlua_p21_lua_close_sentinel)
+    tdlua_enable_sanitizer_test_runtime(tdlua_p21_lua_close_sentinel)
+
+    set(_tdlua_p21_probes
+        cancel_settle_oom_probe
+        completion_error_flag_probe
+        completion_error_oom_probe
+        enqueue_oom_probe
+        handle_anchor_probe
+        metatable_leak_probe
+        metatable_oom_probe
+        metatable_repair_probe
+        multi_vm_probe
+        oom_probe
+        ownership_probe
+        partial_meta_probe
+        promote_oom_probe
+        registry_lifetime_probe
+        registry_lifetime_probe2
+        second_longjmp_probe
+        token_lifetime_probe
+    )
+    foreach(_tdlua_p21_probe IN LISTS _tdlua_p21_probes)
+        add_executable(tdlua_p21_${_tdlua_p21_probe}
+            "tests/p21/${_tdlua_p21_probe}.cpp")
+        target_include_directories(tdlua_p21_${_tdlua_p21_probe} PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_p21_${_tdlua_p21_probe} PRIVATE
+            ${LUA_LIBRARIES})
+        target_compile_features(tdlua_p21_${_tdlua_p21_probe} PRIVATE
+            cxx_std_14)
+        target_compile_definitions(tdlua_p21_${_tdlua_p21_probe} PRIVATE
+            TDLUA_TESTING)
+        if(TDLUA_USE_LUA51_CONTINUATION)
+            target_compile_definitions(tdlua_p21_${_tdlua_p21_probe}
+                PRIVATE TDLUA_USE_LUA51_CONTINUATION)
+        endif()
+        if(TDLUA_USE_LUAJIT_CONTINUATION)
+            target_compile_definitions(tdlua_p21_${_tdlua_p21_probe}
+                PRIVATE TDLUA_USE_LUAJIT_CONTINUATION)
+        endif()
+        tdlua_enable_sanitizers(tdlua_p21_${_tdlua_p21_probe})
+        add_test(NAME tdlua_p21_${_tdlua_p21_probe}
+            COMMAND tdlua_p21_${_tdlua_p21_probe})
+    endforeach()
+
     if(_tdlua_backend STREQUAL "json" AND NOT TDLUA_USE_LUA51_CONTINUATION)
         add_executable(tdlua_fake_client_test "tests/fake_client_test.cpp")
         target_include_directories(tdlua_fake_client_test PRIVATE
@@ -1552,6 +1636,25 @@ if(TDLUA_BUILD_TESTS)
             tdlua_e2e_smoke
             tdlua_managed_driver_backend
         )
+    endif()
+
+    if(TDLUA_LUA_EXECUTABLE)
+        foreach(_tdlua_p21_lua_probe IN ITEMS
+                completion_semantics
+                liveness_probe
+                error_delivery_probe
+                dual_error_probe
+                lua_close_pending)
+            add_test(NAME tdlua_p21_${_tdlua_p21_lua_probe}
+                COMMAND ${TDLUA_LUA_EXECUTABLE}
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/p21/${_tdlua_p21_lua_probe}.lua"
+                        "$<TARGET_FILE_DIR:tdlua>"
+                        "${CMAKE_CURRENT_SOURCE_DIR}")
+            set_tests_properties(tdlua_p21_${_tdlua_p21_lua_probe}
+                PROPERTIES TIMEOUT 60)
+            tdlua_enable_sanitizer_test_runtime(
+                tdlua_p21_${_tdlua_p21_lua_probe})
+        endforeach()
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TDLUA_LUA_EXECUTABLE
        AND NOT TDLUA_ENABLE_SANITIZERS)
