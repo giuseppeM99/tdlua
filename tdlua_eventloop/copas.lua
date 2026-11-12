@@ -171,11 +171,14 @@ function M.new(driver, options)
         bridge_error = nil,
         wake_error = nil,
         kick_hook_error = nil,
+        watch_hook_error = nil,
         error = nil,
         last_state = nil,
         co = nil,
         previous_on_kick = nil,
         kick_hook = nil,
+        previous_on_watch = nil,
+        watch_hook = nil,
         counters = {
             ticks = 0,
             wakeups = 0,
@@ -201,6 +204,29 @@ function M.new(driver, options)
         if not ok then error(err or "wake failed", 0) end
     end
     driver.on_kick = self.kick_hook
+
+    -- The bridge asks for a driver turn when it arms an observer and when a
+    -- wakeup failure becomes fatal. Chain the host hook instead of replacing
+    -- it; `_finish` restores it. A kick never calls tick(), so invoking this
+    -- from inside a scheduler callback does not re-enter the driver.
+    if self.bridge then
+        local previous_watch = self.bridge.on_watch
+        self.previous_on_watch = previous_watch
+        self.watch_hook = function()
+            if previous_watch ~= nil then
+                local ok, err = pcall(previous_watch)
+                if not ok then self.watch_hook_error = err end
+            end
+            local ok, err = self.driver:kick()
+            if not ok then
+                err = err or "tdlua_eventloop.copas: driver kick failed"
+                self.watch_hook_error = err
+                return nil, err
+            end
+            return true
+        end
+        self.bridge.on_watch = self.watch_hook
+    end
     return self
 end
 
@@ -237,6 +263,7 @@ function Adapter:stats()
         bridge_error = self.bridge_error,
         wake_error = self.wake_error,
         kick_hook_error = self.kick_hook_error,
+        watch_hook_error = self.watch_hook_error,
         error = self.error,
         error_traceback = self.error_traceback,
         last_state = self.last_state,
@@ -315,6 +342,12 @@ function Adapter:_finish(reason, detail, hard)
     if self.driver.on_kick == self.kick_hook then
         self.driver.on_kick = self.previous_on_kick
         self.previous_on_kick = nil
+    end
+    if self.bridge and self.watch_hook and
+       self.bridge.on_watch == self.watch_hook then
+        self.bridge.on_watch = self.previous_on_watch
+        self.previous_on_watch = nil
+        self.watch_hook = nil
     end
     local stopped, stop_err = pcall(self.driver.stop, self.driver)
     if not stopped and self.error == nil then
@@ -446,6 +479,12 @@ function Adapter:_loop_body()
 
         if self.bridge then
             self.bridge:poll()
+            if self.bridge.wake_fatal then
+                self.bridge_error = self.bridge.last_wake_error or
+                    "tdlua_eventloop.copas: bridge wake failure"
+                self:_finish("error", self.bridge_error)
+                break
+            end
         end
 
         if state.state == "closed" then
