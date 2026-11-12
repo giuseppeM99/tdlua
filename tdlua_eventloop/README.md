@@ -23,7 +23,7 @@ added to TDLua.
 | `tdlua_eventloop.cqueues` | cqueues adapter: pollable object + controller coroutine + local kick socketpair; standalone or application-owned controller |
 | `tdlua_eventloop.copas` | Copas adapter: readiness proxy + a Copas-owned coroutine; standalone or host-managed loop; POSIX only |
 | `tdlua_eventloop.copas_socket` | Private Copas readiness proxy (`getfd`/`dirty`/`receive`/`settimeout`/`close`); not an application API |
-| `tdlua_eventloop.copas_bridge` | Optional bridge for Copas-owned waiter coroutines: callback Tasks and terminal-handle polling |
+| `tdlua_eventloop.copas_bridge` | Optional bridge for Copas-owned waiter coroutines: P2.1 completion observers, callback Tasks, and a polling fallback for older bindings |
 
 `luv`, `cqueues`, Copas and LuaSocket are optional runtime dependencies of the
 adapters. The generic driver has none, and the core `tdlua` module never loads
@@ -561,47 +561,82 @@ local Bridge = require("tdlua_eventloop.copas_bridge")
 local bridge = Bridge.new({scheduler = copas})
 local adapter = Copas.new(driver, {bridge = bridge})
 
--- Callback Task: true completion notification, no polling.
+-- Callback Task: the callback produces the Task result, no polling.
 copas.addthread(function()
   local waiter = bridge:waiter("getOption")
   client:getOption({name = "version"}, waiter:callback())
   local response = waiter:wait(5)          -- value(s), or raises on failure
 end)
 
--- Existing typed Future: the adapter polls ready() after each driver turn.
+-- Typed Future: a P2.1 observer, no polling.
 copas.addthread(function()
   local future = client:getOption({name = "version"})
   local response = bridge:await_handle(future, 5)
 end)
 ```
 
-`bridge:poll()` is called by the adapter after every `driver:tick()`. If no
-adapter is used, call it yourself or use `bridge:await_poll(handle, timeout,
-interval)`. A terminal handle is read with `handle:wait()`, which does not
-yield; a pending handle is never waited on.
+`bridge:await_handle()` registers `handle:on_complete()` when the module
+exposes `tdlua.capabilities.on_complete`. The callback runs on the owner thread
+inside the scheduler tick, marks the waiter ready and wakes the coroutine. It
+does not read the result. Only the waiter coroutine calls `handle:wait()`, and
+only after `handle:ready()` returned true. A pending handle is never waited on,
+including on Lua 5.1 without continuations, where that would block the thread.
+
+On a binding without the capability, `await_handle()` keeps the previous
+behavior: `bridge:poll()` reads `ready()` after each driver turn. The fallback
+never looks up `on_complete` on a handle. `Bridge.new({completion = false})`
+forces the polling path on a modern binding; `completion = true` cannot create
+a capability the module does not have.
+
+`bridge:poll()` is called by the adapter after every `driver:tick()`. In the
+observer path it returns before allocating a snapshot when there is no polling
+waiter. If no adapter is used, call it yourself or use
+`bridge:await_poll(handle, timeout, interval)`. A terminal handle is read with
+`handle:wait()`, which does not yield.
+
+The adapter chains the bridge `on_watch` hook and restores it during teardown.
+The hook calls `driver:kick()`, which gives the driver a turn without calling
+`tick()` recursively. It covers a request that completes without a new
+transport event and is also the delivery path for a fatal wakeup failure.
 
 `Bridge.new({scheduler = copas})` accepts a scheduler object exposing
 `gettime`, `pause`, `pauseforever` and `wakeup`; Copas 4.12.0 provides all
-four. The bridge never calls `coroutine.resume()`.
+four. `wakeup` failures are retried with `copas.timer` (three attempts); after
+that `bridge.wake_fatal` is set and the adapter stops with an error instead of
+parking forever. The retry timer exists only on the failure path. A persistent
+wakeup failure can leave the waiter coroutine parked with `waiter.co`
+retained: the bridge reports the fatal condition, it cannot force a scheduler
+that refuses to wake a coroutine.
 
 Waiter semantics:
 
 - exactly-once completion; completion-before-arm is preserved;
 - `waiter:complete(...)`, `waiter:fail(err)`, `waiter:cancel([reason])`;
 - `cancel()` is idempotent and terminal; a late completion is ignored;
-- a timeout returns `nil, "timeout", elapsed` and is terminal;
+- a timeout returns `nil, "timeout", elapsed` and is terminal. The bridge
+  reads `ready()` once just before committing the timeout, so a terminal handle
+  wins; after the timeout a late completion is ignored;
 - multiple values and `nil` are preserved;
 - a failure raises the same error from `wait()`;
-- a completed/timed-out/cancelled waiter drops its coroutine reference and is
-  removed from the bridge; `destroy()` releases every remaining waiter;
+- a completed/timed-out/cancelled waiter is removed from the bridge and drops
+  its coroutine reference when the wakeup succeeds; if the wakeup fails, `co`
+  is retained for the retry and `wake_fatal` reports the unrecoverable case;
+  `destroy()` releases every remaining waiter and is idempotent;
 - `waiter:callback()` never yields and returns its arguments unchanged.
 
 `waiter:cancel()` cancels the **host wait**, not the TDLib request. The request
 remains pending until its response or the client closes; per-request
-cancellation is not part of 0.6.x.
+cancellation is not part of 0.6.x. If the result is already terminal the bridge
+observes and discards it, so an already-failed Task is not reported again. A
+request still pending when the waiter is abandoned follows the core policy: a
+later unobserved Task failure may be raised by the next public tick, and the
+adapter then stops with that error. The bridge does not install hidden
+observers to consume it. An abandoned coroutine keeps its waiter until the
+timeout or `bridge:destroy()`; Copas does not close coroutines.
 
 Pass `owns_bridge = true` to let the adapter call `bridge:destroy()` during its
-teardown. Without it, the host owns the bridge life cycle.
+teardown. Without it, the host owns the bridge life cycle. Sharing one bridge
+between two running adapters is not supported.
 
 ### Scheduling and `max_park`
 

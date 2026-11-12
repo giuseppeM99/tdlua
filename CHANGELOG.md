@@ -3,6 +3,29 @@
 
 # Changelog
 
+## Unreleased
+
+### Copas completion notifications
+
+- `tdlua_eventloop.copas_bridge` now uses `Future:on_complete()` and
+  `Task:on_complete()` when the binding exposes
+  `tdlua.capabilities.on_complete`. The observer only signals readiness and
+  wakes the Copas coroutine; the waiter coroutine reads the result with
+  `wait()` after `ready()` returned true.
+- The bridge no longer scans notify waiters in `bridge:poll()`. Polling remains
+  for `await_poll()`, for `completion = false`, and for bindings without the
+  capability.
+- A waiter cancelled or timed out on a pending request releases its token and
+  handle. A terminal result is observed and discarded. A later unobserved Task
+  failure follows the existing core policy.
+- `Bridge.new()` accepts `completion`, `on_watch`, `timer_module`,
+  `wake_retry_limit` and `wake_retry_delay`. Wakeup failures retry with
+  `copas.timer`; after the limit the bridge sets `wake_fatal` and the adapter
+  stops with an error.
+- The Copas adapter chains and restores the bridge `on_watch` hook during
+  teardown.
+- Added `tdlua.capabilities.on_complete` to the module.
+
 ## 0.6.1
 
 ### Optional Copas adapter
