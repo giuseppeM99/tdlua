@@ -148,8 +148,9 @@ jobs:
 
           artifacts="$RUNNER_TEMP/tdlua-artifacts"
           count="$(find "$artifacts" -type f -name '*.so' | wc -l)"
-          test "$count" -eq 10
+          test "$count" -eq 11
           for pattern in \
+            'tdlua-5.1-*.so' \
             'tdlua-5.2-*.so' \
             'tdlua-5.3-*.so' \
             'tdlua-5.4-*.so' \
@@ -163,7 +164,7 @@ jobs:
             find "$artifacts" -type f -name "$pattern" -print -quit | grep -q .
           done
 
-          # The six non-x86_64 packages complete the 16-variant matrix. A
+          # The six non-x86_64 packages complete the 17-variant matrix. A
           # missing or renamed archive fails here rather than reaching
           # SHA256SUMS as a smaller payload.
           platform="$RUNNER_TEMP/tdlua-platform"
@@ -492,8 +493,8 @@ jobs:
           cd payload
 
           # Only artifacts built by this run and by the gates it called are
-          # published: 10 Linux x86_64 modules, 2 AArch64, 2 Windows, 2 macOS.
-          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          # published: 11 Linux x86_64 modules, 2 AArch64, 2 Windows, 2 macOS.
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 11
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
@@ -504,19 +505,23 @@ jobs:
           "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" \
             "$GITHUB_WORKSPACE/release-notes/${release_tag}.md" \
             Lua-5.5-LICENSE.txt
-          test "$(grep -c '  ' SHA256SUMS)" -eq 23
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 24
+          test "$(grep -c '  ' SHA256SUMS)" -eq 24
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 25
 
-          # The declared matrix, verified by name and then counted. The ten
-          # Linux x86-64 modules are five Lua ABIs times two backends; the six
-          # platform archives are named explicitly. A renamed or duplicated
-          # artifact fails here, and the total is derived from the files that
-          # matched instead of being asserted as a constant.
+          # The declared matrix, verified by name and then counted. The eleven
+          # Linux x86-64 modules are six JSON ABIs (Lua 5.1-5.5 and LuaJIT) and
+          # five native ABIs (Lua 5.2-5.5 and LuaJIT); the six platform
+          # archives are named explicitly. A renamed or duplicated artifact
+          # fails here, and the total is derived from the files that matched
+          # instead of being asserted as a constant.
           # The TDLib version in the module names comes from the pinned
           # submodule of this checkout, not from a second hardcoded copy.
           tdlib_version="$(awk '/^project\(TDLib VERSION/ { print $3; exit }' "$GITHUB_WORKSPACE/td/CMakeLists.txt")"
           test -n "$tdlib_version"
           variants=0
+          test -f "tdlua-5.1-${base_version}-${tdlib_version}-linux-x86_64.so"
+          test ! -f "tdlua-5.1-native-${base_version}-${tdlib_version}-linux-x86_64.so"
+          variants=$((variants + 1))
           for abi in 5.2 5.3 5.4 5.5 luajit; do
             test -f "tdlua-${abi}-${base_version}-${tdlib_version}-linux-x86_64.so"
             test -f "tdlua-${abi}-native-${base_version}-${tdlib_version}-linux-x86_64.so"
@@ -532,7 +537,7 @@ jobs:
             test -f "$archive"
             variants=$((variants + 1))
           done
-          test "$variants" -eq 16
+          test "$variants" -eq 17
           for file in LICENSE TDLib-LICENSE_1_0.txt Lua-5.5-LICENSE.txt; do
             test -f "$file"
           done

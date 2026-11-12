@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           cd payload
           sha256sum -c SHA256SUMS
-          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -name '*.so' | wc -l)" -eq 11
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
           test "$(find . -maxdepth 1 -name '*.rockspec' | wc -l)" -eq 3
@@ -73,8 +73,8 @@ jobs:
           "$GITHUB_WORKSPACE/tools/release/verify-release-metadata.sh" \
             "$GITHUB_WORKSPACE/release-notes/${GITHUB_REF_NAME}.md" \
             Lua-5.5-LICENSE.txt
-          test "$(grep -c '  ' SHA256SUMS)" -eq 23
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 24
+          test "$(grep -c '  ' SHA256SUMS)" -eq 24
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 25
           ls -l
 
       - name: Publish GitHub release
