@@ -1268,6 +1268,15 @@ if(TDLUA_BUILD_TESTS)
         second_longjmp_probe
         token_lifetime_probe
     )
+    if(WIN32)
+        # The original probe replaces global operator new, which is a suspect
+        # fault-injection method on the MSVC runtime and currently crashes.
+        # The hook probe covers the same R12 property without replacing
+        # operator new, so the R12 regression stays enabled on Windows with one
+        # test, not zero. Both probes run on Linux and macOS.
+        list(REMOVE_ITEM _tdlua_p21_probes second_longjmp_probe)
+    endif()
+    list(APPEND _tdlua_p21_probes second_longjmp_hook_probe)
     foreach(_tdlua_p21_probe IN LISTS _tdlua_p21_probes)
         add_executable(tdlua_p21_${_tdlua_p21_probe}
             "tests/p21/${_tdlua_p21_probe}.cpp")

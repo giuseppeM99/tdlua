@@ -347,6 +347,22 @@ inline void setObserverPromoteHookForTesting(ObserverPromoteHook hook)
     observerPromoteHook() = hook;
 }
 
+// Diagnostic seam for the R12 registration-failure path. It runs inside the
+// protected registration block, after the core has been acquired and before
+// watchCompletion, so a hook can raise a C++ failure without replacing global
+// operator new. It must throw; the production catch path is what the probe
+// observes.
+using CompletionRegistrationHook = void (*)();
+inline CompletionRegistrationHook &completionRegistrationHook()
+{
+    static thread_local CompletionRegistrationHook hook = nullptr;
+    return hook;
+}
+inline void setCompletionRegistrationHookForTesting(CompletionRegistrationHook hook)
+{
+    completionRegistrationHook() = hook;
+}
+
 // Makes the transport-detach step of disposeStorage fail exactly once, so a
 // test can prove that observer roots are released by the separate protected
 // frame even when detach cannot complete.
@@ -2054,6 +2070,8 @@ public:
         std::size_t lua_registry_refs = 0;
         std::size_t managed_handles = 0;
         std::size_t managed_waiters = 0;
+        std::size_t completion_observers = 0;
+        std::size_t completion_queued = 0;
         bool driver_active = false;
         bool consumer_active = false;
         bool poll_selecting = false;
@@ -2089,6 +2107,7 @@ public:
             if (!state || !seen_states.emplace(state.get(), true).second) return;
             result.managed_handles += state->handle_count;
             result.managed_waiters += state->waiter_count;
+            result.completion_observers += state->observers.size();
             const int refs[] = {state->callback_ref, state->context_ref,
                                 state->thread_ref, state->response_ref,
                                 state->result_ref};
@@ -2136,6 +2155,8 @@ public:
             if (entry.second.thread_ref != LUA_NOREF &&
                 entry.second.thread_ref != LUA_REFNIL)
                 ++result.lua_registry_refs;
+        result.completion_queued =
+            completion_queue_.size() + deferred_completions_.size();
         return result;
     }
 #endif
@@ -3859,6 +3880,9 @@ inline int managedOnComplete(lua_State *L, const char *type)
         Failure::None;
     char message[256] = {0};
     try {
+#ifdef TDLUA_TESTING
+        if (completionRegistrationHook()) completionRegistrationHook()();
+#endif
         const auto observer = core->watchCompletion(L, handle->state, 2);
         try {
             pushCompletionTokenProtected(L, core.get(), observer);
