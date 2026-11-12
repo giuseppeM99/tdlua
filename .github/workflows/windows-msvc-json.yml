@@ -23,6 +23,7 @@ on:
       - 'tests/**'
       - 'tools/windows/**'
       - 'td'
+  workflow_dispatch:
   # release-package.yml calls this workflow so the Windows package is built in
   # the same run as the payload. A standalone push run is unchanged: the branch
   # filter above already excludes packaging branches and tags.
@@ -437,12 +438,19 @@ jobs:
             'tdlua_readiness_core', 'tdlua_readiness_buffering',
             'tdlua_readiness_handler_only',
             'tdlua_readiness_deadline', 'tdlua_backend_readiness',
-            'tdlua_readiness_c_abi'
+            'tdlua_readiness_c_abi',
+            'tdlua_p21_cancel_settle_oom_probe', 'tdlua_p21_completion', 'tdlua_p21_completion_error_flag_probe', 'tdlua_p21_completion_error_oom_probe',
+            'tdlua_p21_completion_semantics', 'tdlua_p21_dual_error_probe', 'tdlua_p21_enqueue_oom_probe', 'tdlua_p21_error_delivery_probe',
+            'tdlua_p21_handle_anchor_probe', 'tdlua_p21_liveness_probe', 'tdlua_p21_lua_close_pending', 'tdlua_p21_lua_close_sentinel',
+            'tdlua_p21_metatable_leak_probe', 'tdlua_p21_metatable_oom_probe', 'tdlua_p21_metatable_repair_probe', 'tdlua_p21_multi_vm_probe',
+            'tdlua_p21_oom_probe', 'tdlua_p21_ownership_probe', 'tdlua_p21_partial_meta_probe', 'tdlua_p21_promote_oom_probe',
+            'tdlua_p21_registry_lifetime_probe', 'tdlua_p21_registry_lifetime_probe2', 'tdlua_p21_second_longjmp_hook_probe', 'tdlua_p21_token_lifetime_probe',
+            'tdlua_p21_completion_token_phase_probe'
           )
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the expected 48-test set; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the expected 73-test set; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency', 'tdlua_readiness_core', 'tdlua_backend_readiness')

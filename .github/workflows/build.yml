@@ -1193,7 +1193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lua: ["5.2", "5.3", "5.4"]
+        lua: ["5.1", "5.2", "5.3", "5.4"]
 
     steps:
       - name: Checkout repository
@@ -1202,10 +1202,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
+          lua_dev="liblua${{ matrix.lua }}-dev"
+          if [ "${{ matrix.lua }}" = "5.1" ]; then
+            lua_dev="liblua5.1-0-dev"
+          fi
           sudo apt-get install -y \
             cmake \
             gperf \
-            liblua${{ matrix.lua }}-dev \
+            "$lua_dev" \
             lua${{ matrix.lua }} \
             ninja-build \
             openssl \
@@ -1391,6 +1395,67 @@ jobs:
           name: tdlua-lua5.5-static
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
+
+  json-sanitizers:
+    name: JSON backend / TDLua ASan + UBSan
+    needs: tdlib
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            curl \
+            gperf \
+            libreadline-dev \
+            libssl-dev \
+            ninja-build \
+            openssl \
+            zlib1g-dev
+
+      - name: Build Lua 5.5
+        uses: ./.github/actions/lua55
+
+      - name: Download static TDLib package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tdlib-static
+          path: ${{ runner.temp }}/tdlib-artifact
+
+      - name: Extract static TDLib package
+        run: |
+          mkdir -p "$RUNNER_TEMP/tdlib"
+          tar -xzf "$RUNNER_TEMP/tdlib-artifact/tdlib-static.tar.gz" \
+            -C "$RUNNER_TEMP/tdlib"
+
+      - name: Configure sanitized JSON backend
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTDLUA_BUILD_TESTS=ON \
+            -DTDLUA_BUNDLED_TDLIB=OFF \
+            -DTDLUA_TD_STATIC=ON \
+            -DTDLUA_ENABLE_SANITIZERS=ON \
+            -DTDLUA_BACKEND=json \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tdlib" \
+            -DTDLUA_LUA_VERSION=5.5 \
+            -DLUA_EXECUTABLE="$RUNNER_TEMP/lua55/bin/lua" \
+            -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
+            -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
+
+      - name: Build and run sanitized P2.1 suite
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          cmake --build build
+          ctest --test-dir build --output-on-failure -R '^tdlua_p21_' \
+            -E 'tdlua_p21_cancel_settle_oom_probe|tdlua_p21_second_longjmp_probe'
 
   legacy-number-precision:
     name: Legacy Lua integer precision / binary64 long double
@@ -1844,7 +1909,8 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1
         run: |
           cmake --build build
-          ctest --test-dir build --output-on-failure -R '^tdlua_'
+          ctest --test-dir build --output-on-failure -R '^tdlua_' \
+            -E 'tdlua_p21_cancel_settle_oom_probe|tdlua_p21_second_longjmp_probe'
 
       - name: Report native compiler cache
         run: ccache --show-stats
@@ -1991,6 +2057,15 @@ jobs:
             echo "tdlua.so unexpectedly depends on shared libtdjson"
             exit 1
           fi
+
+      - name: Run P2.1 Lua probes with JIT off
+        run: |
+          set -euo pipefail
+          for probe in completion_semantics liveness_probe \
+                       error_delivery_probe dual_error_probe \
+                       lua_close_pending; do
+            luajit -joff "tests/p21/${probe}.lua" "$PWD/build" "$PWD"
+          done
 
       # The matrix builds with TDLUA_BUILD_TESTS=ON so the suite can reach the
       # TDLUA_TESTING hooks, and that build exports them from the module. The
