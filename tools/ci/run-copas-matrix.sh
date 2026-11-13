@@ -40,7 +40,11 @@ rm -f "$EVIDENCE_DIR"/*.log
 
 RUNTIMES=(5.1 5.2 5.3 5.4 5.5 luajit luajit-off)
 EXPECTED_ROWS=77
-EXPECTED_CHECKS=3239
+# I07 uses a verifiably pending testNetwork request and asserts the parked
+# waiter, the armed token, the aborted request, the single resume and the
+# released token: eight more checks per runtime than the 0.6.1 inventory
+# (3239 + 8 * 7).
+EXPECTED_CHECKS=3295
 
 binary_for() {
   case "$1" in

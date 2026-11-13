@@ -258,28 +258,65 @@ end
 print("I07  close during a completion wait fails the waiter")
 do
     local s = session()
-    local outcome
+    -- Deterministic pendency: the Future is created and armed in one Copas
+    -- turn, and the closer runs in the same turn before any scheduler tick, so
+    -- the handle cannot be terminal at the close regardless of network
+    -- availability. The close is what aborts it.
+    local shared = {resumes = 0}
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        shared.future = s.client:testNetwork()
+        H.check(not shared.future:ready(), "testNetwork pending before arm")
         local ok, err = H.wait_pcall(function()
-            return s.bridge:await_handle(future, 5)
+            return s.bridge:await_handle(shared.future, 5)
         end)
-        outcome = {ok = ok, err = err}
+        shared.resumes = shared.resumes + 1
+        shared.outcome = {ok = ok, err = err}
     end)
     copas.addthread(function()
-        copas.pause(0.05)
+        -- No pause: the arm above already yielded and no tick has run since
+        -- the Future was created.
+        shared.pending_before_close = shared.future ~= nil and
+            not shared.future:ready()
+        local retained, armed = 0, 0
+        for _, waiter in pairs(s.bridge.waiters) do
+            retained = retained + 1
+            if waiter.token ~= nil and waiter.armed then
+                armed = armed + 1
+                shared.waiter = waiter
+            end
+        end
+        shared.parked_before_close = retained == 1
+        shared.armed_before_close = armed == 1
         H.close_real(s.client)
-        copas.pause(0.05)
+        copas.pause(0.1)
         s.adapter:stop()
     end)
     H.add_watchdog(copas, s.adapter, 6)
     local ok, err = pcall(s.adapter.run, s.adapter)
     H.check(ok, "run returned (" .. tostring(err) .. ")")
-    drain_until(function() return outcome ~= nil end, 0.5)
-    H.check(outcome ~= nil, "waiter returned")
+    drain_until(function() return shared.outcome ~= nil end, 0.5)
+    H.check(shared.pending_before_close == true,
+            "handle pending immediately before close")
+    H.check(shared.parked_before_close == true,
+            "waiter parked immediately before close")
+    H.check(shared.armed_before_close == true,
+            "observer token armed before close")
+    H.check(shared.outcome ~= nil, "waiter returned")
+    -- TDLib answers an aborted request with an error object, so the waiter
+    -- terminates normally with that value rather than raising.
+    local aborted = shared.outcome ~= nil and
+        (shared.outcome.ok == false or
+         (type(shared.outcome.err) == "table" and
+          shared.outcome.err["@type"] == "error"))
+    H.check(aborted, "waiter observed an aborted request")
+    H.equal(shared.resumes, 1, "waiter resumed exactly once")
     local retained = 0
     for _ in pairs(s.bridge.waiters) do retained = retained + 1 end
     H.equal(retained, 0, "no waiter retained")
+    H.equal(shared.waiter ~= nil and shared.waiter.armed, false,
+            "aborted waiter disarmed")
+    H.equal(shared.waiter ~= nil and shared.waiter.token, nil,
+            "aborted waiter token released")
     H.equal(stats_of(s.bridge).wake_errors, 0, "no bridge wake error")
 end
 

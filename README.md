@@ -180,6 +180,44 @@ end
 `receive()` returns raw responses and updates. Responses expose `_request_id`;
 updates do not.
 
+### Completion observers
+
+A managed `Future` or `Task` can report its terminal transition without a
+blocking wait:
+
+```lua
+local token = client:getUser({ user_id = 123 }):on_complete(function(handle)
+    -- Runs on the owner thread, inside a scheduler tick.
+    print(handle:ready(), handle:wait())
+end)
+assert(tdlua.capabilities.on_complete)
+```
+
+- `Future:on_complete(callback)` and `Task:on_complete(callback)` return a
+  token. The callback runs exactly once, with the handle, after the state
+  becomes terminal. Registration never runs the callback synchronously.
+- A registration on a handle that is already terminal is *deferred*: the
+  callback runs on a later scheduler tick, never recursively from
+  `on_complete`.
+- The callback runs on the thread and inside the tick that owns the handle. It
+  must not yield and must not drive the scheduler (`client:poll()`,
+  `client:loop()`, `client:receive()`, an adapter turn or `tick()`); reading the
+  result with `handle:wait()` is supported. Registering another observer from
+  inside the callback is allowed and is delivered on a later tick.
+- `token:cancel()` returns `true` if the callback had not started. Cancelling
+  after delivery, or after the callback started, returns `false`.
+- Dropping the token does not cancel the observer. The observer stays active
+  until delivery, `cancel()`, client close or teardown; this is why
+  `handle:on_complete(cb)` without keeping the token still reports completion.
+- A Lua error raised by a callback does not unwind the tick. It is recorded and
+  raised by the next public call that drains the scheduler (`receive`, `poll`,
+  `loop`, an adapter turn). The adapter reports it and stops.
+- Progress: a pending completion is *work*. `client:readiness():has_work()`
+  returns true while one is queued, and registration rings the owner doorbell,
+  so an event-loop adapter parked before the registration still takes a turn.
+  A host that drives the client manually must call `poll()`/`receive()` (or
+  tick its adapter) for the callback to run.
+
 Close the client with:
 
 ```lua

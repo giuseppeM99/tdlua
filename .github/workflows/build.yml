@@ -332,6 +332,38 @@ jobs:
           lua5.4 tests/eventloop_host_managed_runtime.lua
           lua5.4 tests/eventloop_reconnect_runtime.lua
 
+      - name: Run completion liveness regressions
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/rocks"
+          eval "$(luarocks --lua-version=5.4 --tree="$tree" path)"
+          export LUA_CPATH="$PWD/build-eventloop/?.so;$LUA_CPATH"
+          export LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;$LUA_PATH"
+          log_dir="$RUNNER_TEMP/liveness"
+          rm -rf "$log_dir"
+          mkdir -p "$log_dir"
+          # Exit code and the exact summary are both required: a suite that
+          # stops early, reports a failure or prints a stale count must not
+          # pass. The module directory is the one just built in this job.
+          run_liveness() {
+            local suite="$1"
+            local expected="$2"
+            local log="$log_dir/$(basename "$suite" .lua).log"
+            rm -f "$log"
+            if ! lua5.4 "$suite" "$PWD/build-eventloop" "$PWD" 2>&1 | tee "$log"; then
+              echo "::error::completion liveness suite failed: $suite" >&2
+              return 1
+            fi
+            if ! grep -qxF "$expected" "$log"; then
+              echo "::error::$suite did not report '$expected'" >&2
+              return 1
+            fi
+          }
+          run_liveness tests/eventloop_liveness_luv.lua \
+            'liveness-luv: 36 checks, 0 failures'
+          run_liveness tests/eventloop_liveness_cqueues.lua \
+            'liveness-cqueues: 13 checks, 0 failures'
+
       - name: Run DEF-01 unreliable-transport regressions
         run: |
           set -euo pipefail
@@ -1168,6 +1200,19 @@ jobs:
             2>&1 | tee .ci/aarch64-validation/eventloop-luv-runtime.log
           lua5.4 tests/eventloop_luv_windows.lua \
             2>&1 | tee .ci/aarch64-validation/eventloop-luv-windows.log
+          # Completion liveness on the real AArch64 module and the pinned luv.
+          # cqueues is intentionally absent from this job.
+          log=".ci/aarch64-validation/eventloop-luv-liveness.log"
+          rm -f "$log"
+          if ! lua5.4 tests/eventloop_liveness_luv.lua "$module_dir" "$PWD" \
+            2>&1 | tee "$log"; then
+            echo "::error::completion liveness suite failed on AArch64" >&2
+            exit 1
+          fi
+          if ! grep -qxF 'liveness-luv: 36 checks, 0 failures' "$log"; then
+            echo "::error::completion liveness suite did not report 36/0 on AArch64" >&2
+            exit 1
+          fi
 
       - name: Upload AArch64 release packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

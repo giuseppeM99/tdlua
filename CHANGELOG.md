@@ -26,6 +26,33 @@
   teardown.
 - Added `tdlua.capabilities.on_complete` to the module.
 
+### Completion readiness
+
+- A completion registered on an already-terminal managed handle is now *work*
+  for the owner: `readiness:has_work()` stays true while it is queued, and the
+  registration rings the owner doorbell. An event-loop adapter that was already
+  parked (luv, cqueues) takes a turn and delivers the callback without an
+  application `kick()`.
+- The delivery stays deferred and non-reentrant: a callback that registers a
+  new observer is delivered on a later tick, and the level state keeps the host
+  from parking while it is pending.
+- Cancelling a deferred observer leaves no periodic wake and no spin; the next
+  turn drains it and the adapter returns to sleep. Until that turn,
+  `has_work()` still reports the cancelled entry as work, so a host does not
+  park before the queue is drained.
+- The readiness C ABI is unchanged: `tdlua_readiness_has_work` keeps its
+  mailbox-only meaning. The managed completion level is exposed on the Lua
+  readiness surface used by the event-loop adapters.
+
+### Packaging and repository layout
+
+- All LuaRocks specifications moved to `rockspecs/`; the build and release
+  workflows reference the new paths. No packaged artifact, dependency or module
+  changed.
+- The release payload now includes the Lua 5.1 JSON module: eleven Linux
+  x86_64 modules, twenty-four checksums and twenty-five payload files. There is
+  no Lua 5.1 native module.
+
 ## 0.6.1
 
 ### Optional Copas adapter

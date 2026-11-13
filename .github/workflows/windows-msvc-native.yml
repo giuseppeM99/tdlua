@@ -557,7 +557,7 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Windows registers 67 tests: the Linux native baseline plus the
+          # Native Windows registers 68 tests: the Linux native baseline plus the
           # platform-specific tdlua_windows_residency and the readiness tests.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
@@ -581,6 +581,7 @@ jobs:
             'tdlua_readiness_deadline', 'tdlua_backend_readiness',
             'tdlua_readiness_c_abi',
             'tdlua_p21_cancel_settle_oom_probe', 'tdlua_p21_completion', 'tdlua_p21_completion_error_flag_probe', 'tdlua_p21_completion_error_oom_probe',
+            'tdlua_p21_completion_readiness_probe',
             'tdlua_p21_completion_semantics', 'tdlua_p21_dual_error_probe', 'tdlua_p21_enqueue_oom_probe', 'tdlua_p21_error_delivery_probe',
             'tdlua_p21_handle_anchor_probe', 'tdlua_p21_liveness_probe', 'tdlua_p21_lua_close_pending', 'tdlua_p21_lua_close_sentinel',
             'tdlua_p21_metatable_leak_probe', 'tdlua_p21_metatable_oom_probe', 'tdlua_p21_metatable_repair_probe', 'tdlua_p21_multi_vm_probe',
@@ -592,7 +593,7 @@ jobs:
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 67-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 68-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -619,8 +620,21 @@ jobs:
           # The manifest gate pins the registered set; this pins the executed
           # result, so a silently skipped test cannot pass as green.
           $summary = Get-Content (Join-Path $logDir 'ctest-full.log') -Raw
-          if ($summary -notmatch '0 tests failed out of 67') {
-            throw 'The native CTest suite did not report 67/67: inspect ctest-full.log'
+          $runSummary = [regex]::Match(
+            $summary,
+            '(?im)^[ \t]*(\d+)% tests passed(?:, (\d+) tests failed)? out of (\d+)[ \t]*\r?$')
+          if (-not $runSummary.Success) {
+            throw 'The native CTest suite did not report a result: inspect ctest-full.log'
+          }
+          $failedCount = if ($runSummary.Groups[2].Success) {
+            [int]$runSummary.Groups[2].Value
+          } else {
+            0
+          }
+          $passedPercent = [int]$runSummary.Groups[1].Value
+          $totalCount = [int]$runSummary.Groups[3].Value
+          if ($passedPercent -ne 100 -or $failedCount -ne 0 -or $totalCount -ne 68) {
+            throw 'The native CTest suite did not report 68/68: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.
