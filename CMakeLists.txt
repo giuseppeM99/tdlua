@@ -1253,6 +1253,7 @@ if(TDLUA_BUILD_TESTS)
         cancel_settle_oom_probe
         completion_error_flag_probe
         completion_error_oom_probe
+        completion_readiness_probe
         enqueue_oom_probe
         handle_anchor_probe
         metatable_leak_probe

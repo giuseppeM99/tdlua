@@ -157,7 +157,13 @@ template <class Value> int readinessHasWork(lua_State *L)
 {
     return protected_call(L, [&]() -> int {
         LuaReadiness<Value> *state = readinessState<Value>(L);
-        lua_pushboolean(L, state && state->usable() && state->view.hasWork());
+        // The mailbox view is the transport side of readiness. A managed
+        // completion queued in the scheduler is owner work too: without this
+        // level state a host that cleared the doorbell would park with a
+        // callback still pending.
+        const bool work = state && state->usable() &&
+            (state->view.hasWork() || tdlua::managedCompletionWorkForVm(L));
+        lua_pushboolean(L, work);
         return 1;
     });
 }

@@ -92,6 +92,15 @@ TDLua::TDLua(lua_State *lua)
       lua_(tdlua_lua_main_thread(lua)), owner_(tdlua_json_vm_owner(lua))
 {
     dispatcher_.setManagedPump(this, json_transport_pump);
+    // Edge notification for managed completion work. The scheduler has no
+    // transport, so a registration on an already-terminal handle calls back
+    // into this owner's readiness hub; the level state is reported separately
+    // by readiness:has_work().
+    {
+        const auto hub = JsonRuntime::instance().hub();
+        const std::uint64_t owner = owner_;
+        dispatcher_.setOwnerWake([hub, owner]() { hub->ringOwner(owner); });
+    }
 #ifdef TDLUA_TESTING
     tdlua_json_test_creation_stage(6);
 #endif

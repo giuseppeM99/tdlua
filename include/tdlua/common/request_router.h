@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -610,6 +611,12 @@ class SchedulerCore : public std::enable_shared_from_this<SchedulerCore> {
     bool dispatching_completions_ = false;
     bool observer_delivery_oom_ = false;
 
+    // Owner-thread edge notification. The backend wires it to the readiness
+    // doorbell, so a registration that adds new work can wake a host loop that
+    // is already parked. It is only a signal: it never runs Lua and never
+    // observes the queues.
+    std::function<void()> owner_wake_;
+
     // The pump belongs to the backend facade and can be detached independently
     // of the SchedulerCore lifetime.
     void *pump_context_ = nullptr;
@@ -858,6 +865,7 @@ public:
             settleObserver(observer);
             throw;
         }
+        notifyOwnerWork();
         return observer;
     }
 
@@ -880,6 +888,7 @@ public:
         if (state->observers.empty()) return;
         std::vector<std::shared_ptr<CompletionObserver>> observers;
         observers.swap(state->observers);
+        bool queued = false;
         for (auto &observer : observers) {
             if (!observer->active) continue;
             try {
@@ -888,12 +897,14 @@ public:
 #endif
                 if (deferred) deferred_completions_.push_back(observer);
                 else completion_queue_.push_back(observer);
+                queued = true;
             } catch (...) {
                 observer_delivery_oom_ = true;
                 observer->cancelled = true;
                 settleObserver(observer);
             }
         }
+        if (queued) notifyOwnerWork();
     }
 
     // A terminal transition enqueues the observers registered so far. Future
@@ -2312,6 +2323,25 @@ public:
         managed_pump_ = pump;
         pump_ = nullptr;
     }
+    // Installed by the backend facade on the owner thread. An empty function
+    // disables the edge notification during teardown.
+    void setOwnerWake(std::function<void()> wake)
+    {
+        owner_wake_ = std::move(wake);
+    }
+    // Edge notification for newly queued completion work. Safe to call more
+    // than once: the doorbell is coalesced and the level state remains
+    // authoritative after a clear().
+    void notifyOwnerWork() noexcept
+    {
+        if (!owner_wake_) return;
+        try {
+            owner_wake_();
+        } catch (...) {
+            // A wake failure must not turn a successful registration into an
+            // error. The level state still lets the host observe the work.
+        }
+    }
     bool hasPump() const { return pump_ || managed_pump_; }
     std::uint64_t nextRequestId() { return next_++; }
     void observeRequestId(std::uint64_t id)
@@ -2657,6 +2687,14 @@ public:
     {
         return !ready_.empty() || !running_tasks_.empty() ||
                !completion_queue_.empty() || !deferred_completions_.empty();
+    }
+
+    // Level state for the host: a completion that is queued or waiting for a
+    // later tick is work the owner has not done yet. The readiness surface
+    // exposes it so a host cannot park with a pending callback.
+    bool hasPendingCompletionWork() const
+    {
+        return !completion_queue_.empty() || !deferred_completions_.empty();
     }
 #ifdef TDLUA_TESTING
     bool dispatchingCompletionsForTesting() const
@@ -3342,6 +3380,32 @@ inline void registerVmCore(lua_State *L, const std::shared_ptr<SchedulerCore> &c
     vmCores()[main].push_back(core);
 }
 
+// Level state across every scheduler core of the same VM. A completion that is
+// queued or waiting for a later tick is work the owner has not done yet, even
+// when the mailbox is empty and no deadline is pending. Read on the owner
+// thread only; the registry holds weak references and never extends a core's
+// lifetime.
+inline bool managedCompletionWorkForVm(lua_State *L)
+{
+    if (!L) return false;
+    lua_State *main = tdlua_lua_main_thread(L);
+    auto &registry = vmCores();
+    const auto found = registry.find(main);
+    if (found == registry.end()) return false;
+    auto &list = found->second;
+    for (auto entry = list.begin(); entry != list.end();) {
+        const auto core = entry->lock();
+        if (!core) {
+            entry = list.erase(entry);
+            continue;
+        }
+        if (core->hasPendingCompletionWork()) return true;
+        ++entry;
+    }
+    if (list.empty()) registry.erase(found);
+    return false;
+}
+
 inline double nextDeadlineSecondsForVm(lua_State *L)
 {
     const double none = std::numeric_limits<double>::infinity();
@@ -3469,6 +3533,9 @@ public:
     {
         if (storage_disposed_) return true;
         core_->setPump(nullptr, nullptr);
+        // No edge notification once the storage is being torn down: the owner
+        // is detached below and a late ring would only wake a stopping host.
+        core_->setOwnerWake(nullptr);
         const int top = lua_gettop(lua_owner_);
         bool complete = false;
         try {
@@ -3521,6 +3588,13 @@ public:
     void setManagedPump(void *context, ManagedPump pump)
     {
         core_->setManagedPump(context, pump);
+    }
+    // Owner-thread edge notification to the readiness doorbell. The backend
+    // installs it once it knows the owner token; an empty function removes it
+    // during teardown.
+    void setOwnerWake(std::function<void()> wake)
+    {
+        core_->setOwnerWake(std::move(wake));
     }
     std::uint64_t nextRequestId() { return core_->nextRequestId(); }
     void observeRequestId(std::uint64_t id) { core_->observeRequestId(id); }

@@ -88,8 +88,16 @@ NativeTDLua::NativeTDLua(lua_State *lua)
       client_id_(0), updates_(), ready_(false), closing_(false), closed_(false),
       dispatcher_(lua)
 {
-    client_id_ = NativeRuntime::instance().create_client(owner_);
     dispatcher_.setManagedPump(this, native_transport_pump);
+    // Edge notification for managed completion work, mirroring the JSON
+    // backend. Install it before reserving a client ID: a failed allocation
+    // must unwind before the runtime registration exists.
+    {
+        const auto hub = NativeRuntime::instance().hub();
+        const std::uint64_t owner = owner_;
+        dispatcher_.setOwnerWake([hub, owner]() { hub->ringOwner(owner); });
+    }
+    client_id_ = NativeRuntime::instance().create_client(owner_);
 }
 
 NativeTDLua::~NativeTDLua()

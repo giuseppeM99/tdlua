@@ -112,6 +112,11 @@ void LuaDispatcher::setManagedPump(
     router_.setManagedPump(context, pump);
 }
 
+void LuaDispatcher::setOwnerWake(std::function<void()> wake)
+{
+    router_.setOwnerWake(std::move(wake));
+}
+
 bool LuaDispatcher::responseRequestId(const nlohmann::json &response,
                                       std::uint64_t &request_id)
 {

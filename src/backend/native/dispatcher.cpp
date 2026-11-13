@@ -99,6 +99,11 @@ void NativeDispatcher::setManagedPump(
     router_.setManagedPump(context, pump);
 }
 
+void NativeDispatcher::setOwnerWake(std::function<void()> wake)
+{
+    router_.setOwnerWake(std::move(wake));
+}
+
 void NativeDispatcher::cancel(std::uint64_t id)
 {
     router_.cancel(id);

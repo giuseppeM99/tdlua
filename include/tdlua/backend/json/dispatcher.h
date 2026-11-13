@@ -38,6 +38,8 @@ public:
                   tdlua::WaitContext context = tdlua::WaitContext::Managed);
     void setPump(void *context, tdlua::RequestRouter::Pump pump);
     void setManagedPump(void *context, tdlua::RequestRouter::ManagedPump pump);
+    // Owner-thread edge notification for managed completion work.
+    void setOwnerWake(std::function<void()> wake);
     void cancel(std::uint64_t request_id);
     void observeRequestId(std::uint64_t request_id);
     std::size_t pendingCount() const;
