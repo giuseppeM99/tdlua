@@ -104,16 +104,39 @@ void testExpiredAndTick(lua_State *L)
     Driver first(L);
     Driver second(L);
     first.armWait("expired_a", 0.02);
+    const auto armBefore = Clock::now();
     second.armWait("far_b", 0.5);
+    const auto armAfter = Clock::now();
     checkNear(tdlua::nextDeadlineSecondsForVm(L), 0.02, 0.02,
               "nearest deadline before expiry");
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     check(tdlua::nextDeadlineSecondsForVm(L) == 0.0,
           "an expired deadline is reported as 0 (process without waiting)");
     first.router.core()->tick();
+    const auto queryBefore = Clock::now();
     const double after = tdlua::nextDeadlineSecondsForVm(L);
-    check(after > 0.3 && after < 0.5,
-          "after the first waiter is drained the next deadline is B's");
+    const auto queryAfter = Clock::now();
+    // B's arm time and the deadline read lie within these clock samples.
+    // Account for scheduling delays in either operation, rather than assuming
+    // sleep_for(60ms) and tick finish within a fixed wall-clock budget.
+    const double elapsedMin =
+        std::chrono::duration<double>(queryBefore - armAfter).count();
+    const double elapsedMax =
+        std::chrono::duration<double>(queryAfter - armBefore).count();
+    const double expectedMin = 0.5 - elapsedMax;
+    const double expectedMax = 0.5 - elapsedMin;
+    // deadlineFor truncates to clock ticks; allow one tick plus double rounding.
+    const double tolerance = std::chrono::duration<double>(Clock::duration(1)).count()
+        + 4 * std::numeric_limits<double>::epsilon();
+    const std::string timing = " (elapsed=[" + std::to_string(elapsedMin) + ", "
+        + std::to_string(elapsedMax) + "] s, remaining=" + std::to_string(after)
+        + " s)";
+    check(expectedMin > tolerance,
+          "B must still be unexpired throughout the measurement" + timing);
+    check(std::isfinite(after) && after > 0.0
+              && after >= expectedMin - tolerance
+              && after <= expectedMax + tolerance,
+          "after the first waiter is drained the next deadline is B's" + timing);
 }
 
 void testRecoveryToInfinity(lua_State *L)
