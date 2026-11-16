@@ -11,9 +11,10 @@ source = {
 description = {
    summary = "Full Managed TDLib binding for LuaJIT 2.1",
    detailed = [[
-       TDLua exposes TDLib to Lua through the raw send/receive API and the v0.4
-       managed Future/Task API, including callbacks, event handlers, and
-       cooperative poll/loop drivers.
+       TDLua exposes TDLib to Lua through the raw send/receive API and the v0.6
+       managed Future/Task API, including callbacks, event handlers,
+       cooperative poll/loop drivers and the Future:on_complete /
+       Task:on_complete observers.
    ]],
    homepage = "https://github.com/giuseppeM99/tdlua",
    license = "BSD-3-Clause"

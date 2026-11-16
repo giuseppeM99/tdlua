@@ -3,7 +3,22 @@
 
 # Changelog
 
-## Unreleased
+## 0.6.2
+
+### Completion observers
+
+- Added `Future:on_complete(callback)` and `Task:on_complete(callback)`. They
+  return a token and schedule the callback exactly once, on the owner thread and
+  inside a scheduler tick, after the handle becomes terminal.
+- A registration on an already-terminal handle is deferred to a later turn, so a
+  callback never recurses into `on_complete`. Registering another observer from
+  inside a callback is allowed and delivered on a later tick.
+- Dropping the token does not cancel the observer; `token:cancel()` returns
+  `true` only while the callback has not started.
+- A Lua error raised by a callback does not unwind the tick. It is recorded and
+  raised by the next public call that drains the scheduler, and an adapter
+  reports it and stops instead of dropping it.
+- Added `tdlua.capabilities.on_complete` to the module.
 
 ### Copas completion notifications
 
@@ -24,7 +39,6 @@
   stops with an error.
 - The Copas adapter chains and restores the bridge `on_watch` hook during
   teardown.
-- Added `tdlua.capabilities.on_complete` to the module.
 
 ### Completion readiness
 
@@ -43,15 +57,33 @@
 - The readiness C ABI is unchanged: `tdlua_readiness_has_work` keeps its
   mailbox-only meaning. The managed completion level is exposed on the Lua
   readiness surface used by the event-loop adapters.
+- The level is per VM, not per client: work that belongs to another client of
+  the same VM keeps the owner-wide level true. A driver that pumps one client
+  keeps its bounded `retry_delay` retry (10 ms) until every relevant client is
+  drained. No universal CPU cost is claimed.
+
+### MSVC registration failure
+
+- The `on_complete` registration failure path is split in two phases (R12). The
+  frame that calls `lua_error` no longer owns a scheduler lease, an observer or
+  a token, so the MSVC `/EHsc` cleanup funclet cannot destroy objects the frame
+  no longer owns during a Lua `longjmp`. The Windows-portable diagnostic probe
+  covers the same property with a longjmp-capable hook.
 
 ### Packaging and repository layout
 
 - All LuaRocks specifications moved to `rockspecs/`; the build and release
   workflows reference the new paths. No packaged artifact, dependency or module
   changed.
+- Added `rockspecs/tdlua_eventloop-0.6.2-1.rockspec` for the v0.6.2 source
+  archive. The optional rock keeps its `tdlua >= 0.6.0` dependency, its six
+  modules and the 0.6.1 bridge surface.
+- Refreshed the rockspec descriptions: the LuaJIT rock no longer claims the 0.4
+  managed API, and the core description names the completion observers.
 - The release payload now includes the Lua 5.1 JSON module: eleven Linux
   x86_64 modules, twenty-four checksums and twenty-five payload files. There is
   no Lua 5.1 native module.
+- TDLib is unchanged at 1.8.70; the module version string is `0.6.2-1.8.70`.
 
 ## 0.6.1
 

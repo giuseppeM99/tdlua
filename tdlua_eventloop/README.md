@@ -183,9 +183,10 @@ healthy clients running.
 
 `has_work()` is owner-wide. A second client of the same VM that is not
 registered, or a registered client whose updates are consumed only by
-`client:on`, can keep it true while `receive(0)` returns nil. The public API
-does not expose per-client progress, so `stall_after` is a diagnostic, not an
-exact counter.
+`client:on`, can keep it true while `receive(0)` returns nil. A pending
+completion observer counts as work in the same way, even when it belongs to a
+different client of the VM. The public API does not expose per-client progress,
+so `stall_after` is a diagnostic, not an exact counter.
 
 A stall is **not** terminal by default. When the threshold is reached the
 driver returns `stalled` once per episode with `fatal = false`, then keeps
@@ -750,8 +751,8 @@ authenticated end-to-end integration.
 ## Packaging
 
 `rockspecs/tdlua_eventloop-scm-1.rockspec` is the development rockspec for the separate
-optional rock. `rockspecs/tdlua_eventloop-0.6.1-1.rockspec` is the versioned candidate for
-the v0.6.1 source archive. Both install the driver, the luv and cqueues
+optional rock. `rockspecs/tdlua_eventloop-0.6.2-1.rockspec` is the versioned candidate for
+the v0.6.2 source archive. Both install the driver, the luv and cqueues
 adapters, the Copas adapter and its private proxy/bridge. Neither adds `luv`,
 `cqueues`, `copas` or `luasocket` to the rock's dependencies: each adapter
 loads only its own event loop, in `M.new()`. The core `tdlua` rock is unchanged

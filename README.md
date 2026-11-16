@@ -4,7 +4,7 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-TDLua 0.6.1 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
+TDLua 0.6.2 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
 arm64. The Linux packages require glibc. Dynamic unloading is unsupported.
 
 ## Installation
@@ -38,11 +38,11 @@ The default destination is `lib/lua/<lua-version>/`; change it with
 diagnostic methods and cannot be installed. The install also places the
 standalone readiness header at `include/tdlua/host/readiness_c.h`.
 
-Prebuilt 0.6.1 packages are available for these platforms. Linux x86-64 modules
-cover Lua 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64, Windows and macOS use
-Lua 5.4. Choose the package that matches your Lua ABI and backend. Linux and
-native packages link TDLib statically; Windows and macOS JSON packages include a
-TDLib shared library.
+Prebuilt 0.6.2 packages are available for these platforms. Linux x86-64 modules
+cover Lua 5.1 (JSON only), 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64,
+Windows and macOS use Lua 5.4. Choose the package that matches your Lua ABI and
+backend. Linux and native packages link TDLib statically; Windows and macOS JSON
+packages include a TDLib shared library.
 
 ### Prebuilt Linux x86_64 dependencies
 
@@ -293,3 +293,19 @@ Copas coroutine await a managed handle; TDLua never resumes a Copas coroutine.
 Do not call `Future:wait()` or `Task:wait()` on a pending handle from a Copas
 coroutine. Waiter cancellation cancels the host wait only, not the TDLib
 request. See `tdlua_eventloop/README.md` for the ownership rules.
+
+### Per-VM completion readiness
+
+Completion work is tracked per VM, not per client. `client:readiness():has_work()`
+is true when *any* client of that VM has a pending completion, and a driver that
+pumps only one of those clients can therefore take a bounded retry turn for work
+that belongs to another client. The current driver uses `retry_delay = 0.01` s
+(10 ms) for that retry; there is no guaranteed or universal CPU cost, and no
+adapter workaround. Make every relevant client progress: add it to the same
+driver, pump it in the host loop, or drain it before parking. The driver-level
+contract, including `stall_after` and `driver:progress()`, is in
+`tdlua_eventloop/README.md`.
+
+The versioned LuaRocks specifications live in `rockspecs/`; the optional
+`tdlua_eventloop` rock keeps the `tdlua >= 0.6.0` dependency and never adds an
+event-loop dependency to the core rock.
