@@ -31,17 +31,28 @@ dist_info=${TDLUA_DIST_INFO:-"$script_dir/../../dist.info"}
 [ -s "$dist_info" ] || fail "dist.info is missing or empty: $dist_info"
 
 # dist.info is the single source of truth for the release version, exactly as
-# the packaging job derives it. An empty or malformed line stops the release
-# instead of silently accepting any title.
-base_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$dist_info")
-case "$base_version" in
-    '' | *[!0-9.]*)
-        fail "cannot read a dotted version from $dist_info: '$base_version'"
-        ;;
-esac
+# the packaging job derives it. Every `version = ...` assignment is counted in
+# the file itself, because a command substitution would drop trailing newlines
+# and could hide a second, empty assignment. The value must then be a literal
+# major.minor.patch.
+version_assignments=$(awk '/^[[:space:]]*version[[:space:]]*=/ { n++ } END { print n + 0 }' "$dist_info")
+[ "$version_assignments" -eq 1 ] ||
+    fail "expected exactly one 'version = \"x.y.z\"' assignment in $dist_info, found $version_assignments"
+
+version_line=$(awk '/^[[:space:]]*version[[:space:]]*=/ { print; exit }' "$dist_info")
+base_version=$(printf '%s\n' "$version_line" |
+    sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p')
+[ -n "$base_version" ] ||
+    fail "dist.info version assignment is not of the form version = \"x.y.z\": '$version_line'"
+
+# This structural pattern is the only place where the dots are regular
+# expression metacharacters, and they are intentional here. Every comparison
+# that follows is literal.
+printf '%s\n' "$base_version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' ||
+    fail "dist.info version is not major.minor.patch: '$base_version'"
 
 grep -q '^# TDLua ' "$notes" || fail "release notes have no TDLua title"
-grep -qx "# TDLua $base_version" "$notes" ||
+grep -Fqx "# TDLua $base_version" "$notes" ||
     fail "release notes title is not '# TDLua $base_version'"
 
 # A note that still carries the previous module version is a broken copy: the
