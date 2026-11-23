@@ -1825,6 +1825,7 @@ foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test
         tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
         tdlua_sync_execute_fake_test
         tdlua_composition_fake_test
+        tdlua_composition_native_fake_test
         tdlua_sync_execute_owner_error_test
         tdlua_readiness_deadline_test tdlua_backend_readiness_test
         tdlua_simple_bot_example_test tdlua_async_demo_test
