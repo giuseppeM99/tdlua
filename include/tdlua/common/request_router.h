@@ -847,6 +847,22 @@ public:
         observer->state.reset();
     }
 
+    // Keep a dependency's Lua result reachable for a composition that is not
+    // ready to submit yet. The pin behaves like an extra handle: it delays
+    // retirement (and so the release of the result references) until the
+    // composition has materialized every dependency.
+    void retainManagedState(const State &state) noexcept
+    {
+        if (state) ++state->handle_count;
+    }
+
+    void releaseManagedState(const State &state) noexcept
+    {
+        if (!state) return;
+        if (state->handle_count) --state->handle_count;
+        try { retireState(state); } catch (...) {}
+    }
+
     std::shared_ptr<CompletionObserver> watchCompletion(lua_State *L,
                                                         const State &state,
                                                         int callback_index)
@@ -1068,13 +1084,15 @@ private:
         }
         return state;
     }
-    void failState(const State &state, const std::string &error)
+    void failState(const State &state, std::string error)
     {
         if (isTerminalState(state)) {
             return;
         }
         state->status = ManagedStatus::Failed;
-        state->error = error;
+        // Move: the message was built before the terminal transition, so this
+        // assignment cannot allocate and cannot fail after the state changed.
+        state->error = std::move(error);
         releaseLuaReference(state->callback_ref);
         releaseLuaReference(state->context_ref);
         releaseLuaReference(state->thread_ref);
@@ -2349,6 +2367,9 @@ public:
         if (id >= next_) next_ = id == UINT64_MAX ? id : id + 1;
     }
     std::size_t pendingCount() const { return pending_.size(); }
+    // The VM state this core runs on. Deferred request composition uses it to
+    // reject dependencies owned by another VM before registering observers.
+    lua_State *ownerThread() const { return lua_owner_; }
     ResponseClass responseClass(std::uint64_t id) const
     {
         const auto found = pending_.find(id);
@@ -2946,6 +2967,170 @@ public:
             case RequestKind::Task: return RouteKind::Task;
             case RequestKind::LegacyRequest: return RouteKind::LegacyRequest;
             default: return RouteKind::LegacyAwait;
+        }
+    }
+
+    // Complete a managed Future with a value produced by the owner thread
+    // instead of by a TDLib response. The value at value_index is referenced,
+    // not consumed: the caller still owns its stack slot.
+    //
+    // This reuses the same terminal transition as dispatchRoute: detach the
+    // request id from routing so no later response can settle it, store the
+    // value as the response reference, mark the state resolved and enqueue it
+    // on the existing notification queue. No Lua callback runs here and the
+    // owner wake is rung so a parked host takes a turn.
+    //
+    // Commit order: createLuaReference runs Lua and can reenter teardown (a GC
+    // finalizer may close the client and erase pending entries), so the pending
+    // entry is revalidated afterwards; every fallible step (the reference and
+    // the notification slot) happens before the state becomes terminal, so a
+    // failure never leaves a settled but unnotified request.
+    bool completeLocal(lua_State *L, const State &state, int value_index)
+    {
+        if (!state || state->kind != RequestKind::Future) return false;
+        if (state->core.lock().get() != this) return false;
+        if (isTerminalState(state)) return false;
+        int reference = createLuaReference(L, value_index);
+        const auto found = pending_.find(state->request_id);
+        if (found == pending_.end() || found->second != state ||
+            isTerminalState(state)) {
+            releaseLuaReference(reference);
+            return false;
+        }
+        try {
+            ready_.push_back(state);
+        } catch (...) {
+            releaseLuaReference(reference);
+            throw;
+        }
+        untrackPendingRequest(state);
+        pending_.erase(found);
+        state->response_ref = reference;
+        state->status = ManagedStatus::Resolved;
+        notifyOwnerWork();
+        return true;
+    }
+
+    // Fail a managed Future without a TDLib response. Same detachment and
+    // notification rules as completeLocal; no Lua call happens here.
+    bool failLocal(const State &state, const std::string &error)
+    {
+        if (!state || state->kind != RequestKind::Future) return false;
+        if (state->core.lock().get() != this) return false;
+        if (isTerminalState(state)) return false;
+        const auto found = pending_.find(state->request_id);
+        if (found == pending_.end() || found->second != state) return false;
+        // Build the diagnostic and reserve the notification slot while the
+        // request is still pending and routable: a throw changes nothing.
+        std::string message(error);
+        ready_.push_back(state);
+        untrackPendingRequest(state);
+        pending_.erase(found);
+        failState(state, std::move(message));
+        notifyOwnerWork();
+        return true;
+    }
+
+    // Settle a request whose value was produced locally by deferred request
+    // composition. A dependent Future behaves exactly like completeLocal. A
+    // dependent Task keeps its callback contract: the value becomes the
+    // response reference, so the existing task delivery invokes the callback
+    // with it on a later scheduler step. No Lua callback runs here.
+    bool completeDeferred(lua_State *L, const State &state, int value_index)
+    {
+        if (!state) return false;
+        if (state->kind != RequestKind::Future &&
+            state->kind != RequestKind::Task) {
+            return false;
+        }
+        if (state->core.lock().get() != this) return false;
+        if (isTerminalState(state)) return false;
+        int reference = createLuaReference(L, value_index);
+        // Revalidate after the Lua call: a finalizer may have run teardown.
+        const auto found = pending_.find(state->request_id);
+        if (found == pending_.end() || found->second != state ||
+            isTerminalState(state)) {
+            releaseLuaReference(reference);
+            return false;
+        }
+        try {
+            ready_.push_back(state);
+        } catch (...) {
+            releaseLuaReference(reference);
+            throw;
+        }
+        untrackPendingRequest(state);
+        pending_.erase(found);
+        state->response_ref = reference;
+        // A Task stays non-terminal until its callback has run, exactly like
+        // dispatchRoute: otherwise the ready drain would retire it and the
+        // callback would never see the value.
+        if (!isTaskState(state)) state->status = ManagedStatus::Resolved;
+        notifyOwnerWork();
+        return true;
+    }
+
+    // Fail a request whose dependencies failed before it could be submitted.
+    // The same terminal transition as failLocal; Task failures keep the
+    // existing unobserved-failure reporting until a handle observes them.
+    bool failDeferred(const State &state, const std::string &error)
+    {
+        if (!state) return false;
+        if (state->kind != RequestKind::Future &&
+            state->kind != RequestKind::Task) {
+            return false;
+        }
+        if (state->core.lock().get() != this) return false;
+        if (isTerminalState(state)) return false;
+        const auto found = pending_.find(state->request_id);
+        if (found == pending_.end() || found->second != state) return false;
+        std::string message(error);
+        ready_.push_back(state);
+        untrackPendingRequest(state);
+        pending_.erase(found);
+        failState(state, std::move(message));
+        notifyOwnerWork();
+        return true;
+    }
+
+    // Emergency overload used by the composition when it has to fail its
+    // target from a path where allocating a std::string could itself fail.
+    // `message` must be a short literal: it is stored in the state's
+    // small-string buffer, so the assignment does not allocate. Every step is
+    // contained, so a failure leaves the request pending and routable for a
+    // later retry instead of terminating the observer.
+    bool failDeferred(const State &state, const char *message) noexcept
+    {
+        try {
+            if (!state) return false;
+            if (state->kind != RequestKind::Future &&
+                state->kind != RequestKind::Task) {
+                return false;
+            }
+            if (state->core.lock().get() != this) return false;
+            if (isTerminalState(state)) return false;
+            const auto found = pending_.find(state->request_id);
+            if (found == pending_.end() || found->second != state) return false;
+            // Diagnostics first: while the request is still pending a throw
+            // changes nothing. A long message falls back to the short literal,
+            // which stays in the small-string buffer. The notification slot is
+            // reserved before the transition, as in the ordinary overload.
+            try {
+                state->error = message;
+            } catch (...) {
+                state->error = "tdlua: failed";
+            }
+            ready_.push_back(state);
+            untrackPendingRequest(state);
+            pending_.erase(found);
+            state->status = ManagedStatus::Failed;
+            releaseLuaReference(state->callback_ref);
+            releaseLuaReference(state->context_ref);
+            releaseLuaReference(state->thread_ref);
+            notifyOwnerWork();
+            return true;
+        } catch (...) {
+            return false;
         }
     }
     int pushResult(lua_State *L, const State &state)
@@ -3614,9 +3799,33 @@ public:
     {
         return core_->task(L, callback, context, thread);
     }
+    // Settle a Future on the owner thread without a transport response. The
+    // value at value_index is referenced, not consumed. Used by the
+    // synchronous execute fast path; no Lua callback runs here.
+    bool completeLocal(lua_State *L, const ManagedStatePtr &state,
+                       int value_index)
+    {
+        return core_->completeLocal(L, state, value_index);
+    }
+    bool failLocal(const ManagedStatePtr &state, const std::string &error)
+    {
+        return core_->failLocal(state, error);
+    }
     void onEvent(lua_State *L, const std::string &type, int callback, bool concurrent)
     {
         core_->onEvent(L, type, callback, concurrent);
+    }
+    // Deferred request composition (D1-C) forwarders. The shared composition
+    // component uses the core directly, but the backends expose the same
+    // surface so the primitives stay testable through the router.
+    bool completeDeferred(lua_State *L, const ManagedStatePtr &state,
+                          int value_index)
+    {
+        return core_->completeDeferred(L, state, value_index);
+    }
+    bool failDeferred(const ManagedStatePtr &state, const std::string &error)
+    {
+        return core_->failDeferred(state, error);
     }
     void offEvent(const std::string &type) { core_->offEvent(type); }
     bool pushEventHandler(lua_State *L, const std::string &type)

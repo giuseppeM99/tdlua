@@ -38,6 +38,22 @@ int protected_call(lua_State *L, Function &&function)
     return lua_error(L);
 }
 
+// A protected Lua operation that ran on the VM main thread leaves its error
+// object on that thread's stack. The binding boundary runs on the calling
+// coroutine, so move the object there before rethrowing TDLuaLuaError. Without
+// this, lua_error would raise an unrelated value from the coroutine stack.
+inline void transfer_lua_error(lua_State *from, lua_State *to, int from_top)
+{
+    if (from == to) return;
+    if (!lua_checkstack(to, 1)) {
+        lua_settop(from, from_top);
+        lua_pushliteral(to, "tdlua: Lua error transfer failed");
+        return;
+    }
+    lua_xmove(from, to, 1);
+    lua_settop(from, from_top);
+}
+
 using ClientHandle = void *;
 using ClientFactory = ClientHandle (*)(lua_State *);
 
@@ -187,11 +203,26 @@ inline void reject_reserved_request_fields(lua_State *L, int index)
     }
     const int absolute = lua_absindex(L, index);
     const char *const reserved[] = {"@extra", "_request_id"};
+    // `lua_getfield` consults __index on every Lua version, and an indexing
+    // metamethod can raise. The lookup therefore runs in a protected frame: a
+    // longjmp must not cross the binding frames that own requests and strings.
+    struct Check {
+        const char *field;
+        bool present;
+    } check = {nullptr, false};
     for (const char *field : reserved) {
-        lua_getfield(L, absolute, field);
-        const bool present = !lua_isnil(L, -1);
-        lua_pop(L, 1);
-        if (present) {
+        check.field = field;
+        check.present = false;
+        // The table is copied into the protected frame as its first borrowed
+        // value, so it is at index 2 inside the callback (index 1 is the
+        // frame's context userdata).
+        tdlua::protectedLua(L, [](lua_State *state, void *pointer) {
+            auto *check = static_cast<Check *>(pointer);
+            lua_getfield(state, 2, check->field);
+            check->present = !lua_isnil(state, -1);
+            lua_pop(state, 1);
+        }, &check, absolute, 0);
+        if (check.present) {
             throw std::runtime_error(std::string("tdlua: request field '") +
                                      field + "' is reserved");
         }

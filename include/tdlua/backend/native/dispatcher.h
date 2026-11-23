@@ -27,6 +27,27 @@ public:
     std::shared_ptr<tdlua::ManagedState> task(lua_State *L, int callback_index,
                                               int context_index,
                                               bool supplied_thread);
+    // Synchronous execute fast path: settle a Future with a value already
+    // produced on this owner thread, without submitting the request.
+    bool completeLocal(lua_State *L,
+                       const std::shared_ptr<tdlua::ManagedState> &state,
+                       int value_index)
+    { return router_.completeLocal(L, state, value_index); }
+    bool failLocal(const std::shared_ptr<tdlua::ManagedState> &state,
+                   const std::string &error)
+    { return router_.failLocal(state, error); }
+    // Deferred request composition (D1-C).
+    bool completeDeferred(lua_State *L,
+                          const std::shared_ptr<tdlua::ManagedState> &state,
+                          int value_index)
+    { return router_.completeDeferred(L, state, value_index); }
+    bool failDeferred(const std::shared_ptr<tdlua::ManagedState> &state,
+                      const std::string &error)
+    { return router_.failDeferred(state, error); }
+    // The scheduler that owns the managed states of this dispatcher. The
+    // composition component registers internal observers on it and pushes
+    // dependency results from the owner thread.
+    std::shared_ptr<tdlua::SchedulerCore> core() { return router_.core(); }
     std::shared_ptr<tdlua::ManagedState> awaitState(lua_State *L);
     int wait(lua_State *L, const std::shared_ptr<tdlua::ManagedState> &state,
               bool has_timeout, double timeout,
