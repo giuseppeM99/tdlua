@@ -31,6 +31,13 @@ int protected_call(lua_State *L, Function &&function)
     } catch (const std::exception &error) {
         lua_pushstring(L, error.what());
     } catch (...) {
+        if (!std::current_exception()) {
+            // LuaJIT raises lua_error() with a foreign unwind, which an outer
+            // protected_call would otherwise mistake for an unknown C++
+            // exception and replace with a generic message. Let LuaJIT unwind
+            // it to its own pcall boundary, preserving the original error.
+            throw;
+        }
         lua_pushliteral(L, "tdlua: unknown C++ exception");
     }
     // The lambda and all C++ objects created by it have already unwound.
