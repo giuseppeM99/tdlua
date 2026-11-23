@@ -638,8 +638,8 @@ jobs:
           }
           $passedPercent = [int]$runSummary.Groups[1].Value
           $totalCount = [int]$runSummary.Groups[3].Value
-          if ($passedPercent -ne 100 -or $failedCount -ne 0 -or $totalCount -ne 68) {
-            throw 'The native CTest suite did not report 68/68: inspect ctest-full.log'
+          if ($passedPercent -ne 100 -or $failedCount -ne 0 -or $totalCount -ne 74) {
+            throw 'The native CTest suite did not report 74/74: inspect ctest-full.log'
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.
