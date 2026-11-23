@@ -218,6 +218,70 @@ assert(tdlua.capabilities.on_complete)
   A host that drives the client manually must call `poll()`/`receive()` (or
   tick its adapter) for the callback to run.
 
+### Request composition
+
+A request field can be another request's Future, or a projection of one field
+of it. The dependent request is sent exactly once, when every dependency is
+terminal:
+
+```lua
+local text = client:parseTextEntities {
+    text = "*Hello*",
+    parse_mode = {_ = "textParseModeMarkdown", version = 1},
+}
+local sent = client:sendMessage {
+    chat_id = 123,
+    input_message_content = {_ = "inputMessageText", text = text},
+}
+```
+
+```lua
+local user = client:getUser { user_id = 123 }
+local entities = client:getTextEntities {
+    text = tdlua.ref(user, "profile.first_name"),
+}
+```
+
+- `text = text` copies the whole resolved value; `tdlua.ref(text, "text")`
+  copies one field, and a dotted path such as
+  `tdlua.ref(user, "profile.first_name")` follows nested tables. A missing
+  field, or a field whose value is `nil`, fails the dependent Future with an
+  explicit error instead of sending `null`.
+- Dependencies may appear anywhere in the request, in any order, and may be
+  repeated: each distinct Future is observed once. The dependent request is
+  submitted after the last dependency becomes terminal, so it follows every
+  dependency in the request stream.
+- Managed metadata (`_request_id`, `@extra`) is never copied into the payload.
+- When every dependency is already terminal, the request is materialized in the
+  same call and takes the synchronous fast path: if TDLib can execute the
+  method locally, the returned Future is already ready and nothing is sent.
+- A dependency that failed, or that resolved with a TDLib error object, fails
+  the dependent Future and nothing is sent. The error of the dependent request
+  itself stays a normal value, exactly like a plain request.
+- A request that contains a Future cannot use `__index` anywhere in its tree,
+  and a `Task` cannot be used as a request value. A Task is still supported as
+  the execution mode of a composed request, `execute(request, callback)`; there
+  a failed dependency settles the Task as failed and the error is raised by
+  `wait()` (or by the next scheduler call once the handle is released), because
+  no TDLib response exists to hand to the callback.
+- Future dependencies must belong to the same client: a Future from another
+  client in the same VM is rejected before anything is sent.
+
+`execute(request, timeout)` with a positive timeout treats it as a total budget
+counted from the call. When the budget expires while the request is still
+waiting for its dependencies, the call returns `nil, "timeout"` and the request
+is not sent, not even later. When the budget is already exhausted while the
+dependencies are terminal (for example a budget smaller than the call
+overhead), there is nothing left to wait for and the call fails with
+`dependent request timed out before submission` instead. A non-positive
+timeout keeps the historical "submit and do not wait" form.
+There is no timer for a composition: a dependency that never becomes terminal
+keeps the composition pending while its client stays open, and `close()`
+releases the observers, the retained dependency results and the snapshot.
+
+Fire-and-forget (`execute(request, true)`) is refused when the request has
+Future dependencies, because it could not wait for them.
+
 Close the client with:
 
 ```lua
