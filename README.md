@@ -4,7 +4,7 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-TDLua 0.6.2 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
+TDLua 0.6.3 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
 arm64. The Linux packages require glibc. Dynamic unloading is unsupported.
 
 ## Installation
@@ -38,7 +38,7 @@ The default destination is `lib/lua/<lua-version>/`; change it with
 diagnostic methods and cannot be installed. The install also places the
 standalone readiness header at `include/tdlua/host/readiness_c.h`.
 
-Prebuilt 0.6.2 packages are available for these platforms. Linux x86-64 modules
+Prebuilt 0.6.3 packages are available for these platforms. Linux x86-64 modules
 cover Lua 5.1 (JSON only), 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64,
 Windows and macOS use Lua 5.4. Choose the package that matches your Lua ABI and
 backend. Linux and native packages link TDLib statically; Windows and macOS JSON
@@ -281,6 +281,21 @@ releases the observers, the retained dependency results and the snapshot.
 
 Fire-and-forget (`execute(request, true)`) is refused when the request has
 Future dependencies, because it could not wait for them.
+
+### Synchronous fast path
+
+`execute(request)` returns a Future. Before submitting a managed request the
+binding asks TDLib to execute it synchronously. If TDLib answers, the Future is
+already terminal and nothing is sent. Only the two literal messages
+`The method can't be executed synchronously` and
+`The option can't be get synchronously` authorise the asynchronous fallback;
+any other `400` is the response and is never retried. A missing synchronous
+answer is a local error and is never retried either, because the operation may
+already have run.
+
+`execute(request):wait()` settles both paths. `execute(request, timeout)`,
+`execute(request, false)` and `executeSync(request)` keep returning the raw
+response, and `execute(request, true)` remains fire-and-forget.
 
 Close the client with:
 

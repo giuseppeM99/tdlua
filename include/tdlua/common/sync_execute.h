@@ -6,7 +6,7 @@
 
 namespace tdlua {
 
-// TDLib 1.8.70 has exactly two ways to say "this operation cannot run through
+// TDLib 1.8.71 has exactly two ways to say "this operation cannot run through
 // td_execute/ClientManager::execute": the generic SynchronousRequests template
 // and getOption for a non-synchronous option. Both are reported as error 400
 // with these literal messages.

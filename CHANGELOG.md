@@ -3,6 +3,44 @@
 
 # Changelog
 
+## 0.6.3
+
+### Future composition and synchronous fast path
+
+- `execute(request)` and the dynamic helpers now return a Future for every
+  form, including a synchronous success. `execute(request):wait()` settles
+  both the synchronous fast path and the asynchronous fallback.
+- A request may contain whole Futures and `tdlua.ref(future, path)` field
+  projections. Terminal dependencies are materialized inline; pending
+  dependencies are snapshotted and submitted exactly once.
+- Only the two literal TDLib markers authorise the asynchronous fallback. A
+  missing synchronous answer is a local error and is never retried.
+- `execute(request, timeout)`, `execute(request, false)`, `execute(request,
+  true)` and `executeSync(request)` keep their existing return conventions.
+- Fire-and-forget with pending dependencies, Task-as-value, cycles,
+  `__index`, cross-client dependencies and a missing projection field are
+  rejected explicitly.
+
+### LuaJIT error messages
+
+- The outer binding boundary now rethrows a foreign unwind from `lua_error()`
+  instead of replacing its message with `tdlua: unknown C++ exception`.
+  Binding and TDLib errors on LuaJIT keep their original text; only unknown
+  C++ exceptions use the generic message.
+
+### TDLib 1.8.71
+
+- The `td` submodule moves from 1.8.70 (`23383aef…`) to 1.8.71
+  (`f10611ee1f03f91ddae8185483a1ccfd3d664668`). The module version string is
+  `0.6.3-1.8.71`; `tdlua.tdlib_version` reports `1.8.71`.
+- TDLib removes `getUpgradedGiftWithdrawalUrl` and `withdrawUpgradedGift`,
+  adds required arguments to `getForumTopics` and `searchGiftsForResale`,
+  changes the return type of
+  `replyToCallbackQueryWithEphemeralMessage`, and renames `export_date` to
+  `mint_date`, `minimum_price` to `min_price`, and page-block `text` to
+  `blocks`. The synchronous-request implementation and the two fallback
+  markers are unchanged.
+
 ## 0.6.2
 
 ### Completion observers

@@ -10,7 +10,7 @@ repository root.
 | `tdlua_eventloop-scm-1.rockspec` | `tdlua_eventloop` | event-loop development rock, tracks `master` |
 | `tdlua-0.4.0-1.rockspec` … `tdlua-0.5.1-1.rockspec` | `tdlua` | historical versioned rocks |
 | `tdlua-luajit-0.4.0-1.rockspec` … `tdlua-luajit-0.5.1-1.rockspec` | `tdlua-luajit` | historical versioned rocks |
-| `tdlua_eventloop-0.6.0-1.rockspec` … `tdlua_eventloop-0.6.2-1.rockspec` | `tdlua_eventloop` | versioned event-loop rocks |
+| `tdlua_eventloop-0.6.0-1.rockspec` … `tdlua_eventloop-0.6.3-1.rockspec` | `tdlua_eventloop` | versioned event-loop rocks |
 
 The `scm-1` rocks are the source-of-truth development specs. Release rocks
 (`<package>-<version>-1.rockspec`) are generated from them by

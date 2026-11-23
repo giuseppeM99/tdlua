@@ -57,17 +57,17 @@ grep -Fqx "# TDLua $base_version" "$notes" ||
 
 # A note that still carries the previous module version is a broken copy: the
 # payload version and the documented version must agree.
-if grep -qF '0.6.1-1.8.70' "$notes"; then
-    fail "release notes still reference the 0.6.1-1.8.70 module version"
+if grep -qF '0.6.2-1.8.70' "$notes"; then
+    fail "release notes still reference the 0.6.2-1.8.70 module version"
 fi
-if grep -qF 'tdlua_eventloop-0.6.1-1.rockspec' "$notes"; then
-    fail "release notes still reference the 0.6.1 event-loop rockspec"
+if grep -qF 'tdlua_eventloop-0.6.2-1.rockspec' "$notes"; then
+    fail "release notes still reference the 0.6.2 event-loop rockspec"
 fi
 
 # The public body must contain the sections and limits that the release
 # contract promises. The first list is inherited from the 0.6.0 contract and
 # must keep holding; the second records the optional Copas surface added in
-# 0.6.1. Keep both in sync with release-notes/v0.6.2.md.
+# 0.6.1. Keep both in sync with release-notes/v0.6.3.md.
 for section in \
     '## Highlights' \
     '## What is new' \
@@ -105,7 +105,7 @@ for section in \
     'Future:wait()' \
     'waiter:cancel()' \
     'Copas 4.12.0' \
-    'TDLib 1.8.70'; do
+    'TDLib 1.8.71'; do
     grep -qF "$section" "$notes" || fail "release notes missing: $section"
 done
 
@@ -133,8 +133,22 @@ for section in \
     'Lua 5.1 native module' \
     'GLIBC_2.38' \
     'TDLib-LICENSE_1_0.txt' \
-    '0.6.2-1.8.70' \
-    'rockspecs/tdlua_eventloop-0.6.2-1.rockspec'; do
+    '0.6.3-1.8.71' \
+    'rockspecs/tdlua_eventloop-0.6.3-1.rockspec'; do
+    grep -qF "$section" "$notes" || fail "release notes missing: $section"
+done
+
+# 0.6.3 adds future composition, tdlua.ref, the synchronous fast path, the
+# LuaJIT error-message fix and TDLib 1.8.71. These phrases are the public
+# contract of this release.
+for section in \
+    'Future composition' \
+    'tdlua.ref()' \
+    'execute(req):wait()' \
+    'LuaJIT' \
+    'TDLib 1.8.71' \
+    '0.6.3-1.8.71' \
+    'rockspecs/tdlua_eventloop-0.6.3-1.rockspec'; do
     grep -qF "$section" "$notes" || fail "release notes missing: $section"
 done
 
