@@ -557,7 +557,7 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Windows registers 68 tests: the Linux native baseline plus the
+          # Native Windows registers 74 tests: the Linux native baseline plus the
           # platform-specific tdlua_windows_residency and the readiness tests.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
@@ -568,6 +568,11 @@ jobs:
             'tdlua_buffering_accounting', 'tdlua_scheduler_concurrency',
             'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
             'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
+            'tdlua_composition_native_fake', 'tdlua_composition_sync_path',
+            'tdlua_local_future_completion',
+            'tdlua_sync_execute_fast_path',
+            'tdlua_sync_execute_native_metamethod',
+            'tdlua_sync_execute_owner_error',
             'tdlua_vm_threads', 'tdlua_release', 'tdlua_uploadtravis',
             'tdlua_native_codec', 'tdlua_native_decoder_safety', 'tdlua_native_generic_ticket',
             'tdlua_native_schema', 'tdlua_hardening_backend', 'tdlua_lifecycle',
@@ -593,7 +598,7 @@ jobs:
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 68-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 74-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
