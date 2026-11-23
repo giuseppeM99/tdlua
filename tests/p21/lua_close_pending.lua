@@ -14,7 +14,7 @@ local tdlua = require 'tdlua'
 tdlua.setLogLevel(0)
 
 local client = tdlua()
-local future = client:getOption({name = 'version'})
+local future = client:getMe()
 local calls = 0
 future:on_complete(function() calls = calls + 1 end)
 assert(calls == 0, 'observer must be pending before close')

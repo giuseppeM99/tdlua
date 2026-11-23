@@ -2,8 +2,9 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 --
 -- P2.2 completion-bridge integration tests with the real TDLua module and the
--- real Copas 4.12. No Telegram credentials: getOption is a local TDLib round
--- trip. Identifiers I01-I12 map to the planned R05-R16 scenarios; the existing
+-- real Copas 4.12. No Telegram credentials: getMe is a local TDLib round
+-- trip that returns a deterministic error before initialization.
+-- Identifiers I01-I12 map to the planned R05-R16 scenarios; the existing
 -- eventloop_copas_runtime.lua already owns R01-R12.
 
 local script_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
@@ -22,7 +23,7 @@ local CopasAdapter = require("tdlua_eventloop.copas")
 local Bridge = require("tdlua_eventloop.copas_bridge")
 
 local INF = math.huge
-local VERSION = H.tdlib_version()
+local VERSION = 400 -- getMe before initialization: error.code
 
 do
     local tdlua = require("tdlua")
@@ -35,7 +36,7 @@ end
 
 local function version_of(response)
     if type(response) ~= "table" then return nil end
-    return response.text or response.value
+    return response.code
 end
 
 local function session(options)
@@ -78,7 +79,7 @@ do
     local outcome
     local started, finished
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         H.check(not future:ready(), "future is pending before arm")
         started = copas.gettime()
         local response, err = s.bridge:await_handle(future, 5)
@@ -111,7 +112,7 @@ do
     local futures = {}
     local results = {}
     for index = 1, 20 do
-        futures[index] = s.client:getOption({name = "version"})
+        futures[index] = s.client:getMe()
     end
     for index = 1, 20 do
         copas.addthread(function()
@@ -154,7 +155,7 @@ do
     local bridge = Bridge.new()
     local outcome
     copas.addthread(function()
-        local future = client:getOption({name = "version"})
+        local future = client:getMe()
         local response, err = bridge:await_handle(future, 0.05)
         outcome = {response = response, err = err,
                    elapsed = copas.gettime()}
@@ -177,7 +178,7 @@ do
     H.check(bridge.on_watch ~= custom, "adapter installed its hook")
     local outcome
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local response, err = s.bridge:await_handle(future, 5)
         outcome = {value = version_of(response), err = err}
         s.adapter:stop()
@@ -199,7 +200,7 @@ do
     local other = H.new_real_client()
     local outcome
     copas.addthread(function()
-        local future = other:getOption({name = "version"})
+        local future = other:getMe()
         local ok, err = H.wait_pcall(function()
             return s.bridge:await_handle(future, 5)
         end)
@@ -238,7 +239,7 @@ do
     local s = session({bridge = bridge})
     local outcome
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local response, err = s.bridge:await_handle(future, 5)
         outcome = {value = version_of(response), err = err}
         s.adapter:stop()
@@ -325,8 +326,8 @@ do
     local s = session()
     local outcome
     copas.addthread(function()
-        local task = s.client:getOption({name = "version"},
-                                        function() error("task boom", 0) end)
+        local task = s.client:getMe(
+            function() error("task boom", 0) end)
         local ok, err = H.wait_pcall(function()
             return s.bridge:await_handle(task, 5)
         end)
@@ -347,7 +348,7 @@ do
     local s = session()
     local outcome
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local deadline = copas.gettime() + 5
         while not future:ready() and copas.gettime() < deadline do
             s.client:receive(0.01)
@@ -376,7 +377,7 @@ do
     local other = H.new_real_client()
     local outcome = {}
     copas.addthread(function()
-        local task = other:getOption({name = "version"}, function(r) return r end)
+        local task = other:getMe(function(r) return r end)
         local ok, err = H.wait_pcall(s.bridge.await_handle, s.bridge, task, 5)
         outcome.ok = ok
         outcome.err = err
@@ -429,12 +430,12 @@ do
     local s = session()
     local results = {}
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local response, err = s.bridge:await_handle(future, 5)
         results.notify = {value = version_of(response), err = err}
     end)
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local response, err = s.bridge:await_poll(future, 5, 0.01)
         results.poll = {value = version_of(response), err = err}
     end)

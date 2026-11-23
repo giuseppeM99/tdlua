@@ -3,7 +3,7 @@
 --
 -- Real TDLua + real Copas runtime tests.
 --
--- No Telegram credentials: getOption is a local TDLib round trip. The client,
+-- No Telegram credentials: getMe is a local TDLib round trip. The client,
 -- TDLib worker and readiness descriptor are real; Copas is the real 4.12.0.
 
 local script_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
@@ -22,12 +22,12 @@ local CopasAdapter = require("tdlua_eventloop.copas")
 local Bridge = require("tdlua_eventloop.copas_bridge")
 
 local INF = math.huge
-local VERSION = H.tdlib_version()
-H.check(VERSION ~= nil, "TDLib version resolved")
+local VERSION = 400 -- getMe before initialization: error.code
+H.check(VERSION ~= nil, "round-trip value resolved")
 
 local function version_of(response)
     if type(response) ~= "table" then return nil end
-    return response.text or response.value
+    return response.code
 end
 
 local function session(options)
@@ -68,7 +68,7 @@ do
     local outcome
     copas.addthread(function()
         local waiter = s.bridge:waiter("notify")
-        local task = s.client:getOption({name = "version"},
+        local task = s.client:getMe(
                                         waiter:callback())
         local response, err = waiter:wait(5)
         outcome = {
@@ -96,7 +96,7 @@ do
     local s = session()
     local outcome
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local response, err = s.bridge:await_handle(future, 5)
         outcome = {value = version_of(response), err = err}
         s.adapter:stop()
@@ -145,7 +145,7 @@ print("R04  completion before arm needs no park")
 do
     local client = H.new_real_client()
     local bridge = Bridge.new()
-    local future = client:getOption({name = "version"})
+    local future = client:getMe()
     local deadline = os.clock() + 2
     while not future:ready() and os.clock() < deadline do
         client:receive(0.01)
@@ -264,7 +264,7 @@ do
     local s = session()
     local futures = {}
     for index = 1, 3 do
-        futures[index] = s.client:getOption({name = "version"})
+        futures[index] = s.client:getMe()
     end
     local results = {}
     for index = 1, #futures do
@@ -307,7 +307,7 @@ do
     local outcome
     copas.addthread(function()
         local waiter = s.bridge:waiter("scheduled")
-        s.client:getOption({name = "version"}, function()
+        s.client:getMe( function()
             -- TDLua owns this managed Task coroutine. It only schedules a
             -- Copas coroutine that completes the host waiter; it does not
             -- resume a Copas coroutine itself.
@@ -331,7 +331,7 @@ do
     local s = session()
     local outcome
     copas.addthread(function()
-        local task = s.client:getOption({name = "version"}, function()
+        local task = s.client:getMe( function()
             error("callback boom")
         end)
         local ok, err = H.wait_pcall(function()
@@ -355,7 +355,7 @@ do
     local s = session({owns_bridge = true, max_park = 0.1})
     local outcome
     copas.addthread(function()
-        local future = s.client:getOption({name = "version"})
+        local future = s.client:getMe()
         local ok, err = H.wait_pcall(function()
             return s.bridge:await_handle(future, 5)
         end)

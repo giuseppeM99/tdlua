@@ -31,8 +31,8 @@ local Driver = require("tdlua_eventloop.driver")
 local CopasAdapter = require("tdlua_eventloop.copas")
 
 local mode = arg and arg[1] or "direct"
-local VERSION = H.tdlib_version()
-H.check(VERSION ~= nil, "TDLib version resolved")
+local VERSION = 400 -- getMe before initialization: error.code
+H.check(VERSION ~= nil, "round-trip value resolved")
 local errors = {}
 copas.seterrorhandler(function(err)
     errors[#errors + 1] = tostring(err)
@@ -69,12 +69,11 @@ if mode == "direct" then
     local client, driver, adapter = new_session()
     local observed
     copas.addthread(function()
-        local future = client:getOption({name = "version"})
+        local future = client:getMe()
         local ok, response = H.wait_pcall(function() return future:wait() end)
         observed = {
             ok = ok,
-            value = type(response) == "table" and
-                (response.text or response.value) or response,
+            value = type(response) == "table" and response.code or response,
         }
     end)
     local deadline = copas.gettime() + 3
@@ -118,7 +117,7 @@ elseif mode == "supplied" then
     H.check(copas.issleeping(donated), "Copas coroutine is parked")
     -- TDLua accepts a supplied coroutine and will resume it from its own
     -- scheduler when the response arrives. This is the ownership violation.
-    local task = client:getOption({name = "version"}, donated)
+    local task = client:getMe( donated)
     local deadline = copas.gettime() + 3
     while not resumed and copas.gettime() < deadline do
         adapter:step(0.01)
@@ -135,12 +134,11 @@ elseif mode == "await" then
     local observed
     copas.addthread(function()
         local ok, response = H.wait_pcall(function()
-            return client:await({_ = "getOption", name = "version"})
+            return client:await({_ = "getMe"})
         end)
         observed = {
             ok = ok,
-            value = type(response) == "table" and
-                (response.text or response.value) or response,
+            value = type(response) == "table" and response.code or response,
         }
     end)
     local deadline = copas.gettime() + 3

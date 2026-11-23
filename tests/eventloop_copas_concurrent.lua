@@ -6,7 +6,7 @@
 --
 -- The deterministic scenarios use the real Copas dispatcher and a real TCP
 -- descriptor with fake owners/handles. The real scenarios use TDLua clients,
--- a real TDLib worker and the local getOption round trip.
+-- a real TDLib worker and the local getMe round trip.
 
 local script_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 local root = script_dir .. "/.."
@@ -20,7 +20,7 @@ local Bridge = require("tdlua_eventloop.copas_bridge")
 
 local unpack = H.unpack
 local INF = math.huge
-local VERSION = H.tdlib_version()
+local VERSION = 400 -- getMe before initialization: error.code
 
 local function pack(...)
     return {n = select("#", ...), ...}
@@ -28,7 +28,7 @@ end
 
 local function version_of(response)
     if type(response) ~= "table" then return nil end
-    return response.text or response.value
+    return response.code
 end
 
 local Handle = {}
@@ -143,7 +143,7 @@ end
 print("C03  two clients on one VM, two waiter coroutines")
 do
     if H.has_real_tdlua() then
-        H.check(VERSION ~= nil, "TDLib version resolved")
+        H.check(VERSION ~= nil, "round-trip value resolved")
         local a = H.new_real_client()
         local b = H.new_real_client()
         local driver = Driver.new({on_update = function() end})
@@ -157,7 +157,7 @@ do
         local function wait(key, client)
             copas.addthread(function()
                 local waiter = bridge:waiter(key)
-                client:getOption({name = "version"}, waiter:callback())
+                client:getMe( waiter:callback())
                 local response = waiter:wait(5)
                 out[key] = {value = version_of(response),
                             co = coroutine.running()}
@@ -341,7 +341,7 @@ end
 print("C10  two real clients with an out-of-order reply burst")
 do
     if H.has_real_tdlua() then
-        H.check(VERSION ~= nil, "TDLib version resolved")
+        H.check(VERSION ~= nil, "round-trip value resolved")
         local a = H.new_real_client()
         local b = H.new_real_client()
         local driver = Driver.new({on_update = function() end})
@@ -354,7 +354,7 @@ do
         local out = {}
         local function wait(key, client)
             copas.addthread(function()
-                local future = client:getOption({name = "version"})
+                local future = client:getMe()
                 local response, err = bridge:await_handle(future, 5)
                 out[key] = {value = version_of(response), err = err,
                             at = H.mono()}

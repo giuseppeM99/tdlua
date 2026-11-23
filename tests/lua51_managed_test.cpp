@@ -87,7 +87,20 @@ struct Fake {
                 f.incoming.pop_front();
                 return result;
             },
-            [](void *, Request) { return Response(); },
+            [](void *, Request) {
+                // Mirror td_execute for a method without a synchronous handler.
+#ifdef TDLUA_NATIVE_BACKEND
+                Response response;
+                response.object = td::td_api::make_object<td::td_api::error>(
+                    400, "The method can't be executed synchronously");
+                return response;
+#else
+                return Response{{"@type", "error"},
+                                {"code", 400},
+                                {"message",
+                                 "The method can't be executed synchronously"}};
+#endif
+            },
             [](void *p) { static_cast<Fake *>(p)->closed = true; },
             [](void *p) { return static_cast<Fake *>(p)->closed; }
         };

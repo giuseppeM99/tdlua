@@ -12,7 +12,7 @@ local Driver = require 'tdlua_eventloop.driver'
 tdlua.setLogLevel(0)
 
 local client = tdlua()
-local future = client:getOption({name = 'version'})
+local future = client:getMe()
 for _ = 1, 300 do
     if future:ready() then break end
     client:receive(0.01)

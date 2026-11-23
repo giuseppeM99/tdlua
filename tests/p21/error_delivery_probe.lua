@@ -36,7 +36,7 @@ print("case1")
 -- 1. Two different observer errors are reported on successive pumps.
 do
     local client = tdlua()
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local errors = {}
     _G.__last_pump_error = function(err) errors[#errors + 1] = tostring(err) end
     future:on_complete(function() error('first observer error') end)
@@ -58,7 +58,7 @@ print("case2")
 -- 2. token:cancel() from the callback associated with that token.
 do
     local client = tdlua()
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local calls, self_cancel, later_cancel = 0, nil, nil
     local token
     token = future:on_complete(function()
@@ -80,7 +80,7 @@ print("case3")
 -- 3. poll(0) and receive(0) from inside a callback.
 do
     local client = tdlua()
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local poll_ok, poll_err, receive_ok, receive_err, calls = nil, nil, nil, nil, 0
     future:on_complete(function()
         calls = calls + 1
@@ -100,7 +100,7 @@ print("case4")
 -- 4. destroy() from inside a callback does not corrupt delivery.
 do
     local client = tdlua()
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local destroy_ok, after = nil, 0
     future:on_complete(function()
         destroy_ok = pcall(client.destroy, client)

@@ -63,12 +63,12 @@ local function close_client(client)
 end
 
 local function terminal_future(client)
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local spin = 0
     while not future:ready() do
         client:receive(0.01)
         spin = spin + 1
-        assert(spin < 2000, 'getOption did not complete')
+        assert(spin < 2000, 'getMe did not complete')
     end
     future:wait()
     for _ = 1, 20 do client:receive(0) end

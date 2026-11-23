@@ -28,7 +28,12 @@ struct Fake {
     std::vector<std::pair<std::uint64_t, json>> sent;
     std::vector<tdlua::ResponseClass> sent_classes;
     std::deque<json> incoming;
-    json sync = {{"@type", "ok"}};
+    // TDLib answers only its real synchronous methods through execute();
+    // everything else reports the fallback marker so this fake keeps
+    // driving the asynchronous paths it was written for.
+    json sync = {{"@type", "error"},
+                 {"code", 400},
+                 {"message", "The method can't be executed synchronously"}};
     bool closed = false;
     bool fail = false;
     bool auto_shutdown = true;
@@ -601,6 +606,7 @@ void testAwaitAndSynchronousCalls(lua_State *L, Fake &fake)
 
     const auto await_id = fake.sent.back().first;
     fake.response(await_id, 4);
+    fake.sync = json({{"@type", "ok"}});
     runLua(L,
            "c:receive(0); "
            "assert(awaited.value == 4 and coroutine.status(co) == 'dead'); "
@@ -608,6 +614,9 @@ void testAwaitAndSynchronousCalls(lua_State *L, Fake &fake)
            "assert(c:_execute{_='getMe'}['@type'] == 'ok'); "
            "assert(not pcall(c.send, c, {_='getMe', ['@extra']=1})); "
            "assert(not pcall(c.request, c, {_='getMe', _request_id=1}))");
+    fake.sync = json({{"@type", "error"},
+                      {"code", 400},
+                      {"message", "The method can't be executed synchronously"}});
 }
 
 void testManagedFutureAndTasks(lua_State *L, Fake &fake)

@@ -32,9 +32,9 @@ local function close(client)
 end
 
 local function terminal_future(client)
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     assert(pump(client, function() return future:ready() end),
-           'getOption did not complete')
+           'getMe did not complete')
     return future
 end
 
@@ -42,7 +42,7 @@ end
 -- in a later drain. destroy()/GC is the path that discards it.
 do
     local client = tdlua()
-    local future = client:getOption({name = 'version'})
+    local future = client:getMe()
     local calls = 0
     future:on_complete(function() calls = calls + 1 end)
     close(client)

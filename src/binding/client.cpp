@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "tdlua/binding/lua_binding.h"
+#include "tdlua/common/composition.h"
 #include "tdlua/common/module_residency.h"
 #ifdef TDLUA_JSON_BACKEND
 #include "tdlua/backend/json/runtime.h"
@@ -278,6 +279,26 @@ static int tdclient_setlogverbosity(lua_State *L)
     return operations().set_log_level(L);
 }
 
+// tdlua.ref(future, field): a deferred projection. The Future is not read
+// here; only its managed state and the field path are captured.
+static int tdclient_ref(lua_State *L)
+{
+    return tdlua_binding::protected_call(L, [&]() -> int {
+        if (lua_gettop(L) != 2) {
+            throw std::runtime_error("tdlua: ref expects (future, field)");
+        }
+        if (!tdlua::composition::isFutureHandle(L, 1, nullptr)) {
+            throw std::runtime_error("tdlua: ref expects a Future");
+        }
+        const char *field = lua_tostring(L, 2);
+        if (!field || !*field) {
+            throw std::runtime_error(
+                "tdlua: ref expects a non-empty field name");
+        }
+        return tdlua::composition::pushRefValue(L, 1, field);
+    });
+}
+
 static luaL_Reg methods[] = {
     {"receive", tdclient_receive},
     {"poll", tdclient_poll},
@@ -313,6 +334,7 @@ static luaL_Reg module_functions[] = {
     {"setLogPath", tdclient_setlogpath},
     {"setLogMaxSize", tdclient_setlogmaxsize},
     {"setLogLevel", tdclient_setlogverbosity},
+    {"ref", tdclient_ref},
     {nullptr, nullptr}
 };
 

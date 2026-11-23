@@ -44,7 +44,11 @@ struct Fake {
                 fake.recordResponse(result);
                 return result;
             },
-            [](void *, json) { return json({{"@type", "ok"}}); },
+            [](void *, json) {
+                return json({{"@type", "error"},
+                             {"code", 400},
+                             {"message", "The method can't be executed synchronously"}});
+            },
             [](void *context) {
                 static_cast<Fake *>(context)->incoming.clear();
             },

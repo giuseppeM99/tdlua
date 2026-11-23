@@ -22,7 +22,14 @@ struct FakeTransport {
     static NativeResponse receive(void *, double) { return NativeResponse(); }
     static NativeResponse execute(
         void *, td::td_api::object_ptr<td::td_api::Function>)
-    { return NativeResponse(); }
+    {
+        // Mirror ClientManager::execute for a method without a synchronous
+        // handler: an empty answer now means "the result was lost".
+        NativeResponse response;
+        response.object = td::td_api::make_object<td::td_api::error>(
+            400, "The method can't be executed synchronously");
+        return response;
+    }
     static void close(void *context)
     {
         static_cast<FakeTransport *>(context)->closed = true;

@@ -47,7 +47,7 @@ int main()
         "local t = tdlua_module\n"
         "t.setLogLevel(0)\n"
         "local client = t()\n"
-        "local future = client:getOption({name = 'version'})\n"
+        "local future = client:getOption({name = 'my_id'})\n"
         "assert(not future:ready(), 'future must be pending')\n"
         "local token = future:on_complete(p21_sentinel)\n"
         "assert(type(token) == 'userdata', 'on_complete must return a token')\n";
