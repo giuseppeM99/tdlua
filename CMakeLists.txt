@@ -1187,6 +1187,47 @@ if(TDLUA_BUILD_TESTS)
         tdlua_enable_sanitizers(tdlua_common_router_test)
         add_test(NAME tdlua_common_router COMMAND tdlua_common_router_test)
 
+        add_executable(tdlua_local_future_completion_test
+            "tests/local_future_completion_test.cpp")
+        target_include_directories(tdlua_local_future_completion_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(tdlua_local_future_completion_test PRIVATE
+            ${LUA_LIBRARIES})
+        target_compile_features(tdlua_local_future_completion_test PRIVATE
+            cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_local_future_completion_test)
+        add_test(NAME tdlua_local_future_completion
+            COMMAND tdlua_local_future_completion_test)
+
+        add_executable(tdlua_sync_execute_owner_error_test
+            "tests/sync_execute_owner_error_test.cpp")
+        target_include_directories(tdlua_sync_execute_owner_error_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_sync_execute_owner_error_test PRIVATE
+            TDLUA_TESTING)
+        if(_tdlua_backend STREQUAL "native")
+            target_compile_definitions(tdlua_sync_execute_owner_error_test
+                PRIVATE TDLUA_TEST_BACKEND_NATIVE)
+        else()
+            target_compile_definitions(tdlua_sync_execute_owner_error_test
+                PRIVATE TDLUA_TEST_BACKEND_JSON)
+        endif()
+        target_link_libraries(tdlua_sync_execute_owner_error_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        target_compile_features(tdlua_sync_execute_owner_error_test PRIVATE
+            cxx_std_11)
+        tdlua_enable_sanitizers(tdlua_sync_execute_owner_error_test)
+        add_test(NAME tdlua_sync_execute_owner_error
+            COMMAND tdlua_sync_execute_owner_error_test)
+        if(TDLUA_ENABLE_SANITIZERS)
+            # The test links the real JSON runtime, whose TDLib worker leaves
+            # a known thread-local string at process exit. ASan still checks
+            # this test; only LeakSanitizer's process-exit scan is disabled.
+            set_tests_properties(tdlua_sync_execute_owner_error PROPERTIES
+                ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+        endif()
+
         add_executable(tdlua_hardening_common_test "tests/hardening_common_test.cpp")
         target_include_directories(tdlua_hardening_common_test PRIVATE
             ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -1331,6 +1372,36 @@ if(TDLUA_BUILD_TESTS)
         add_test(NAME tdlua_m5_conformance
             COMMAND tdlua_fake_client_test --m5-only
         )
+
+        if(_tdlua_backend STREQUAL "json")
+        add_executable(tdlua_composition_fake_test
+            "tests/composition_fake_test.cpp")
+        target_include_directories(tdlua_composition_fake_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_composition_fake_test PRIVATE
+            TDLUA_TESTING)
+        target_compile_features(tdlua_composition_fake_test PRIVATE cxx_std_11)
+        target_link_libraries(tdlua_composition_fake_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_composition_fake_test)
+        add_test(NAME tdlua_composition_fake
+            COMMAND tdlua_composition_fake_test)
+        endif()
+
+        add_executable(tdlua_sync_execute_fake_test
+            "tests/sync_execute_fake_test.cpp")
+        target_include_directories(tdlua_sync_execute_fake_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_sync_execute_fake_test PRIVATE
+            TDLUA_TESTING)
+        target_compile_features(tdlua_sync_execute_fake_test PRIVATE cxx_std_11)
+        target_link_libraries(tdlua_sync_execute_fake_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_sync_execute_fake_test)
+        add_test(NAME tdlua_sync_execute_fake
+            COMMAND tdlua_sync_execute_fake_test)
 
         add_executable(tdlua_simple_bot_example_test
             "tests/simple_bot_example_test.cpp"
@@ -1568,6 +1639,12 @@ if(TDLUA_BUILD_TESTS)
                 "$<TARGET_FILE_DIR:tdlua>")
         set_tests_properties(tdlua_lua51_backend PROPERTIES TIMEOUT 30)
         tdlua_enable_sanitizer_test_runtime(tdlua_lua51_backend)
+        add_test(NAME tdlua_lua51_sync_execute
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/sync_execute_lua51.lua"
+                "$<TARGET_FILE_DIR:tdlua>")
+        set_tests_properties(tdlua_lua51_sync_execute PROPERTIES TIMEOUT 60)
+        tdlua_enable_sanitizer_test_runtime(tdlua_lua51_sync_execute)
     elseif(TDLUA_LUA_EXECUTABLE)
         if(TDLUA_USE_LUAJIT_CONTINUATION)
             foreach(mode on off)
@@ -1594,6 +1671,62 @@ if(TDLUA_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/async.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
+        add_test(NAME tdlua_sync_execute_fast_path
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/sync_execute_fast_path.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+        set_tests_properties(tdlua_sync_execute_fast_path PROPERTIES TIMEOUT 60)
+        if(_tdlua_backend STREQUAL "native")
+            add_executable(tdlua_composition_native_fake_test
+                "tests/composition_native_fake_test.cpp")
+            target_include_directories(tdlua_composition_native_fake_test PRIVATE
+                ${LUA_INCLUDE_DIRS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                "${_tdlua_native_td_include_dirs}"
+                "${TDLUA_NATIVE_GENERATED_DIR}")
+            if(NOT TDLUA_BUNDLED_TDLIB)
+                target_include_directories(tdlua_composition_native_fake_test PRIVATE
+                    "${CMAKE_CURRENT_SOURCE_DIR}/td/tdutils"
+                    "${_tdlua_codegen_build_dir}/td/tdutils")
+            endif()
+            target_link_libraries(tdlua_composition_native_fake_test PRIVATE
+                tdlua ${LUA_LIBRARIES} ${_tdlua_tdjson_private_target})
+            target_compile_features(tdlua_composition_native_fake_test PRIVATE
+                cxx_std_23)
+            target_compile_definitions(tdlua_composition_native_fake_test PRIVATE
+                TDLUA_TESTING TDLUA_NATIVE_BACKEND)
+            tdlua_enable_sanitizers(tdlua_composition_native_fake_test)
+            if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                target_compile_options(tdlua_composition_native_fake_test PRIVATE
+                    -fno-sanitize=vptr)
+            endif()
+            add_dependencies(tdlua_composition_native_fake_test
+                tdlua_native_generated)
+            add_test(NAME tdlua_composition_native_fake
+                COMMAND tdlua_composition_native_fake_test)
+            set_tests_properties(tdlua_composition_native_fake PROPERTIES TIMEOUT 60)
+            tdlua_enable_sanitizer_test_runtime(tdlua_composition_native_fake)
+        endif()
+        add_test(NAME tdlua_composition_sync_path
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/composition_sync_path.lua"
+                    "$<TARGET_FILE_DIR:tdlua>"
+        )
+        set_tests_properties(tdlua_composition_sync_path PROPERTIES TIMEOUT 60)
+        tdlua_enable_sanitizer_test_runtime(tdlua_composition_sync_path)
+        if(_tdlua_backend STREQUAL "native")
+            add_test(NAME tdlua_sync_execute_native_metamethod
+                COMMAND ${TDLUA_LUA_EXECUTABLE}
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/sync_execute_native_metamethod.lua"
+                        "$<TARGET_FILE_DIR:tdlua>"
+            )
+            set_tests_properties(tdlua_sync_execute_native_metamethod
+                PROPERTIES TIMEOUT 30)
+            tdlua_enable_sanitizer_test_runtime(
+                tdlua_sync_execute_native_metamethod)
+        endif()
         add_test(NAME tdlua_backend_parity
             COMMAND ${TDLUA_LUA_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/backend_parity.lua"
@@ -1646,6 +1779,8 @@ if(TDLUA_BUILD_TESTS)
         tdlua_enable_sanitizer_test_runtime(
             tdlua_lifecycle
             tdlua_async
+            tdlua_sync_execute_fast_path
+            tdlua_composition_sync_path
             tdlua_backend_parity
             tdlua_e2e_smoke
             tdlua_managed_driver_backend
@@ -1686,7 +1821,11 @@ endif()
 # Apply the VM capability only to TDLua code. TDLib remains untouched.
 foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test tdlua_lua51_managed_test tdlua_codec_test tdlua_managed_adapter_test tdlua_managed_cache_test
         tdlua_common_router_test
+        tdlua_local_future_completion_test
         tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
+        tdlua_sync_execute_fake_test
+        tdlua_composition_fake_test
+        tdlua_sync_execute_owner_error_test
         tdlua_readiness_deadline_test tdlua_backend_readiness_test
         tdlua_simple_bot_example_test tdlua_async_demo_test
         tdlua_native_codec_test tdlua_native_decoder_safety_test
