@@ -273,8 +273,10 @@ waiting for its dependencies, the call returns `nil, "timeout"` and the request
 is not sent, not even later. When the budget is already exhausted while the
 dependencies are terminal (for example a budget smaller than the call
 overhead), there is nothing left to wait for and the call fails with
-`dependent request timed out before submission` instead. A non-positive
-timeout keeps the historical "submit and do not wait" form.
+`dependent request timed out before submission` instead. A zero timeout submits
+the request and returns immediately: if it is not already terminal, the call
+returns `nil, "timeout"`. A negative timeout is rejected with
+`tdlua: timeout must be finite and non-negative`.
 There is no timer for a composition: a dependency that never becomes terminal
 keeps the composition pending while its client stays open, and `close()`
 releases the observers, the retained dependency results and the snapshot.
@@ -295,7 +297,9 @@ already have run.
 
 `execute(request):wait()` settles both paths. `execute(request, timeout)`,
 `execute(request, false)` and `executeSync(request)` keep returning the raw
-response, and `execute(request, true)` remains fire-and-forget.
+response, and `execute(request, true)` remains fire-and-forget. A native request
+whose tree contains `__index` bypasses the synchronous probe and is submitted
+once asynchronously.
 
 Close the client with:
 
