@@ -7,9 +7,12 @@
 
 ### Future composition and synchronous fast path
 
-- `execute(request)` and the dynamic helpers now return a Future for every
-  form, including a synchronous success. `execute(request):wait()` settles
-  both the synchronous fast path and the asynchronous fallback.
+- `execute(request)` keeps returning a Future, as in 0.6.2, and the dynamic
+  helpers do the same. A request TDLib can answer synchronously now completes
+  inside the call, so its Future is already terminal and the observable
+  completion order can differ; the response is unchanged.
+  `execute(request):wait()` settles both the locally completed and the
+  submitted path.
 - A request may contain whole Futures and `tdlua.ref(future, path)` field
   projections. Terminal dependencies are materialized inline; pending
   dependencies are snapshotted and submitted exactly once.
@@ -43,8 +46,8 @@
   changes the return type of
   `replyToCallbackQueryWithEphemeralMessage`, and renames `export_date` to
   `mint_date`, `minimum_price` to `min_price`, and page-block `text` to
-  `blocks`. The synchronous-request implementation and the two fallback
-  markers are unchanged.
+  `blocks`. The synchronous-request implementation and the two
+  synchronous-unavailable markers are unchanged.
 
 ## 0.6.2
 

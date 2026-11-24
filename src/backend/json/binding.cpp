@@ -244,18 +244,18 @@ static int tdclient_send(lua_State *L)
     });
 }
 
-// The two literal TDLib markers that authorize an asynchronous retry. Any
-// other error object is a real response and must not be sent again.
 #ifdef TDLUA_TESTING
 // Simulates a Lua failure at the owner-thread conversion boundary. The error
 // object is left on the owner stack exactly like a real allocation failure.
 thread_local int sync_execute_owner_error_mode = 0;
 #endif
 
-// The two literal TDLib markers that report a request TDLib cannot execute
-// synchronously. With a preventive classifier they only appear when the
-// classifier and the linked TDLib disagree, or when testReturnError echoes the
-// caller's own error, so they never authorize a retry.
+// The classifier decides before anything runs: an asynchronous request is
+// submitted directly, a synchronous one is executed locally. These two literal
+// TDLib markers therefore only appear when the classifier and the linked TDLib
+// disagree, or as the caller's own payload from testReturnError. A disagreement
+// is reported as a local classifier error, the echoed payload is delivered as
+// data, and no marker authorizes a second send.
 static bool json_sync_unavailable(const json &response, std::string &message)
 {
     if (!response.is_object()) return false;

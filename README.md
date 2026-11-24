@@ -247,6 +247,22 @@ local entities = client:getTextEntities {
   `tdlua.ref(user, "profile.first_name")` follows nested tables. A missing
   field, or a field whose value is `nil`, fails the dependent Future with an
   explicit error instead of sending `null`.
+- A numeric segment addresses a Lua array and follows Lua indexing: arrays
+  start at 1, so `tdlua.ref(entities, "entities.1")` projects the first
+  entity, while `tdlua.ref(entities, "entities.0")` selects nothing and fails
+  the dependent Future with the same missing-field error. The `entities` of a
+  `textEntities` result are an array, for example:
+
+  ```lua
+  local entities = client:getTextEntities { text = "@telegram" }
+  local sent = client:sendMessage {
+      chat_id = 123,
+      input_message_content = { _ = "inputMessageText", text = {
+          _ = "formattedText", text = "@telegram",
+          entities = { tdlua.ref(entities, "entities.1") },
+      } },
+  }
+  ```
 - Dependencies may appear anywhere in the request, in any order, and may be
   repeated: each distinct Future is observed once. The dependent request is
   submitted after the last dependency becomes terminal, so it follows every
