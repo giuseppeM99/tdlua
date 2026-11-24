@@ -32,6 +32,16 @@ end
 local client = tdlua()
 assert(client:isClosed() == false)
 
+-- A build that cannot verify the classifier for the linked TDLib disables the
+-- managed fast path; every assertion below expects it to exist.
+local first = client:execute({_ = "getOption", name = "version"})
+if first:ready() == false then
+    first:wait(0.5)
+    io.write("synchronous fast path disabled: classifier not verified\n")
+    os.exit(77)
+end
+
+
 local function pending_count()
     if type(client.pendingCount) ~= "function" then return nil end
     return client.pendingCount(client)

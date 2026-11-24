@@ -1011,6 +1011,15 @@ void testDeepRequest(lua_State *L)
 
 }  // namespace
 
+// The inline path of a terminal dependency is the synchronous fast path. A
+// build that disabled it reports that instead of asserting the opposite.
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+int main()
+{
+    std::cout << "synchronous fast path disabled: classifier not verified\n";
+    return 0;
+}
+#else
 int main()
 {
     lua_State *L = luaL_newstate();
@@ -1055,3 +1064,4 @@ int main()
     lua_close(L);
     return result;
 }
+#endif

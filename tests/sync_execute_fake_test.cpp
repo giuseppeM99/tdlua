@@ -292,7 +292,10 @@ void testSynchronousMethodsExecuteOnce(lua_State *L)
         runLua(L, (std::string("future = client:execute(") + test_case.source +
                    ")").c_str());
         require(fake.sync_calls == 1,
-                "a synchronous request was not executed exactly once");
+                (std::string("a synchronous request was not executed exactly "
+                             "once: ") + test_case.source +
+                 " sync_calls=" + std::to_string(fake.sync_calls) +
+                 " sent=" + std::to_string(fake.sent.size())).c_str());
         require(fake.sent.empty(),
                 "a synchronous request was also submitted asynchronously");
         require(fake.sync_requests.size() == 1, "sync payload was not observed");
@@ -591,6 +594,18 @@ void testClosePaths(lua_State *L)
 
 }  // namespace
 
+
+// The classifier is generated from the TDLib sources; a build that cannot
+// verify it for the linked TDLib disables the managed fast path, and this
+// whole suite asserts the opposite behaviour.
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+int main()
+{
+    std::cout << "tdlua synchronous fast path disabled: classifier not verified "
+                 "for the linked TDLib\n";
+    return 77;
+}
+#else
 int main()
 {
     lua_State *L = luaL_newstate();
@@ -614,3 +629,4 @@ int main()
     lua_close(L);
     return result;
 }
+#endif

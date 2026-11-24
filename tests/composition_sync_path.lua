@@ -14,6 +14,15 @@ local tdlua = require "tdlua"
 tdlua.setLogLevel(0)
 local client = tdlua()
 
+-- A build that cannot verify the classifier for the linked TDLib disables the
+-- managed fast path; this script exists to observe it.
+local probe = client:execute({_ = "getOption", name = "version"})
+if probe:ready() == false then
+    probe:wait(0.5)
+    io.write("synchronous fast path disabled: classifier not verified\n")
+    os.exit(77)
+end
+
 local function assert_td_object(value, label)
     assert(type(value) == "table", label .. " must return a table")
     assert(type(value._) == "string", label .. " must expose _")

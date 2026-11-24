@@ -9,6 +9,7 @@
 #include "tdlua/common/lua_json.h"
 #include "tdlua/common/sync_classifier_generated.h"
 #include "tdlua/common/sync_classifier_ids_generated.h"
+#include "tdlua/common/sync_classifier_shape.h"
 #include "tdlua/common/sync_execute.h"
 #include "tdlua/backend/native/client.h"
 #include "tdlua/backend/native/runtime.h"
@@ -428,15 +429,24 @@ static bool native_sync_unavailable(const td::td_api::Object &response,
 // resolved by the same td_api.h the library was compiled against, so a renamed
 // or removed method fails the build. getOption depends on its argument, exactly
 // like TDLib's own predicate.
+//
+// The predicate is used only when it describes the linked TDLib; otherwise
+// every request is submitted, which is always correct.
 static bool native_can_execute_synchronously(
     const td::td_api::Function *request)
 {
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+    (void)request;
+    return false;
+#else
+    if (!tdlua::isSupportedSyncClassifierShape()) return false;
     if (request == nullptr) return false;
     const std::int32_t id = request->get_id();
     if (!tdlua::sync_classifier::isSynchronousMethodId(id)) return false;
     if (id != td::td_api::getOption::ID) return true;
     const auto &option = static_cast<const td::td_api::getOption &>(*request);
     return tdlua::sync_classifier::isSynchronousOption(option.name_);
+#endif
 }
 
 // Execute a request the classifier accepted and settle the Future locally.

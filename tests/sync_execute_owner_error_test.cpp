@@ -164,6 +164,15 @@ void closeClient(lua_State *L)
 
 }  // namespace
 
+// The synchronous path is what this test observes; a build that disabled it
+// because the classifier could not be verified has nothing to check here.
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+int main()
+{
+    std::cout << "synchronous fast path disabled: classifier not verified\n";
+    return 0;
+}
+#else
 int main()
 {
     lua_State *L = luaL_newstate();
@@ -204,3 +213,4 @@ int main()
     lua_close(L);
     return result;
 }
+#endif

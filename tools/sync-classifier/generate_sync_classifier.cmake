@@ -48,12 +48,29 @@ foreach(_input IN ITEMS "${_sync_cpp}" "${_sync_h}" "${_option_cpp}")
     endif()
 endforeach()
 
-# 1. Cases of is_synchronous_request(). The switch is the only place where
-#    TDLib enumerates the methods ClientManager::execute can run.
+# 1. The complete body of is_synchronous_request(). Only one scaffold is
+#    accepted, and every non-case line must match it exactly: an upstream change
+#    of the return expressions, of the default branch or of an argument-dependent
+#    condition therefore fails instead of producing a plausible but wrong list.
+#
+#    Accepted body:
+#
+#      switch (function->get_id()) {
+#        case td_api::a::ID:
+#        case td_api::b::ID:
+#          return true;
+#        case td_api::getOption::ID:
+#          return OptionManager::is_synchronous_option(
+#              static_cast<const td_api::getOption *>(function)->name_);
+#        default:
+#          return false;
+#      }
+#
+#    The getOption case is the only case that does not return true, and only the
+#    default branch may return anything else.
 file(STRINGS "${_sync_cpp}" _sync_lines)
+set(_predicate "")
 set(_in_predicate FALSE)
-set(_cases "")
-set(_saw_get_option FALSE)
 foreach(_line IN LISTS _sync_lines)
     if(_line MATCHES "^bool SynchronousRequests::is_synchronous_request")
         set(_in_predicate TRUE)
@@ -64,22 +81,164 @@ foreach(_line IN LISTS _sync_lines)
             set(_in_predicate FALSE)
             continue()
         endif()
-        if(_line MATCHES "case[ \t]+td_api::([A-Za-z0-9_]+)::ID:")
-            set(_name "${CMAKE_MATCH_1}")
-            list(APPEND _cases "${_name}")
-            if(_name STREQUAL "getOption")
-                set(_saw_get_option TRUE)
-            endif()
-        elseif(_line MATCHES "getOption")
-            set(_saw_get_option TRUE)
+        # Blank lines would not survive as list elements, so they are dropped;
+        # every other statement must match exactly after stripping.
+        string(STRIP "${_line}" _stripped)
+        string(LENGTH "${_stripped}" _len)
+        if(_len GREATER 0)
+            list(APPEND _predicate "${_stripped}")
         endif()
     endif()
 endforeach()
 
-if(NOT _cases)
+if(NOT _predicate)
     message(FATAL_ERROR
-            "No is_synchronous_request cases were found in '${_sync_cpp}'; "
+            "is_synchronous_request() was not found in '${_sync_cpp}'; "
             "the classifier source layout changed")
+endif()
+
+# A macro, not a function: the messages quote this file's own variables.
+macro(_classifier_fail_message reason)
+    message(FATAL_ERROR
+            "is_synchronous_request() no longer matches the scaffold the "
+            "synchronous classifier is generated from: ${reason}\n"
+            "Review the TDLib predicate, then update "
+            "tools/sync-classifier/generate_sync_classifier.cmake.")
+endmacro()
+
+set(_index 0)
+set(_count 0)
+foreach(_line IN LISTS _predicate)
+    math(EXPR _count "${_count} + 1")
+endforeach()
+
+if(NOT _index LESS _count)
+    _classifier_fail_message("empty body")
+endif()
+list(GET _predicate ${_index} _line)
+if(NOT _line MATCHES "^switch[ \t]*\\([ \t]*function->get_id\\(\\)[ \t]*\\)[ \t]*\\{[ \t]*$")
+    _classifier_fail_message("the first statement is not 'switch (function->get_id()) {': '${_line}'")
+endif()
+math(EXPR _index "${_index} + 1")
+
+# The body is a flat token sequence. The method cases form one group that must
+# end with the only `return true;` in the predicate. The getOption case is
+# separate and returns an OptionManager call, and the default branch must
+# return false.
+set(_case_open FALSE)
+set(_cases "")
+set(_saw_true FALSE)
+set(_saw_get_option FALSE)
+set(_saw_default FALSE)
+set(_closed FALSE)
+
+while(_index LESS _count)
+    list(GET _predicate ${_index} _line)
+    math(EXPR _index "${_index} + 1")
+
+    # Blank lines are already gone; CMake lists drop them, but a stray empty
+    # element is still skipped so the scaffold check sees only statements.
+    if(NOT _line MATCHES "[^ \t]")
+        continue()
+    endif()
+
+    if(_closed)
+        _classifier_fail_message("unexpected trailing statement '${_line}'")
+    endif()
+
+    set(_line_is_case FALSE)
+    if(_line MATCHES "^case[ \t]+td_api::([A-Za-z0-9_]+)::ID:$")
+        # `_name` is also the loop variable of the generation step below, so it
+        # must not survive this block.
+        set(_case_name "${CMAKE_MATCH_1}")
+        if(_line MATCHES "^case[ \t]+td_api::getOption::ID:$")
+            if(_case_open)
+                _classifier_fail_message(
+                    "a case follows a case group that does not return true")
+            endif()
+            if(_saw_get_option)
+                _classifier_fail_message("getOption appears twice")
+            endif()
+            set(_saw_get_option TRUE)
+        else()
+            # Every method case belongs to the group that ends with return true.
+            if(_saw_true)
+                _classifier_fail_message(
+                    "method case '${_case_name}' follows 'return true;'")
+            endif()
+            set(_case_open TRUE)
+            list(APPEND _cases "${_case_name}")
+        endif()
+        set(_line_is_case TRUE)
+    endif()
+    if(_line_is_case)
+        continue()
+    endif()
+
+    if(_line MATCHES "^return true")
+        if(NOT _case_open)
+            _classifier_fail_message("'return true;' without a preceding case")
+        endif()
+        if(_saw_true)
+            _classifier_fail_message("a second 'return true;'")
+        endif()
+        set(_case_open FALSE)
+        set(_saw_true TRUE)
+        continue()
+    endif()
+
+    if(_line MATCHES "^return OptionManager::is_synchronous_option")
+        if(_saw_get_option)
+            continue()
+        endif()
+        _classifier_fail_message(
+            "an OptionManager::is_synchronous_option return without a getOption case")
+    endif()
+
+    if(_line MATCHES "^default:$")
+        if(_case_open)
+            _classifier_fail_message("a case has no return before the default branch")
+        endif()
+        if(NOT _saw_get_option)
+            _classifier_fail_message("the switch has no getOption case")
+        endif()
+        set(_saw_default TRUE)
+        continue()
+    endif()
+
+    if(_line MATCHES "^return false")
+        if(NOT _saw_default)
+            _classifier_fail_message(
+                "'return false;' outside the default branch")
+        endif()
+        continue()
+    endif()
+
+    if(_line MATCHES "^\\}$")
+        if(NOT _saw_default)
+            _classifier_fail_message("the switch has no default branch")
+        endif()
+        set(_closed TRUE)
+        continue()
+    endif()
+
+    _classifier_fail_message("unrecognised statement '${_line}'")
+endwhile()
+
+if(NOT _closed)
+    _classifier_fail_message("the switch is not closed")
+endif()
+if(_case_open)
+    _classifier_fail_message("the method case group does not end with 'return true;'")
+endif()
+if(NOT _saw_true)
+    _classifier_fail_message("the method case group never returns true")
+endif()
+if(NOT _saw_get_option)
+    _classifier_fail_message("the switch has no getOption case")
+endif()
+if(NOT _saw_default)
+    _classifier_fail_message("there is no default branch")
 endif()
 
 # 2. Declared do_request overloads. Every synchronous method has exactly one;
@@ -94,6 +253,9 @@ foreach(_line IN LISTS _header_lines)
     endif()
 endforeach()
 
+# getOption is synchronous only for its argument-dependent subset, but it does
+# have a handler, so it belongs to the comparison.
+list(APPEND _cases "getOption")
 list(SORT _cases)
 list(REMOVE_DUPLICATES _cases)
 list(SORT _overloads)
@@ -104,6 +266,7 @@ if(NOT _cases STREQUAL _overloads)
             "The synchronous request switch and the declared handlers disagree.\n"
             "Switch cases: ${_cases}\nDeclared handlers: ${_overloads}")
 endif()
+
 
 if(NOT _saw_get_option)
     message(FATAL_ERROR
@@ -129,6 +292,38 @@ foreach(_line IN LISTS _option_lines)
         set(_in_options FALSE)
     endif()
 endforeach()
+
+if(NOT _options)
+    message(FATAL_ERROR
+            "Could not read get_synchronous_options() from '${_option_cpp}'")
+endif()
+
+# The list alone does not prove the lookup: is_synchronous_option() must still
+# be a membership test over get_synchronous_options().
+set(_in_lookup FALSE)
+set(_saw_contains FALSE)
+foreach(_line IN LISTS _option_lines)
+    if(_line MATCHES "^bool OptionManager::is_synchronous_option")
+        set(_in_lookup TRUE)
+        continue()
+    endif()
+    if(_in_lookup)
+        if(_line MATCHES "^}")
+            set(_in_lookup FALSE)
+            continue()
+        endif()
+        if(_line MATCHES "return[ \t]+td::contains\\([ \t]*get_synchronous_options\\(\\)[ \t]*,[ \t]*name[ \t]*\\);[ \t]*$")
+            set(_saw_contains TRUE)
+        endif()
+    endif()
+endforeach()
+
+if(NOT _saw_contains)
+    message(FATAL_ERROR
+            "OptionManager::is_synchronous_option() is no longer a membership "
+            "test over get_synchronous_options(); the option classifier must be "
+            "reviewed in '${_option_cpp}'.")
+endif()
 
 list(SORT _options)
 list(REMOVE_DUPLICATES _options)
@@ -211,6 +406,8 @@ string(APPEND _ids "}\n\n")
 string(APPEND _ids "} // namespace sync_classifier\n")
 string(APPEND _ids "} // namespace tdlua\n")
 
+# The scaffold this generator accepts is the only one it can recognise; a
+# different body fails above instead of being emitted.
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
 file(WRITE "${OUTPUT_DIR}/sync_classifier_generated.h" "${_names}")
 file(WRITE "${OUTPUT_DIR}/sync_classifier_ids_generated.h" "${_ids}")

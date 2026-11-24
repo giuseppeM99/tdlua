@@ -35,6 +35,10 @@ option(TDLUA_BUNDLED_TDLIB "Build the TDLib copy in the td subdirectory" ON)
 set(TDLUA_TDLIB_CODEGEN_BUILD_DIR "" CACHE PATH
     "Existing bundled TDLua build containing TDLib native codec tools (required for native builds with TDLUA_BUNDLED_TDLIB=OFF)")
 option(TDLUA_NATIVE_BACKEND "Build TDLua against TDLib's native C++ interface" OFF)
+option(TDLUA_DISABLE_SYNC_FAST_PATH
+       "Never execute a managed request synchronously" OFF)
+# Set below when the classifier cannot be trusted for the linked TDLib.
+set(TDLUA_FAST_PATH_DISABLED OFF)
 option(TDLUA_ENABLE_SANITIZERS
        "Enable AddressSanitizer and UndefinedBehaviorSanitizer for TDLua targets"
        OFF)
@@ -383,6 +387,33 @@ if(TDLUA_CALLS)
   message(FATAL_ERROR "VoIP bindings have been removed; TDLUA_CALLS is no longer supported")
 endif()
 
+# The TDLib the build actually links, read after find_package/add_subdirectory
+# so the package has set Td_DIR. The synchronous classifier is generated from
+# one TDLib version only, so it is used only when this is that version.
+set(_tdlua_linked_tdlib_version "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt")
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt" _tdlib_project_line
+       REGEX "^project\\(TDLib VERSION ")
+  string(REGEX MATCH "VERSION ([0-9]+\\.[0-9]+\\.[0-9]+)"
+         _tdlib_project_match "${_tdlib_project_line}")
+  if(_tdlib_project_match)
+    set(_tdlua_linked_tdlib_version "${CMAKE_MATCH_1}")
+  endif()
+elseif(Td_DIR AND EXISTS "${Td_DIR}/TdConfigVersion.cmake")
+  file(STRINGS "${Td_DIR}/TdConfigVersion.cmake" _tdlib_version_line
+       REGEX "^set\\(PACKAGE_VERSION ")
+  string(REGEX MATCH "\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+         _tdlib_version_match "${_tdlib_version_line}")
+  if(_tdlib_version_match)
+    set(_tdlua_linked_tdlib_version "${CMAKE_MATCH_1}")
+  endif()
+elseif(TDLUA_TDLIB_VERSION STREQUAL "unknown")
+  set(_tdlua_linked_tdlib_version "")
+else()
+  set(_tdlua_linked_tdlib_version "${TDLUA_TDLIB_VERSION}")
+endif()
+
+
 if(TDLUA_TDLIB_VERSION STREQUAL "")
   if(TDLUA_BUNDLED_TDLIB AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt")
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/td/CMakeLists.txt" _tdlib_project_line
@@ -466,8 +497,25 @@ if(_tdlua_sync_classifier_sources_present)
       ${_tdlua_sync_classifier_sources}
       "${CMAKE_CURRENT_SOURCE_DIR}/tools/sync-classifier/generate_sync_classifier.cmake")
 else()
-  message(STATUS
-          "TDLib sources not present: using the committed synchronous classifier")
+  # Without the sources the committed classifier still has to describe the
+  # TDLib the build actually links (_tdlua_linked_tdlib_version, read before
+  # TDLib's own build). Any other version may have a different synchronous
+  # method set, so the managed fast path is disabled and every managed request
+  # is submitted asynchronously.
+  if(TDLUA_DISABLE_SYNC_FAST_PATH)
+    message(STATUS "TDLUA_DISABLE_SYNC_FAST_PATH is on: execute() always submits")
+  elseif(_tdlua_linked_tdlib_version STREQUAL "1.8.71")
+    message(STATUS
+            "TDLib sources not present: using the committed synchronous classifier "
+            "generated from TDLib 1.8.71, which is the linked TDLib")
+  else()
+    set(TDLUA_FAST_PATH_DISABLED ON)
+    message(WARNING
+            "TDLib sources not present and the linked TDLib is "
+            "'${_tdlua_linked_tdlib_version}', not the 1.8.71 the committed classifier was "
+            "generated from. The managed synchronous fast path is disabled: "
+            "execute() always submits. Initialise the td submodule to re-enable it.")
+  endif()
 endif()
 
 if(_tdlua_backend STREQUAL "native")
@@ -612,6 +660,9 @@ target_compile_definitions(tdlua PRIVATE
     "TDLUA_VERSION_STRING=\"${TDLUA_VERSION_STRING}\""
     "TDLUA_BASE_VERSION=\"${TDLUA_BASE_VERSION}\""
     "TDLUA_TDLIB_VERSION=\"${TDLUA_TDLIB_VERSION}\"")
+if(TDLUA_FAST_PATH_DISABLED OR TDLUA_DISABLE_SYNC_FAST_PATH)
+  target_compile_definitions(tdlua PRIVATE TDLUA_DISABLE_SYNC_FAST_PATH)
+endif()
 if(_tdlua_backend STREQUAL "json")
   target_compile_definitions(tdlua PRIVATE TDLUA_JSON_BACKEND)
 else()
@@ -1271,6 +1322,10 @@ if(TDLUA_BUILD_TESTS)
         endif()
         target_link_libraries(tdlua_sync_execute_owner_error_test PRIVATE
             tdlua ${LUA_LIBRARIES})
+        if(TDLUA_FAST_PATH_DISABLED OR TDLUA_DISABLE_SYNC_FAST_PATH)
+            target_compile_definitions(tdlua_sync_execute_owner_error_test
+                PRIVATE TDLUA_DISABLE_SYNC_FAST_PATH)
+        endif()
         target_compile_features(tdlua_sync_execute_owner_error_test PRIVATE
             cxx_std_11)
         tdlua_enable_sanitizers(tdlua_sync_execute_owner_error_test)
@@ -1445,6 +1500,25 @@ if(TDLUA_BUILD_TESTS)
             COMMAND tdlua_composition_fake_test)
         endif()
 
+        add_executable(tdlua_composition_routing_fake_test
+            "tests/composition_routing_fake_test.cpp")
+        target_include_directories(tdlua_composition_routing_fake_test PRIVATE
+            ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(tdlua_composition_routing_fake_test PRIVATE
+            TDLUA_TESTING)
+        if(TDLUA_FAST_PATH_DISABLED OR TDLUA_DISABLE_SYNC_FAST_PATH)
+          target_compile_definitions(tdlua_composition_routing_fake_test PRIVATE
+              TDLUA_DISABLE_SYNC_FAST_PATH)
+        endif()
+        target_compile_features(tdlua_composition_routing_fake_test PRIVATE
+            cxx_std_11)
+        target_link_libraries(tdlua_composition_routing_fake_test PRIVATE
+            tdlua ${LUA_LIBRARIES})
+        tdlua_enable_sanitizers(tdlua_composition_routing_fake_test)
+        add_test(NAME tdlua_composition_routing_fake
+            COMMAND tdlua_composition_routing_fake_test)
+
         add_executable(tdlua_sync_execute_fake_test
             "tests/sync_execute_fake_test.cpp")
         target_include_directories(tdlua_sync_execute_fake_test PRIVATE
@@ -1458,6 +1532,14 @@ if(TDLUA_BUILD_TESTS)
         tdlua_enable_sanitizers(tdlua_sync_execute_fake_test)
         add_test(NAME tdlua_sync_execute_fake
             COMMAND tdlua_sync_execute_fake_test)
+        # 77 means the build disabled the managed fast path because the
+        # classifier could not be verified for the linked TDLib.
+        set_tests_properties(tdlua_sync_execute_fake PROPERTIES
+            SKIP_RETURN_CODE 77)
+        if(TDLUA_FAST_PATH_DISABLED OR TDLUA_DISABLE_SYNC_FAST_PATH)
+          target_compile_definitions(tdlua_sync_execute_fake_test PRIVATE
+              TDLUA_DISABLE_SYNC_FAST_PATH)
+        endif()
 
         add_executable(tdlua_simple_bot_example_test
             "tests/simple_bot_example_test.cpp"
@@ -1732,8 +1814,34 @@ if(TDLUA_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/sync_execute_fast_path.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
-        set_tests_properties(tdlua_sync_execute_fast_path PROPERTIES TIMEOUT 60)
+        set_tests_properties(tdlua_sync_execute_fast_path PROPERTIES
+            TIMEOUT 60 SKIP_RETURN_CODE 77)
         if(_tdlua_backend STREQUAL "native")
+            add_executable(tdlua_composition_routing_native_fake_test
+                "tests/composition_routing_native_fake_test.cpp")
+            target_include_directories(
+                tdlua_composition_routing_native_fake_test PRIVATE
+                ${LUA_INCLUDE_DIRS} "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${TDLUA_NATIVE_GENERATED_DIR}"
+                "${_tdlua_native_td_include_dirs}")
+            target_compile_definitions(
+                tdlua_composition_routing_native_fake_test PRIVATE
+                TDLUA_TESTING TDLUA_TEST_BACKEND_NATIVE)
+            if(TDLUA_FAST_PATH_DISABLED OR TDLUA_DISABLE_SYNC_FAST_PATH)
+              target_compile_definitions(
+                  tdlua_composition_routing_native_fake_test PRIVATE
+                  TDLUA_DISABLE_SYNC_FAST_PATH)
+            endif()
+            target_compile_features(
+                tdlua_composition_routing_native_fake_test PRIVATE cxx_std_11)
+            target_link_libraries(
+                tdlua_composition_routing_native_fake_test PRIVATE
+                tdlua ${LUA_LIBRARIES})
+            tdlua_enable_sanitizers(tdlua_composition_routing_native_fake_test)
+            add_test(NAME tdlua_composition_routing_native_fake
+                COMMAND tdlua_composition_routing_native_fake_test)
+
             add_executable(tdlua_composition_native_fake_test
                 "tests/composition_native_fake_test.cpp")
             target_include_directories(tdlua_composition_native_fake_test PRIVATE
@@ -1770,7 +1878,8 @@ if(TDLUA_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/composition_sync_path.lua"
                     "$<TARGET_FILE_DIR:tdlua>"
         )
-        set_tests_properties(tdlua_composition_sync_path PROPERTIES TIMEOUT 60)
+        set_tests_properties(tdlua_composition_sync_path PROPERTIES
+            TIMEOUT 60 SKIP_RETURN_CODE 77)
         tdlua_enable_sanitizer_test_runtime(tdlua_composition_sync_path)
         if(_tdlua_backend STREQUAL "native")
             add_test(NAME tdlua_sync_execute_native_metamethod
@@ -1881,7 +1990,9 @@ foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test
         tdlua_hardening_common_test tdlua_managed_driver_test tdlua_fake_client_test
         tdlua_sync_execute_fake_test
         tdlua_composition_fake_test
+        tdlua_composition_routing_fake_test
         tdlua_composition_native_fake_test
+        tdlua_composition_routing_native_fake_test
         tdlua_sync_execute_owner_error_test
         tdlua_readiness_deadline_test tdlua_backend_readiness_test
         tdlua_simple_bot_example_test tdlua_async_demo_test

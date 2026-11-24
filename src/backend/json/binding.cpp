@@ -9,6 +9,7 @@
 #include "tdlua/common/composition.h"
 #include "tdlua/common/lua_json.h"
 #include "tdlua/common/sync_classifier_generated.h"
+#include "tdlua/common/sync_classifier_shape.h"
 #include "tdlua/common/sync_execute.h"
 #include <chrono>
 #include <cmath>
@@ -282,8 +283,16 @@ static bool json_sync_unavailable(const json &response, std::string &message)
 // The classifier is generated from the pinned TDLib sources, and the request
 // is already encoded, so the answer describes exactly the payload that would
 // be submitted.
+//
+// The generated predicate is used only when it describes the TDLib this module
+// links. Otherwise every request is submitted, which is always correct.
 static bool json_can_execute_synchronously(const json &request)
 {
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+    (void)request;
+    return false;
+#else
+    if (!tdlua::isSupportedSyncClassifierShape()) return false;
     if (!request.is_object()) return false;
     const auto type = request.find("@type");
     if (type == request.end() || !type->is_string()) return false;
@@ -294,6 +303,7 @@ static bool json_can_execute_synchronously(const json &request)
     return name != request.end() && name->is_string() &&
            tdlua::sync_classifier::isSynchronousOption(
                name->get_ref<const std::string &>());
+#endif
 }
 
 // testReturnError returns the caller's error object verbatim, so a synchronous
