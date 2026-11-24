@@ -414,6 +414,62 @@ message(STATUS "TDLua version: ${TDLUA_VERSION_STRING}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tdlua-version.txt"
      "${TDLUA_VERSION_STRING}\n")
 
+# The synchronous-request classifier is generated from the pinned TDLib
+# sources, but committed, so a JSON build against an installed TDLib does not
+# need the td submodule. Whenever the submodule is present the configure step
+# regenerates both headers and fails on any difference, which makes a stale
+# classifier a build error instead of a silent behaviour change.
+set(TDLUA_SYNC_CLASSIFIER_HEADERS
+    "sync_classifier_generated.h"
+    "sync_classifier_ids_generated.h")
+set(_tdlua_sync_classifier_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/td/td/telegram/SynchronousRequests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/td/td/telegram/SynchronousRequests.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/td/td/telegram/OptionManager.cpp")
+set(_tdlua_sync_classifier_sources_present TRUE)
+foreach(_source IN LISTS _tdlua_sync_classifier_sources)
+  if(NOT EXISTS "${_source}")
+    set(_tdlua_sync_classifier_sources_present FALSE)
+  endif()
+endforeach()
+if(_tdlua_sync_classifier_sources_present)
+  set(_tdlua_sync_classifier_check_dir
+      "${CMAKE_CURRENT_BINARY_DIR}/sync-classifier-check")
+  execute_process(
+      COMMAND "${CMAKE_COMMAND}"
+          "-DTDLIB_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/td"
+          "-DTDLIB_VERSION=${TDLUA_TDLIB_VERSION}"
+          "-DOUTPUT_DIR=${_tdlua_sync_classifier_check_dir}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/sync-classifier/generate_sync_classifier.cmake"
+      RESULT_VARIABLE _tdlua_sync_classifier_result)
+  if(NOT _tdlua_sync_classifier_result EQUAL 0)
+    message(FATAL_ERROR
+            "Failed to generate the synchronous request classifier from the pinned TDLib sources")
+  endif()
+  foreach(_header IN LISTS TDLUA_SYNC_CLASSIFIER_HEADERS)
+    file(READ "${_tdlua_sync_classifier_check_dir}/${_header}"
+         _tdlua_sync_classifier_expected)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/tdlua/common/${_header}"
+         _tdlua_sync_classifier_actual)
+    if(NOT _tdlua_sync_classifier_expected STREQUAL
+        _tdlua_sync_classifier_actual)
+      message(FATAL_ERROR
+              "include/tdlua/common/${_header} does not match TDLib "
+              "${TDLUA_TDLIB_VERSION}. Regenerate it with:\n"
+              "  cmake -DTDLIB_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/td "
+              "-DTDLIB_VERSION=${TDLUA_TDLIB_VERSION} "
+              "-DOUTPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include/tdlua/common "
+              "-P ${CMAKE_CURRENT_SOURCE_DIR}/tools/sync-classifier/generate_sync_classifier.cmake")
+    endif()
+  endforeach()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${_tdlua_sync_classifier_sources}
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/sync-classifier/generate_sync_classifier.cmake")
+else()
+  message(STATUS
+          "TDLib sources not present: using the committed synchronous classifier")
+endif()
+
 if(_tdlua_backend STREQUAL "native")
   list(APPEND tdlua_srcs
       "src/binding/client.cpp"

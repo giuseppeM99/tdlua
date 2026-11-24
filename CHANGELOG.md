@@ -13,8 +13,13 @@
 - A request may contain whole Futures and `tdlua.ref(future, path)` field
   projections. Terminal dependencies are materialized inline; pending
   dependencies are snapshotted and submitted exactly once.
-- Only the two literal TDLib markers authorise the asynchronous fallback. A
-  missing synchronous answer is a local error and is never retried.
+- A managed request is classified before execution: only requests TDLib
+  declares synchronous reach `executeSync`. The classifier is generated from
+  the pinned TDLib sources for both backends, checked at configure time against
+  the generator output, and never maintained by hand. Asynchronous requests
+  are never probed, and a marker on a classified-synchronous request is a
+  local classifier error, never a retry. A missing synchronous answer is a
+  local error and is never retried.
 - `execute(request, timeout)`, `execute(request, false)`, `execute(request,
   true)` and `executeSync(request)` keep their existing return conventions.
 - Fire-and-forget with pending dependencies, Task-as-value, cycles,

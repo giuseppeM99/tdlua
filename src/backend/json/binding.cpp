@@ -8,6 +8,7 @@
 #include "tdlua/backend/json/runtime.h"
 #include "tdlua/common/composition.h"
 #include "tdlua/common/lua_json.h"
+#include "tdlua/common/sync_classifier_generated.h"
 #include "tdlua/common/sync_execute.h"
 #include <chrono>
 #include <cmath>
@@ -250,7 +251,11 @@ static int tdclient_send(lua_State *L)
 thread_local int sync_execute_owner_error_mode = 0;
 #endif
 
-static bool json_sync_unavailable(const json &response)
+// The two literal TDLib markers that report a request TDLib cannot execute
+// synchronously. With a preventive classifier they only appear when the
+// classifier and the linked TDLib disagree, or when testReturnError echoes the
+// caller's own error, so they never authorize a retry.
+static bool json_sync_unavailable(const json &response, std::string &message)
 {
     if (!response.is_object()) return false;
     const auto type = response.find("@type");
@@ -259,28 +264,57 @@ static bool json_sync_unavailable(const json &response)
         return false;
     }
     const auto code = response.find("code");
-    const auto message = response.find("message");
-    if (code == response.end() || message == response.end() ||
+    const auto text = response.find("message");
+    if (code == response.end() || text == response.end() ||
         !(code->is_number_integer() || code->is_number_unsigned()) ||
-        !message->is_string()) {
+        !text->is_string()) {
         return false;
     }
-    return tdlua::isAsyncExecuteFallback(
-        code->get<int>(), message->get<std::string>());
+    if (!tdlua::isSyncUnavailableMarker(code->get<int>(),
+                                        text->get<std::string>())) {
+        return false;
+    }
+    message = text->get<std::string>();
+    return true;
 }
 
-// Try the synchronous transport for a managed Future. Returns true when the
-// Future was settled and the request must not be submitted. Returns false when
-// the request must be submitted asynchronously: the two exact TDLib
-// "not executable synchronously" markers, or a transport with no synchronous
-// answer.
+// Whether TDLib declares this request executable through its synchronous path.
+// The classifier is generated from the pinned TDLib sources, and the request
+// is already encoded, so the answer describes exactly the payload that would
+// be submitted.
+static bool json_can_execute_synchronously(const json &request)
+{
+    if (!request.is_object()) return false;
+    const auto type = request.find("@type");
+    if (type == request.end() || !type->is_string()) return false;
+    const std::string &method = type->get_ref<const std::string &>();
+    if (!tdlua::sync_classifier::isSynchronousMethod(method)) return false;
+    if (method != "getOption") return true;
+    const auto name = request.find("name");
+    return name != request.end() && name->is_string() &&
+           tdlua::sync_classifier::isSynchronousOption(
+               name->get_ref<const std::string &>());
+}
+
+// testReturnError returns the caller's error object verbatim, so a synchronous
+// classification may legitimately deliver either marker message as data.
+static bool json_marker_is_payload(const json &request)
+{
+    const auto type = request.find("@type");
+    return type != request.end() && type->is_string() &&
+           type->get_ref<const std::string &>() == "testReturnError";
+}
+
+// Execute a request the classifier accepted and settle the Future locally.
+// The caller must not submit the request afterwards.
 //
 // The response is pushed through a protected Lua frame so a Lua allocation
 // failure unwinds the caller's C++ owners instead of longjmping past them.
-static bool settle_json_sync(lua_State *L, TDLua *td,
-                      const std::shared_ptr<tdlua::ManagedState> &state,
-                      const json &request)
+static void execute_json_synchronously(
+    lua_State *L, TDLua *td,
+    const std::shared_ptr<tdlua::ManagedState> &state, const json &request)
 {
+    const bool marker_is_payload = json_marker_is_payload(request);
     json response = td->transport().executeSync(request);
     // `td_execute` answers every valid function, including an empty one
     // ("Request is empty"). A missing answer therefore means the transport
@@ -290,7 +324,11 @@ static bool settle_json_sync(lua_State *L, TDLua *td,
         throw std::runtime_error(
             "tdlua: synchronous execution returned no result");
     }
-    if (json_sync_unavailable(response)) return false;
+    std::string marker;
+    if (!marker_is_payload && json_sync_unavailable(response, marker)) {
+        throw std::runtime_error(
+            "tdlua: synchronous classifier disagreed with TDLib: " + marker);
+    }
 
     // Mirror the managed dispatch shape: public @extra is never exposed and
     // the response carries the logical request id.
@@ -339,7 +377,6 @@ static bool settle_json_sync(lua_State *L, TDLua *td,
         lua_settop(owner, owner_top);
         throw;
     }
-    return true;
 }
 
 // D1-C: execute a materialized request for a dependent Future or Task. The
@@ -364,7 +401,10 @@ static bool json_composition_execute(lua_State *L, void *client,
         return false;
     }
     try {
-        if (allow_sync && settle_json_sync(L, td, state, request)) return true;
+        if (allow_sync && json_can_execute_synchronously(request)) {
+            execute_json_synchronously(L, td, state, request);
+            return true;
+        }
         td->transport().send(state->request_id, std::move(request),
                              td->dispatcher().responseClass(state->request_id));
     } catch (const std::exception &exception) {
@@ -561,7 +601,9 @@ static int tdclient_execute(lua_State *L)
 
         auto state = td->dispatcher().future(numeric_execute);
         try {
-            if (!settle_json_sync(L, td, state, j)) {
+            if (json_can_execute_synchronously(j)) {
+                execute_json_synchronously(L, td, state, j);
+            } else {
                 tdlua::submit(td->dispatcher(), td->transport(),
                               state->request_id, std::move(j));
             }
@@ -737,7 +779,9 @@ static int call(lua_State *L)
 
         auto state = td->dispatcher().future();
         try {
-            if (!settle_json_sync(L, td, state, request)) {
+            if (json_can_execute_synchronously(request)) {
+                execute_json_synchronously(L, td, state, request);
+            } else {
                 tdlua::submit(td->dispatcher(), td->transport(),
                               state->request_id, std::move(request));
             }

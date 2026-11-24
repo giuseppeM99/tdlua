@@ -105,7 +105,7 @@ void runJsonStringFailure(lua_State *L, int mode, const char *label)
         co = coroutine.create(function()
             local ok, err = pcall(function()
                 return client:execute(
-                    '{"_":"parseTextEntities","parse_mode":{"_":"textParseModeMarkdown","version":1},"text":"*x*"}')
+                    '{"@type":"parseTextEntities","parse_mode":{"@type":"textParseModeMarkdown","version":1},"text":"*x*"}')
             end)
             co_ok = ok
             co_err = tostring(err)

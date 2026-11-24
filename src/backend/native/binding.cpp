@@ -7,6 +7,8 @@
 
 #include "tdlua/common/composition.h"
 #include "tdlua/common/lua_json.h"
+#include "tdlua/common/sync_classifier_generated.h"
+#include "tdlua/common/sync_classifier_ids_generated.h"
 #include "tdlua/common/sync_execute.h"
 #include "tdlua/backend/native/client.h"
 #include "tdlua/backend/native/runtime.h"
@@ -320,24 +322,14 @@ static int tdclient_receive(lua_State *L)
     });
 }
 
-static bool request_tree_has_index_metamethod(lua_State *L, int index,
-                                              int depth = 0);
-
 static bool make_request(lua_State *L, NativeTDLua *td, int index,
                          td::td_api::object_ptr<td::td_api::Function> &request,
                          int &table_index, bool &owned, bool &codec_error,
-                         std::string &error, bool *metamethod_stable = nullptr)
+                         std::string &error)
 {
     codec_error = false;
     if (!request_table(L, index, table_index, owned, error)) {
         return false;
-    }
-    // This must run before any lua_getfield on the request: an __index can
-    // mutate the table (including removing its own metatable) and make a later
-    // check see a table that is no longer stable.
-    if (metamethod_stable) {
-        *metamethod_stable =
-            !request_tree_has_index_metamethod(L, table_index);
     }
     // Request identity fields belong to the TDLua API. Reject them before
     // schema conversion so they remain Lua API errors.
@@ -414,56 +406,49 @@ static int tdclient_send(lua_State *L)
 thread_local int native_sync_execute_owner_error_mode = 0;
 #endif
 
-// The native codec reads named fields through lua_getfield, which honors
-// __index. Re-encoding the request for the asynchronous fallback would then
-// invoke the metamethod a second time and could send a different request under
-// the same id. Such a request never takes the synchronous path: it is encoded
-// once and submitted.
-static bool request_tree_has_index_metamethod(lua_State *L, int index,
-                                              int depth)
-{
-    if (depth > 100) return true;
-    if (!lua_istable(L, index)) return false;
-    if (!lua_checkstack(L, 8)) return true;
-    index = lua_absindex(L, index);
-    if (lua_getmetatable(L, index)) {
-        lua_pushliteral(L, "__index");
-        lua_rawget(L, -2);
-        const bool has_index = !lua_isnil(L, -1);
-        lua_pop(L, 2);
-        if (has_index) return true;
-    }
-    lua_pushnil(L);
-    while (lua_next(L, index) != 0) {
-        const bool nested = lua_istable(L, -1) &&
-            request_tree_has_index_metamethod(L, -1, depth + 1);
-        lua_pop(L, 1);
-        if (nested) {
-            lua_pop(L, 1);
-            return true;
-        }
-    }
-    return false;
-}
-
-// The two literal TDLib markers that authorize an asynchronous retry. Any
-// other error object is a real response and must not be sent again.
-static bool native_sync_unavailable(const td::td_api::Object &response)
+// The two literal TDLib markers that report a request TDLib cannot execute
+// synchronously. With a preventive classifier they only appear when the
+// classifier and the linked TDLib disagree, or when testReturnError echoes the
+// caller's own error, so they never authorize a retry.
+static bool native_sync_unavailable(const td::td_api::Object &response,
+                                    std::string &message)
 {
     if (response.get_id() != td::td_api::error::ID) return false;
     const auto &error = static_cast<const td::td_api::error &>(response);
-    return tdlua::isAsyncExecuteFallback(error.code_, error.message_);
+    if (!tdlua::isSyncUnavailableMarker(error.code_, error.message_)) {
+        return false;
+    }
+    message = error.message_;
+    return true;
 }
 
-// Try the synchronous transport for a managed Future. The request is consumed:
-// on true the Future is settled and must not be submitted; on false the caller
-// must rebuild it from table_index and submit. False is returned only for the
-// two exact TDLib "not executable synchronously" markers.
-static bool settle_native_sync(
+// Whether TDLib declares this encoded request executable synchronously. The
+// method set is generated from the pinned TDLib sources (see
+// tools/sync-classifier/generate_sync_classifier.cmake) and the case labels are
+// resolved by the same td_api.h the library was compiled against, so a renamed
+// or removed method fails the build. getOption depends on its argument, exactly
+// like TDLib's own predicate.
+static bool native_can_execute_synchronously(
+    const td::td_api::Function *request)
+{
+    if (request == nullptr) return false;
+    const std::int32_t id = request->get_id();
+    if (!tdlua::sync_classifier::isSynchronousMethodId(id)) return false;
+    if (id != td::td_api::getOption::ID) return true;
+    const auto &option = static_cast<const td::td_api::getOption &>(*request);
+    return tdlua::sync_classifier::isSynchronousOption(option.name_);
+}
+
+// Execute a request the classifier accepted and settle the Future locally.
+// The caller must not submit the request afterwards: the encoded request is
+// consumed here and is never rebuilt from the Lua table.
+static void execute_native_synchronously(
     lua_State *L, NativeTDLua *td,
     const std::shared_ptr<tdlua::ManagedState> &state,
     td::td_api::object_ptr<td::td_api::Function> request)
 {
+    const bool marker_is_payload =
+        request->get_id() == td::td_api::testReturnError::ID;
     NativeResponse response = td->transport().executeSync(std::move(request));
     // `ClientManager::execute` answers every valid function, including an empty
     // one ("Request is empty"). A missing answer therefore means the transport
@@ -473,7 +458,12 @@ static bool settle_native_sync(
         throw std::runtime_error(
             "tdlua: synchronous execution returned no result");
     }
-    if (native_sync_unavailable(*response.object)) return false;
+    std::string marker;
+    if (!marker_is_payload &&
+        native_sync_unavailable(*response.object, marker)) {
+        throw std::runtime_error(
+            "tdlua: synchronous classifier disagreed with TDLib: " + marker);
+    }
 
     // Mirror the managed dispatch shape: the response carries the logical
     // request id and is pushed with the shared native response codec.
@@ -512,7 +502,6 @@ static bool settle_native_sync(
         lua_settop(owner, owner_top);
         throw;
     }
-    return true;
 }
 
 // D1-C: execute a materialized request for a dependent Future or Task. The
@@ -553,12 +542,10 @@ static bool native_composition_execute(lua_State *L, void *client,
     }
     try {
         if (!synthesized_error && allow_sync &&
-            settle_native_sync(L, td, state, std::move(request))) {
+            native_can_execute_synchronously(request.get())) {
+            execute_native_synchronously(L, td, state, std::move(request));
             return true;
         }
-        // Only the fast path consumes the encoded request. The synthesized
-        // error request cannot be re-encoded from the source table.
-        if (!synthesized_error && allow_sync) request = td->makeRequest(L, table_index);
         td->transport().send(state->request_id, std::move(request),
                              td->dispatcher().responseClass(state->request_id));
     } catch (const std::exception &exception) {
@@ -713,16 +700,14 @@ static int tdclient_execute(lua_State *L)
         bool owned = false;
         td::td_api::object_ptr<td::td_api::Function> request;
         bool codec_error = false;
-        bool stable = false;
         if (!make_request(L, td, request_index, request, table_index, owned,
-                          codec_error, error, &stable)) {
+                          codec_error, error)) {
             if (!codec_error) {
                 pop_owned(L, owned);
                 throw std::runtime_error(error);
             }
             request = codec_error_request(error);
         }
-        stable = stable && !codec_error;
         std::shared_ptr<tdlua::ManagedState> state;
         try {
             if (fire_and_forget) {
@@ -744,18 +729,12 @@ static int tdclient_execute(lua_State *L)
                 return 1;
             }
             state = td->dispatcher().future(numeric_execute);
-            bool settled = false;
-            bool consumed = false;
-            if (stable) {
-                consumed = true;
-                settled = settle_native_sync(L, td, state, std::move(request));
-            }
-            if (!settled) {
-                if (consumed) {
-                    // The snapshot is metatable-free, so this second encoding
-                    // is identical to the first by construction.
-                    request = td->makeRequest(L, table_index);
-                }
+            // A schema error is delivered as a TDLib error response; it is not
+            // a request the caller wrote and must not be executed locally.
+            if (!codec_error &&
+                native_can_execute_synchronously(request.get())) {
+                execute_native_synchronously(L, td, state, std::move(request));
+            } else {
                 tdlua::submit(td->dispatcher(), td->transport(),
                               state->request_id, std::move(request));
             }
@@ -884,16 +863,14 @@ static int call(lua_State *L)
         int encoded_table_index = 0;
         bool encoded_owned = false;
         bool codec_error = false;
-        bool stable = false;
         if (!make_request(L, td, request_index, request, encoded_table_index,
-                          encoded_owned, codec_error, error, &stable)) {
+                          encoded_owned, codec_error, error)) {
             if (!codec_error) {
                 pop_owned(L, owned);
                 throw std::runtime_error(error);
             }
             request = codec_error_request(error);
         }
-        stable = stable && !codec_error;
         if (fire_and_forget) {
             const std::uint64_t id = td->dispatcher().registerRawRequest();
             tdlua::submit(td->dispatcher(), td->transport(), id, std::move(request));
@@ -921,16 +898,10 @@ static int call(lua_State *L)
 
         auto state = td->dispatcher().future();
         try {
-            bool settled = false;
-            bool consumed = false;
-            if (stable) {
-                consumed = true;
-                settled = settle_native_sync(L, td, state, std::move(request));
-            }
-            if (!settled) {
-                if (consumed) {
-                    request = td->makeRequest(L, request_index);
-                }
+            if (!codec_error &&
+                native_can_execute_synchronously(request.get())) {
+                execute_native_synchronously(L, td, state, std::move(request));
+            } else {
                 tdlua::submit(td->dispatcher(), td->transport(),
                               state->request_id, std::move(request));
             }

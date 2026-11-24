@@ -6,16 +6,16 @@
 
 namespace tdlua {
 
-// TDLib 1.8.71 has exactly two ways to say "this operation cannot run through
-// td_execute/ClientManager::execute": the generic SynchronousRequests template
-// and getOption for a non-synchronous option. Both are reported as error 400
-// with these literal messages.
+// TDLib reports a request it cannot run through ClientManager::execute with
+// exactly these two messages: the generic SynchronousRequests template and
+// getOption for an option that is not synchronous. Both use error code 400.
 //
-// No other 400 authorizes an asynchronous retry. In particular a method that
-// really ran and rejected its input (parseMarkdown with empty text, for
-// example) returns its own message and must be delivered as a normal TDLib
-// error response, never re-executed.
-inline bool isAsyncExecuteFallback(int code, const std::string &message)
+// Since the classifier is preventive, a managed request never reaches
+// executeSync unless TDLib declared it synchronous. A marker on such a
+// request therefore means the classifier and the linked TDLib disagree. It is
+// reported as a local error and never authorizes a resubmission: an operation
+// that may already have run must not be executed a second time.
+inline bool isSyncUnavailableMarker(int code, const std::string &message)
 {
     if (code != 400) return false;
     return message == "The method can't be executed synchronously" ||

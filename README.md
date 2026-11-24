@@ -286,20 +286,39 @@ Future dependencies, because it could not wait for them.
 
 ### Synchronous fast path
 
-`execute(request)` returns a Future. Before submitting a managed request the
-binding asks TDLib to execute it synchronously. If TDLib answers, the Future is
-already terminal and nothing is sent. Only the two literal messages
-`The method can't be executed synchronously` and
-`The option can't be get synchronously` authorise the asynchronous fallback;
-any other `400` is the response and is never retried. A missing synchronous
-answer is a local error and is never retried either, because the operation may
-already have run.
+`execute(request)` returns a Future. A managed request is classified before it
+is executed: only requests TDLib declares synchronously executable are passed
+to `executeSync`, and they are never submitted as well. Every other request is
+submitted exactly once and never reaches `executeSync`, not even to obtain an
+error message.
+
+TDLib's predicate lives in `td/telegram/SynchronousRequests.cpp`, which is not
+part of its installed package, so the classifier is generated from those
+sources by `tools/sync-classifier/generate_sync_classifier.cmake` and committed
+as `include/tdlua/common/sync_classifier*_generated.h`. The JSON backend matches
+the method name, the native backend the `td_api` type id of the encoded
+request; both headers come from one parse of the same file and cannot disagree.
+`getOption` depends on its argument and is classified by option name; only
+`version` and `commit_hash` are synchronous in TDLib 1.8.71.
+
+The generator refuses to emit a classifier when the `is_synchronous_request`
+switch and the declared `do_request` handlers disagree, and every build that
+has the `td` submodule regenerates the headers and fails on any difference. A
+stale classifier is therefore a build error, not a silent behaviour change, and
+the table is never maintained by hand.
+
+The request is encoded once and the classifier reads the encoded object, so an
+`__index` metamethod is consulted once and cannot make the classified request
+differ from the executed or submitted one. A marker error on a
+classified-synchronous request means the classifier and TDLib disagree: it is
+reported as a local error (`tdlua: synchronous classifier disagreed with
+TDLib: ...`) and the request is not re-executed. `testReturnError` is the one
+method that returns its caller-supplied error object verbatim, so such a value
+is delivered as data. A missing synchronous answer is a local error as well.
 
 `execute(request):wait()` settles both paths. `execute(request, timeout)`,
 `execute(request, false)` and `executeSync(request)` keep returning the raw
-response, and `execute(request, true)` remains fire-and-forget. A native request
-whose tree contains `__index` bypasses the synchronous probe and is submitted
-once asynchronously.
+response, and `execute(request, true)` remains fire-and-forget.
 
 Close the client with:
 

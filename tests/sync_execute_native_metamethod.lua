@@ -1,10 +1,12 @@
 -- Copyright (c) 2018-2026 Giuseppe Marino
 -- SPDX-License-Identifier: BSD-3-Clause
 --
--- D1-B, native backend: the C++ codec reads named fields through lua_getfield,
--- which honors __index. A fallback re-encoding must not invoke the metamethod
--- a second time and send a different request under the same id. Requests whose
--- tree contains __index are encoded once and submitted asynchronously.
+-- D2-FIX, native backend: the C++ codec reads named fields through
+-- lua_getfield, which honors __index. The request is encoded exactly once and
+-- the classifier looks at the encoded td_api object, so a metamethod cannot
+-- produce a different request between the classification and the submission.
+-- A request whose encoded method is asynchronous is submitted once; one whose
+-- encoded method is synchronous executes once, with no second read.
 
 local module_dir = assert(arg[1], "the module directory is required")
 package.cpath = module_dir .. "/?.so;" .. package.cpath
@@ -20,7 +22,8 @@ local function assert_td_object(value, label)
 end
 
 -- Top-level changing __index: the old code attempted the first value
--- synchronously and re-encoded the second value asynchronously.
+-- synchronously and re-encoded the second value asynchronously. The encoded
+-- request asks for my_id, which is not synchronous, so it is submitted.
 local lookups = 0
 local request = setmetatable({}, {__index = function(_, key)
     if key == "_" then return "getOption" end
@@ -64,8 +67,8 @@ tricky_future:wait(0.5)
 assert(tricky_future:ready() == false,
        "the fallback re-encoded the mutated request")
 
--- Nested changing __index: still one encoding, and the asynchronous response
--- is the one the single encoding produced.
+-- Nested changing __index: still one encoding. The encoded request is a valid
+-- parseTextEntities, so the classifier executes it synchronously.
 local nested_lookups = 0
 local parse_mode = setmetatable({}, {__index = function(_, key)
     if key == "_" then return "textParseModeMarkdown" end
@@ -81,13 +84,30 @@ local parsed = client:execute({
 })
 assert(nested_lookups == 1,
        "nested request was encoded " .. nested_lookups .. " times")
-assert(parsed:ready() == false,
-       "a nested __index request must not use the synchronous path")
+assert(parsed:ready() == true,
+       "a nested __index request lost the synchronous path")
 local parsed_result = parsed:wait()
 assert_td_object(parsed_result, "parseTextEntities")
 assert(parsed_result._ == "formattedText" and parsed_result.text == "nested")
 assert(parsed_result.entities[1].type._ == "textEntityTypeBold")
-assert(nested_lookups == 1, "the asynchronous path re-encoded the request")
+assert(nested_lookups == 1, "the synchronous path re-read the metamethod")
+
+-- A top-level __index that resolves to a synchronous option is executed
+-- synchronously from the single encoded request.
+local sync_lookups = 0
+local sync_request = setmetatable({}, {__index = function(_, key)
+    if key == "_" then return "getOption" end
+    if key == "name" then
+        sync_lookups = sync_lookups + 1
+        return "commit_hash"
+    end
+end})
+local sync_option = client:execute(sync_request)
+assert(sync_lookups == 1,
+       "top-level synchronous request was encoded " .. sync_lookups .. " times")
+assert(sync_option:ready() == true,
+       "a synchronous __index request was not executed synchronously")
+assert(sync_option:wait()._ == "optionValueString")
 
 -- A plain table still takes the fast path.
 local plain = client:execute({

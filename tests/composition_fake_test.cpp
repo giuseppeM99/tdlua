@@ -191,12 +191,6 @@ void testWholeFutureReady(lua_State *L)
 {
     Fake fake;
     fake.sync_by_type["parseTextEntities"] = formattedText();
-    // The composed method is not synchronous in TDLib: the exact marker makes
-    // the request observable on the asynchronous path.
-    fake.sync_by_type["sendMessage"] =
-        json{{"@type", "error"},
-             {"code", 400},
-             {"message", "The method can't be executed synchronously"}};
     fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
@@ -231,22 +225,22 @@ void testWholeFutureReady(lua_State *L)
 }
 
 // 2. A pending Future blocks submission until it completes; the dependent
-// request is then submitted exactly once with a stable id.
+// request is then submitted exactly once with a stable id. The dependent
+// method is asynchronous, so the classifier never probes it.
 void testPendingFuture(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
-    fake.auto_reply.insert("parseTextEntities");
+    fake.sync_by_type["parseTextEntities"] = formattedText();
+    fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
         assert(user:ready() == false)
-        dependent = client:execute({_ = "parseTextEntities",
-                                     text = "still",
-                                     parse_mode = {_ = "textParseModeMarkdown",
-                                                   version = 1},
-                                     extra = user})
+        dependent = client:execute({_ = "sendMessage",
+                                     chat_id = 1,
+                                     input_message_content = {
+                                         _ = "inputMessageText",
+                                         text = user}})
         assert(dependent:ready() == false)
         dep_id = dependent._request_id
         user_id = user._request_id
@@ -264,9 +258,9 @@ void testPendingFuture(lua_State *L)
     )lua");
     require(fake.sent.size() == 2, "dependent request was not submitted once");
     const json &payload = fake.sent[1].request;
-    require(payload.value("@type", "") == "parseTextEntities",
+    require(payload.value("@type", "") == "sendMessage",
             "dependent payload has the wrong method");
-    const json &extra = payload.at("extra");
+    const json &extra = payload.at("input_message_content").at("text");
     require(extra.value("@type", "") == "user", "dependency value missing");
     require(extra.value("id", 0) == 77, "dependency field lost");
     require(extra.find("_request_id") == extra.end(),
@@ -282,54 +276,52 @@ void testPendingFuture(lua_State *L)
 void testProjection(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
-    fake.auto_reply.insert("getTextEntities");
+    fake.sync_by_type["parseTextEntities"] = formattedText();
     createClient(L, fake);
     runLua(L, R"lua(
         formatted = client:execute({_ = "parseTextEntities", text = "*x*",
                                      parse_mode = {_ = "textParseModeMarkdown",
                                                    version = 1}})
-        dependent = client:getTextEntities({text = tdlua.ref(formatted, "text")})
+        dependent = client:sendMessage({chat_id = 1,
+                                        input_message_content = {
+                                            _ = "inputMessageText",
+                                            text = tdlua.ref(formatted, "text")}})
         assert(dependent:ready() == false)
-        formatted_id = formatted._request_id
     )lua");
-    lua_getglobal(L, "formatted_id");
-    const auto source_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
-    lua_pop(L, 1);
-    fake.respond(source_id, formattedText());
-    pumpAndRespond(L, fake, 1, json{{"@type", "ok"}});
-    runLua(L, "assert(dependent:wait(5)._ == 'ok')");
-    require(fake.sent[1].request.value("text", "") == "Hello",
+    require(fake.sent.size() == 1, "the dependent request was not submitted");
+    const json &payload = fake.sent[0].request;
+    require(payload.at("input_message_content").at("text") == "Hello",
             "projection did not produce the field value");
+    fake.respond(fake.sent[0].id, json{{"@type", "ok"}});
+    runLua(L, "assert(dependent:wait(5)._ == 'ok')");
     finish(L);
 }
 
-// 4. A missing projection fails the dependent request and submits nothing.
+// 4. A missing projection fails the composed request and submits nothing.
+// The synchronous source is already terminal, so the failure is reported by
+// execute() itself rather than by a Future wait.
 void testMissingProjection(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
+    fake.sync_by_type["parseTextEntities"] = formattedText();
     createClient(L, fake);
     runLua(L, R"lua(
         formatted = client:execute({_ = "parseTextEntities", text = "*x*",
                                      parse_mode = {_ = "textParseModeMarkdown",
                                                    version = 1}})
-        formatted_id = formatted._request_id
-        dependent = client:getTextEntities({text = tdlua.ref(formatted, "nope")})
-        assert(dependent:ready() == false)
-    )lua");
-    lua_getglobal(L, "formatted_id");
-    const auto source_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
-    lua_pop(L, 1);
-    fake.respond(source_id, formattedText());
-    runLua(L, R"lua(
-        local ok, err = pcall(function() return dependent:wait(5) end)
-        assert(ok == false)
+        local ok, value = pcall(function()
+            return client:sendMessage({text = tdlua.ref(formatted, "nope")})
+        end)
+        local err = value
+        if ok then
+            local waited, wait_err = pcall(function() return value:wait(5) end)
+            assert(waited == false, "a missing projection produced a value")
+            err = wait_err
+        end
         assert(tostring(err):find("projection", 1, true), tostring(err))
         assert(client.pendingCount(client) == 0)
     )lua");
-    require(fake.sent.size() == 1, "the dependent request was submitted");
+    require(fake.sent.empty(), "the dependent request was submitted");
     finish(L);
 }
 
@@ -338,12 +330,11 @@ void testMissingProjection(lua_State *L)
 void testDependencyErrorResponse(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
         user_id = user._request_id
-        dependent = client:getTextEntities({text = tdlua.ref(user, "id")})
+        dependent = client:sendMessage({text = tdlua.ref(user, "id")})
         assert(dependent:ready() == false)
     )lua");
     lua_getglobal(L, "user_id");
@@ -374,7 +365,7 @@ void testCycleRejected(lua_State *L)
         formatted = client:execute({_ = "parseTextEntities", text = "*x*",
                                      parse_mode = {_ = "textParseModeMarkdown",
                                                    version = 1}})
-        request = {_ = "getTextEntities", text = formatted}
+        request = {_ = "sendMessage", text = formatted}
         request.self = request
         local ok, err = pcall(function() return client:execute(request) end)
         assert(ok == false)
@@ -395,7 +386,7 @@ void testMetamethodRejected(lua_State *L)
         formatted = client:execute({_ = "parseTextEntities", text = "*x*",
                                      parse_mode = {_ = "textParseModeMarkdown",
                                                    version = 1}})
-        request = setmetatable({_ = "getTextEntities", text = formatted},
+        request = setmetatable({_ = "sendMessage", text = formatted},
             {__index = function(_, key) return "dynamic" end})
         local ok, err = pcall(function() return client:execute(request) end)
         assert(ok == false)
@@ -405,41 +396,37 @@ void testMetamethodRejected(lua_State *L)
 }
 
 // 8. Mutating the caller's table after execute does not change the deferred
-// request: the snapshot is independent.
+// request: the snapshot is independent. The source is asynchronous, so the
+// dependent request is still pending when the caller mutates its table.
 void testSnapshotImmutability(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
-    fake.auto_reply.insert("getTextEntities");
+    fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "parseTextEntities", text = "*x*",
-                                  parse_mode = {_ = "textParseModeMarkdown",
-                                                version = 1}})
+        source = client:execute({_ = "getMe"})
         source_id = source._request_id
-        params = {text = tdlua.ref(source, "text"), note = "original"}
-        dependent = client:getTextEntities(params)
-        params.note = "mutated"
-        params.text = "changed"
+        request = {_ = "sendMessage", chat_id = 1,
+                   input_message_content = {_ = "inputMessageText",
+                                            text = tdlua.ref(source, "id")},
+                   note = "original"}
+        dependent = client:execute(request)
+        request.note = "mutated"
+        request.input_message_content.text = "changed"
     )lua");
     lua_getglobal(L, "source_id");
     const auto source_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
     lua_pop(L, 1);
-    fake.respond(source_id, formattedText());
+    fake.respond(source_id, json{{"@type", "user"}, {"id", 42}});
     pumpAndRespond(L, fake, 1, json{{"@type", "ok"}});
     runLua(L, "assert(dependent:wait(5)._ == 'ok')");
-    bool found = false;
-    for (const auto &sent : fake.sent) {
-        if (sent.request.value("@type", "") == "getTextEntities") {
-            require(sent.request.value("note", "") == "original",
-                    "a later mutation changed the request");
-            require(sent.request.value("text", "") == "Hello",
-                    "the projection was evaluated too early");
-            found = true;
-        }
-    }
-    require(found, "dependent request not submitted");
+    require(fake.sent.size() == 2, "dependent request not submitted");
+    const json &payload = fake.sent[1].request;
+    require(payload.value("@type", "") == "sendMessage", "wrong method");
+    require(payload.at("note") == "original",
+            "a later mutation changed the request");
+    require(payload.at("input_message_content").at("text") == 42,
+            "the projection was evaluated too early");
     finish(L);
 }
 
@@ -447,13 +434,14 @@ void testSnapshotImmutability(lua_State *L)
 void testFireAndForgetRejected(lua_State *L)
 {
     Fake fake;
+    fake.sync_by_type["parseTextEntities"] = formattedText();
     createClient(L, fake);
     runLua(L, R"lua(
         formatted = client:execute({_ = "parseTextEntities", text = "*x*",
                                      parse_mode = {_ = "textParseModeMarkdown",
                                                    version = 1}})
         local ok, err = pcall(function()
-            return client:execute({_ = "getTextEntities", text = formatted}, true)
+            return client:execute({_ = "sendMessage", text = formatted}, true)
         end)
         assert(ok == false)
         assert(tostring(err):find("fire%-and%-forget") ~= nil, tostring(err))
@@ -462,20 +450,19 @@ void testFireAndForgetRejected(lua_State *L)
 }
 
 // 10. A Task form with a pending dependency defers its callback until the
-// request is submitted and answered.
+// request is submitted and answered. Task targets never take the synchronous
+// path, so the dependent is submitted even though getTextEntities is a
+// synchronous method.
 void testTaskForm(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
     fake.auto_reply.insert("getTextEntities");
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "parseTextEntities", text = "*x*",
-                                  parse_mode = {_ = "textParseModeMarkdown",
-                                                version = 1}})
+        source = client:execute({_ = "getMe"})
         source_id = source._request_id
         called = 0
-        task = client:execute({_ = "getTextEntities", text = tdlua.ref(source, "text")},
+        task = client:execute({_ = "getTextEntities", text = tdlua.ref(source, "id")},
                               function(result)
                                   called = called + 1
                                   task_result = result
@@ -485,7 +472,7 @@ void testTaskForm(lua_State *L)
     lua_getglobal(L, "source_id");
     const auto source_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
     lua_pop(L, 1);
-    fake.respond(source_id, formattedText());
+    fake.respond(source_id, json{{"@type", "user"}, {"id", 42}});
     pumpAndRespond(L, fake, 1, json{{"@type", "ok"}});
     runLua(L, R"lua(
         for _ = 1, 50 do
@@ -495,6 +482,7 @@ void testTaskForm(lua_State *L)
         assert(called == 1, "callback count " .. tostring(called))
         assert(task_result._ == "ok")
     )lua");
+    require(fake.sent.size() == 2, "the Task dependent was not submitted");
     finish(L);
 }
 
@@ -503,12 +491,10 @@ void testTaskForm(lua_State *L)
 void testCloseBeforeResolution(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
-        dependent = client:getTextEntities({text = tdlua.ref(user, "id")})
+        dependent = client:sendMessage({text = tdlua.ref(user, "id")})
         dependent_id = dependent._request_id
     )lua");
     runLua(L, "client:close()");
@@ -524,15 +510,13 @@ void testCloseBeforeResolution(lua_State *L)
 void testTwoDependenciesOutOfOrder(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         first = client:execute({_ = "getMe"})
         second = client:execute({_ = "getMe"})
         first_id = first._request_id
         second_id = second._request_id
-        dependent = client:getTextEntities({text = "pair", a = first, b = second})
+        dependent = client:sendMessage({text = "pair", a = first, b = second})
         assert(dependent:ready() == false)
     )lua");
     require(fake.sent.size() == 2, "the dependencies were not submitted once");
@@ -570,14 +554,13 @@ void testTwoDependenciesOutOfOrder(lua_State *L)
 void testDependencyChain(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
-        a = client:execute({_ = "getTextEntities", text = "a"})
+        a = client:execute({_ = "sendMessage", text = "a"})
         a_id = a._request_id
-        b = client:execute({_ = "getTextEntities", text = tdlua.ref(a, "text")})
+        b = client:execute({_ = "sendMessage", text = tdlua.ref(a, "text")})
         b_id = b._request_id
-        c = client:execute({_ = "getTextEntities", text = tdlua.ref(b, "text")})
+        c = client:execute({_ = "sendMessage", text = tdlua.ref(b, "text")})
         assert(a:ready() == false and b:ready() == false and c:ready() == false)
     )lua");
     require(fake.sent.size() == 1, "the chain was submitted eagerly");
@@ -605,12 +588,11 @@ void testDependencyChain(lua_State *L)
 void testSameFutureTwice(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "getTextEntities", text = "dup"})
+        source = client:execute({_ = "sendMessage", text = "dup"})
         source_id = source._request_id
-        dependent = client:getTextEntities({text = tdlua.ref(source, "text"),
+        dependent = client:sendMessage({text = tdlua.ref(source, "text"),
                                             whole = source})
         assert(dependent:ready() == false)
     )lua");
@@ -633,13 +615,12 @@ void testSameFutureTwice(lua_State *L)
 void testTaskValueRejected(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
         task = client:execute({_ = "getMe"}, function() end)
         local ok, err = pcall(function()
-            return client:getTextEntities({text = tdlua.ref(user, "first_name"),
+            return client:sendMessage({text = tdlua.ref(user, "first_name"),
                                            extra = task})
         end)
         assert(ok == false)
@@ -654,17 +635,16 @@ void testTaskValueRejected(lua_State *L)
 void testTaskValueWithoutDependencies(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         task = client:execute({_ = "getMe"}, function() end)
         local ok, err = pcall(function()
-            return client:getTextEntities({text = "x", extra = task})
+            return client:sendMessage({text = "x", extra = task})
         end)
         assert(ok == false, "a Task value was accepted")
         assert(tostring(err):find("Task", 1, true), tostring(err))
         local ok2, err2 = pcall(function()
-            return client:execute({_ = "getTextEntities", text = "x",
+            return client:execute({_ = "sendMessage", text = "x",
                                    extra = task})
         end)
         assert(ok2 == false, "a Task value was accepted by execute")
@@ -678,12 +658,11 @@ void testTaskValueWithoutDependencies(lua_State *L)
 void testTaskValueWithoutDependencyRejected(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         task = client:execute({_ = "getMe"}, function() end)
         local ok, err = pcall(function()
-            return client:getTextEntities({text = "x", extra = task})
+            return client:sendMessage({text = "x", extra = task})
         end)
         assert(ok == false)
         assert(tostring(err):find("Task", 1, true), tostring(err))
@@ -698,13 +677,12 @@ void testTaskValueWithoutDependencyRejected(lua_State *L)
 void testGarbageCollectedDependent(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         do
-            source = client:execute({_ = "getTextEntities", text = "gc"})
+            source = client:execute({_ = "sendMessage", text = "gc"})
             source_id = source._request_id
-            client:getTextEntities({text = tdlua.ref(source, "text")})
+            client:sendMessage({text = tdlua.ref(source, "text")})
         end
         collectgarbage()
         collectgarbage()
@@ -726,14 +704,13 @@ void testGarbageCollectedDependent(lua_State *L)
 void testTimeoutBeforeSubmission(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "getTextEntities", text = "slow"})
+        source = client:execute({_ = "sendMessage", text = "slow"})
         source_id = source._request_id
         -- Numeric execute returns (nil, "timeout"); it does not raise.
         local result, err = client:execute(
-            {_ = "getTextEntities", text = tdlua.ref(source, "text")}, 0.05)
+            {_ = "sendMessage", text = tdlua.ref(source, "text")}, 0.05)
         assert(result == nil and err == "timeout",
                tostring(result) .. " " .. tostring(err))
     )lua");
@@ -776,13 +753,12 @@ void testInlineTimeout(lua_State *L)
 void testDottedProjection(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
-    fake.auto_reply.insert("getTextEntities");
+    fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
         user_id = user._request_id
-        dependent = client:getTextEntities({
+        dependent = client:sendMessage({
             text = tdlua.ref(user, "profile.first_name"),
             extra = {deep = tdlua.ref(user, "profile.first_name")},
             note = "tail"})
@@ -809,15 +785,12 @@ void testDottedProjection(lua_State *L)
 void testRefOutlivesFuture(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["parseTextEntities"] = syncUnavailable();
-    fake.auto_reply.insert("getTextEntities");
+    fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "parseTextEntities", text = "*x*",
-                                  parse_mode = {_ = "textParseModeMarkdown",
-                                                version = 1}})
+        source = client:execute({_ = "getMe"})
         source_id = source._request_id
-        dependent = client:getTextEntities({text = tdlua.ref(source, "text")})
+        dependent = client:sendMessage({text = tdlua.ref(source, "id")})
         source = nil
         collectgarbage()
         collectgarbage()
@@ -825,10 +798,10 @@ void testRefOutlivesFuture(lua_State *L)
     lua_getglobal(L, "source_id");
     const auto source_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
     lua_pop(L, 1);
-    fake.respond(source_id, formattedText());
+    fake.respond(source_id, json{{"@type", "user"}, {"id", 42}});
     pumpAndRespond(L, fake, 1, json{{"@type", "ok"}});
     runLua(L, "assert(dependent:wait(5)._ == 'ok')");
-    require(fake.sent[1].request.value("text", "") == "Hello",
+    require(fake.sent[1].request.at("text") == 42,
             "a collected Future lost the projected result");
     finish(L);
 }
@@ -839,15 +812,13 @@ void testRefOutlivesFuture(lua_State *L)
 void testErrorDependencyFailsComposition(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
         user_id = user._request_id
-        formatted = client:execute({_ = "getTextEntities", text = "wait"})
+        formatted = client:execute({_ = "sendMessage", text = "wait"})
         formatted_id = formatted._request_id
-        dependent = client:execute({_ = "getTextEntities", text = "x",
+        dependent = client:execute({_ = "sendMessage", text = "x",
                                      a = user, b = formatted})
     )lua");
     lua_getglobal(L, "user_id");
@@ -881,8 +852,6 @@ void testCrossClientRejected(lua_State *L)
 {
     Fake fake;
     Fake other;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
-    other.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, "other = tdlua()");
     lua_getglobal(L, "other");
@@ -891,15 +860,15 @@ void testCrossClientRejected(lua_State *L)
     other_client->injectTransport(other.transport());
     lua_pop(L, 1);
     runLua(L, R"lua(
-        foreign = other:execute({_ = "getTextEntities", text = "x"})
+        foreign = other:execute({_ = "sendMessage", text = "x"})
         assert(foreign:ready() == false)
         local ok, err = pcall(function()
-            return client:getTextEntities({text = tdlua.ref(foreign, "text")})
+            return client:sendMessage({text = tdlua.ref(foreign, "text")})
         end)
         assert(ok == false, "a cross-client projection was accepted")
         assert(tostring(err):find("different client", 1, true), tostring(err))
         local ok2, err2 = pcall(function()
-            return client:execute({_ = "getTextEntities", text = "x",
+            return client:execute({_ = "sendMessage", text = "x",
                                     extra = foreign})
         end)
         assert(ok2 == false, "a cross-client Future was accepted")
@@ -931,7 +900,6 @@ void testCrossClientRejected(lua_State *L)
 void testTaskDependencyFailure(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getMe"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
         user = client:execute({_ = "getMe"})
@@ -968,12 +936,11 @@ void testTaskDependencyFailure(lua_State *L)
 void testNeverTerminalDependency(lua_State *L)
 {
     Fake fake;
-    fake.sync_by_type["getTextEntities"] = syncUnavailable();
     createClient(L, fake);
     runLua(L, R"lua(
-        source = client:execute({_ = "getTextEntities", text = "silent"})
+        source = client:execute({_ = "sendMessage", text = "silent"})
         local result, err = client:execute(
-            {_ = "getTextEntities", text = tdlua.ref(source, "text")}, 0.05)
+            {_ = "sendMessage", text = tdlua.ref(source, "text")}, 0.05)
         assert(result == nil and err == "timeout",
                tostring(result) .. " " .. tostring(err))
         -- Accepted limitation: the composition stays pending (its observer and
@@ -1009,7 +976,7 @@ void testScanDepthRejected(lua_State *L)
         local value = {leaf = "x"}
         for _ = 1, 120 do value = {next = value} end
         local ok, err = pcall(function()
-            return client:execute({_ = "getTextEntities", text = "deep",
+            return client:execute({_ = "sendMessage", text = "deep",
                                    nested = value})
         end)
         assert(ok == false, "a request beyond the scan bound was accepted")
@@ -1026,7 +993,7 @@ void testDeepRequest(lua_State *L)
 {
     Fake fake;
     fake.sync_by_type["parseTextEntities"] = formattedText();
-    fake.auto_reply.insert("getTextEntities");
+    fake.auto_reply.insert("sendMessage");
     createClient(L, fake);
     runLua(L, R"lua(
         source = client:execute({_ = "parseTextEntities", text = "*d*",
@@ -1035,7 +1002,7 @@ void testDeepRequest(lua_State *L)
         assert(source:ready() == true)
         local value = {leaf = tdlua.ref(source, "text")}
         for _ = 1, 40 do value = {next = value} end
-        dependent = client:getTextEntities({text = "deep", nested = value})
+        dependent = client:sendMessage({text = "deep", nested = value})
     )lua");
     runLua(L, "assert(dependent:wait(5)._ == 'ok')");
     require(fake.sent.size() == 1, "the deep request was not submitted once");

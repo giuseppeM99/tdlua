@@ -1,11 +1,11 @@
 -- Copyright (c) 2018-2026 Giuseppe Marino
 -- SPDX-License-Identifier: BSD-3-Clause
 --
--- D1-B: synchronous fast path for the managed execute() forms.
+-- D2-FIX: preventive classification for the managed execute() forms.
 --
 -- Runs against the production module, so the same script covers JSON and
--- native. Static requests are answered by TDLib itself; the fallback cases use
--- real asynchronous responses.
+-- native. TDLib itself answers the synchronous methods; methods it does not
+-- declare synchronous are submitted once and never probed.
 
 local module_dir = assert(arg[1], "the module directory is required")
 package.cpath = module_dir .. "/?.so;" .. package.cpath
@@ -60,9 +60,9 @@ local function no_duplicate_response(id, label)
     end
 end
 
--- 1. The two exact TDLib markers are visible on the raw synchronous API.
--- This is the contract the managed fast path relies on, verified on the
--- running binary rather than deduced from source.
+-- 1. The two exact TDLib markers are still what the raw executeSync API
+-- returns for a method it cannot run. The managed path does not rely on them:
+-- it classifies first, so these calls only document the explicit raw surface.
 local method_marker = client:executeSync({_ = "getMe"})
 assert_error(method_marker, "raw getMe", 400,
              "The method can't be executed synchronously")
@@ -163,8 +163,8 @@ client:execute({
     _ = "setLogVerbosityLevel", new_verbosity_level = before.verbosity_level
 }):wait()
 
--- 8. Fallback: getMe is not executable synchronously and must be submitted
--- exactly once, preserving the Future's original request id.
+-- 8. getMe is classified asynchronous: it must be submitted exactly once,
+-- preserving the Future's original request id, without a synchronous probe.
 local get_me = client:execute({_ = "getMe"})
 assert(get_me:ready() == false, "getMe must fall back to the asynchronous path")
 assert(has_async_work(), "fallback did not submit a managed request")
@@ -181,14 +181,14 @@ for _ = 1, 5 do
     end
 end
 
--- 9. Fallback: getOption(my_id) uses the second, distinct marker. Before
--- TDLib initialization the asynchronous request has no response, so this only
--- asserts the fallback decision and submission. It runs on its own client so
--- the pending Future cannot disturb the remaining cases.
+-- 9. getOption is classified by option name: my_id is asynchronous. Before
+-- TDLib initialization the request has no response, so this only asserts the
+-- classification and the single submission. It runs on its own client so the
+-- pending Future cannot disturb the remaining cases.
 local option_client = tdlua.new()
 local my_id = option_client:execute({_ = "getOption", name = "my_id"})
 assert(my_id:ready() == false,
-       "getOption(my_id) must fall back to the asynchronous path")
+       "getOption(my_id) must be submitted asynchronously")
 assert(type(option_client.pendingCount) ~= "function" or
        option_client.pendingCount(option_client) == 1,
        "getOption(my_id) fallback did not submit exactly one request")
@@ -273,8 +273,7 @@ local helper_version = client:getOption({name = "version"})
 assert(helper_version:ready() == true)
 assert(helper_version:wait().value == tdlua.tdlib_version)
 
--- Helper fallback keeps the original request and id (native rebuilds the
--- consumed C++ request from the Lua argument here).
+-- A helper with an asynchronous method keeps the original request and id.
 local helper_me = client:getMe()
 assert(helper_me:ready() == false)
 local helper_me_result = helper_me:wait()
