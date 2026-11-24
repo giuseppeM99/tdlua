@@ -18,9 +18,9 @@ source = {
 description = {
    summary = "Optional event-loop adapters for TDLua readiness",
    detailed = [[
-Pure-Lua driver and optional luv, cqueues and Copas adapters for the TDLua
+Pure-Lua driver and optional luv, cqueues, Copas and OpenResty adapters for the TDLua
 readiness surface. The TDLua core has no event-loop dependency. luv, cqueues,
-Copas and LuaSocket are optional runtime requirements of their adapters: each
+Copas, LuaSocket and OpenResty are optional requirements of their adapters: each
 adapter loads only its own event loop, in new(). The Copas bridge is a separate
 module and is never loaded by the core or by the luv/cqueues adapters.
 ]],
@@ -42,5 +42,6 @@ build = {
       ["tdlua_eventloop.copas"] = "tdlua_eventloop/copas.lua",
       ["tdlua_eventloop.copas_socket"] = "tdlua_eventloop/copas_socket.lua",
       ["tdlua_eventloop.copas_bridge"] = "tdlua_eventloop/copas_bridge.lua",
+      ["tdlua_eventloop.openresty"] = "tdlua_eventloop/openresty.lua",
    },
 }

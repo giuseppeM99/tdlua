@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: BSD-3-Clause
+name: OpenResty adapter gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openresty:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gperf ninja-build libpcre2-dev libssl-dev zlib1g-dev binutils ripgrep iproute2
+
+      - name: Identify the TDLib cache
+        id: td
+        run: |
+          printf 'commit=%s\n' "$(git -C td rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'gcc=%s\n' "$(g++ -dumpfullversion -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ${{ runner.temp }}/tdlua-native-bootstrap
+            ${{ runner.temp }}/tdlua-native-stage
+          key: tdlua-openresty-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.td.outputs.gcc }}-v2-${{ steps.td.outputs.commit }}-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+          restore-keys: |
+            tdlua-native-codegen-${{ runner.os }}-ubuntu-24.04-gcc-${{ steps.td.outputs.gcc }}-v2-${{ steps.td.outputs.commit }}-${{ hashFiles('td/CMakeLists.txt', 'td/td/generate/scheme/td_api.tl') }}
+
+      - name: Build OpenResty and both Release modules
+        env:
+          P2_TD_PREFIX: ${{ runner.temp }}/tdlua-native-stage
+          P2_CODEGEN: ${{ runner.temp }}/tdlua-native-bootstrap
+        run: tools/ci/prepare-openresty.sh "$RUNNER_TEMP/openresty-gate"
+
+      - name: Validate lifecycle and ABI
+        env:
+          P2_OPENRESTY: ${{ runner.temp }}/openresty-gate/openresty/bin/openresty
+          P2_LUA: ${{ runner.temp }}/openresty-gate/openresty/luajit/bin/luajit
+          P2_JSON_MODDIR: ${{ runner.temp }}/openresty-gate/json
+          P2_NATIVE_MODDIR: ${{ runner.temp }}/openresty-gate/native
+        run: |
+          tools/ci/openresty-gate.sh "$RUNNER_TEMP/openresty-evidence" runtime
+          export P2_HOST_NETNS
+          P2_HOST_NETNS=$(readlink /proc/self/ns/net)
+          sudo --preserve-env=P2_OPENRESTY,P2_JSON_MODDIR,P2_NATIVE_MODDIR,P2_HOST_NETNS \
+            unshare --net --setuid "$(id -u)" --setgid "$(id -g)" \
+            python3 tests/openresty/run.py database "$RUNNER_TEMP/openresty-evidence/database"
+
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openresty-gate
+          path: ${{ runner.temp }}/openresty-evidence
+          if-no-files-found: ignore

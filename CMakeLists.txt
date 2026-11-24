@@ -1822,6 +1822,13 @@ if(TDLUA_BUILD_TESTS)
         find_program(TDLUA_LUA_EXECUTABLE
             NAMES "lua${TDLUA_LUA_VERSION}" lua5.5 lua5.4 lua5.3 lua5.2 lua5.1 luajit lua)
     endif()
+    if(TDLUA_LUA_EXECUTABLE)
+        add_test(NAME tdlua_eventloop_openresty
+            COMMAND ${TDLUA_LUA_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/eventloop_openresty_test.lua"
+                "${CMAKE_CURRENT_SOURCE_DIR}")
+        set_tests_properties(tdlua_eventloop_openresty PROPERTIES TIMEOUT 20)
+    endif()
     if(TDLUA_LUA_EXECUTABLE AND TDLUA_USE_LUA51_CONTINUATION)
         add_test(NAME tdlua_lua51_backend
             COMMAND ${TDLUA_LUA_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua51_backend.lua"

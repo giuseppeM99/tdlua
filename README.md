@@ -424,6 +424,10 @@ driver, pump it in the host loop, or drain it before parking. The driver-level
 contract, including `stall_after` and `driver:progress()`, is in
 `tdlua_eventloop/README.md`.
 
+`tdlua_eventloop.openresty` is the optional HTTP OpenResty adapter.
+It uses a Lua adaptive timer and a request-scoped semaphore bridge. See
+[OpenResty setup and lifecycle](tdlua_eventloop/openresty.md).
+
 The versioned LuaRocks specifications live in `rockspecs/`; the optional
 `tdlua_eventloop` rock keeps the `tdlua >= 0.6.0` dependency and never adds an
 event-loop dependency to the core rock.

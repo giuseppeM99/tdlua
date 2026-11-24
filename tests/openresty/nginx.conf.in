@@ -1,0 +1,27 @@
+daemon off;
+master_process on;
+worker_processes @WORKERS@;
+worker_shutdown_timeout 700ms;
+pid nginx.pid;
+error_log error.log notice;
+env P2_PROFILE;
+env P2_DBROOT;
+events { worker_connections 1024; }
+http {
+    access_log off;
+    lua_code_cache on;
+    lua_check_client_abort on;
+    lua_package_path '@REPO@/?.lua;@TESTS@/?.lua;@REFERENCE@;;';
+    lua_package_cpath '@MODULE@/?.so;;';
+    init_worker_by_lua_block { require("app").start() }
+    exit_worker_by_lua_block { require("app").stop() }
+    server {
+        listen @LISTEN@;
+        location / {
+            rewrite_by_lua_block { require("app").phase() }
+            access_by_lua_block { require("app").phase() }
+            content_by_lua_block { require("app").serve() }
+            log_by_lua_block { require("app").cleanup() }
+        }
+    }
+}

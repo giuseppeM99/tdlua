@@ -692,6 +692,13 @@ driver rejects `add()`.
 - **One adapter per driver and one Copas coroutine.** Do not run two adapters
   on the same driver, and do not call `copas.loop()` from inside `run()`.
 
+## OpenResty adapter
+
+`tdlua_eventloop.openresty` drives a worker-local driver with an adaptive
+`ngx.timer.at` loop and waits on Future and Task completions through
+`ngx.semaphore`. See [the OpenResty guide](openresty.md) for the worker and
+request lifecycle, API and runnable offline example.
+
 ## Operational rules
 
 1. One poller/controller per VM owner. One adapter per driver.
