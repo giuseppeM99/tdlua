@@ -1016,8 +1016,8 @@ void testDeepRequest(lua_State *L)
 #if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
 int main()
 {
-    std::cout << "synchronous fast path disabled: classifier not verified\n";
-    return 0;
+    std::cout << "synchronous fast path disabled by configuration\n";
+    return 77;
 }
 #else
 int main()

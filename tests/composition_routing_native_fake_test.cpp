@@ -150,10 +150,9 @@ void testTerminalCompositionRoutes(lua_State *L)
     require(fake.sync_requests.size() == 1,
             "parseTextEntities was not executed exactly once");
     runLua(L, R"lua(
-        entities = client:execute({_ = "testReturnError",
-                                    error = {_ = "error", code = 400,
-                                             message = "composed"}})
-        assert(entities:ready() == false or entities:wait()._ == "error")
+        entities = client:execute({_ = "getTextEntities",
+                                    text = tdlua.ref(formatted, "text")})
+        assert(entities:ready() == false or entities:wait()._ == "textEntities")
     )lua");
     require(fake.sent.empty(), "a composed synchronous request was submitted");
     require(fake.sync_requests.size() == 2,
@@ -163,8 +162,8 @@ void testTerminalCompositionRoutes(lua_State *L)
     finish(L);
 }
 
-// 2. A pending asynchronous dependency never reaches executeSync, and the
-// dependent request is submitted once with the resolved value.
+// 2. An asynchronous dependent never reaches executeSync, before or after its
+// dependency resolves, and is submitted once with the resolved value.
 void testPendingCompositionRoutes(lua_State *L)
 {
     Fake fake;
@@ -203,15 +202,11 @@ void testPendingCompositionRoutes(lua_State *L)
 
 }  // namespace
 
-#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
-int main()
+// The asynchronous half needs no synchronous path and always runs; the
+// synchronous half is skipped only when the build disabled it.
+int main(int argc, char **argv)
 {
-    std::cout << "synchronous fast path disabled: classifier not verified\n";
-    return 0;
-}
-#else
-int main()
-{
+    const std::string mode = argc > 1 ? argv[1] : "all";
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
     int result = 0;
@@ -219,8 +214,18 @@ int main()
         luaopen_tdlua(L);
         lua_setglobal(L, "tdlua");
         lua_settop(L, 0);
-        testTerminalCompositionRoutes(L);
-        testPendingCompositionRoutes(L);
+        if (mode != "async") {
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+            std::cout << "synchronous fast path disabled by configuration\n";
+            lua_close(L);
+            return 77;
+#else
+            testTerminalCompositionRoutes(L);
+#endif
+        }
+        if (mode != "sync") {
+            testPendingCompositionRoutes(L);
+        }
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
@@ -228,4 +233,3 @@ int main()
     lua_close(L);
     return result;
 }
-#endif

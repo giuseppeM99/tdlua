@@ -172,7 +172,8 @@ void testTerminalDependency(lua_State *L)
                                     parse_mode = {_ = "textParseModeMarkdown",
                                                   version = 1}})
         assert(formatted:ready() == true)
-        entities = client:execute({_ = "getTextEntities", text = formatted})
+        entities = client:execute({_ = "getTextEntities",
+                                    text = tdlua.ref(formatted, "text")})
         assert(entities:ready() == true)
     )lua");
     require(fake.sent.empty(), "a composed synchronous request was submitted");
@@ -181,18 +182,13 @@ void testTerminalDependency(lua_State *L)
     require(fake.sync_requests[1].value("@type", "") == "getTextEntities",
             "executeSync received the wrong composed method");
     const json &text = fake.sync_requests[1].at("text");
-    require(text.value("@type", "") == "formattedText",
-            "the dependency was not materialized");
-    require(text.value("text", "") == "Hello",
-            "the dependency value was lost");
-    require(text.find("_request_id") == text.end(),
-            "managed request id leaked into the composed payload");
+    require(text == "Hello", "the projection did not reach executeSync");
     finish(L);
 }
 
-// 2. A pending asynchronous dependency does not probe and does not compose
-// early; the dependent request is submitted once when the dependency resolves.
-void testPendingDependency(lua_State *L)
+// 2. A pending dependency does not probe and does not compose early; when it
+// resolves, the synchronous dependent is executed exactly once.
+void testPendingSyncDependency(lua_State *L)
 {
     Fake fake = synchronousFake();
     createClient(L, fake);
@@ -265,46 +261,104 @@ void testFailedDependency(lua_State *L)
 void testMarkerIsNotARetry(lua_State *L)
 {
     Fake fake = synchronousFake();
+    fake.sync_by_type["getTextEntities"] =
+        json{{"@type", "error"},
+             {"code", 400},
+             {"message", "The method can't be executed synchronously"}};
     createClient(L, fake);
     runLua(L, R"lua(
         formatted = client:execute({_ = "parseTextEntities",
                                     text = "*Hello*",
                                     parse_mode = {_ = "textParseModeMarkdown",
                                                   version = 1}})
-        ok, err = pcall(function()
-            return client:execute({_ = "testReturnError",
-                                    error = {_ = "error", code = 400,
-                                             message = "x"}})
+        assert(formatted:ready() == true)
+        local ok, value = pcall(function()
+            return client:execute({_ = "getTextEntities",
+                                    text = tdlua.ref(formatted, "text")})
         end)
-        assert(ok == true)
+        local err = value
+        if ok then
+            -- A composed request reports through its Future.
+            local waited, wait_err = pcall(function() return value:wait() end)
+            assert(waited == false, "classifier drift was accepted")
+            err = wait_err
+        end
+        assert(tostring(err):find("classifier", 1, true), tostring(err))
         assert(client.pendingCount(client) == 0)
     )lua");
-    require(fake.sent.empty(), "the composed request was submitted");
-    closeClient(L);
+    require(fake.sent.empty(),
+            "classifier drift on a composed request was submitted");
+    require(fake.sync_calls == 2,
+            "classifier drift on a composed request was retried");
+    finish(L);
+}
+
+// 5. An asynchronous dependent never reaches executeSync, before or after its
+// dependency resolves, and is submitted exactly once.
+void testAsyncDependentRoutes(lua_State *L)
+{
+    Fake fake = synchronousFake();
+    createClient(L, fake);
+    runLua(L, R"lua(
+        user = client:execute({_ = "getMe"})
+        assert(user:ready() == false)
+        dependent = client:execute({_ = "sendMessage", chat_id = 1,
+                                     input_message_content = {
+                                         _ = "inputMessageText",
+                                         text = tdlua.ref(user, "id")}})
+        assert(dependent:ready() == false)
+        user_id = user._request_id
+    )lua");
+    require(fake.sync_calls == 0, "an asynchronous dependent reached executeSync");
+    require(fake.sent.size() == 1, "the source was not submitted exactly once");
+    lua_getglobal(L, "user_id");
+    const auto user_id = static_cast<std::uint64_t>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    json reply = {{"@type", "user"}, {"id", 42}};
+    reply["@extra"] = {{"__tdlua_request_id", user_id}};
+    fake.incoming.push_back(std::move(reply));
+    for (int i = 0; i < 20 && fake.sent.size() < 2; ++i) {
+        runLua(L, "client:poll(0.01)");
+    }
+    require(fake.sent.size() == 2,
+            "the dependent was not submitted exactly once");
+    require(fake.sync_calls == 0,
+            "the asynchronous dependent reached executeSync");
+    require(fake.sent[1].request.value("@type", "") == "sendMessage",
+            "the dependent payload has the wrong method");
+    require(fake.sent[1].request.at("input_message_content").at("text") == 42,
+            "the projection was not materialized");
     finish(L);
 }
 
 }  // namespace
 
-// The synchronous path is what this test observes; a build that disabled it
-// because the classifier could not be verified has nothing to check here.
-#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
-int main()
+// The suite has two halves. The asynchronous half needs no synchronous path and
+// always runs. The synchronous half is skipped only when the build disabled the
+// fast path; in a normal build a pending Future where an immediate answer is
+// expected is a regression and fails.
+int main(int argc, char **argv)
 {
-    std::cout << "synchronous fast path disabled: classifier not verified\n";
-    return 0;
-}
-#else
-int main()
-{
+    const std::string mode = argc > 1 ? argv[1] : "all";
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
     int result = 0;
     try {
-        testTerminalDependency(L);
-        testPendingDependency(L);
-        testFailedDependency(L);
-        testMarkerIsNotARetry(L);
+        if (mode != "async") {
+#if defined(TDLUA_DISABLE_SYNC_FAST_PATH)
+            std::cout << "synchronous fast path disabled by configuration\n";
+            lua_close(L);
+            return 77;
+#else
+            testTerminalDependency(L);
+            testPendingSyncDependency(L);
+            testMarkerIsNotARetry(L);
+#endif
+        }
+        if (mode != "sync") {
+            testAsyncDependentRoutes(L);
+            testFailedDependency(L);
+        }
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         result = 1;
@@ -312,4 +366,3 @@ int main()
     lua_close(L);
     return result;
 }
-#endif

@@ -48,10 +48,12 @@ foreach(_input IN ITEMS "${_sync_cpp}" "${_sync_h}" "${_option_cpp}")
     endif()
 endforeach()
 
-# 1. The complete body of is_synchronous_request(). Only one scaffold is
-#    accepted, and every non-case line must match it exactly: an upstream change
-#    of the return expressions, of the default branch or of an argument-dependent
-#    condition therefore fails instead of producing a plausible but wrong list.
+# 1. The complete body of is_synchronous_request(), matched as a whole.
+#
+#    The body is flattened to one line with single spaces, then reduced to its
+#    exact scaffold. Nothing but the case labels may vary, so an extra
+#    condition, a different return expression or a second default branch fails
+#    instead of producing a plausible but wrong method list.
 #
 #    Accepted body:
 #
@@ -65,13 +67,10 @@ endforeach()
 #        default:
 #          return false;
 #      }
-#
-#    The getOption case is the only case that does not return true, and only the
-#    default branch may return anything else.
-file(STRINGS "${_sync_cpp}" _sync_lines)
-set(_predicate "")
+file(STRINGS "${_sync_cpp}" _sync_body_lines)
+set(_sync_body "")
 set(_in_predicate FALSE)
-foreach(_line IN LISTS _sync_lines)
+foreach(_line IN LISTS _sync_body_lines)
     if(_line MATCHES "^bool SynchronousRequests::is_synchronous_request")
         set(_in_predicate TRUE)
         continue()
@@ -81,17 +80,11 @@ foreach(_line IN LISTS _sync_lines)
             set(_in_predicate FALSE)
             continue()
         endif()
-        # Blank lines would not survive as list elements, so they are dropped;
-        # every other statement must match exactly after stripping.
-        string(STRIP "${_line}" _stripped)
-        string(LENGTH "${_stripped}" _len)
-        if(_len GREATER 0)
-            list(APPEND _predicate "${_stripped}")
-        endif()
+        string(APPEND _sync_body " ${_line}")
     endif()
 endforeach()
 
-if(NOT _predicate)
+if(_sync_body STREQUAL "")
     message(FATAL_ERROR
             "is_synchronous_request() was not found in '${_sync_cpp}'; "
             "the classifier source layout changed")
@@ -106,140 +99,88 @@ macro(_classifier_fail_message reason)
             "tools/sync-classifier/generate_sync_classifier.cmake.")
 endmacro()
 
-set(_index 0)
-set(_count 0)
-foreach(_line IN LISTS _predicate)
-    math(EXPR _count "${_count} + 1")
+# Line wrapping and indentation are not semantic, so they are normalised; the
+# statements themselves must match exactly.
+string(REGEX REPLACE "[ \t\r\n]+" " " _sync_body "${_sync_body}")
+string(REGEX REPLACE "^ " "" _sync_body "${_sync_body}")
+string(REGEX REPLACE " $" "" _sync_body "${_sync_body}")
+string(REGEX REPLACE " ?([{}();:,*&]) ?" "\\1" _sync_body "${_sync_body}")
+string(REGEX REPLACE " ?-> ?" "->" _sync_body "${_sync_body}")
+
+set(_prefix "switch(function->get_id()){")
+set(_mid_tail "case td_api::getOption::ID:return OptionManager::is_synchronous_option(static_cast<const td_api::getOption*>(function)->name_);")
+set(_suffix "default:return false;}")
+
+if(NOT _sync_body MATCHES "^switch\\(function->get_id\\(\\)\\)\\{")
+    _classifier_fail_message(
+        "the predicate no longer starts with 'switch (function->get_id()) {', so "
+        "something runs before the classification: '${_sync_body}'")
+endif()
+string(LENGTH "${_prefix}" _prefix_length)
+string(SUBSTRING "${_sync_body}" ${_prefix_length} -1 _sync_body)
+string(LENGTH "${_suffix}" _suffix_length)
+string(LENGTH "${_sync_body}" _sync_body_length)
+math(EXPR _mid_length "${_sync_body_length} - ${_suffix_length}")
+if(_mid_length LESS 1)
+    _classifier_fail_message("the predicate is shorter than its scaffold")
+endif()
+string(SUBSTRING "${_sync_body}" ${_mid_length} -1 _sync_suffix)
+string(SUBSTRING "${_sync_body}" 0 ${_mid_length} _sync_mid)
+if(NOT _sync_suffix STREQUAL "${_suffix}")
+    _classifier_fail_message(
+        "the predicate no longer ends with 'default: return false; }': found "
+        "'${_sync_suffix}'")
+endif()
+
+# The getOption branch is the last case and the only conditional one.
+string(LENGTH "${_mid_tail}" _tail_length)
+string(LENGTH "${_sync_mid}" _mid_full_length)
+math(EXPR _cases_length "${_mid_full_length} - ${_tail_length}")
+if(_cases_length LESS 1)
+    _classifier_fail_message(
+        "the predicate has no method cases before the getOption branch")
+endif()
+string(SUBSTRING "${_sync_mid}" ${_cases_length} -1 _sync_tail)
+string(SUBSTRING "${_sync_mid}" 0 ${_cases_length} _sync_cases)
+if(NOT _sync_tail STREQUAL "${_mid_tail}")
+    _classifier_fail_message(
+        "the getOption branch is not the exact scaffold expression, or it is not "
+        "the last case: found '${_sync_tail}'")
+endif()
+
+# What is left is the method group: case labels followed by one return true.
+string(REGEX REPLACE "return true;$" "" _sync_cases "${_sync_cases}")
+if(_sync_cases MATCHES "return")
+    _classifier_fail_message(
+        "the method group contains a return other than one trailing "
+        "'return true;': '${_sync_cases}'")
+endif()
+
+string(REGEX MATCHALL "case td_api::[A-Za-z0-9_]+::ID:" _case_labels "${_sync_cases}")
+if(NOT _case_labels)
+    _classifier_fail_message("no method cases were found")
+endif()
+
+# Removing every recognised label must leave nothing behind, so an extra
+# statement cannot hide between the cases.
+set(_case_residue "${_sync_cases}")
+foreach(_label IN LISTS _case_labels)
+    string(REPLACE "${_label}" "" _case_residue "${_case_residue}")
+    string(REGEX REPLACE "^case td_api::([A-Za-z0-9_]+)::ID:$" "\\1" _case_name "${_label}")
+    list(APPEND _cases "${_case_name}")
 endforeach()
-
-if(NOT _index LESS _count)
-    _classifier_fail_message("empty body")
+if(NOT _case_residue STREQUAL "")
+    _classifier_fail_message(
+        "the method group contains unrecognised text: '${_case_residue}'")
 endif()
-list(GET _predicate ${_index} _line)
-if(NOT _line MATCHES "^switch[ \t]*\\([ \t]*function->get_id\\(\\)[ \t]*\\)[ \t]*\\{[ \t]*$")
-    _classifier_fail_message("the first statement is not 'switch (function->get_id()) {': '${_line}'")
-endif()
-math(EXPR _index "${_index} + 1")
 
-# The body is a flat token sequence. The method cases form one group that must
-# end with the only `return true;` in the predicate. The getOption case is
-# separate and returns an OptionManager call, and the default branch must
-# return false.
-set(_case_open FALSE)
-set(_cases "")
-set(_saw_true FALSE)
-set(_saw_get_option FALSE)
-set(_saw_default FALSE)
-set(_closed FALSE)
+list(SORT _cases)
+list(REMOVE_DUPLICATES _cases)
 
-while(_index LESS _count)
-    list(GET _predicate ${_index} _line)
-    math(EXPR _index "${_index} + 1")
-
-    # Blank lines are already gone; CMake lists drop them, but a stray empty
-    # element is still skipped so the scaffold check sees only statements.
-    if(NOT _line MATCHES "[^ \t]")
-        continue()
-    endif()
-
-    if(_closed)
-        _classifier_fail_message("unexpected trailing statement '${_line}'")
-    endif()
-
-    set(_line_is_case FALSE)
-    if(_line MATCHES "^case[ \t]+td_api::([A-Za-z0-9_]+)::ID:$")
-        # `_name` is also the loop variable of the generation step below, so it
-        # must not survive this block.
-        set(_case_name "${CMAKE_MATCH_1}")
-        if(_line MATCHES "^case[ \t]+td_api::getOption::ID:$")
-            if(_case_open)
-                _classifier_fail_message(
-                    "a case follows a case group that does not return true")
-            endif()
-            if(_saw_get_option)
-                _classifier_fail_message("getOption appears twice")
-            endif()
-            set(_saw_get_option TRUE)
-        else()
-            # Every method case belongs to the group that ends with return true.
-            if(_saw_true)
-                _classifier_fail_message(
-                    "method case '${_case_name}' follows 'return true;'")
-            endif()
-            set(_case_open TRUE)
-            list(APPEND _cases "${_case_name}")
-        endif()
-        set(_line_is_case TRUE)
-    endif()
-    if(_line_is_case)
-        continue()
-    endif()
-
-    if(_line MATCHES "^return true")
-        if(NOT _case_open)
-            _classifier_fail_message("'return true;' without a preceding case")
-        endif()
-        if(_saw_true)
-            _classifier_fail_message("a second 'return true;'")
-        endif()
-        set(_case_open FALSE)
-        set(_saw_true TRUE)
-        continue()
-    endif()
-
-    if(_line MATCHES "^return OptionManager::is_synchronous_option")
-        if(_saw_get_option)
-            continue()
-        endif()
-        _classifier_fail_message(
-            "an OptionManager::is_synchronous_option return without a getOption case")
-    endif()
-
-    if(_line MATCHES "^default:$")
-        if(_case_open)
-            _classifier_fail_message("a case has no return before the default branch")
-        endif()
-        if(NOT _saw_get_option)
-            _classifier_fail_message("the switch has no getOption case")
-        endif()
-        set(_saw_default TRUE)
-        continue()
-    endif()
-
-    if(_line MATCHES "^return false")
-        if(NOT _saw_default)
-            _classifier_fail_message(
-                "'return false;' outside the default branch")
-        endif()
-        continue()
-    endif()
-
-    if(_line MATCHES "^\\}$")
-        if(NOT _saw_default)
-            _classifier_fail_message("the switch has no default branch")
-        endif()
-        set(_closed TRUE)
-        continue()
-    endif()
-
-    _classifier_fail_message("unrecognised statement '${_line}'")
-endwhile()
-
-if(NOT _closed)
-    _classifier_fail_message("the switch is not closed")
-endif()
-if(_case_open)
-    _classifier_fail_message("the method case group does not end with 'return true;'")
-endif()
-if(NOT _saw_true)
-    _classifier_fail_message("the method case group never returns true")
-endif()
-if(NOT _saw_get_option)
-    _classifier_fail_message("the switch has no getOption case")
-endif()
-if(NOT _saw_default)
-    _classifier_fail_message("there is no default branch")
-endif()
+# getOption is synchronous only for its argument-dependent subset, and it does
+# have a handler, so it belongs to the comparison below.
+list(APPEND _cases "getOption")
+list(SORT _cases)
 
 # 2. Declared do_request overloads. Every synchronous method has exactly one;
 #    the generic template is not tied to a td_api type. If the switch and the
@@ -253,11 +194,6 @@ foreach(_line IN LISTS _header_lines)
     endif()
 endforeach()
 
-# getOption is synchronous only for its argument-dependent subset, but it does
-# have a handler, so it belongs to the comparison.
-list(APPEND _cases "getOption")
-list(SORT _cases)
-list(REMOVE_DUPLICATES _cases)
 list(SORT _overloads)
 list(REMOVE_DUPLICATES _overloads)
 
@@ -268,17 +204,15 @@ if(NOT _cases STREQUAL _overloads)
 endif()
 
 
-if(NOT _saw_get_option)
-    message(FATAL_ERROR
-            "is_synchronous_request() no longer special-cases getOption; the "
-            "option classifier must be reviewed")
-endif()
-
 # 3. Synchronous options of OptionManager::is_synchronous_option(). getOption
 #    depends on its argument, so the method list alone is not enough.
 file(STRINGS "${_option_cpp}" _option_lines)
+
+# The list itself, and the lookup that must be a membership test over it.
 set(_in_options FALSE)
 set(_options "")
+set(_in_lookup FALSE)
+set(_lookup_body "")
 foreach(_line IN LISTS _option_lines)
     if(_line MATCHES "get_synchronous_options\\(\\)")
         set(_in_options TRUE)
@@ -291,18 +225,7 @@ foreach(_line IN LISTS _option_lines)
         endforeach()
         set(_in_options FALSE)
     endif()
-endforeach()
 
-if(NOT _options)
-    message(FATAL_ERROR
-            "Could not read get_synchronous_options() from '${_option_cpp}'")
-endif()
-
-# The list alone does not prove the lookup: is_synchronous_option() must still
-# be a membership test over get_synchronous_options().
-set(_in_lookup FALSE)
-set(_saw_contains FALSE)
-foreach(_line IN LISTS _option_lines)
     if(_line MATCHES "^bool OptionManager::is_synchronous_option")
         set(_in_lookup TRUE)
         continue()
@@ -312,17 +235,35 @@ foreach(_line IN LISTS _option_lines)
             set(_in_lookup FALSE)
             continue()
         endif()
-        if(_line MATCHES "return[ \t]+td::contains\\([ \t]*get_synchronous_options\\(\\)[ \t]*,[ \t]*name[ \t]*\\);[ \t]*$")
-            set(_saw_contains TRUE)
-        endif()
+        string(APPEND _lookup_body " ${_line}")
     endif()
 endforeach()
 
-if(NOT _saw_contains)
+if(NOT _options)
     message(FATAL_ERROR
-            "OptionManager::is_synchronous_option() is no longer a membership "
-            "test over get_synchronous_options(); the option classifier must be "
-            "reviewed in '${_option_cpp}'.")
+            "Could not read get_synchronous_options() from '${_option_cpp}'")
+endif()
+
+if(_lookup_body STREQUAL "")
+    message(FATAL_ERROR
+            "OptionManager::is_synchronous_option() was not found in "
+            "'${_option_cpp}'")
+endif()
+
+string(REGEX REPLACE "[ \t\r\n]+" " " _lookup_body "${_lookup_body}")
+string(REGEX REPLACE "^ " "" _lookup_body "${_lookup_body}")
+string(REGEX REPLACE " $" "" _lookup_body "${_lookup_body}")
+string(REGEX REPLACE " ?([{}();:,*&]) ?" "\\1" _lookup_body "${_lookup_body}")
+
+# The whole body must be the membership test: a conditional return before it
+# would change the classification while leaving the list intact.
+set(_expected_lookup
+    "return td::contains(get_synchronous_options(),name);")
+if(NOT _lookup_body STREQUAL "${_expected_lookup}")
+    message(FATAL_ERROR
+            "OptionManager::is_synchronous_option() is no longer exactly "
+            "'${_expected_lookup}'.\nFound: '${_lookup_body}'\n"
+            "The option classifier must be reviewed in '${_option_cpp}'.")
 endif()
 
 list(SORT _options)

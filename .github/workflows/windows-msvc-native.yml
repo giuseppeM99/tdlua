@@ -557,7 +557,7 @@ jobs:
           $testManifest = ($testList -join "`n") | ConvertFrom-Json
           $testNames = @($testManifest.tests | ForEach-Object { $_.name })
           $testNames | Sort-Object | Set-Content .ci\windows-msvc-native\ctest-test-names.txt
-          # Native Windows registers 75 tests: the Linux native baseline plus the
+          # Native Windows registers 76 tests: the Linux native baseline plus the
           # platform-specific tdlua_windows_residency and the readiness tests.
           $expected = @(
             'tdlua_core_anchor_ownership', 'tdlua_managed_routing_oom',
@@ -569,7 +569,8 @@ jobs:
             'tdlua_retention_policy_poc', 'tdlua_codec', 'tdlua_managed_adapter',
             'tdlua_common_router', 'tdlua_hardening_common', 'tdlua_managed_driver_common',
             'tdlua_composition_native_fake', 'tdlua_composition_sync_path',
-            'tdlua_composition_routing_native_fake',
+            'tdlua_composition_routing_native_fake_sync',
+            'tdlua_composition_routing_native_fake_async',
             'tdlua_local_future_completion',
             'tdlua_sync_execute_fast_path',
             'tdlua_sync_execute_native_metamethod',
@@ -599,7 +600,7 @@ jobs:
           if ($delta) {
             $delta | Format-Table -AutoSize | Out-String |
               Tee-Object -FilePath .ci\windows-msvc-native\ctest-manifest-delta.log
-            throw "Native CTest manifest differs from the expected 75-test set; actual=$($testNames.Count)"
+            throw "Native CTest manifest differs from the expected 76-test set; actual=$($testNames.Count)"
           }
           "Native CTest manifest enumerated: $($testNames.Count) tests matching the expected set." |
             Set-Content .ci\windows-msvc-native\ctest-manifest-verdict.txt
@@ -639,8 +640,15 @@ jobs:
           }
           $passedPercent = [int]$runSummary.Groups[1].Value
           $totalCount = [int]$runSummary.Groups[3].Value
-          if ($passedPercent -ne 100 -or $failedCount -ne 0 -or $totalCount -ne 75) {
-            throw 'The native CTest suite did not report 75/75: inspect ctest-full.log'
+          if ($passedPercent -ne 100 -or $failedCount -ne 0 -or $totalCount -ne 76) {
+            throw 'The native CTest suite did not report 76/76: inspect ctest-full.log'
+          }
+          # A skipped suite means the synchronous classifier was disabled. This
+          # build links the pinned TDLib it was generated from, so a skip is a
+          # regression.
+          $skippedCount = [regex]::Matches($summary, '\*\*\*Skipped').Count
+          if ($skippedCount -gt 0) {
+            throw "The native CTest suite skipped $skippedCount tests; the fast path must be enabled"
           }
           # Repeated runs are the gate, not a single sample. A flake is recorded
           # in its log and classified; the gate is never muted for it.

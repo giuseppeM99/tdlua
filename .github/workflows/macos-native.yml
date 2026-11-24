@@ -556,6 +556,14 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/tdlua-native-test-build" --output-on-failure -j2 \
             2>&1 | tee "$RUNNER_TEMP/tdlua-native-artifacts/ctest.log"
 
+          # The fast path is part of what this build ships. A skipped suite
+          # would mean the classifier was disabled, so treat it as a failure.
+          if grep -q "The following tests did not run" "$RUNNER_TEMP/tdlua-artifacts/ctest.log"; then
+            echo "CTest skipped suites in a build that must run them"
+            grep -A20 "The following tests did not run" "$RUNNER_TEMP/tdlua-artifacts/ctest.log"
+            exit 1
+          fi
+
       - name: Repeat native receiver, lifecycle, release, and residency tests
         if: always() && steps.test-build.outcome == 'success'
         shell: bash

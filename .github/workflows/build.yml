@@ -827,6 +827,11 @@ jobs:
           ctest --test-dir build-aarch64-native --output-on-failure --timeout 180 \
             2>&1 | tee .ci/aarch64-validation/native-ctest.log
 
+          if grep -q "The following tests did not run" ".ci/aarch64-validation/native-ctest.log"; then
+            echo "CTest skipped suites in a build that must run them"
+            exit 1
+          fi
+
       - name: Repeat native lifecycle and receiver tests
         run: |
           set -euo pipefail
@@ -957,6 +962,11 @@ jobs:
           set -euo pipefail
           ctest --test-dir build-aarch64-json --output-on-failure --timeout 180 \
             2>&1 | tee .ci/aarch64-validation/json-ctest.log
+
+          if grep -q "The following tests did not run" ".ci/aarch64-validation/json-ctest.log"; then
+            echo "CTest skipped suites in a build that must run them"
+            exit 1
+          fi
 
       - name: Repeat JSON lifecycle and receiver tests
         run: |
@@ -1301,7 +1311,17 @@ jobs:
           fi
 
       - name: Run regression tests
-        run: ctest --test-dir build --output-on-failure -R '^tdlua_'
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -R '^tdlua_' 2>&1 | tee ctest.log
+          # A skipped suite means the synchronous classifier was disabled, which
+          # this build must not do: it links the pinned TDLib it was generated
+          # from.
+          if grep -q "The following tests did not run" ctest.log; then
+            echo "CTest skipped suites in a build that must run them"
+            grep -A20 "The following tests did not run" ctest.log
+            exit 1
+          fi
 
       - name: Check Lua examples
         run: luac${{ matrix.lua }} -p examples/luajit.lua
@@ -1401,7 +1421,12 @@ jobs:
             -DLUA_INCLUDE_DIR="$RUNNER_TEMP/lua55/include" \
             -DLUA_LIBRARY="$RUNNER_TEMP/lua55/lib/liblua.a"
           cmake --build build
-          ctest --test-dir build --output-on-failure -R '^tdlua_'
+          ctest --test-dir build --output-on-failure -R '^tdlua_' 2>&1 | tee ctest-lua55.log
+          if grep -q "The following tests did not run" ctest-lua55.log; then
+            echo "CTest skipped suites in a build that must run them"
+            grep -A20 "The following tests did not run" ctest-lua55.log
+            exit 1
+          fi
           if ldd build/tdlua.so 2>/dev/null | grep -q 'libtdjson'; then
             echo "tdlua.so unexpectedly depends on shared libtdjson"
             exit 1

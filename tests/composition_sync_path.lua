@@ -14,13 +14,20 @@ local tdlua = require "tdlua"
 tdlua.setLogLevel(0)
 local client = tdlua()
 
--- A build that cannot verify the classifier for the linked TDLib disables the
--- managed fast path; this script exists to observe it.
-local probe = client:execute({_ = "getOption", name = "version"})
-if probe:ready() == false then
-    probe:wait(0.5)
-    io.write("synchronous fast path disabled: classifier not verified\n")
+-- The build states whether the managed fast path is enabled: a disabled path
+-- is a configuration, while an enabled build that stays pending is a routing
+-- regression and must fail below.
+local fast_path_state = arg[2] or "enabled"
+if fast_path_state == "disabled" then
+    local pending = client:execute({_ = "getOption", name = "version"})
+    assert(pending:ready() == false,
+           "the fast path was disabled but a managed request ran synchronously")
+    pending:wait(0.5)
+    io.write("synchronous fast path disabled by configuration\n")
     os.exit(77)
+elseif fast_path_state ~= "enabled" then
+    io.stderr:write("unknown fast path state: " .. tostring(fast_path_state) .. "\n")
+    os.exit(1)
 end
 
 local function assert_td_object(value, label)

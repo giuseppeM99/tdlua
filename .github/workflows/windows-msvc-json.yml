@@ -429,7 +429,8 @@ jobs:
             'tdlua_hardening_fake', 'tdlua_handler_only_prefilter', 'tdlua_handler_mutation',
             'tdlua_managed_driver', 'tdlua_m5_conformance', 'tdlua_simple_bot_example',
             'tdlua_composition_fake', 'tdlua_composition_sync_path',
-            'tdlua_composition_routing_fake',
+            'tdlua_composition_routing_fake_sync',
+            'tdlua_composition_routing_fake_async',
             'tdlua_local_future_completion',
             'tdlua_sync_execute_fake', 'tdlua_sync_execute_fast_path',
             'tdlua_sync_execute_owner_error',
@@ -456,7 +457,7 @@ jobs:
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the expected 81-test set; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the expected 82-test set; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency', 'tdlua_readiness_core', 'tdlua_backend_readiness')
@@ -517,6 +518,15 @@ jobs:
           }
           if ($notRunCount -gt 0) {
             $diagnosis += "Full CTest reported $notRunCount not-run tests."
+          }
+          # A skipped suite means the synchronous classifier was disabled. This
+          # build links the pinned TDLib the classifier was generated from, so a
+          # skip is a regression, not a configuration.
+          $skippedCount = [regex]::Matches($fullLog, '\*\*\*Skipped').Count
+          if ($skippedCount -gt 0) {
+            $diagnosis += "Full CTest reported $skippedCount skipped tests."
+            $diagnosis | Add-Content .ci\windows-msvc\ctest-full-diagnostic.txt
+            throw "Full CTest skipped $skippedCount tests; the fast path must be enabled"
           }
           $diagnosis | Add-Content .ci\windows-msvc\ctest-full-diagnostic.txt
 
