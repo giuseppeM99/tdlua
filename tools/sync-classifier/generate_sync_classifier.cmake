@@ -27,6 +27,10 @@
 # Builds verify the committed headers against the pinned sources; see the
 # `synchronous request classifier` block in CMakeLists.txt.
 
+# Run as a script: this sets the policy baseline so IN_LIST below is the new
+# operator on every supported CMake version, not only on recent defaults.
+cmake_minimum_required(VERSION 3.10)
+
 if(NOT DEFINED TDLIB_SOURCE_DIR OR TDLIB_SOURCE_DIR STREQUAL "")
     message(FATAL_ERROR "TDLIB_SOURCE_DIR is required")
 endif()
