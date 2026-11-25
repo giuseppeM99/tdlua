@@ -906,6 +906,27 @@ void testLuaReadinessArguments()
 
 } // namespace
 
+#if defined(TDLUA_TEST_BACKEND_NATIVE)
+// The native backend formats an unsolicited update with td_api::to_string()
+// when the client has at least one registered handler type, so retention can
+// be decided. Report the cost of that formatting.
+void handlerClassificationCost()
+{
+    auto object = td::td_api::make_object<td::td_api::updateAuthorizationState>(
+        td::td_api::make_object<td::td_api::authorizationStateWaitTdlibParameters>());
+    const int iterations = 20000;
+    std::size_t bytes = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i)
+        bytes += td::td_api::to_string(object).size();
+    const double ns = std::chrono::duration<double, std::nano>(
+                          std::chrono::steady_clock::now() - start).count() /
+                      iterations;
+    std::cout << "native_handler_classification_ns_per_update,to_string=" << ns
+              << ",bytes_per_update=" << bytes / iterations << '\n';
+}
+#endif
+
 int main()
 {
     std::cout.setf(std::ios::unitbuf);
@@ -917,6 +938,9 @@ int main()
 #endif
               << ") ==\n";
     try {
+#if defined(TDLUA_TEST_BACKEND_NATIVE)
+        handlerClassificationCost();
+#endif
         {
             LuaState lua;
             lua.run("deadline_owner = tdlua()");

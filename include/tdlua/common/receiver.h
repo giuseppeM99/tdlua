@@ -760,16 +760,18 @@ template <class Value> class Runtime {
     // True when retention for this client can be decided by a handler type,
     // so a backend must classify an unsolicited envelope before publishing it.
     //
-    // A handler-only consumer or a handler subscription selects by type; a
-    // generic consumer or a generic subscription alone preserves everything.
-    // The decision ignores the other interests on purpose: classification
-    // runs before publication and takes the runtime mutex at a different
-    // time, so a generic interest that disappears in between must not cost
-    // the envelope its type. The price is one extra classification when
-    // another interest would have preserved the envelope anyway: the object
-    // is formatted, and a matching handler update beside a generic consumer
-    // then follows the existing selected-handler retention rule instead of
-    // taking a generic capacity/TTL ticket.
+    // A registered handler type is itself a retention interest, even without a
+    // handler-only consumer: an update of that type must survive a gap between
+    // driving calls when another demand keeps the worker reading. A
+    // subscription handler selects by type; a generic consumer or a generic
+    // subscription alone preserves everything. The decision ignores the other
+    // interests on purpose: classification runs before publication and takes
+    // the runtime mutex at a different time, so a generic interest that
+    // disappears in between must not cost the envelope its type. The price is
+    // one extra classification when another interest would have preserved the
+    // envelope anyway: the object is formatted, and a matching handler update
+    // beside a generic consumer then follows the existing selected-handler
+    // retention rule instead of taking a generic capacity/TTL ticket.
     bool needsHandlerType(int id) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -777,7 +779,8 @@ template <class Value> class Runtime {
         if (found == entries_.end()) return false;
         const auto& entry = found->second;
         return entry.handler_only_consumers != 0 ||
-               entry.subscription_handlers != 0;
+               entry.subscription_handlers != 0 ||
+               !entry.handler_types.empty();
     }
 
     // Classifies an unsolicited envelope through describe() when the
@@ -1299,9 +1302,16 @@ template <class Value> class Runtime {
                     !item.event_type.empty() && !selected_handler_update &&
                     !request_id && !terminal &&
                     entry.lifecycle_demands == 0;
+                // A type registered with on() is retained even when no driver or
+                // consumer is active: another demand can keep the shared worker
+                // reading, and a gap between driving calls must not lose the
+                // update. The handler-only prefilter above still applies.
+                const bool handler_retained_update =
+                    !selected_handler_update && handler_registered && unsolicited;
                 const bool preserve = request_id != 0 || terminal ||
                     entry.lifecycle_demands != 0 || driver_active ||
                     generic_consumer || selected_handler_update ||
+                    handler_retained_update ||
                     (subscription_only && subscription_generic && unsolicited);
                 if (handler_filter) {
                     ++stats_.dropped_unsolicited;

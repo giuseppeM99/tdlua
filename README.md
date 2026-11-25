@@ -178,7 +178,16 @@ end
 ```
 
 `receive()` returns raw responses and updates. Responses expose `_request_id`;
-updates do not.
+updates do not. `on(type, handler)` is a persistent interest in `type`: an
+update of that type is retained even when it arrives while no `receive()`,
+`poll()` or `loop()` is running, as long as something keeps the shared receiver
+reading (a pending request, another client's call, or a readiness lease).
+`on()` alone creates no transport demand, so drive the client to dispatch
+retained updates. Retention is decided when the update is published: an update
+already discarded before `on(type)` is never replayed, and an update read while
+no handler existed is not classified, so a later registration does not retain
+it. Unsolicited updates of unregistered types for a client with no active
+consumer may still be discarded.
 
 ### Completion observers
 

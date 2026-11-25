@@ -3,6 +3,26 @@
 
 # Changelog
 
+## Unreleased
+
+### Handler update retention
+
+- `on(type, callback)` now retains unsolicited updates of registered types even
+  while no `receive`, `poll` or `loop` call is active, when another demand (for
+  example a pending managed request, another client's call, or a readiness
+  lease) keeps the shared worker reading. Such an update could previously be
+  dropped before the next driving call, including `updateAuthorizationState`.
+  The change is limited to registered types: unregistered unsolicited updates
+  still follow the existing inactive-client policy, and `on()` still creates no
+  transport demand or generic retention.
+- `off(type)` stops the interest for later updates only. Retention is
+  linearized at the publication decision: an envelope whose type is already
+  known is retained when `on(type)` lands before that decision, while an update
+  that was already discarded is never replayed. An envelope whose
+  classification was skipped because no handler existed is not retained by a
+  later registration. Retention stays per client and per type, and the
+  destructive handler-only `loop()` prefilter is unchanged.
+
 ## 0.6.3
 
 ### Future composition and synchronous fast path

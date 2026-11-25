@@ -135,18 +135,22 @@ struct Fixture {
 
 void testPredicate()
 {
-    std::cout << "H1  handler-only subscription requires classification\n";
+    std::cout << "H1  handler registration and subscription require classification\n";
     Fixture fixture;
+    check(!fixture.engine->needsHandlerType(fixture.client),
+          "no handler needs no classification");
     check(fixture.engine->setHandlerRegistered(fixture.client, "updateProbe", true),
           "handler type registered");
-    check(fixture.engine->setSubscriptionInterest(fixture.client, true, false),
-          "subscription handler interest");
     auto lease = fixture.engine->acquireWatch(fixture.client);
     check(fixture.engine->needsHandlerType(fixture.client),
-          "generic=false subscription needs the event type");
+          "a registered handler type needs the event type without a consumer");
     check(!fixture.engine->needsHandlerType(fixture.client + 999),
           "unknown client needs nothing");
 
+    check(fixture.engine->setSubscriptionInterest(fixture.client, true, false),
+          "subscription handler interest");
+    check(fixture.engine->needsHandlerType(fixture.client),
+          "generic=false subscription needs the event type");
     check(fixture.engine->setSubscriptionInterest(fixture.client, true, true),
           "generic subscription interest added");
     check(fixture.engine->needsHandlerType(fixture.client),
@@ -158,8 +162,13 @@ void testPredicate()
 
     check(fixture.engine->setSubscriptionInterest(fixture.client, false, false),
           "handler-only subscription removed");
+    check(fixture.engine->needsHandlerType(fixture.client),
+          "the registered handler type still needs classification");
+
+    check(fixture.engine->setHandlerRegistered(fixture.client, "updateProbe", false),
+          "handler type removed");
     check(!fixture.engine->needsHandlerType(fixture.client),
-          "no classification without handler-only interest");
+          "no classification without handler registration or subscription");
 
     check(fixture.engine->setConsumerInterest(fixture.client, true, true),
           "traditional consumer interest");
@@ -250,7 +259,7 @@ void testNoHandlerMeansNoRetention()
 
 void testDisableStopsRetention()
 {
-    std::cout << "H5  disabling the interest stops retention\n";
+    std::cout << "H5  disabling every interest stops retention\n";
     Fixture fixture;
     check(fixture.engine->setHandlerRegistered(fixture.client, "updateProbe", true),
           "handler type registered");
@@ -259,6 +268,10 @@ void testDisableStopsRetention()
     auto lease = fixture.engine->acquireWatch(fixture.client);
     check(fixture.engine->setSubscriptionInterest(fixture.client, false, false),
           "subscription removed");
+    check(fixture.engine->needsHandlerType(fixture.client),
+          "the registered handler keeps classification after the subscription");
+    check(fixture.engine->setHandlerRegistered(fixture.client, "updateProbe", false),
+          "handler type unregistered");
     check(!fixture.engine->needsHandlerType(fixture.client),
           "classification no longer required");
     fixture.source->push(fixture.client, 10);
@@ -269,7 +282,7 @@ void testDisableStopsRetention()
           }, 5000),
           "worker processed the update");
     check(fixture.engine->stats().published == 0,
-          "no retention after the interest is gone");
+          "no retention after the interests are gone");
     lease.release();
 }
 
@@ -292,10 +305,12 @@ void testRefcount()
           "second subscription keeps classification");
     check(fixture.engine->setSubscriptionInterest(fixture.client, false, false),
           "second subscription removed");
-    check(!fixture.engine->needsHandlerType(fixture.client),
-          "no classification with the refcount at zero");
+    check(fixture.engine->needsHandlerType(fixture.client),
+          "the registered handler keeps classification at refcount zero");
     check(fixture.engine->setHandlerRegistered(fixture.client, "updateProbe", false),
           "handler type unregistered");
+    check(!fixture.engine->needsHandlerType(fixture.client),
+          "no classification without any handler interest");
     lease.release();
 }
 

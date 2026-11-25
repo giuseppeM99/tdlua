@@ -157,7 +157,10 @@ class RetentionBuffer {
         const ConsumerMode mode = modes_[event.client];
         if (event.kind == EventKind::Update) {
             if (!mode.generic_consumers) {
-                const bool selected = mode.handler_only_loops &&
+                // A registered type is retained even without a consumer; the
+                // handler-only loop filter and the inactive-client drop share
+                // this PoC's prefilter counter.
+                const bool selected =
                     mode.handlers.find(event.type) != mode.handlers.end();
                 if (!selected) {
                     ++stats_[event.client].prefilter_dropped;
@@ -359,8 +362,10 @@ void testConditionalPrefilterAndLinearization()
     no_driver.handlers.insert("updateNewMessage"); // on() only
     buffer.setMode(3, no_driver);
     buffer.publish(update(3, 1, "updateNewMessage"), zero);
-    require(buffer.depth(3) == 0 && buffer.stats(3).prefilter_dropped == 1,
-            "handler registration alone created retention");
+    buffer.publish(update(3, 2, "updateOption"), zero);
+    require(buffer.depth(3) == 1 && buffer.sequences(3)[0] == 1 &&
+                buffer.stats(3).prefilter_dropped == 1,
+            "on() retained only its registered type without a consumer");
 
     // setMode and publish share the fake runtime mutex. The mode at the
     // publish/classification critical section is the linearization point.

@@ -194,6 +194,215 @@ void createClients(lua_State *L)
     runLua(L, "c = tdlua(); d = tdlua()");
 }
 
+void testRegisteredHandlerRetentionWithoutConsumer(lua_State *L)
+{
+    createClients(L);
+    lua_getglobal(L, "c");
+    auto *client = static_cast<TDLua *>(tdlua_binding::get_client(L));
+    if (!client) throw std::runtime_error("missing JSON runtime test client");
+    const std::int32_t client_id = client->clientIdForTesting();
+    lua_pop(L, 1);
+
+    JsonRuntime &runtime = JsonRuntime::instance();
+    const auto before_registration = runtime.stats();
+    runLua(L,
+           "handler_seen={}; "
+           "c:on('updateNewMessage', function(update) "
+           " handler_seen[#handler_seen+1]=update.value end)");
+    const auto registered = runtime.stats();
+    if (registered.consumer_interests != before_registration.consumer_interests ||
+        registered.handler_only_consumers != before_registration.handler_only_consumers ||
+        registered.driver_demands != before_registration.driver_demands)
+        throw std::runtime_error("on() created consumer interest without a driver");
+
+    // Another client's one-shot keeps the shared worker reading. The update
+    // for A arrives while A has no receive/poll in progress: its registered
+    // type must be retained for the next driving call.
+    const auto before = runtime.stats();
+    if (!tdlua_json_test_control(0))
+        throw std::runtime_error("could not pause receiver source for handler retention");
+    try {
+        runLua(L, "assert(d:receive(0) == nil)");
+        if (!tdlua_json_test_control(2))
+            throw std::runtime_error("receiver did not enter the paused source");
+        runtime.injectReceivedForTesting(
+            client_id, json{{"@type", "updateNewMessage"}, {"value", 41}});
+        if (!tdlua_json_test_control(1))
+            throw std::runtime_error("could not release receiver source");
+        if (!runtime.waitForClassifiedForTesting(
+                before.published + before.dropped_unsolicited + 1,
+                std::chrono::seconds(2)))
+            throw std::runtime_error("receiver did not classify the registered update");
+    } catch (...) {
+        tdlua_json_test_control(1);
+        throw;
+    }
+    const auto after = runtime.stats();
+    if (after.received != before.received + 1 ||
+        after.published != before.published + 1 ||
+        after.dropped_unsolicited != before.dropped_unsolicited ||
+        after.handler_only_consumers != before.handler_only_consumers)
+        throw std::runtime_error(
+            "a registered handler update was dropped without an active consumer");
+
+    // loop() drains the retained update through its handler; off() inside the
+    // handler is what gives the handler-only loop an exit condition.
+    runLua(L,
+           "c:on('updateNewMessage', function(update) "
+           " handler_seen[#handler_seen+1]=update.value; "
+           " c:off('updateNewMessage') end); "
+           "c:loop(); assert(#handler_seen==1 and handler_seen[1]==41)");
+    std::cout << "scenario=handler_retention_without_consumer retained=1 "
+                 "dispatched=1\n";
+}
+
+void testRegisteredHandlerRetentionDrivingPaths(lua_State *L)
+{
+    createClients(L);
+    lua_getglobal(L, "c");
+    auto *client = static_cast<TDLua *>(tdlua_binding::get_client(L));
+    if (!client) throw std::runtime_error("missing JSON runtime test client");
+    const std::int32_t client_id = client->clientIdForTesting();
+    lua_pop(L, 1);
+    JsonRuntime &runtime = JsonRuntime::instance();
+
+    // A readiness lease on d is a continuous watch demand: the worker keeps
+    // reading, so the test can pause the source deterministically without
+    // relying on a one-shot from a client whose queue may still hold updates.
+    // It creates no consumer interest, so client c stays inactive.
+    runLua(L, "driver_box=d:readiness()");
+
+    auto injectWhileReading = [&](const char *stage, const char *type, int value) {
+        const auto before = runtime.stats();
+        if (!tdlua_json_test_control(0))
+            throw std::runtime_error("could not pause receiver source");
+        try {
+            if (!tdlua_json_test_control(2))
+                throw std::runtime_error(std::string("receiver did not enter the paused "
+                                                    "source: ") + stage);
+            runtime.injectReceivedForTesting(
+                client_id, json{{"@type", type}, {"value", value}});
+            if (!tdlua_json_test_control(1))
+                throw std::runtime_error("could not release receiver source");
+            if (!runtime.waitForClassifiedForTesting(
+                    before.published + before.dropped_unsolicited + 1,
+                    std::chrono::seconds(2)))
+                throw std::runtime_error(std::string("receiver did not classify: ") + stage);
+        } catch (...) {
+            tdlua_json_test_control(1);
+            throw;
+        }
+        return runtime.stats();
+    };
+
+    runLua(L,
+           "handler_seen={}; "
+           "c:on('updateNewMessage', function(update) "
+           " handler_seen[#handler_seen+1]=update.value end)");
+
+    // poll() and receive() must each dispatch a retained update exactly once.
+    // Bounded driving loops keep the assertion independent from unrelated
+    // background events the shared runtime may also have queued.
+    injectWhileReading("poll", "updateNewMessage", 51);
+    runLua(L, "for _=1,50 do if #handler_seen>=1 then break end c:poll(0) end; "
+              "assert(#handler_seen==1 and handler_seen[1]==51)");
+    injectWhileReading("receive", "updateNewMessage", 52);
+    runLua(L, "for _=1,50 do if #handler_seen>=2 then break end c:receive(0) end; "
+              "assert(#handler_seen==2 and handler_seen[2]==52)");
+
+    // Client c's own readiness lease is a driving demand by itself: the same
+    // retention must not depend on another client's call.
+    runLua(L, "rd=c:readiness()");
+    injectWhileReading("readiness", "updateNewMessage", 54);
+    runLua(L, "for _=1,50 do if #handler_seen>=3 then break end c:poll(0) end; "
+              "assert(#handler_seen==3 and handler_seen[3]==54); "
+              "for _=1,5 do c:poll(0) end; assert(#handler_seen==3); "
+              "rd:close(); driver_box:close()");
+    std::cout << "scenario=handler_retention_paths poll=1 receive=1 "
+                 "readiness=1 no_double_delivery=1\n";
+}
+
+void testRegisteredHandlerRetentionMetrics(lua_State *L)
+{
+    createClients(L);
+    lua_getglobal(L, "c");
+    auto *client = static_cast<TDLua *>(tdlua_binding::get_client(L));
+    if (!client) throw std::runtime_error("missing JSON runtime test client");
+    const std::int32_t client_id = client->clientIdForTesting();
+    lua_pop(L, 1);
+    JsonRuntime &runtime = JsonRuntime::instance();
+
+    runLua(L, "driver_box=d:readiness()");
+    // Let the real client finish its startup traffic, then take a quiet
+    // baseline: from here the shared worker only sees what the test injects.
+    runLua(L, "for _=1,40 do d:receive(0) end; for _=1,40 do c:receive(0) end");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    runLua(L, "for _=1,40 do d:receive(0) end; for _=1,40 do c:receive(0) end");
+
+    runLua(L,
+           "handler_seen=0; "
+           "c:on('updateNewMessage', function() handler_seen=handler_seen+1 end)");
+
+    const int retained = 50, dropped = 50;
+    auto injectBatch = [&](const char *type, int count) {
+        const auto before = runtime.stats();
+        if (!tdlua_json_test_control(0) || !tdlua_json_test_control(2))
+            throw std::runtime_error("could not pause receiver source");
+        try {
+            for (int i = 0; i < count; ++i)
+                runtime.injectReceivedForTesting(
+                    client_id, json{{"@type", type}, {"value", i}});
+        } catch (...) {
+            tdlua_json_test_control(1);
+            throw;
+        }
+        if (!tdlua_json_test_control(1))
+            throw std::runtime_error("could not release receiver source");
+        if (!runtime.waitForClassifiedForTesting(
+                before.published + before.dropped_unsolicited + count,
+                std::chrono::seconds(10)))
+            throw std::runtime_error("batch did not finish classification");
+        return std::make_pair(before, runtime.stats());
+    };
+
+    // Registered updates accumulate while no consumer drives the client.
+    const auto retained_run = injectBatch("updateNewMessage", retained);
+    const std::size_t depth_while_idle = retained_run.second.depth;
+    runLua(L, "for _=1,400 do if handler_seen>=50 then break end c:poll(0) end; "
+              "assert(handler_seen==50)");
+    const auto after_drain = runtime.stats();
+
+    // Unregistered updates on the same idle client follow the existing policy.
+    const auto dropped_run = injectBatch("updateDeleteMessage", dropped);
+    runLua(L, "for _=1,50 do c:poll(0) end; assert(handler_seen==50)");
+    const auto after_unregistered = runtime.stats();
+
+    runLua(L, "c:close(); for _=1,20 do if c:isClosed() then break end c:poll(0.05) end; "
+              "assert(c:isClosed()); driver_box:close(); collectgarbage('collect')");
+    const auto after_close = runtime.stats();
+
+    std::cout << "scenario=handler_retention_metrics"
+              << ",retained_injected=" << retained
+              << ",retained_published="
+              << (retained_run.second.published - retained_run.first.published)
+              << ",mailbox_depth_while_idle=" << depth_while_idle
+              << ",dispatched=" << 50
+              << ",mailbox_depth_after_drain=" << after_drain.depth
+              << ",unregistered_injected=" << dropped
+              << ",unregistered_dropped="
+              << (dropped_run.second.dropped_unsolicited -
+                  dropped_run.first.dropped_unsolicited)
+              << ",mailbox_depth_after_unregistered=" << after_unregistered.depth
+              << ",clients_after_close=" << after_close.clients << '\n';
+
+    if (retained_run.second.published - retained_run.first.published <
+            static_cast<std::uint64_t>(retained) ||
+        dropped_run.second.dropped_unsolicited - dropped_run.first.dropped_unsolicited <
+            static_cast<std::uint64_t>(dropped) ||
+        after_drain.depth != 0)
+        throw std::runtime_error("retention metrics did not match the policy");
+}
+
 void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
 {
     createClients(L);
@@ -218,8 +427,9 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         throw std::runtime_error("on() created consumer interest without a driver");
 
     // A one-shot receive by B can acquire an unsolicited update for A while
-    // A only has a registered handler. Hold the source until the update is
-    // queued so the worker's classification point is deterministic.
+    // A only has a registered handler. An unregistered type is still dropped
+    // for that inactive client. Hold the source until the update is queued so
+    // the worker's classification point is deterministic.
     const auto before_inactive = runtime.stats();
     if (!tdlua_json_test_control(0))
         throw std::runtime_error("could not pause receiver source for inactive-client test");
@@ -228,7 +438,7 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         if (!tdlua_json_test_control(2))
             throw std::runtime_error("receiver did not enter the paused source");
         runtime.injectReceivedForTesting(
-            client_id, json{{"@type", "updateNewMessage"}, {"value", 11}});
+            client_id, json{{"@type", "updateDeleteMessage"}, {"value", 11}});
         if (!tdlua_json_test_control(1))
             throw std::runtime_error("could not release receiver source");
         if (!runtime.waitForClassifiedForTesting(
@@ -245,7 +455,8 @@ void testHandlerOnlyPrefilterThroughBinding(lua_State *L)
         after_inactive.dropped_unsolicited != before_inactive.dropped_unsolicited + 1 ||
         after_inactive.handler_only_consumers != before_inactive.handler_only_consumers)
         throw std::runtime_error(
-            "an update acquired for an inactive client was not dropped exactly once");
+            "an unregistered update acquired for an inactive client was not "
+            "dropped exactly once");
 
     const auto before_handler_only = runtime.stats();
     runtime.injectReceivedForTesting(
@@ -2554,6 +2765,12 @@ int main(int argc, char **argv)
         if (argc > 1 && std::string(argv[1]) == "--hardening-only") {
             testTaskCloseOwnership();
             testHardening();
+        } else if (argc > 1 && std::string(argv[1]) == "--handler-retention-metrics") {
+            testRegisteredHandlerRetentionMetrics(L);
+        } else if (argc > 1 && std::string(argv[1]) == "--handler-retention-paths") {
+            testRegisteredHandlerRetentionDrivingPaths(L);
+        } else if (argc > 1 && std::string(argv[1]) == "--handler-retention-retained") {
+            testRegisteredHandlerRetentionWithoutConsumer(L);
         } else if (argc > 1 && std::string(argv[1]) == "--handler-only-prefilter") {
             testHandlerOnlyPrefilterThroughBinding(L);
         } else if (argc > 1 && std::string(argv[1]) == "--handler-mutation-only") {

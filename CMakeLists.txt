@@ -1509,6 +1509,12 @@ if(TDLUA_BUILD_TESTS)
         target_link_libraries(tdlua_fake_client_test PRIVATE tdlua ${LUA_LIBRARIES})
         tdlua_enable_sanitizers(tdlua_fake_client_test)
         add_test(NAME tdlua_fake_client COMMAND tdlua_fake_client_test)
+        add_test(NAME tdlua_handler_retention_paths
+                 COMMAND tdlua_fake_client_test --handler-retention-paths)
+        add_test(NAME tdlua_handler_retention_retained
+                 COMMAND tdlua_fake_client_test --handler-retention-retained)
+        add_test(NAME tdlua_handler_retention_metrics
+                 COMMAND tdlua_fake_client_test --handler-retention-metrics)
         add_test(NAME tdlua_terminal_shutdown
                  COMMAND tdlua_fake_client_test --terminal-close-only)
         add_test(NAME tdlua_harness_cleanup COMMAND tdlua_fake_client_test --harness-failure-only)

@@ -900,18 +900,22 @@ static void handlerOnlyPrefilterAndResponseClassification()
     auto generic_demand = engine.acquireDriver(2);
     const auto inactive_before = engine.stats();
     source->push(1, 10, false, 0, "updateNewMessage");
+    source->push(1, 11, false, 0, "updateDeleteMessage");
     source->push(2, 20, false, 0, "updateDeleteMessage");
-    check(engine.waitForReceived(inactive_before.received + 2, Ms(2000)) &&
+    check(engine.waitForReceived(inactive_before.received + 3, Ms(2000)) &&
               engine.waitForClassified(inactive_before.published +
-                                           inactive_before.dropped_unsolicited + 2,
+                                           inactive_before.dropped_unsolicited + 3,
                                        Ms(2000)),
           "shared worker did not classify inactive and generic client updates");
     auto inactive_stats = engine.stats();
     Item item;
-    check(box->stats().depth == 0 && generic_box->stats().depth == 1 &&
+    check(box->stats().depth == 1 && generic_box->stats().depth == 1 &&
               inactive_stats.dropped_by_handler_filter == 0 &&
               inactive_stats.dropped_unsolicited == 1,
-          "handler registration without a driver retained an inactive client's update");
+          "handler registration without a driver lost its selected update or "
+          "retained an unregistered one");
+    check(box->tryPop(item) == Pop::Item && item.value == 10,
+          "handler registration did not retain its selected update");
     check(generic_box->tryPop(item) == Pop::Item && item.value == 20,
           "generic client did not retain its unsolicited update independently");
     check(engine.setConsumerInterest(2, false, true),
@@ -1327,6 +1331,262 @@ static void handlerMetadataLinearizesAtPublication()
     engine.detachOwner(owner);
 }
 
+static void handlerRetentionSurvivesDemandEndingBeforePublication()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool arrived = false;
+    bool proceed = false;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        arrived = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return proceed; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    // on() registers the type but creates no consumer interest.
+    check(engine.setHandlerRegistered(1, "updateAuthorizationState", true),
+          "handler registration failed");
+    auto demand = engine.acquireDriver(1);
+    const auto before = engine.stats();
+    source->push(1, 10, false, 0, "updateAuthorizationState");
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return arrived; }),
+              "worker did not reach the publication gate");
+    }
+    // The driving request completes while the update is still in publish():
+    // the worker read it under the client's demand, so the registered type
+    // must survive the demand release for the next driving call.
+    demand.release();
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        proceed = true;
+        gate_changed.notify_all();
+    }
+    check(engine.waitForReceived(before.received + 1, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 1,
+                                       Ms(2000)),
+          "update did not finish publication");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 10 &&
+              item.event_type == "updateAuthorizationState",
+          "registered handler update was lost when its demand ended before publication");
+    check(engine.stats().dropped_unsolicited == before.dropped_unsolicited,
+          "registered handler update was counted as unsolicited");
+    engine.detachOwner(owner);
+}
+
+static void handlerRetentionIsPerTypeAndPerClient()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    const auto a_box = engine.createClient(owner, [] { return 1; }).second;
+    const auto b_box = engine.createClient(owner, [] { return 2; }).second;
+    // A registers two types; B registers a different one. Neither has a
+    // consumer; B's driver is the only reason the worker keeps reading.
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true) &&
+              engine.setHandlerRegistered(1, "updateOption", true) &&
+              engine.setHandlerRegistered(2, "updateDeleteMessages", true),
+          "handler registration failed");
+    auto demand = engine.acquireDriver(2);
+    const auto before = engine.stats();
+    source->push(1, 10, false, 0, "updateNewMessage");
+    source->push(1, 11, false, 0, "updateDeleteMessages");
+    source->push(1, 12, false, 0, "updateOption");
+    source->push(2, 20, false, 0, "updateDeleteMessages");
+    check(engine.waitForReceived(before.received + 4, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 4,
+                                       Ms(2000)),
+          "worker did not classify the four updates");
+    const auto after = engine.stats();
+    check(after.dropped_unsolicited == before.dropped_unsolicited + 1 &&
+              a_box->stats().depth == 2 && b_box->stats().depth == 1,
+          "per-type retention kept an unregistered type or lost a registered one");
+    Item item;
+    check(a_box->tryPop(item) == Pop::Item && item.value == 10 &&
+              a_box->tryPop(item) == Pop::Item && item.value == 12 &&
+              a_box->tryPop(item) == Pop::Timeout,
+          "client A did not retain exactly its two registered types in FIFO order");
+    check(b_box->tryPop(item) == Pop::Item && item.value == 20,
+          "client B did not receive its own type");
+    demand.release();
+    check(engine.waitForIdle(Ms(2000)), "per-type retention probe leaked demand");
+    engine.detachOwner(owner);
+}
+
+static void handlerRegistrationAfterSkippedClassificationIsNotReplayed()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool arrived = false;
+    bool proceed = false;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        arrived = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return proceed; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    const auto other_box = engine.createClient(owner, [] { return 2; }).second;
+    check(!engine.needsHandlerType(1),
+          "classification is required before any handler exists");
+    // Another client's driver keeps the worker reading. Client 1 has no demand.
+    auto demand = engine.acquireDriver(2);
+    const auto before = engine.stats();
+    // The source reads client 1's envelope before the handler exists, so it does
+    // not classify it: event_type stays empty. Registering the type afterwards
+    // must not resurrect that already-read update.
+    source->push(1, 5);
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return arrived; }),
+              "worker did not reach the publication gate");
+    }
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true),
+          "late handler registration failed");
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        proceed = true;
+        gate_changed.notify_all();
+    }
+    check(engine.waitForClassified(before.published + before.dropped_unsolicited + 1,
+                                   Ms(2000)),
+          "unclassified envelope did not finish publication");
+    check(box->stats().depth == 0 && other_box->stats().depth == 0 &&
+              engine.stats().published == before.published,
+          "registration after classification retroactively retained the update");
+
+    // From now on the type is classified and retained.
+    const auto second = engine.stats();
+    source->push(1, 6, false, 0, "updateNewMessage");
+    check(engine.waitForClassified(second.published + second.dropped_unsolicited + 1,
+                                   Ms(2000)),
+          "classified envelope did not finish publication");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 6,
+          "the registered type was not retained after the registration point");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
+static void handlerRegistrationBeforePublicationRetainsTypedEnvelope()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool arrived = false;
+    bool proceed = false;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        arrived = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return proceed; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    engine.createClient(owner, [] { return 2; });
+    auto demand = engine.acquireDriver(2);
+    const auto before = engine.stats();
+    // A backend that always classifies (the JSON backend sets @type on every
+    // object) fills event_type before publication. Retention is linearized at
+    // the publication decision, so a registration that lands before it must
+    // retain the envelope even though no handler existed when it was read.
+    source->push(1, 7, false, 0, "updateNewMessage");
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return arrived; }),
+              "worker did not reach the publication gate");
+    }
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true),
+          "registration before publication failed");
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        proceed = true;
+        gate_changed.notify_all();
+    }
+    check(engine.waitForClassified(before.published + before.dropped_unsolicited + 1,
+                                   Ms(2000)),
+          "typed envelope did not finish publication");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 7,
+          "registration before the publication decision did not retain the typed envelope");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
+static void handlerRetentionSurvivesCloseUntilDrained()
+{
+    auto source = std::make_shared<Fake>();
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool arrived = false;
+    bool proceed = false;
+    Engine::Hooks hooks;
+    hooks.before_publish = [&](const Item &) {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        arrived = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return proceed; });
+    };
+    Engine engine(source, Ms(5), std::move(hooks));
+    FailureCleanup ledger;
+    ledger.registerClient(1);
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    check(engine.setHandlerRegistered(1, "updateAuthorizationState", true),
+          "handler registration failed");
+    auto demand = engine.acquireDriver(1);
+    const auto before = engine.stats();
+    source->push(1, 7, false, 0, "updateAuthorizationState");
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        check(gate_changed.wait_for(lock, Ms(2000), [&] { return arrived; }),
+              "worker did not reach the publication gate");
+    }
+    // The driving request ends while the update is being published.
+    demand.release();
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        proceed = true;
+        gate_changed.notify_all();
+    }
+    check(engine.waitForClassified(before.published + before.dropped_unsolicited + 1,
+                                   Ms(2000)),
+          "registered update did not finish publication");
+    check(box->stats().depth == 1,
+          "registered update was dropped when its demand ended at publication");
+
+    // Close arrives while the retained update is still queued: the terminal
+    // must not discard it, and the owner drains both in FIFO order.
+    check(engine.admitSend(ledger, 1, true, 401), "close admission failed");
+    ledger.endSend(1, true, true);
+    engine.endSend(1, true, 401, true);
+    source->push(1, 0, true);
+    check(engine.waitForState(State::Running, Ms(1000)) &&
+              engine.waitForIdle(Ms(2000)),
+          "terminal did not retire the lifecycle demand");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 7 &&
+              !item.terminal,
+          "close discarded the retained handler update");
+    check(box->tryPop(item) == Pop::Item && item.terminal &&
+              box->tryPop(item) == Pop::Closed,
+          "terminal did not follow the retained update exactly once");
+    engine.detachOwner(owner);
+}
+
 static void lifecycleDemandAndConcurrentLeases()
 {
     auto source = std::make_shared<Fake>();
@@ -1496,6 +1756,36 @@ static void idleStopJoinAndRestart()
           "restarted worker did not deliver response");
     restarted.release();
     check(engine.waitForIdle(Ms(2000)), "restarted worker failed to return to idle");
+    engine.detachOwner(owner);
+}
+
+static void handlerClassificationOverhead()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    const int iterations = 200000;
+    auto measure = [&]() {
+        const auto start = Clock::now();
+        for (int i = 0; i < iterations; ++i) {
+            Envelope<int> item;
+            item.client = 1;
+            engine.classifyForRetention(1, item, [] {
+                return std::string("updateNewMessage { id = 1 }");
+            });
+        }
+        const auto elapsed = std::chrono::duration<double, std::nano>(
+                                 Clock::now() - start).count();
+        return elapsed / iterations;
+    };
+    const double without_handler = measure();
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true),
+          "classification benchmark registration failed");
+    const double with_handler = measure();
+    std::cout << "handler_classification_ns_per_update,without_handler="
+              << without_handler << ",with_handler=" << with_handler
+              << ",added=" << (with_handler - without_handler) << '\n';
     engine.detachOwner(owner);
 }
 
@@ -1721,6 +2011,11 @@ int main(int argc, char **argv)
         rawSendDoesNotKeepReceiveDemandAndLateManagedStaysProtected();
         boundedGenericBuffer();
         handlerMetadataLinearizesAtPublication();
+        handlerRetentionSurvivesDemandEndingBeforePublication();
+        handlerRetentionIsPerTypeAndPerClient();
+        handlerRegistrationAfterSkippedClassificationIsNotReplayed();
+        handlerRegistrationBeforePublicationRetainsTypedEnvelope();
+        handlerRetentionSurvivesCloseUntilDrained();
         lifecycleDemandAndConcurrentLeases();
         detachedOwnerPreservesCloseLifecycle();
         receiveLeaseEndsBeforeDispatch();
@@ -1739,6 +2034,7 @@ int main(int argc, char **argv)
         check(box.tryPop(item) == Pop::Item && *item.value == 9, "move-only payload");
         if (argc > 1)
             metrics();
+        handlerClassificationOverhead();
         std::cout << "PASS common receiver lifecycle / FIFO / concurrency / failure / queue-only\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
