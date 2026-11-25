@@ -68,6 +68,11 @@ public:
         return engine_.setHandlerRegistered(client_id, type,
                                             tdlua_native::type_id(type), active);
     }
+    bool releaseHandlerRegistration(td::ClientManager::ClientId client_id,
+                                    const std::string &type) noexcept
+    {
+        return engine_.releaseHandlerRegistration(client_id, type);
+    }
     Engine &engine() { return engine_; }
     const std::shared_ptr<tdlua::receiver::ReadinessHub<NativeResponse>> &hub() const
     {

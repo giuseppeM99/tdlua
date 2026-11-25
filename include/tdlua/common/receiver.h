@@ -756,6 +756,44 @@ template <class Value> class Runtime {
     {
         return updateHandlerRegistration(id, type, type_id, active);
     }
+    // Shared, allocation-free release of one reference for a name. Used by the
+    // atomic update path on its copies and by releaseHandlerRegistration on
+    // the live maps, so both implement the same refcount and id-association
+    // rules. Returns false when the name has no live reference.
+    static bool releaseHandlerEntry(std::map<std::string, unsigned> &types,
+                                    std::map<std::int32_t, unsigned> &ids,
+                                    std::map<std::string, std::int32_t> &by_name,
+                                    const std::string &type) noexcept
+    {
+        auto registration = types.find(type);
+        if (registration == types.end() || registration->second == 0)
+            return false;
+        auto known = by_name.find(type);
+        if (known != by_name.end()) {
+            auto by_id = ids.find(known->second);
+            if (by_id != ids.end()) {
+                if (by_id->second > 1) --by_id->second;
+                else ids.erase(by_id);
+            }
+        }
+        if (registration->second > 1) {
+            --registration->second;
+        } else {
+            types.erase(registration);
+            by_name.erase(type);
+        }
+        return true;
+    }
+    // handler_types is the authoritative refcount per name. handler_type_ids
+    // mirrors it per numeric id and handler_type_id_by_name remembers the id
+    // learned for a name, so a textual off() releases a numeric registration
+    // and vice versa. The invariant is
+    //   handler_type_ids[i] == number of active registrations whose name is
+    //   mapped to i
+    // for every id present, and a name is mapped only while it is active.
+    //
+    // The whole update works on copies: an allocation failure leaves the
+    // client's registration state untouched.
     bool updateHandlerRegistration(int id, const std::string &type,
                                    std::int32_t type_id, bool active)
     {
@@ -763,38 +801,55 @@ template <class Value> class Runtime {
         auto found = entries_.find(id);
         if (found == entries_.end() || found->second.terminal) return false;
         Entry &entry = found->second;
-        std::int32_t effective = type_id;
-        if (effective == 0) {
-            auto known = entry.handler_type_id_by_name.find(type);
-            if (known != entry.handler_type_id_by_name.end())
-                effective = known->second;
-        }
+        std::map<std::string, unsigned> types = entry.handler_types;
+        std::map<std::int32_t, unsigned> ids = entry.handler_type_ids;
+        std::map<std::string, std::int32_t> by_name = entry.handler_type_id_by_name;
         if (active) {
             // Refcounted: two independent views (or a Lua handler plus a
             // C++ host) may register the same type and unsubscribe
             // independently.
-            ++entry.handler_types[type];
-            if (effective != 0) {
-                ++entry.handler_type_ids[effective];
-                entry.handler_type_id_by_name[type] = effective;
+            auto known = by_name.find(type);
+            if (known != by_name.end()) {
+                // The first learned association wins; a later registration
+                // with a different id for the same name keeps the old one.
+                ++types[type];
+                ++ids[known->second];
+            } else if (type_id != 0) {
+                // Learn the association and cover registrations that arrived
+                // before it was known.
+                by_name.emplace(type, type_id);
+                unsigned &count = types[type];
+                ++count;
+                ids[type_id] += count;
+            } else {
+                ++types[type];
             }
         } else {
-            auto registration = entry.handler_types.find(type);
-            if (registration != entry.handler_types.end()) {
-                if (registration->second > 1) --registration->second;
-                else {
-                    entry.handler_types.erase(registration);
-                    entry.handler_type_id_by_name.erase(type);
-                }
-            }
-            if (effective != 0) {
-                auto by_id = entry.handler_type_ids.find(effective);
-                if (by_id != entry.handler_type_ids.end()) {
-                    if (by_id->second > 1) --by_id->second;
-                    else entry.handler_type_ids.erase(by_id);
-                }
-            }
+            releaseHandlerEntry(types, ids, by_name, type);
         }
+        entry.handler_types.swap(types);
+        entry.handler_type_ids.swap(ids);
+        entry.handler_type_id_by_name.swap(by_name);
+        ++generation_;
+        changed_.notify_all();
+        return true;
+    }
+    // Allocation-free release of one registration reference, used by the Lua
+    // binding for off() and for rolling back a receiver registration whose Lua
+    // handler failed to publish. Unlike updateHandlerRegistration it does not
+    // copy the maps, so std::bad_alloc cannot leave the receiver with interest
+    // for a handler that was never installed. It mirrors the inactive branch:
+    // one reference of the name is released and the learned id association is
+    // dropped when the last reference goes away. Safe on an absent name.
+    bool releaseHandlerRegistration(int id, const std::string &type) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = entries_.find(id);
+        if (found == entries_.end() || found->second.terminal) return false;
+        Entry &entry = found->second;
+        if (!releaseHandlerEntry(entry.handler_types, entry.handler_type_ids,
+                                 entry.handler_type_id_by_name, type))
+            return false;
         ++generation_;
         changed_.notify_all();
         return true;
@@ -1340,9 +1395,19 @@ template <class Value> class Runtime {
                 const bool handler_consumer = entry.handler_only_consumers != 0;
                 const bool subscription_generic = entry.subscription_generic != 0;
                 const bool subscription_handler = entry.subscription_handlers != 0;
-                bool handler_registered =
-                    entry.handler_types.find(item.event_type) !=
-                    entry.handler_types.end();
+                bool handler_registered = false;
+                if (!item.event_type.empty()) {
+                    handler_registered =
+                        entry.handler_types.find(item.event_type) !=
+                        entry.handler_types.end();
+                } else if (item.event_type_id == 0) {
+                    // A genuinely untyped envelope keeps the old behaviour for
+                    // an empty-name registration; a numerically classified one
+                    // must not match it.
+                    handler_registered =
+                        entry.handler_types.find(std::string()) !=
+                        entry.handler_types.end();
+                }
                 if (!handler_registered && item.event_type_id != 0)
                     handler_registered =
                         entry.handler_type_ids.find(item.event_type_id) !=

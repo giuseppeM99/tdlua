@@ -1,7 +1,9 @@
 #include "tdlua/common/receiver.h"
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,45 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
+
+namespace {
+// Failure injection for the registration state machine: only the calling
+// thread is affected, so the receiver worker keeps allocating normally.
+thread_local long allocation_fail_after = -1;
+}  // namespace
+
+void *operator new(std::size_t size)
+{
+    if (allocation_fail_after == 0) throw std::bad_alloc();
+    if (allocation_fail_after > 0) --allocation_fail_after;
+    if (void *pointer = std::malloc(size ? size : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void *operator new[](std::size_t size)
+{
+    return operator new(size);
+}
+
+void operator delete(void *pointer) noexcept
+{
+    std::free(pointer);
+}
+
+void operator delete[](void *pointer) noexcept
+{
+    std::free(pointer);
+}
+
+void operator delete(void *pointer, std::size_t) noexcept
+{
+    std::free(pointer);
+}
+
+void operator delete[](void *pointer, std::size_t) noexcept
+{
+    std::free(pointer);
+}
 
 using namespace tdlua::receiver;
 using Clock = std::chrono::steady_clock;
@@ -1466,6 +1507,250 @@ static void handlerRegistrationOverloadsStaySymmetric()
     engine.detachOwner(owner);
 }
 
+// A registration that throws std::bad_alloc must leave the client exactly as
+// it was: no partial refcount that would later keep an update retained. The
+// failure index walks every allocation site of the update.
+static void handlerRegistrationFailureIsAtomic()
+{
+    constexpr std::int32_t option_id = 42;
+    const std::string type = "updateOption";
+
+    for (int fail_after = 0; fail_after < 16; ++fail_after) {
+        // Case 1: a textual registration already exists, so the map copies in
+        // updateHandlerRegistration allocate before the id is learned.
+        {
+            auto source = std::make_shared<Fake>();
+            Engine engine(source, Ms(5));
+            const auto owner = engine.attachOwner();
+            engine.createClient(owner, [] { return 1; });
+            check(engine.setHandlerRegistered(1, type, true),
+                  "textual registration failed");
+            bool completed = false;
+            allocation_fail_after = fail_after;
+            try {
+                completed = engine.setHandlerRegistered(1, type, option_id, true);
+            } catch (const std::bad_alloc &) {
+            }
+            allocation_fail_after = -1;
+            if (!completed) {
+                check(engine.setHandlerRegistered(1, type, option_id, true),
+                      "registration after a failed one failed");
+            }
+            // Whatever happened, the same number of offs must leave no
+            // interest: a partially applied refcount would survive.
+            check(engine.setHandlerRegistered(1, type, option_id, false),
+                  "numeric off failed");
+            check(engine.setHandlerRegistered(1, type, false),
+                  "textual off failed");
+            Envelope<int> probe;
+            probe.client = 1;
+            engine.classifyForRetentionId(1, probe, option_id);
+            check(probe.event_type_id == 0,
+                  "a failed registration left partial interest");
+            engine.detachOwner(owner);
+        }
+        // Case 2: no prior registration, so an exception before the final
+        // swap must leave no handler interest at all.
+        {
+            auto source = std::make_shared<Fake>();
+            Engine engine(source, Ms(5));
+            const auto owner = engine.attachOwner();
+            engine.createClient(owner, [] { return 1; });
+            bool completed = false;
+            allocation_fail_after = fail_after;
+            try {
+                completed = engine.setHandlerRegistered(1, type, option_id, true);
+            } catch (const std::bad_alloc &) {
+            }
+            allocation_fail_after = -1;
+            Envelope<int> probe;
+            probe.client = 1;
+            engine.classifyForRetentionId(1, probe, option_id);
+            if (completed) {
+                check(probe.event_type_id == option_id,
+                      "a completed registration created no interest");
+                check(engine.setHandlerRegistered(1, type, option_id, false),
+                      "numeric off failed");
+            } else {
+                check(probe.event_type_id == 0,
+                      "a failed first registration left partial interest");
+            }
+            engine.detachOwner(owner);
+        }
+    }
+}
+
+// The binding releases receiver interest through the allocation-free path on
+// off() and when a Lua handler fails to publish. Armed allocation failure must
+// not prevent the release nor leave interest behind.
+static void handlerReleaseIsAllocationFree()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    constexpr std::int32_t option_id = 42;
+    const std::string type = "updateOption";
+
+    check(engine.setHandlerRegistered(1, type, true),
+          "textual registration failed");
+    check(engine.setHandlerRegistered(1, type, option_id, true),
+          "numeric registration failed");
+
+    for (int release = 0; release < 2; ++release) {
+        bool threw = false;
+        bool released = false;
+        allocation_fail_after = 0;
+        try {
+            released = engine.releaseHandlerRegistration(1, type);
+        } catch (...) {
+            threw = true;
+        }
+        allocation_fail_after = -1;
+        check(!threw && released,
+              "handler release allocated while freeing a reference");
+        Envelope<int> probe;
+        probe.client = 1;
+        engine.classifyForRetentionId(1, probe, option_id);
+        check(probe.event_type_id == (release == 0 ? option_id : 0),
+              "handler release left the wrong residual interest");
+    }
+    engine.detachOwner(owner);
+}
+
+// The mixed sequence must survive publication, not only classification: the
+// update of the residual registration has to reach the mailbox while a demand
+// on another client keeps the worker reading.
+static void residualHandlerInterestSurvivesPublish()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    engine.createClient(owner, [] { return 2; });
+    constexpr std::int32_t option_id = 42;
+    const std::string type = "updateOption";
+
+    check(engine.setHandlerRegistered(1, type, true) &&
+              engine.setHandlerRegistered(1, type, option_id, true) &&
+              engine.setHandlerRegistered(1, type, option_id, false),
+          "mixed registration sequence failed");
+    auto demand = engine.acquireDriver(2);
+    const auto before = engine.stats();
+    source->push(1, 10, false, 0, {}, option_id);
+    check(engine.waitForReceived(before.received + 1, Ms(2000)) &&
+              engine.waitForClassified(
+                  before.published + before.dropped_unsolicited + 1, Ms(2000)),
+          "the residual registration update was not processed");
+    check(engine.stats().dropped_unsolicited == before.dropped_unsolicited &&
+              box->stats().depth == 1,
+          "the residual registration lost its update at publication");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 10,
+          "the residual registration update was not delivered");
+
+    check(engine.releaseHandlerRegistration(1, type),
+          "release of the residual registration failed");
+    const auto removed = engine.stats();
+    source->push(1, 11, false, 0, {}, option_id);
+    check(engine.waitForClassified(
+              removed.published + removed.dropped_unsolicited + 1, Ms(2000)),
+          "post-release update was not classified");
+    check(engine.stats().dropped_unsolicited ==
+              removed.dropped_unsolicited + 1 &&
+              box->stats().depth == 0,
+          "release left retention interest behind");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
+static void handlerRegistrationSequenceKeepsResidualInterest()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    constexpr std::int32_t option_id = 42;
+
+    // Textual on(), numeric on(), numeric off(): one registration remains and
+    // it must keep the numeric interest, even though the first on() could not
+    // know the id yet.
+    check(engine.setHandlerRegistered(1, "updateOption", true),
+          "textual registration failed");
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "numeric registration failed");
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, false),
+          "numeric off failed");
+    Envelope<int> probe;
+    probe.client = 1;
+    engine.classifyForRetentionId(1, probe, option_id);
+    check(probe.event_type_id == option_id,
+          "the residual textual registration lost its numeric interest");
+    engine.detachOwner(owner);
+}
+
+static void handlerRegistrationEdgeCases()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    engine.createClient(owner, [] { return 2; });
+    // Client 2's driver keeps the shared worker reading; client 1 stays idle.
+    auto demand = engine.acquireDriver(2);
+    constexpr std::int32_t option_id = 42, other_id = 99;
+
+    // off() without a corresponding registration changes nothing.
+    check(engine.setHandlerRegistered(1, "updateOption", false),
+          "off without registration reported failure");
+    Envelope<int> probe;
+    probe.client = 1;
+    engine.classifyForRetentionId(1, probe, option_id);
+    check(probe.event_type_id == 0, "off without registration created interest");
+
+    // A conflicting id for a name already mapped is ignored: the first
+    // learned association wins, so only the first id is retained.
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "numeric registration failed");
+    check(engine.setHandlerRegistered(1, "updateOption", other_id, true),
+          "conflicting numeric registration failed");
+    const auto before = engine.stats();
+    source->push(1, 10, false, 0, {}, other_id);
+    source->push(1, 12, false, 0, {}, option_id);
+    check(engine.waitForReceived(before.received + 2, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 2,
+                                       Ms(2000)),
+          "conflict probe updates were not classified");
+    check(engine.stats().dropped_unsolicited == before.dropped_unsolicited + 1 &&
+              box->stats().depth == 1,
+          "a conflicting id was retained for an already mapped name");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 12,
+          "the first learned association was not the one retained");
+
+    // An empty-name registration matches only envelopes with no type at all,
+    // never a numerically classified update.
+    const auto empty_box = engine.createClient(owner, [] { return 3; }).second;
+    check(engine.setHandlerRegistered(3, "", true),
+          "empty-name registration failed");
+    const auto empty_before = engine.stats();
+    source->push(3, 13, false, 0, {}, 77);
+    source->push(3, 11);
+    check(engine.waitForReceived(empty_before.received + 2, Ms(2000)) &&
+              engine.waitForClassified(empty_before.published +
+                                           empty_before.dropped_unsolicited + 2,
+                                       Ms(2000)),
+          "empty-name probe updates were not classified");
+    check(engine.stats().dropped_unsolicited ==
+              empty_before.dropped_unsolicited + 1 &&
+              empty_box->stats().depth == 1,
+          "the empty-name handler swallowed a numerically classified update");
+    check(empty_box->tryPop(item) == Pop::Item && item.value == 11,
+          "the untyped envelope did not match the empty-name registration");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
 static void handlerRetentionByNumericTypeId()
 {
     auto source = std::make_shared<Fake>();
@@ -2178,6 +2463,11 @@ int main(int argc, char **argv)
         handlerRetentionSurvivesDemandEndingBeforePublication();
         numericClassificationRequiresHandlerInterest();
         handlerRegistrationOverloadsStaySymmetric();
+        handlerRegistrationSequenceKeepsResidualInterest();
+        handlerRegistrationEdgeCases();
+        handlerRegistrationFailureIsAtomic();
+        handlerReleaseIsAllocationFree();
+        residualHandlerInterestSurvivesPublish();
         handlerRetentionByNumericTypeId();
         numericHandlerOnlyPrefilter();
         handlerRetentionIsPerTypeAndPerClient();

@@ -70,6 +70,7 @@ public:
     bool closed() const;
     void setConsumerInterest(bool active, bool generic = true);
     bool setHandlerRegistered(const std::string &type, bool active);
+    bool releaseHandlerRegistered(const std::string &type) noexcept;
     bool ready() const;
     void checkAuthState(const NativeResponse &response);
 

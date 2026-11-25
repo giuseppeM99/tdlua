@@ -198,6 +198,11 @@ void NativeTDLua::setConsumerInterest(bool active, bool generic)
     NativeRuntime::instance().setConsumerInterest(client_id_, active, generic);
 }
 
+bool NativeTDLua::releaseHandlerRegistered(const std::string &type) noexcept
+{
+    return NativeRuntime::instance().releaseHandlerRegistration(client_id_, type);
+}
+
 bool NativeTDLua::setHandlerRegistered(const std::string &type, bool active)
 {
     if (injected_transport_.operations)

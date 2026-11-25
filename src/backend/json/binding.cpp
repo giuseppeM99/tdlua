@@ -94,7 +94,7 @@ static void json_on(tdlua_binding::ClientHandle client, lua_State *L,
         // scheduler handler published. Only a newly added Lua registration
         // needs its receiver interest rolled back.
         if (!had_lua_handler)
-            td->setHandlerRegistered(type, false);
+            td->releaseHandlerRegistered(type);
         throw;
     }
 }
@@ -105,7 +105,7 @@ static void json_off(tdlua_binding::ClientHandle client, const char *type)
     if (!td->dispatcher().hasHandler(type))
         return;
     td->dispatcher().off(type);
-    td->setHandlerRegistered(type, false);
+    td->releaseHandlerRegistered(type);
 }
 
 static void json_unload(tdlua_binding::ClientHandle client)

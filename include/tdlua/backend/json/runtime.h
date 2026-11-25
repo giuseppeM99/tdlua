@@ -30,6 +30,9 @@ class JsonRuntime {
     { return engine_.setConsumerInterest(client, active, generic); }
     bool setHandlerRegistered(std::int32_t client, const std::string &type, bool active)
     { return engine_.setHandlerRegistered(client, type, active); }
+    bool releaseHandlerRegistration(std::int32_t client,
+                                    const std::string &type) noexcept
+    { return engine_.releaseHandlerRegistration(client, type); }
 #ifdef TDLUA_TESTING
     bool waitForNoOwners()
     {

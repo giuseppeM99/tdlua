@@ -230,6 +230,11 @@ void TDLua::setConsumerInterest(bool active, bool generic)
     JsonRuntime::instance().setConsumerInterest(client_id, active, generic);
 }
 
+bool TDLua::releaseHandlerRegistered(const std::string &type) noexcept
+{
+    return JsonRuntime::instance().releaseHandlerRegistration(client_id, type);
+}
+
 bool TDLua::setHandlerRegistered(const std::string &type, bool active)
 {
     if (injected_transport_.operations)
