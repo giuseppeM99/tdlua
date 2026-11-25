@@ -4,7 +4,7 @@
 # TDLUA
 **A Lua binding for TDLib with JSON and native C++ backends**
 
-TDLua 0.6.3 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
+TDLua 0.6.4 is available for Linux x86-64, Linux AArch64, Windows x64 and macOS
 arm64. The Linux packages require glibc. Dynamic unloading is unsupported.
 
 ## Installation
@@ -38,7 +38,7 @@ The default destination is `lib/lua/<lua-version>/`; change it with
 diagnostic methods and cannot be installed. The install also places the
 standalone readiness header at `include/tdlua/host/readiness_c.h`.
 
-Prebuilt 0.6.3 packages are available for these platforms. Linux x86-64 modules
+Prebuilt 0.6.4 packages are available for these platforms. Linux x86-64 modules
 cover Lua 5.1 (JSON only), 5.2, 5.3, 5.4, 5.5 and LuaJIT 2.1; Linux AArch64,
 Windows and macOS use Lua 5.4. Choose the package that matches your Lua ABI and
 backend. Linux and native packages link TDLib statically; Windows and macOS JSON
@@ -184,10 +184,13 @@ update of that type is retained even when it arrives while no `receive()`,
 reading (a pending request, another client's call, or a readiness lease).
 `on()` alone creates no transport demand, so drive the client to dispatch
 retained updates. Retention is decided when the update is published: an update
-already discarded before `on(type)` is never replayed, and an update read while
-no handler existed is not classified, so a later registration does not retain
-it. Unsolicited updates of unregistered types for a client with no active
-consumer may still be discarded.
+already discarded before `on(type)` is never replayed, and a later registration
+cannot recover an envelope whose classification was skipped when it was read.
+The JSON backend always knows the type, so such an envelope can still be
+retained if the registration lands before that decision; the native backend
+classifies only while at least one handler is registered. Unsolicited updates
+of unregistered types for a client with no active consumer may still be
+discarded.
 
 ### Completion observers
 

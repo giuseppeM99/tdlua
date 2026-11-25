@@ -3,9 +3,12 @@
 
 # Changelog
 
-## Unreleased
+## 0.6.4
 
 ### Handler update retention
+
+TDLua 0.6.4 is a fix release; TDLib stays at 1.8.71
+(`f10611ee1f03f91ddae8185483a1ccfd3d664668`).
 
 - `on(type, callback)` now retains unsolicited updates of registered types even
   while no `receive`, `poll` or `loop` call is active, when another demand (for
