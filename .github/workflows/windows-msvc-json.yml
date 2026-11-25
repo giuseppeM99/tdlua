@@ -428,7 +428,7 @@ jobs:
             'tdlua_fake_client', 'tdlua_terminal_shutdown', 'tdlua_harness_cleanup',
             'tdlua_hardening_fake', 'tdlua_handler_only_prefilter', 'tdlua_handler_mutation',
             'tdlua_managed_driver', 'tdlua_m5_conformance', 'tdlua_simple_bot_example',
-            'tdlua_composition_fake', 'tdlua_composition_sync_path',
+            'tdlua_composition_fake', 'tdlua_composition_sync_path', 'tdlua_eventloop_openresty',
             'tdlua_composition_routing_fake_sync',
             'tdlua_composition_routing_fake_async',
             'tdlua_local_future_completion',
@@ -457,7 +457,7 @@ jobs:
           $actualSorted = @($testNames | Sort-Object)
           $expectedSorted = @($expectedTestNames | Sort-Object)
           if (Compare-Object $expectedSorted $actualSorted) {
-            throw "Registered MSVC test manifest differs from the expected 82-test set; actual=$($testNames.Count)"
+            throw "Registered MSVC test manifest differs from the expected 83-test set; actual=$($testNames.Count)"
           }
           "Expected platform difference: tdlua_signals is Linux-only; tdlua_windows_residency is Windows-only." | Set-Content .ci\windows-msvc\test-platform-delta.log
           $requiredTests = @('tdlua_release', 'tdlua_receiver_runtime', 'tdlua_shutdown_admission', 'tdlua_lifecycle', 'tdlua_managed_driver_backend', 'tdlua_windows_residency', 'tdlua_readiness_core', 'tdlua_backend_readiness')
