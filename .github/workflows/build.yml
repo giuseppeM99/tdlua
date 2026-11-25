@@ -390,11 +390,11 @@ jobs:
           set -euo pipefail
           tree="$RUNNER_TEMP/pack"
           luarocks --lua-version=5.4 --tree="$tree" make \
-            rockspecs/tdlua_eventloop-0.6.3-1.rockspec --deps-mode=none
-          luarocks lint rockspecs/tdlua_eventloop-0.6.3-1.rockspec
+            rockspecs/tdlua_eventloop-0.6.4-1.rockspec --deps-mode=none
+          luarocks lint rockspecs/tdlua_eventloop-0.6.4-1.rockspec
           # The release tarball has no internal agent notes. Guard against a
           # checkout-path build shipping one through LuaRocks' default docs.
-          test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.3-1/doc/AGENTS.md"
+          test ! -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.4-1/doc/AGENTS.md"
           # All six modules must reach the installed rock: the three original
           # adapters plus the Copas adapter, its private socket proxy and the
           # bridge. A rockspec that forgets one would still lint and build.
@@ -609,7 +609,7 @@ jobs:
           retention-days: 7
 
   eventloop-copas-packaging:
-    name: Copas package / 0.6.3 staging
+    name: Copas package / 0.6.4 staging
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -621,10 +621,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y liblua5.4-dev lua5.4 luarocks
 
-      - name: Stage and verify the non-publishing 0.6.3 payload
+      - name: Stage and verify the non-publishing 0.6.4 payload
         run: |
           set -euo pipefail
-          stage="$RUNNER_TEMP/tdlua-v0.6.3"
+          stage="$RUNNER_TEMP/tdlua-v0.6.4"
           rm -rf "$stage"
           mkdir -p "$stage/tdlua_eventloop"
           cp tdlua_eventloop/driver.lua \
@@ -634,10 +634,10 @@ jobs:
              tdlua_eventloop/copas_socket.lua \
              tdlua_eventloop/copas_bridge.lua \
              tdlua_eventloop/README.md "$stage/tdlua_eventloop/"
-          cp rockspecs/tdlua_eventloop-0.6.3-1.rockspec "$stage/"
-          archive="$RUNNER_TEMP/tdlua-v0.6.3-source.tar.gz"
-          tar -czf "$archive" -C "$RUNNER_TEMP" tdlua-v0.6.3
-          listing="$RUNNER_TEMP/tdlua-v0.6.3-listing.txt"
+          cp rockspecs/tdlua_eventloop-0.6.4-1.rockspec "$stage/"
+          archive="$RUNNER_TEMP/tdlua-v0.6.4-source.tar.gz"
+          tar -czf "$archive" -C "$RUNNER_TEMP" tdlua-v0.6.4
+          listing="$RUNNER_TEMP/tdlua-v0.6.4-listing.txt"
           tar -tzf "$archive" | sort > "$listing"
           cat "$listing"
           if grep -q 'env/rocks' "$listing"; then
@@ -649,7 +649,7 @@ jobs:
             exit 1
           fi
           for module in driver luv cqueues copas copas_socket copas_bridge; do
-            grep -qx "tdlua-v0.6.3/tdlua_eventloop/$module.lua" "$listing"
+            grep -qx "tdlua-v0.6.4/tdlua_eventloop/$module.lua" "$listing"
           done
           # The core rock and the C++ build never gain an event-loop
           # dependency. This is a content check so it also holds on branches
@@ -669,12 +669,12 @@ jobs:
           (
             cd "$stage"
             luarocks --lua-version=5.4 --tree="$tree" make \
-              tdlua_eventloop-0.6.3-1.rockspec --deps-mode=none
+              tdlua_eventloop-0.6.4-1.rockspec --deps-mode=none
           )
-          luarocks lint rockspecs/tdlua_eventloop-0.6.3-1.rockspec
+          luarocks lint rockspecs/tdlua_eventloop-0.6.4-1.rockspec
           installed="$tree/share/lua/5.4/tdlua_eventloop"
           test "$(find "$installed" -maxdepth 1 -name '*.lua' | wc -l)" -eq 6
-          if [ -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.3-1/doc/AGENTS.md" ]; then
+          if [ -e "$tree/lib/luarocks/rocks-5.4/tdlua_eventloop/0.6.4-1/doc/AGENTS.md" ]; then
             echo "::error::optional rock ships AGENTS.md"
             exit 1
           fi
@@ -688,7 +688,7 @@ jobs:
               assert(type(b.new) == "function")
               assert(package.loaded["copas"] == nil)
               assert(package.loaded["socket"] == nil)
-              print("copas-0.6.3-staging: Copas modules load without optional runtimes")
+              print("copas-0.6.4-staging: Copas modules load without optional runtimes")
             '
 
       - name: Upload Copas packaging evidence
@@ -697,8 +697,8 @@ jobs:
         with:
           name: eventloop-copas-packaging
           path: |
-            ${{ runner.temp }}/tdlua-v0.6.3-listing.txt
-            ${{ runner.temp }}/tdlua-v0.6.3-source.tar.gz
+            ${{ runner.temp }}/tdlua-v0.6.4-listing.txt
+            ${{ runner.temp }}/tdlua-v0.6.4-source.tar.gz
           if-no-files-found: warn
           retention-days: 7
 
