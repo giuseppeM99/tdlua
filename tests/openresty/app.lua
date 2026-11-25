@@ -130,11 +130,25 @@ function routes.errors()
 end
 
 function routes.timeout()
-    local f = alarm(0.08)
-    local value, err = await(f, 0.002)
-    assert(not value and err == "timeout" and not f:ready())
+    local f = alarm(0.25)
+    local scope = rt.adapter:scope()
+    local function check(timeout, suspended)
+        local before = rt.adapter:stats()
+        local child = ngx.thread.spawn(function() return scope:await(f, timeout) end)
+        local active = rt.adapter:stats().active
+        -- spawn returns when the child either yields in wait or exits.
+        assert(active == before.active + (suspended and 1 or 0))
+        local ok, value, err = ngx.thread.wait(child)
+        assert(ok and value == nil and err == "timeout", tostring(value or err))
+        local after = rt.adapter:stats()
+        assert(after.active == before.active and after.canceled == before.canceled + 1)
+        assert(after.delivered == before.delivered)
+    end
+    check(0, false)
+    check(0.0005, true)
     assert(await(f)._ == "ok")
-    return {timeout = true}
+    assert(scope:await(f, 0.1 + 0.2)._ == "ok")
+    return {zero = "immediate", submillisecond = "suspended", canceled = 2, future_finished = true}
 end
 
 function routes.multi()

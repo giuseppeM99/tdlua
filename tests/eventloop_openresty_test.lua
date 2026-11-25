@@ -145,6 +145,50 @@ local function in_http(fn)
 end
 
 do
+    local e = fixture()
+    local scope = e:enter()
+    local now, deadline = 1234567, 1234567.0055
+    local cases = {
+        {0, 0}, {0.3, 300}, {1.1, 1100}, {0.1 + 0.2, 300}, {2 - 1.7, 300},
+        {1e-300, 1}, {0.0005, 1}, {1.001, 1001}, {1 + 1e-10, 1001},
+        {1.2345, 1235}, {deadline - now, 6}, {60 - 1e-9, 60000}, {60, 60000},
+        {[2] = 10000},
+    }
+    for _, case in ipairs(cases) do
+        local timeout, expected_ms = case[1], case[2]
+        local terminal = handle(true)
+        e.timeout = nil
+        eq(scope:await(terminal, timeout).code, 400)
+        eq(e.timeout, nil)
+        eq(#terminal.observers, 0)
+
+        local pending = handle(false)
+        local result, err = in_http(function() return scope:await(pending, timeout) end)
+        eq(result, nil)
+        eq(err, "timeout")
+        -- lua-resty-core scales the argument and LuaJIT truncates to a C int.
+        eq(math.floor(e.timeout * 1000), expected_ms)
+        if expected_ms == 0 then eq(e.timeout, 0) end
+        eq(pending.cancellations, 1)
+        eq(e.adapter:stats().active, 0)
+        local delivered = e.adapter:stats().delivered
+        pending:deliver()
+        eq(e.adapter:stats().delivered, delivered)
+    end
+
+    for _, value in ipairs({-1e-300, 60 + 1e-9, 0/0, math.huge, -math.huge, "0.3", false, {}}) do
+        for _, ready in ipairs({true, false}) do
+            local future = handle(ready)
+            raises(function()
+                in_http(function() scope:await(future, value) end)
+            end, "timeout must be a finite number")
+            eq(#future.observers, 0)
+        end
+    end
+    e:close()
+end
+
+do
     local e = fixture({idle_cap = 0.005})
     assert(e.adapter:start())
     for _, delay in ipairs({1, 2, 2, 5, 5}) do

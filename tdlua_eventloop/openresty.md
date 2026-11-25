@@ -59,7 +59,23 @@ end
 
 `scope:await(future_or_task [, timeout])` reads terminal handles immediately. For pending work it registers a completion observer and waits in OpenResty. The observer posts a semaphore and drops its references to the scope and coroutine. OpenResty resumes the HTTP coroutine, which reads the terminal handle. Composition with `tdlua.ref`, multiple return values and multiple independent waiters on the same handle use the ordinary TDLua contract. A TDLib error remains data. A managed error raises from the terminal read.
 
-Timeouts use seconds, accept whole milliseconds from zero through 60 s and default to 10 s. A local timeout returns `nil, "timeout"` and cancels the observer. The underlying TDLib operation continues. After a stop, new waits return `nil, reason, detail`, including for an already terminal handle. A result posted before stop remains readable by its existing waiter.
+Timeouts are finite numbers in seconds from 0 through 60 and default to 10 s.
+Zero permits an immediate check without suspension. Positive timeouts round up
+to the next millisecond, with a small floating-point tolerance at integer
+boundaries. A positive delay shorter than a millisecond waits for one nominal
+millisecond. Worker scheduling can delay the actual wakeup.
+
+```lua
+local deadline = ngx.now() + 0.3
+local future = client:getAuthorizationState()
+local remaining = math.max(0, deadline - ngx.now())
+local value, reason, detail = scope:await(future, remaining)
+```
+
+A local timeout returns `nil, "timeout"` and cancels the observer. The underlying
+TDLib operation continues. After a stop, new waits return `nil, reason, detail`,
+including for an already terminal handle. A result posted before stop remains
+readable by its existing waiter.
 
 Use `scope:cleanup()` in application-owned abort handling and `adapter:cleanup()` in `log_by_lua`. Cleanup permanently closes this request scope and is idempotent. A cleanup in a live request wakes its pending waiters with `"scope closed"`. In the log phase it detaches observers without waking requests that are ending. If using `ngx.on_abort`, enable `lua_check_client_abort` and coordinate the hook with your existing application callback.
 
@@ -81,6 +97,14 @@ Managed Tasks can use the managed scheduler's APIs for their own continuation. R
 ## Scheduling and shutdown
 
 The adapter polls. It advances with 1 ms scheduling after managed completion, raw work or kick, and backs off when quiet. It checks readiness and deadlines before a drain and forces reconciliation at the configured cap, measured in requested timer delays. The unreliable-readiness fallback uses a delay of up to 5 ms, bounded by the cap and the next deadline. A driver stall uses its own bounded retry, also subject to the cap. An already armed Nginx timer cannot be moved by a kick. A cap bounds the requested delay, with actual latency subject to event-loop jitter, drain time and TDLib processing. The synchronous TDLua fast path runs on the calling worker and can delay other requests.
+
+In the P2 measurements on one Linux x86_64 host with OpenResty 1.31.9.1 and the
+default 5 ms cap, idle CPU for Nginx master and workers together was
+1.25%–1.50% of one core with one worker and 2.50%–2.75% with two workers,
+across the JSON and native backends. Idle CPU depends on the machine,
+configuration and number of workers. A higher `idle_cap` can reduce idle
+wakeups and increase the wait for new work after an idle period. A lower cap
+has the opposite trade-off.
 
 During quit or reload, a pending waiter receives `"worker shutdown"` if its request can still run. Call stop in `exit_worker_by_lua` to retire any remaining token state. This is an HTTP wait shutdown policy. The application still owns its clients and persistent data. Close a live client with the driver running and observe its terminal close before a database handoff. During reload old and new workers can coexist. Keep a database under exclusive ownership, or give workers distinct directories. A worker index alone is insufficient across generations.
 

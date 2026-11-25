@@ -199,6 +199,10 @@ def integration(root, backend):
             save(app.run / "responses.json", evidence)
         assert evidence["/sync"]["value"] == "f10611ee1f03f91ddae8185483a1ccfd3d664668"
         assert evidence["/composition"]["entities"] == 1
+        assert evidence["/timeout"] == {
+            "zero": "immediate", "submillisecond": "suspended",
+            "canceled": 2, "future_finished": True,
+        }
         assert evidence["/kill?raw=1"]["active"] == 1
         assert app.status()["active"] == 0
         before = app.status()

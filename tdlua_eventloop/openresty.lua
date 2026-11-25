@@ -39,14 +39,30 @@ local function request_context(ngx, operation, cleanup)
     return ngx.ctx, phase
 end
 
-local function milliseconds(value, minimum, name)
-    if type(value) == "number" and value == value and
-       value >= minimum / 1000 and value <= MAX_SECONDS then
+local function idle_cap_ms(value)
+    if type(value) == "number" and value >= 0.001 and value <= MAX_SECONDS then
         local ms = math.floor(value * 1000 + 0.5)
         if ms / 1000 == value then return ms end
     end
-    error(PREFIX .. name .. " must be in whole milliseconds between " ..
-          minimum .. " ms and " .. MAX_SECONDS .. " s", 3)
+    error(PREFIX .. "idle_cap must be in whole milliseconds between 1 ms and " ..
+          MAX_SECONDS .. " s", 3)
+end
+
+local function semaphore_timeout(seconds)
+    if seconds == nil then return 10 end
+    if type(seconds) ~= "number" or not (seconds >= 0 and seconds <= MAX_SECONDS) then
+        error(PREFIX .. "timeout must be a finite number between 0 and " ..
+              MAX_SECONDS .. " s", 3)
+    end
+    if seconds == 0 then return 0 end
+    local ms = seconds * 1000
+    -- Allow a few binary64 rounding units near an integer millisecond.
+    local delay = math.max(1, math.ceil(ms - ms * 2^-50))
+    local encoded = delay / 1000
+    -- ngx.semaphore multiplies by 1000 and passes the result as a C int.
+    -- Stay inside the intended millisecond when the round trip is short.
+    if encoded * 1000 < delay then return (delay + 0.5) / 1000 end
+    return encoded
 end
 
 local function deadline_ms(seconds)
@@ -159,7 +175,7 @@ function Scope:await(handle, timeout)
     if self.closed then return nil, "scope closed" end
     if adapter.reason then return nil, adapter.reason, adapter.detail end
     if not adapter.started then return nil, "not started" end
-    local delay = milliseconds(timeout == nil and 10 or timeout, 0, "timeout")
+    local seconds = semaphore_timeout(timeout)
     if handle:ready() then return handle:wait() end
 
     local thread = coroutine.running()
@@ -176,7 +192,7 @@ function Scope:await(handle, timeout)
     adapter.active = adapter.active + 1
     adapter.dirty = true
 
-    local ok, acquired, wait_error = pcall(sem.wait, sem, delay / 1000)
+    local ok, acquired, wait_error = pcall(sem.wait, sem, seconds)
     detach(waiter)
     if waiter.reason then return nil, waiter.reason, waiter.detail end
     if not ok then error(acquired, 0) end
@@ -391,7 +407,7 @@ function M.new(driver, options)
             error(PREFIX .. key .. " must be a function", 2)
         end
     end
-    local cap = milliseconds(options.idle_cap == nil and 0.005 or options.idle_cap, 1, "idle_cap")
+    local cap = idle_cap_ms(options.idle_cap == nil and 0.005 or options.idle_cap)
     local retry = math.min(cap, deadline_ms(driver.retry_delay or 0.01))
     return setmetatable({
         ngx = ngx, driver = driver, semaphore = require("ngx.semaphore"),
