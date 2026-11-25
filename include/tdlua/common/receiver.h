@@ -97,6 +97,9 @@ template <class Value> struct Envelope {
     std::uint64_t sequence = 0;
     ResponseClass response_class = ResponseClass::GenericRaw;
     std::string event_type;
+    // Set by a backend that can report the type structurally (get_id()) instead
+    // of formatting the object. Zero means "not classified numerically".
+    std::int32_t event_type_id = 0;
     std::chrono::steady_clock::time_point acquired_at;
     std::shared_ptr<GenericTicket> generic_ticket;
     Value value;
@@ -452,6 +455,8 @@ template <class Value> class Runtime {
                     entry.consumer_interests = 0;
                     entry.handler_only_consumers = 0;
                     entry.handler_types.clear();
+                    entry.handler_type_ids.clear();
+                    entry.handler_type_id_by_name.clear();
                     entry.subscription_generic = 0;
                     entry.subscription_handlers = 0;
                     entry.pending_requests.clear();
@@ -529,6 +534,8 @@ template <class Value> class Runtime {
                 entry.consumer_interests = 0;
                 entry.handler_only_consumers = 0;
                 entry.handler_types.clear();
+                entry.handler_type_ids.clear();
+                entry.handler_type_id_by_name.clear();
                 entry.subscription_generic = 0;
                 entry.subscription_handlers = 0;
             }
@@ -738,19 +745,54 @@ template <class Value> class Runtime {
     }
     bool setHandlerRegistered(int id, const std::string &type, bool active)
     {
+        return updateHandlerRegistration(id, type, 0, active);
+    }
+    // A backend that knows the numeric td_api type resolves the name once at
+    // registration, so classification never formats an envelope. Both
+    // overloads update the same pair of refcounts: the recorded id lets a
+    // textual off() release a numeric registration and vice versa.
+    bool setHandlerRegistered(int id, const std::string &type,
+                              std::int32_t type_id, bool active)
+    {
+        return updateHandlerRegistration(id, type, type_id, active);
+    }
+    bool updateHandlerRegistration(int id, const std::string &type,
+                                   std::int32_t type_id, bool active)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         auto found = entries_.find(id);
         if (found == entries_.end() || found->second.terminal) return false;
+        Entry &entry = found->second;
+        std::int32_t effective = type_id;
+        if (effective == 0) {
+            auto known = entry.handler_type_id_by_name.find(type);
+            if (known != entry.handler_type_id_by_name.end())
+                effective = known->second;
+        }
         if (active) {
             // Refcounted: two independent views (or a Lua handler plus a
             // C++ host) may register the same type and unsubscribe
             // independently.
-            ++found->second.handler_types[type];
+            ++entry.handler_types[type];
+            if (effective != 0) {
+                ++entry.handler_type_ids[effective];
+                entry.handler_type_id_by_name[type] = effective;
+            }
         } else {
-            auto registration = found->second.handler_types.find(type);
-            if (registration != found->second.handler_types.end()) {
+            auto registration = entry.handler_types.find(type);
+            if (registration != entry.handler_types.end()) {
                 if (registration->second > 1) --registration->second;
-                else found->second.handler_types.erase(registration);
+                else {
+                    entry.handler_types.erase(registration);
+                    entry.handler_type_id_by_name.erase(type);
+                }
+            }
+            if (effective != 0) {
+                auto by_id = entry.handler_type_ids.find(effective);
+                if (by_id != entry.handler_type_ids.end()) {
+                    if (by_id->second > 1) --by_id->second;
+                    else entry.handler_type_ids.erase(by_id);
+                }
             }
         }
         ++generation_;
@@ -780,7 +822,8 @@ template <class Value> class Runtime {
         const auto& entry = found->second;
         return entry.handler_only_consumers != 0 ||
                entry.subscription_handlers != 0 ||
-               !entry.handler_types.empty();
+               !entry.handler_types.empty() ||
+               !entry.handler_type_ids.empty();
     }
 
     // Classifies an unsolicited envelope through describe() when the
@@ -797,6 +840,17 @@ template <class Value> class Runtime {
         const std::string description = describe();
         const auto delimiter = description.find_first_of(" {\n");
         item.event_type = description.substr(0, delimiter);
+    }
+    // Structural classification: the backend already knows the numeric type, so
+    // nothing is formatted and nested fields are never visited.
+    void classifyForRetentionId(int id, Envelope<Value> &item, std::int32_t type_id)
+    {
+        if (type_id == 0) return;
+        if (item.event_type_id != 0 || !item.event_type.empty() ||
+            item.request_id != 0 || item.terminal)
+            return;
+        if (!needsHandlerType(id)) return;
+        item.event_type_id = type_id;
     }
     bool requestOneShot(int id)
     {
@@ -964,6 +1018,8 @@ template <class Value> class Runtime {
         std::size_t subscription_generic = 0;
         std::size_t subscription_handlers = 0;
         std::map<std::string, unsigned> handler_types;
+        std::map<std::int32_t, unsigned> handler_type_ids;
+        std::map<std::string, std::int32_t> handler_type_id_by_name;
         bool one_shot_pending = false, one_shot_in_flight = false;
         std::map<std::uint64_t, std::size_t> pending_requests;
         std::map<std::uint64_t, ResponseClass> protected_requests;
@@ -1029,6 +1085,8 @@ template <class Value> class Runtime {
         entry.consumer_interests = 0;
         entry.handler_only_consumers = 0;
         entry.handler_types.clear();
+        entry.handler_type_ids.clear();
+        entry.handler_type_id_by_name.clear();
         entry.subscription_generic = 0;
         entry.subscription_handlers = 0;
         ++generation_;
@@ -1282,9 +1340,15 @@ template <class Value> class Runtime {
                 const bool handler_consumer = entry.handler_only_consumers != 0;
                 const bool subscription_generic = entry.subscription_generic != 0;
                 const bool subscription_handler = entry.subscription_handlers != 0;
-                const bool handler_registered =
+                bool handler_registered =
                     entry.handler_types.find(item.event_type) !=
                     entry.handler_types.end();
+                if (!handler_registered && item.event_type_id != 0)
+                    handler_registered =
+                        entry.handler_type_ids.find(item.event_type_id) !=
+                        entry.handler_type_ids.end();
+                const bool typed_event =
+                    !item.event_type.empty() || item.event_type_id != 0;
                 const bool selected_handler_update =
                     (handler_consumer || subscription_handler) && handler_registered;
                 // A traditional consumer (receive/poll/loop/on) always keeps its
@@ -1299,7 +1363,7 @@ template <class Value> class Runtime {
                     (handler_consumer ||
                      (subscription_only && subscription_handler && !subscription_generic)) &&
                     !generic_consumer && !subscription_generic &&
-                    !item.event_type.empty() && !selected_handler_update &&
+                    typed_event && !selected_handler_update &&
                     !request_id && !terminal &&
                     entry.lifecycle_demands == 0;
                 // A type registered with on() is retained even when no driver or

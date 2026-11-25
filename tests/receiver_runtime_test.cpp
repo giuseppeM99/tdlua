@@ -83,7 +83,7 @@ class Fake final : public Source<int> {
         if (acknowledge) acknowledge(id);
     }
     void push(int id, int value, bool terminal = false, std::uint64_t request_id = 0,
-              std::string event_type = {})
+              std::string event_type = {}, std::int32_t event_type_id = 0)
     {
         std::lock_guard<std::mutex> lock(mutex);
         Item item;
@@ -92,6 +92,7 @@ class Fake final : public Source<int> {
         item.terminal = terminal;
         item.request_id = request_id;
         item.event_type = std::move(event_type);
+        item.event_type_id = event_type_id;
         queue.push_back(std::move(item));
         changed.notify_all();
     }
@@ -1381,6 +1382,169 @@ static void handlerRetentionSurvivesDemandEndingBeforePublication()
     engine.detachOwner(owner);
 }
 
+static void numericClassificationRequiresHandlerInterest()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    constexpr std::int32_t option_id = 1234;
+    Envelope<int> item;
+    item.client = 1;
+    engine.classifyForRetentionId(1, item, option_id);
+    check(item.event_type_id == 0 && item.event_type.empty(),
+          "unregistered numeric type was classified");
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "numeric handler registration failed");
+    engine.classifyForRetentionId(1, item, option_id);
+    check(item.event_type_id == option_id,
+          "registered numeric type was not classified structurally");
+
+    Envelope<int> correlated;
+    correlated.client = 1;
+    correlated.request_id = 7;
+    engine.classifyForRetentionId(1, correlated, option_id);
+    check(correlated.event_type_id == 0,
+          "correlated response was classified as an update");
+    Envelope<int> terminal;
+    terminal.client = 1;
+    terminal.terminal = true;
+    engine.classifyForRetentionId(1, terminal, option_id);
+    check(terminal.event_type_id == 0,
+          "terminal object was classified as an update");
+    Envelope<int> textual;
+    textual.client = 1;
+    textual.event_type = "updateOption";
+    engine.classifyForRetentionId(1, textual, option_id);
+    check(textual.event_type_id == 0 && textual.event_type == "updateOption",
+          "textual classification was overwritten by the numeric path");
+    engine.detachOwner(owner);
+}
+
+static void handlerRegistrationOverloadsStaySymmetric()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    engine.createClient(owner, [] { return 1; });
+    constexpr std::int32_t option_id = 42, message_id = 77;
+
+    // Numeric on(), textual off(): the recorded id must be released too.
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "numeric registration failed");
+    check(engine.setHandlerRegistered(1, "updateOption", false),
+          "textual off after a numeric registration failed");
+    Envelope<int> probe;
+    probe.client = 1;
+    engine.classifyForRetentionId(1, probe, option_id);
+    check(probe.event_type_id == 0,
+          "textual off left the numeric interest behind");
+
+    // Textual on(), numeric off(): no numeric refcount was taken, so off must
+    // not underflow or leave the name registered.
+    check(engine.setHandlerRegistered(1, "updateNewMessage", true),
+          "textual registration failed");
+    check(engine.setHandlerRegistered(1, "updateNewMessage", message_id, false),
+          "numeric off after a textual registration failed");
+    Envelope<int> second;
+    second.client = 1;
+    engine.classifyForRetentionId(1, second, message_id);
+    check(second.event_type_id == 0,
+          "numeric off left the textual interest behind");
+
+    // Refcounts survive a double registration and one off().
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true) &&
+              engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "double numeric registration failed");
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, false),
+          "first numeric off failed");
+    Envelope<int> third;
+    third.client = 1;
+    engine.classifyForRetentionId(1, third, option_id);
+    check(third.event_type_id == option_id,
+          "one off() discarded a still registered numeric type");
+    engine.detachOwner(owner);
+}
+
+static void handlerRetentionByNumericTypeId()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    const auto a_box = engine.createClient(owner, [] { return 1; }).second;
+    const auto b_box = engine.createClient(owner, [] { return 2; }).second;
+    constexpr std::int32_t option_id = 11, message_id = 22, deleted_id = 33;
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true) &&
+              engine.setHandlerRegistered(1, "updateNewMessage", message_id, true) &&
+              engine.setHandlerRegistered(2, "updateDeleteMessages", deleted_id, true),
+          "numeric handler registration failed");
+    auto demand = engine.acquireDriver(2);
+    const auto before = engine.stats();
+    source->push(1, 10, false, 0, {}, option_id);
+    source->push(1, 11, false, 0, {}, deleted_id);
+    source->push(1, 12, false, 0, {}, message_id);
+    source->push(2, 20, false, 0, {}, deleted_id);
+    check(engine.waitForReceived(before.received + 4, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 4,
+                                       Ms(2000)),
+          "worker did not classify the numeric updates");
+    check(engine.stats().dropped_unsolicited == before.dropped_unsolicited + 1 &&
+              a_box->stats().depth == 2 && b_box->stats().depth == 1,
+          "numeric retention kept an unregistered type or lost a registered one");
+    Item item;
+    check(a_box->tryPop(item) == Pop::Item && item.value == 10 &&
+              a_box->tryPop(item) == Pop::Item && item.value == 12 &&
+              a_box->tryPop(item) == Pop::Timeout,
+          "client A did not retain its numeric types in FIFO order");
+    check(b_box->tryPop(item) == Pop::Item && item.value == 20,
+          "client B did not receive its own numeric type");
+
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, false),
+          "numeric handler removal failed");
+    const auto removed = engine.stats();
+    source->push(1, 13, false, 0, {}, option_id);
+    check(engine.waitForClassified(removed.published + removed.dropped_unsolicited + 1,
+                                   Ms(2000)),
+          "post-removal update was not classified");
+    check(engine.stats().dropped_unsolicited == removed.dropped_unsolicited + 1 &&
+              a_box->stats().depth == 0,
+          "off() left the numeric retention interest behind");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
+static void numericHandlerOnlyPrefilter()
+{
+    auto source = std::make_shared<Fake>();
+    Engine engine(source, Ms(5));
+    const auto owner = engine.attachOwner();
+    const auto box = engine.createClient(owner, [] { return 1; }).second;
+    constexpr std::int32_t option_id = 7;
+    check(engine.setHandlerRegistered(1, "updateOption", option_id, true),
+          "numeric handler registration failed");
+    check(engine.setConsumerInterest(1, true, false),
+          "handler-only consumer interest failed");
+    auto demand = engine.acquireDriver(1);
+    const auto before = engine.stats();
+    source->push(1, 1, false, 0, {}, option_id);
+    source->push(1, 2, false, 0, {}, 99);
+    check(engine.waitForReceived(before.received + 2, Ms(2000)) &&
+              engine.waitForClassified(before.published + before.dropped_unsolicited + 2,
+                                       Ms(2000)),
+          "handler-only numeric updates were not classified");
+    check(engine.stats().dropped_by_handler_filter ==
+              before.dropped_by_handler_filter + 1 &&
+              box->stats().depth == 1,
+          "numeric prefilter delivered an unregistered type or dropped the registered one");
+    Item item;
+    check(box->tryPop(item) == Pop::Item && item.value == 1,
+          "numeric prefilter lost the registered update");
+    check(engine.setConsumerInterest(1, false, false),
+          "handler-only consumer release failed");
+    demand.release();
+    engine.detachOwner(owner);
+}
+
 static void handlerRetentionIsPerTypeAndPerClient()
 {
     auto source = std::make_shared<Fake>();
@@ -2012,6 +2176,10 @@ int main(int argc, char **argv)
         boundedGenericBuffer();
         handlerMetadataLinearizesAtPublication();
         handlerRetentionSurvivesDemandEndingBeforePublication();
+        numericClassificationRequiresHandlerInterest();
+        handlerRegistrationOverloadsStaySymmetric();
+        handlerRetentionByNumericTypeId();
+        numericHandlerOnlyPrefilter();
         handlerRetentionIsPerTypeAndPerClient();
         handlerRegistrationAfterSkippedClassificationIsNotReplayed();
         handlerRegistrationBeforePublicationRetainsTypedEnvelope();

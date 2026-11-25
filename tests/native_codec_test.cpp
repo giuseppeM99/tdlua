@@ -389,6 +389,37 @@ void test_native_response_push_oom()
 
 }  // namespace
 
+void test_update_type_id_mapping()
+{
+    struct Case {
+        const char *name;
+        std::int32_t id;
+    };
+    const Case updates[] = {
+        {"updateAuthorizationState", td::td_api::updateAuthorizationState::ID},
+        {"updateOption", td::td_api::updateOption::ID},
+        {"updateNewMessage", td::td_api::updateNewMessage::ID},
+        {"updateChatFolders", td::td_api::updateChatFolders::ID},
+        {"updateAccentColors", td::td_api::updateAccentColors::ID},
+        {"updateWebProxyCarrierOpened", td::td_api::updateWebProxyCarrierOpened::ID},
+    };
+    for (const Case &entry : updates) {
+        require(tdlua_native::type_id(entry.name) == entry.id,
+                std::string("type_id mismatch for ") + entry.name);
+    }
+    require(tdlua_native::type_id("message") == 0,
+            "a non-update type resolved to a numeric update id");
+    require(tdlua_native::type_id("updateDoesNotExist") == 0,
+            "an unknown type resolved to a numeric update id");
+    require(tdlua_native::type_id("") == 0,
+            "the empty type resolved to a numeric update id");
+    // Names just outside the sorted table exercise both binary-search edges.
+    require(tdlua_native::type_id("a") == 0,
+            "a name before the first entry resolved to an update id");
+    require(tdlua_native::type_id("zzz") == 0,
+            "a name after the last entry resolved to an update id");
+}
+
 int main()
 {
     lua_State *L = luaL_newstate();
@@ -411,6 +442,7 @@ int main()
         expect_invalid_int64(L, "");
         expect_omitted_set_tdlib_parameters(L);
         test_native_response_push_oom();
+        test_update_type_id_mapping();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         lua_close(L);

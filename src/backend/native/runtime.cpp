@@ -131,9 +131,8 @@ class NativeSource final : public tdlua::receiver::Source<NativeResponse>,
         item.terminal = isTerminal(response);
         item.request_id = response.request_id;
         if (response.request_id == 0 && engine)
-            engine->classifyForRetention(response.client_id, item, [&response] {
-                return td::td_api::to_string(response.object);
-            });
+            engine->classifyForRetentionId(response.client_id, item,
+                                           response.object->get_id());
         // This public terminal is synthesized after ClientManager retires its
         // actor/callback. Inspect scalars before the sole object_ptr move.
         ledger_->observe(item.client, item.terminal);
@@ -397,11 +396,8 @@ void NativeRuntime::injectReceivedForTesting(
     Envelope item;
     item.client = client_id;
     item.terminal = object && isTerminalObject(*object);
-    if (object) {
-        const auto description = td::td_api::to_string(object);
-        const auto delimiter = description.find_first_of(" {\n");
-        item.event_type = description.substr(0, delimiter);
-    }
+    if (object)
+        item.event_type_id = object->get_id();
     item.value.client_id = client_id;
     item.value.object = std::move(object);
     static_cast<NativeSource *>(source_.get())->inject(std::move(item));

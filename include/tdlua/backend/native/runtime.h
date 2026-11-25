@@ -62,7 +62,12 @@ public:
     { return engine_.setConsumerInterest(client_id, active, generic); }
     bool setHandlerRegistered(td::ClientManager::ClientId client_id,
                               const std::string &type, bool active)
-    { return engine_.setHandlerRegistered(client_id, type, active); }
+    {
+        // Resolve the name once: the receiver classifies by numeric type and
+        // never formats an update.
+        return engine_.setHandlerRegistered(client_id, type,
+                                            tdlua_native::type_id(type), active);
+    }
     Engine &engine() { return engine_; }
     const std::shared_ptr<tdlua::receiver::ReadinessHub<NativeResponse>> &hub() const
     {

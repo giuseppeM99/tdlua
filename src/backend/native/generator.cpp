@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -260,7 +261,8 @@ private:
     static bool is_dispatch_symbol(const std::string &symbol)
     {
         return symbol == "read_function" || symbol == "push_object" ||
-               symbol == "from_lua" || symbol == "from_lua_object";
+               symbol == "from_lua" || symbol == "from_lua_object" ||
+               symbol == "type_id";
     }
 
     static void write_if_different(const std::string &path, const std::string &contents)
@@ -363,6 +365,7 @@ private:
         out << "#include \"tdlua/backend/native/codec.h\"\n"
             << "#include \"tdlua/backend/native/codec_runtime.h\"\n\n"
             << "#include <td/telegram/td_api.hpp>\n\n"
+            << "#include <cstddef>\n"
             << "#include <cstdint>\n"
             << "#include <string>\n"
             << "#include <vector>\n\n"
@@ -686,6 +689,49 @@ private:
 
     void write_public_functions(std::ostream &out) const
     {
+        // Update constructor names are the only names an unsolicited envelope
+        // can carry, so the table stays small and derived from the schema.
+        const CustomType *update_type = nullptr;
+        for (const CustomType *type : schema_.custom_types) {
+            if (type->name == "Update") {
+                update_type = type;
+                break;
+            }
+        }
+        if (update_type == nullptr || update_type->constructors.empty()) {
+            throw std::runtime_error("native codec schema has no Update constructors");
+        }
+        std::vector<std::pair<std::string, std::string>> updates;
+        for (const Constructor *constructor : update_type->constructors) {
+            updates.emplace_back(constructor->name, constructor_name(constructor));
+        }
+        std::sort(updates.begin(), updates.end());
+        out << "std::int32_t type_id(const std::string &name) {\n"
+            << "    struct Entry {\n"
+            << "        const char *name;\n"
+            << "        std::int32_t id;\n"
+            << "    };\n"
+            << "    static const Entry entries[] = {\n";
+        for (const auto &update : updates) {
+            out << "        {\"" << update.first << "\", td::td_api::"
+                << update.second << "::ID},\n";
+        }
+        out << "    };\n"
+            << "    std::size_t low = 0;\n"
+            << "    std::size_t high = sizeof(entries) / sizeof(entries[0]);\n"
+            << "    while (low < high) {\n"
+            << "        const std::size_t middle = low + (high - low) / 2;\n"
+            << "        const int order = name.compare(entries[middle].name);\n"
+            << "        if (order < 0) {\n"
+            << "            high = middle;\n"
+            << "        } else if (order > 0) {\n"
+            << "            low = middle + 1;\n"
+            << "        } else {\n"
+            << "            return entries[middle].id;\n"
+            << "        }\n"
+            << "    }\n"
+            << "    return 0;\n"
+            << "}\n\n";
         out << "td::td_api::object_ptr<td::td_api::Function> from_lua("
             << "lua_State *L, int index, const std::string &path) {\n"
             << "    return read_function(L, index, path);\n"
