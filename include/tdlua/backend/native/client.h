@@ -34,6 +34,7 @@ public:
     bool tryPopPumpItem(bool discard_unobserved_raw, PumpValue &result);
 #ifdef TDLUA_TESTING
     int clientIdForTesting() const { return client_id_; }
+    static std::uint64_t handlerRegistrationsForTesting() noexcept;
     void setEventPublicationFailureForTesting(bool fail);
     std::size_t queuedPumpItemsForTesting() const { return updates_.size(); }
     std::size_t genericPumpItemsForTesting() const

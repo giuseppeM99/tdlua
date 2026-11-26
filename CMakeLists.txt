@@ -1943,6 +1943,49 @@ if(TDLUA_BUILD_TESTS)
                 COMMAND tdlua_composition_native_fake_test)
             set_tests_properties(tdlua_composition_native_fake PROPERTIES TIMEOUT 60)
             tdlua_enable_sanitizer_test_runtime(tdlua_composition_native_fake)
+
+            # Operator-new interposition reaches a shared tdlua on ELF and
+            # Mach-O, so the binding-level allocation-failure test runs on
+            # UNIX only. Windows still compiles the same binding code and runs
+            # the full native suite.
+            if(UNIX)
+                add_executable(tdlua_handler_binding_atomicity_test
+                    "tests/handler_binding_atomicity_test.cpp")
+                target_include_directories(
+                    tdlua_handler_binding_atomicity_test PRIVATE
+                    ${LUA_INCLUDE_DIRS}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                    "${_tdlua_native_td_include_dirs}"
+                    "${TDLUA_NATIVE_GENERATED_DIR}")
+                if(NOT TDLUA_BUNDLED_TDLIB)
+                    target_include_directories(
+                        tdlua_handler_binding_atomicity_test PRIVATE
+                        "${CMAKE_CURRENT_SOURCE_DIR}/td/tdutils"
+                        "${_tdlua_codegen_build_dir}/td/tdutils")
+                endif()
+                target_link_libraries(tdlua_handler_binding_atomicity_test PRIVATE
+                    tdlua ${LUA_LIBRARIES} ${_tdlua_tdjson_private_target})
+                target_compile_features(tdlua_handler_binding_atomicity_test
+                    PRIVATE cxx_std_23)
+                target_compile_definitions(
+                    tdlua_handler_binding_atomicity_test PRIVATE
+                    TDLUA_TESTING TDLUA_NATIVE_BACKEND)
+                tdlua_enable_sanitizers(tdlua_handler_binding_atomicity_test)
+                if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                    target_compile_options(
+                        tdlua_handler_binding_atomicity_test PRIVATE
+                        -fno-sanitize=vptr)
+                endif()
+                add_dependencies(tdlua_handler_binding_atomicity_test
+                    tdlua_native_generated)
+                add_test(NAME tdlua_handler_binding_atomicity
+                    COMMAND tdlua_handler_binding_atomicity_test)
+                set_tests_properties(tdlua_handler_binding_atomicity PROPERTIES
+                    TIMEOUT 120)
+                tdlua_enable_sanitizer_test_runtime(
+                    tdlua_handler_binding_atomicity)
+            endif()
         endif()
         add_test(NAME tdlua_composition_sync_path
             COMMAND ${TDLUA_LUA_EXECUTABLE}
@@ -2069,6 +2112,7 @@ foreach(target tdlua tdlua_userdata_constructor_test tdlua_lua51_wait_fault_test
         tdlua_readiness_deadline_test tdlua_backend_readiness_test
         tdlua_simple_bot_example_test tdlua_async_demo_test
         tdlua_native_codec_test tdlua_native_decoder_safety_test
+        tdlua_handler_binding_atomicity_test
         tdlua_model_benchmark)
     if(TARGET ${target})
         target_link_libraries(${target} PRIVATE tdlua_lua_runtime)

@@ -8,6 +8,7 @@
 #include "tdlua/backend/native/runtime.h"
 #include "tdlua/common/client_pump.h"
 
+#include <atomic>
 #include <chrono>
 #include <new>
 #include <utility>
@@ -198,8 +199,20 @@ void NativeTDLua::setConsumerInterest(bool active, bool generic)
     NativeRuntime::instance().setConsumerInterest(client_id_, active, generic);
 }
 
+#ifdef TDLUA_TESTING
+namespace {
+std::atomic<std::uint64_t> handler_registrations_for_testing{0};
+} // namespace
+
+std::uint64_t NativeTDLua::handlerRegistrationsForTesting() noexcept
+{
+    return handler_registrations_for_testing.load(std::memory_order_relaxed);
+}
+#endif
+
 bool NativeTDLua::releaseHandlerRegistered(const std::string &type) noexcept
 {
+    if (injected_transport_.operations) return true;
     return NativeRuntime::instance().releaseHandlerRegistration(client_id_, type);
 }
 
@@ -207,7 +220,13 @@ bool NativeTDLua::setHandlerRegistered(const std::string &type, bool active)
 {
     if (injected_transport_.operations)
         return true;
-    return NativeRuntime::instance().setHandlerRegistered(client_id_, type, active);
+    const bool registered =
+        NativeRuntime::instance().setHandlerRegistered(client_id_, type, active);
+#ifdef TDLUA_TESTING
+    if (registered)
+        handler_registrations_for_testing.fetch_add(1, std::memory_order_relaxed);
+#endif
+    return registered;
 }
 
 #ifdef TDLUA_TESTING

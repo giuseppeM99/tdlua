@@ -949,6 +949,17 @@ template <class Value> class Runtime {
             throw std::runtime_error(failureMessage(failure_));
     }
 #ifdef TDLUA_TESTING
+    std::size_t handlerRegistrationCountForTesting(
+        int id, const std::string &type) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(id);
+        if (found == entries_.end()) return 0;
+        const auto registration = found->second.handler_types.find(type);
+        return registration == found->second.handler_types.end()
+                   ? 0
+                   : registration->second;
+    }
     std::size_t genericPendingForTesting(int id) const
     {
         std::lock_guard<std::mutex> lock(mutex_);

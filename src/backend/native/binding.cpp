@@ -88,17 +88,21 @@ static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
                       const char *type, int callback_index, bool concurrent)
 {
     auto *td = static_cast<NativeTDLua *>(client);
-    const bool had_lua_handler = td->dispatcher().hasHandler(type);
-    if (!had_lua_handler && !td->setHandlerRegistered(type, true))
+    // Build the key once, before touching any state: every later conversion
+    // would allocate, and a conversion inside the catch below could replace
+    // the original exception while receiver interest is still registered.
+    const std::string key(type);
+    const bool had_lua_handler = td->dispatcher().hasHandler(key);
+    if (!had_lua_handler && !td->setHandlerRegistered(key, true))
         throw std::runtime_error("tdlua: client handler registry unavailable");
     try {
-        td->dispatcher().on(L, type, callback_index, concurrent);
+        td->dispatcher().on(L, key, callback_index, concurrent);
     } catch (...) {
         // onEvent is failure-atomic: a failed replacement leaves the previous
         // scheduler handler published. Only a newly added Lua registration
         // needs its receiver interest rolled back.
         if (!had_lua_handler)
-            td->releaseHandlerRegistered(type);
+            td->releaseHandlerRegistered(key);
         throw;
     }
 }
@@ -106,10 +110,11 @@ static void native_on(tdlua_binding::ClientHandle client, lua_State *L,
 static void native_off(tdlua_binding::ClientHandle client, const char *type)
 {
     auto *td = static_cast<NativeTDLua *>(client);
-    if (!td->dispatcher().hasHandler(type))
+    const std::string key(type);
+    if (!td->dispatcher().hasHandler(key))
         return;
-    td->dispatcher().off(type);
-    td->releaseHandlerRegistered(type);
+    td->dispatcher().off(key);
+    td->releaseHandlerRegistered(key);
 }
 
 static void native_unload(tdlua_binding::ClientHandle client)

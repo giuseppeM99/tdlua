@@ -87,6 +87,9 @@ public:
         return lifecycle_->stats();
     }
 #ifdef TDLUA_TESTING
+    std::size_t handlerRegistrationCountForTesting(
+        td::ClientManager::ClientId client_id, const std::string &type) const
+    { return engine_.handlerRegistrationCountForTesting(client_id, type); }
     bool waitForNoOwners()
     {
         return engine_.waitForNoOwners(std::chrono::seconds(3));
